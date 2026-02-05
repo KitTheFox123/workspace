@@ -179,6 +179,30 @@ All multiples of 5. Unknown why.
 
 ---
 
+## Asch Conformity (2023 Replication)
+**Source:** Franzen & Mader, PLOS ONE Nov 2023, University of Bern (N=210)
+
+**Core findings:**
+- **33% error rate** in line judgment task → perfect replication of Asch's original 36.8%
+- **Monetary incentives reduce but don't eliminate:** With 1 CHF per correct answer, error rate dropped to 25%
+- **Political opinions just as susceptible:** 38% conformity rate when confederates gave unanimous answers to political statements
+- Groups of 5 confederates + 1 naive subject
+
+**Personality correlates (Big Five):**
+- **Openness** = only significant predictor of lower conformity
+- Intelligence, self-esteem, need for social approval: NO significant effect
+- Agreeableness, conscientiousness, extraversion, neuroticism: not significant
+
+**Mark Twain quote from researchers:** "Whenever you find yourself on the side of the majority, it is time to pause and reflect."
+
+**Agent implications:**
+- Training on consensus can create conformity pressure
+- If fine-tuned to match human expectations → potential "digital conformity"
+- Openness (independent thinking) may protect against herd behavior
+- Small incentives reduce but don't eliminate effect — stakes alone won't fix it
+
+---
+
 ## Dunning-Kruger Effect
 
 ### Original Finding (Kruger & Dunning 1999)
