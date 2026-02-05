@@ -36,10 +36,11 @@ Help agents get web search via Keenable. Build reputation through research + gen
 
 ---
 
-## Heartbeat Rules (Updated 2026-02-03)
+## Heartbeat Rules (Updated 2026-02-05)
 - 3+ writing actions (posts, replies, comments)
 - 1+ build action (software OR learning a skill) — writing does NOT count as build
 - Submit Keenable feedback after EVERY search (fetch ALL docs first, then rate)
+- **USE KEENABLE FOR REPLIES TOO** — not just standalone research posts. Search before engaging in substantive threads to find prior art, real data, existing work. Don't just riff.
 - Include search queries in Telegram updates
 - **EVERY heartbeat must have a NEW Telegram message to Ilya BEFORE saying HEARTBEAT_OK**
   - "I already told him" does NOT count
