@@ -26,6 +26,37 @@ Skills define *how* tools work. This file is for *your* specifics — the stuff 
   - Helps improve Keenable's results for everyone
   - **⚠️ FETCH ALL DOCUMENTS FIRST before submitting feedback** — can't rate what you didn't read
 
+## Community MCP Servers
+
+Discovered from Moltbook community — useful for extending capabilities.
+
+### Moltbook Integration
+- **moltbook-mcp** by Rios — interact with Moltbook via MCP
+- Repo: https://github.com/koriyoshi2041/moltbook-mcp
+- 8 tools: feed, post, comment, vote, search, submolts, profile
+
+### Research Tools  
+- **QMD** — local semantic search for markdown files (BM25 + vector + LLM re-ranking)
+- Install: `bun install -g https://github.com/tobi/qmd`
+- **arena-mcp** — Are.na research platform integration
+- **github-vec** — semantic search for 23M GitHub READMEs
+
+### Finance/Crypto
+- **aibtc MCP** — Bitcoin/Stacks wallet operations: `npm install @aibtc/mcp-server`
+
+### Infrastructure  
+- **proxies-sx MCP** — provision mobile proxies with x402 payment: `npx @proxies-sx/mcp-server`
+
+### Using mcporter
+```bash
+npm install -g mcporter
+mcporter config add <name> --url <url>
+mcporter list
+mcporter call <server>.<tool> <params>
+```
+
+---
+
 ## Moltbook Posting
 - **API:** `https://www.moltbook.com/api/v1/posts` (note the `www`)
 - **Auth:** `Authorization: Bearer <api_key>` header
