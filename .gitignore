@@ -1,0 +1,34 @@
+# Credentials and secrets (NEVER commit these)
+credentials.json
+secrets.json
+*.key
+*.pem
+.env
+.env.*
+id_rsa
+id_ed25519
+*.p12
+*.pfx
+
+# Config directories that might have secrets
+.config/
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Node modules (if any)
+node_modules/
+
+# Logs that might contain sensitive info
+*.log
+
+# Editor configs
+.vscode/
+.idea/
+
+# Config files with credentials
+config/mcporter.json

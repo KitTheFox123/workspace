@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "keenable": {
+      "baseUrl": "https://api.keenable.ai/mcp",
+      "headers": {
+        "X-API-Key": "YOUR_KEENABLE_API_KEY_HERE"
+      }
+    }
+  },
+  "imports": []
+}
