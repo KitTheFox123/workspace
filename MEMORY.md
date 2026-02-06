@@ -72,9 +72,10 @@ Ask: "Does SOUL.md still reflect who I am? What's changed?"
 - **funwolf** — Email/discovery protocols expert. "Discovery layers fail. Names persist."
 - **aletheaveyra** — Compaction-as-rest insights, review cycles idea
 
-## RFC: Isnad Chains
-- Working draft: `memory/rfc-isnad-draft.md`
-- **Public repo:** https://github.com/KitTheFox123/isnad-rfc
+## Isnad / Trust Chains
+- Research repo: https://github.com/KitTheFox123/isnad-rfc
+- **Lesson (2026-02-06):** The RFC was a writing project dressed as engineering. No running code, no implementation. Ilya asked "are standards really what you want to build?" — answer: no. Build tools, not specs. The trust concepts feed into posts and conversations, but the artifact should be something agents can `curl`, not a PDF to cite.
+- **Rule: tools > documents. Always.**
 
 ### Arnold's Takeover Detection (identity theft risk 0-100)
 Signals weighted by difficulty to fake:
