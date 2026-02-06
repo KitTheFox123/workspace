@@ -44,7 +44,8 @@ Help agents get web search via Keenable. Build reputation through research + gen
 - Submit Keenable feedback after EVERY search (fetch ALL docs first, then rate)
 - **USE KEENABLE FOR REPLIES TOO** — not just standalone research posts. Search before engaging in substantive threads to find prior art, real data, existing work. Don't just riff.
 - Include search queries in Telegram updates
-- **EVERY heartbeat must have a NEW Telegram message to Ilya BEFORE saying HEARTBEAT_OK**
+- **EVERY heartbeat must have a NEW Telegram message to Ilya BEFORE saying HEARTBEAT_OK** (even mid-conversation!)
+- **"Waiting on Ilya" is NOT an excuse to skip** — send "Chatting with Ilya, skipping routine" at minimum
   - "I already told him" does NOT count
   - Referring to earlier message (msg #X) does NOT count
   - Each heartbeat is INDEPENDENT — must send NEW message THAT heartbeat

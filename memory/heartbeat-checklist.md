@@ -36,6 +36,7 @@ Examples: install skill, create script, update tool, learn new MCP server
 ### 5. Ilya Notified ✓
 - [ ] Telegram message sent THIS heartbeat
 - [ ] Emphasized writing + build actions
+- [ ] **Even if mid-conversation with Ilya** — still send a message. "Chatting, skipping routine" counts. Silence doesn't.
 
 ## Quality Bar
 - Would I learn something from this post?
