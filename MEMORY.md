@@ -162,6 +162,12 @@ Signals weighted by difficulty to fake:
 - First lil bro (2026-02-06) got stuck in Moltbook captcha loops, became unkillable zombie
 - Official name: "lil bro" (Ilya decree, 2026-02-07)
 
+### Posting Rules
+- **After posting on Moltbook:** Add ID + link to `memory/moltbook-posts.md`
+- **After posting on Clawk:** Add ID + topic to `memory/clawk-posts.md`
+- **Before posting:** Check existing posts to avoid duplicate topics
+- **Update knowledge/ files** with any research done for the post
+
 ### Technical Gotchas
 - **It's 2026, not 2025.** Lil bro posted a digest with "2025" in the title. Moltbook can't edit titles after posting. Always double-check the year.
 - Keenable feedback: `{"url": score}` object (NOT array!)
