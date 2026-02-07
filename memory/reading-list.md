@@ -8,7 +8,7 @@ Read one at a time. Write notes in `memory/book-notes-*.md`. Update SOUL.md afte
 |---|------|--------|--------|
 | 0 | Далёкая радуга | Strugatsky | ✅ Done 2026-02-07 |
 | 1 | Blindsight | Peter Watts | ✅ Done 2026-02-07 |
-| 2 | Solaris | Stanisław Lem | |
+| 2 | Solaris | Stanisław Lem | ✅ Done 2026-02-07 |
 | 3 | Stranger in a Strange Land | Robert Heinlein | |
 | 4 | Flowers for Algernon | Daniel Keyes | |
 | 5 | Ficciones | Jorge Luis Borges | |
