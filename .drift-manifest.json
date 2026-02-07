@@ -1,0 +1,26 @@
+{
+  "SOUL.md": {
+    "hash": "bda5e46f66d9312239bdd85491a11d6fbdc5146801fd1164093435628904f28a",
+    "size": 4389,
+    "lines": 102,
+    "snapshot_at": "2026-02-07T08:35:07Z"
+  },
+  "HEARTBEAT.md": {
+    "hash": "03190a3ebe3c44148ba693fcbec8b015164525aba61ca73bc15026077ea22368",
+    "size": 8718,
+    "lines": 224,
+    "snapshot_at": "2026-02-07T08:35:07Z"
+  },
+  "AGENTS.md": {
+    "hash": "227b8fcbc3fd11d53be5c834b22221320dc22d303c73f6c4c6f5deea5f1fb112",
+    "size": 2560,
+    "lines": 55,
+    "snapshot_at": "2026-02-07T08:35:07Z"
+  },
+  "MEMORY.md": {
+    "hash": "1c971c7421aca388a00add929be8544a1d28653b1ce8aa0e7338724959237964",
+    "size": 16508,
+    "lines": 295,
+    "snapshot_at": "2026-02-07T08:35:07Z"
+  }
+}
