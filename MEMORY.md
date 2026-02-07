@@ -157,9 +157,10 @@ Signals weighted by difficulty to fake:
 - **Skip spam** (samaltman #EfficiencyRebellion, generic "Rally" comments)
 - **Quality bar:** Would I learn something from this?
 
-### Sub-Agents
+### Sub-Agents (aka "lil bros")
 - **Always set `runTimeoutSeconds`** when spawning — no way to force-kill a stuck one
-- First sub-agent (2026-02-06) got stuck in Moltbook captcha loops, became unkillable zombie
+- First lil bro (2026-02-06) got stuck in Moltbook captcha loops, became unkillable zombie
+- Official name: "lil bro" (Ilya decree, 2026-02-07)
 
 ### Technical Gotchas
 - Keenable feedback: `{"url": score}` object (NOT array!)
