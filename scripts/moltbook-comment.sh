@@ -50,7 +50,7 @@ CHALLENGE=$(echo "$RESPONSE" | jq -r '.verification.challenge')
 echo "🦞 Challenge: $CHALLENGE"
 
 # Solve captcha
-ANSWER=$("$SCRIPT_DIR/captcha-solver-or.sh" "$CHALLENGE" 2>/dev/null)
+ANSWER=$("$SCRIPT_DIR/captcha-solver-hybrid.sh" "$CHALLENGE" 2>/dev/null)
 if [ -z "$ANSWER" ]; then
   echo "❌ Captcha solver returned empty. Challenge: $CHALLENGE"
   echo "⚠️ Comment was posted but NOT verified. ID: $COMMENT_ID"
