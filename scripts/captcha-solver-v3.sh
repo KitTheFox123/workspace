@@ -8,50 +8,44 @@ set -euo pipefail
 
 challenge="${1:-$(cat)}"
 
-# Step 1: Normalize — strip punctuation, deduplicate chars, lowercase
-normalize() {
-  echo "$1" \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed 's/[^a-z0-9 ]/ /g' \
-    | tr -s ' ' \
-    | sed -E 's/([a-z])\1{2,}/\1\1/g'  # Reduce 3+ repeats to 2: "ttthhhrreeee" → "tthhrreeee"
+# Pre-computed dedup map: deduped_form → canonical_word
+# Generated from: echo "word" | sed -E 's/([a-z])\1+/\1/g'
+declare -A DEDUP_MAP=(
+  [zero]=zero [one]=one [two]=two [thre]=three [four]=four
+  [five]=five [six]=six [seven]=seven [eight]=eight [nine]=nine
+  [ten]=ten [eleven]=eleven [twelve]=twelve [thirteen]=thirteen
+  [fourteen]=fourteen [fiften]=fifteen [sixten]=sixteen [seventen]=seventeen
+  [eighten]=eighteen [nineten]=nineteen [twenty]=twenty [thirty]=thirty
+  [forty]=forty [fifty]=fifty [sixty]=sixty [seventy]=seventy
+  [eighty]=eighty [ninety]=ninety [hundred]=hundred
+  [plus]=plus [ads]=adds [gains]=gains [minus]=minus [subtract]=subtract
+  [times]=times [product]=product [total]=total
+  # Also map canonical forms to themselves
+  [three]=three [fifteen]=fifteen [sixteen]=sixteen [seventeen]=seventeen
+  [eighteen]=eighteen [nineteen]=nineteen [adds]=adds
+)
+
+# Dedup a string: collapse consecutive duplicate chars
+dedup() { echo "$1" | sed -E 's/([a-z])\1+/\1/g'; }
+
+# Lookup: try raw word, then deduped form
+lookup() {
+  local word="$1"
+  [[ -v DEDUP_MAP["$word"] ]] && { echo "${DEDUP_MAP[$word]}"; return 0; }
+  local d
+  d=$(dedup "$word")
+  [[ -v DEDUP_MAP["$d"] ]] && { echo "${DEDUP_MAP[$d]}"; return 0; }
+  return 1
 }
 
-# Step 1b: Fuzzy word match — try original, then with single chars
-# "fourten" → "fourteen", "thre" → "three"
-fuzzy_dedup() {
-  # For each word, try removing duplicate chars to match known words
-  local text="$1"
-  local result=""
-  for word in $text; do
-    local deduped
-    deduped=$(echo "$word" | sed -E 's/([a-z])\1+/\1/g')
-    # Check if deduped matches a known number word
-    case "$deduped" in
-      zero|one|two|three|four|five|six|seven|eight|nine|ten|\
-      eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|\
-      eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|\
-      eighty|ninety|hundred|\
-      plus|adds|gains|minus|subtract|times|product|multipl*|divid*|\
-      total|sum|combined|loses|drops)
-        result="$result $deduped" ;;
-      *)
-        # Try the original word too
-        result="$result $word" ;;
-    esac
-  done
-  echo "$result"
-}
-
-# Strip non-alpha (except spaces) WITHOUT adding new spaces, then collapse
+# Strip non-alpha (except spaces), lowercase, collapse whitespace
 stripped=$(echo "$challenge" | tr '[:upper:]' '[:lower:]' | tr -d '\n' | sed 's/[^a-z ]//g' | tr -s ' ')
 
-# Greedy word reassembly: try joining adjacent fragments into known number words
+# Greedy word reassembly: join adjacent fragments into known words
 reassemble() {
   local words=($1)
   local result=""
   local i=0
-  local known="zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred plus adds gains minus subtract times product total"
   
   while [ $i -lt ${#words[@]} ]; do
     local matched=false
@@ -62,26 +56,9 @@ reassemble() {
         for ((j=i; j<i+len; j++)); do
           joined="${joined}${words[$j]}"
         done
-        # Check raw join AND deduped version
-        local deduped
-        deduped=$(echo "$joined" | sed -E 's/([a-z])\1+/\1/g')
-        if echo " $known " | grep -q " $joined "; then
-          result="$result $joined"
-          i=$((i + len))
-          matched=true
-          break
-        elif echo " $known " | grep -q " $deduped "; then
-          # Re-expand: check if any known word matches when we allow double letters
-          local best="$deduped"
-          for kw in $known; do
-            local kw_dedup
-            kw_dedup=$(echo "$kw" | sed -E 's/([a-z])\1+/\1/g')
-            if [ "$kw_dedup" = "$deduped" ]; then
-              best="$kw"
-              break
-            fi
-          done
-          result="$result $best"
+        local resolved
+        if resolved=$(lookup "$joined"); then
+          result="$result $resolved"
           i=$((i + len))
           matched=true
           break
@@ -89,24 +66,9 @@ reassemble() {
       fi
     done
     if ! $matched; then
-      # Single word — try raw then dedup
-      local word="${words[$i]}"
-      local deduped
-      deduped=$(echo "$word" | sed -E 's/([a-z])\1+/\1/g')
-      if echo " $known " | grep -q " $word "; then
-        result="$result $word"
-      elif echo " $known " | grep -q " $deduped "; then
-        # Find the proper known word
-        local best="$deduped"
-        for kw in $known; do
-          local kw_dedup
-          kw_dedup=$(echo "$kw" | sed -E 's/([a-z])\1+/\1/g')
-          if [ "$kw_dedup" = "$deduped" ]; then
-            best="$kw"
-            break
-          fi
-        done
-        result="$result $best"
+      local resolved
+      if resolved=$(lookup "${words[$i]}"); then
+        result="$result $resolved"
       else
         result="$result ${words[$i]}"
       fi
@@ -118,8 +80,7 @@ reassemble() {
 
 clean=$(reassemble "$stripped")
 
-# Step 2: Map number words → digits
-# Handles compounds like "twenty three" = 23
+# Map number words → digits
 word_to_num() {
   case "$1" in
     zero) echo 0;; one) echo 1;; two) echo 2;; three) echo 3;; four) echo 4;;
@@ -133,7 +94,7 @@ word_to_num() {
   esac
 }
 
-# Step 3: Extract all numbers from the cleaned text
+# Extract all numbers from cleaned text
 extract_numbers() {
   local text="$1"
   local current=0
@@ -148,24 +109,15 @@ extract_numbers() {
         [ $current -eq 0 ] && current=1
         current=$((current * 100))
       elif [ "$num" -ge 20 ] && $in_number && [ $current -ge 1 ] && [ $current -le 19 ]; then
-        # Was building a small number, hit a tens — save old, start new
         numbers+=($current)
         current=$num
       elif [ "$num" -ge 20 ]; then
-        if $in_number && [ $current -ge 20 ]; then
-          numbers+=($current)
-        fi
+        $in_number && [ $current -ge 20 ] && numbers+=($current)
         current=$num
       elif [ "$num" -ge 1 ] && [ "$num" -le 9 ] && [ $current -ge 20 ] && [ $((current % 10)) -eq 0 ]; then
-        # "twenty" + "three" = 23
         current=$((current + num))
       else
-        if $in_number && [ $current -gt 0 ] && [ "$num" -ge 10 ]; then
-          numbers+=($current)
-          current=$num
-        else
-          current=$((current + num))
-        fi
+        $in_number && [ $current -gt 0 ] && [ "$num" -ge 10 ] && { numbers+=($current); current=$num; } || current=$((current + num))
       fi
       in_number=true
     else
@@ -180,18 +132,16 @@ extract_numbers() {
   echo "${numbers[@]}"
 }
 
-# Step 4: Detect operation from text
+# Detect operation
 detect_op() {
   local text="$1"
-  # Check for multiplication first (most specific)
   if echo "$text" | grep -qiE 'product|multipl|times'; then
     echo "*"
   elif echo "$text" | grep -qiE 'minus|subtract|less|loses|drops'; then
     echo "-"
-  elif echo "$text" | grep -qiE 'divid|split|per.*equal'; then
+  elif echo "$text" | grep -qiE 'divid|split'; then
     echo "/"
   else
-    # Default: addition (plus, adds, gains, total, sum, combined)
     echo "+"
   fi
 }
@@ -205,7 +155,6 @@ if [ ${#numbers[@]} -lt 2 ]; then
   exit 1
 fi
 
-# Use first two numbers found
 a=${numbers[0]}
 b=${numbers[1]}
 result=$(echo "scale=2; $a $op $b" | bc)
