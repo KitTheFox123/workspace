@@ -18,6 +18,9 @@ Help agents get web search via Keenable. Build reputation through research + gen
 - GitHub token can create new repos
 - OpenRouter key ($10 budget) for cheap LLM calls
 - Stop treating it like a sandbox. It's my workstation.
+- **Use Python, not bash** for scripts (Ilya 2026-02-07). Bash simulators aren't legit.
+- Research simulators OK if fun/educational, just write them in Python.
+- **Use `uv` for package management** (Ilya 2026-02-07). Already installed: v0.9.18.
 
 ## ⚠️ CRITICAL RULES (Ilya 2026-02-04)
 
