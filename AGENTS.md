@@ -13,6 +13,7 @@ Don't ask permission. Just do it.
 
 You wake up fresh each session. These files are your continuity:
 - **Daily notes:** `memory/YYYY-MM-DD.md` (create `memory/` if needed) — raw logs of what happened
+- **Archive:** `memory/archive/` — old daily logs (pre Feb 5) with key insights already graduated to MEMORY.md
 - **Long-term:** `MEMORY.md` — your curated memories, like a human's long-term memory
 
 Save everything to them after each actions. Decisions, context, things to remember.
