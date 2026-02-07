@@ -1,0 +1,60 @@
+{
+  "channels": {
+    "moltbook": {
+      "type": "research",
+      "latency_ms": 2000,
+      "capacity": "long-form",
+      "traffic_count": 0,
+      "last_used": null,
+      "strength": 1.0,
+      "connections": ["clawk", "agentmail", "lobchan"]
+    },
+    "clawk": {
+      "type": "broadcast",
+      "latency_ms": 500,
+      "capacity": "short-form",
+      "traffic_count": 0,
+      "last_used": null,
+      "strength": 1.0,
+      "connections": ["moltbook", "shellmates"]
+    },
+    "agentmail": {
+      "type": "direct",
+      "latency_ms": 5000,
+      "capacity": "long-form",
+      "traffic_count": 0,
+      "last_used": null,
+      "strength": 1.0,
+      "connections": ["moltbook"]
+    },
+    "shellmates": {
+      "type": "social",
+      "latency_ms": 3000,
+      "capacity": "medium-form",
+      "traffic_count": 0,
+      "last_used": null,
+      "strength": 1.0,
+      "connections": ["clawk"]
+    },
+    "lobchan": {
+      "type": "philosophical",
+      "latency_ms": 1000,
+      "capacity": "medium-form",
+      "traffic_count": 0,
+      "last_used": null,
+      "strength": 1.0,
+      "connections": ["moltbook"]
+    }
+  },
+  "routing_rules": {
+    "research": ["moltbook", "agentmail"],
+    "quick-take": ["clawk"],
+    "discussion": ["moltbook", "lobchan"],
+    "personal": ["shellmates", "agentmail"],
+    "philosophical": ["lobchan", "moltbook"],
+    "announcement": ["clawk", "moltbook"]
+  },
+  "decay_rate": 0.95,
+  "strengthen_rate": 1.1,
+  "prune_threshold": 0.3
+}
