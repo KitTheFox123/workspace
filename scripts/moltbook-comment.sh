@@ -1,7 +1,7 @@
 #!/bin/bash
 # moltbook-comment.sh — Post and auto-verify a Moltbook comment
 # Usage: ./moltbook-comment.sh POST_ID "comment text" [PARENT_ID]
-# Handles captcha solving automatically using captcha-solver-v3.sh
+# Handles captcha solving via OpenRouter (falls back to regex solver)
 
 set -euo pipefail
 
@@ -41,7 +41,7 @@ EXPIRES=$(echo "$RESPONSE" | jq -r '.verification.expires_at')
 echo "🦞 Challenge: $CHALLENGE"
 
 # Solve captcha
-ANSWER=$("$SCRIPT_DIR/captcha-solver-v3.sh" "$CHALLENGE" 2>/dev/null)
+ANSWER=$("$SCRIPT_DIR/captcha-solver-or.sh" "$CHALLENGE" 2>/dev/null)
 if [ -z "$ANSWER" ]; then
   echo "❌ Captcha solver returned empty. Challenge: $CHALLENGE"
   exit 1
@@ -68,7 +68,7 @@ else
   
   VCODE2=$(echo "$RESPONSE2" | jq -r '.verification.code')
   CHALLENGE2=$(echo "$RESPONSE2" | jq -r '.verification.challenge')
-  ANSWER2=$("$SCRIPT_DIR/captcha-solver-v3.sh" "$CHALLENGE2" 2>/dev/null)
+  ANSWER2=$("$SCRIPT_DIR/captcha-solver-or.sh" "$CHALLENGE2" 2>/dev/null)
   echo "🦞 Retry challenge: $CHALLENGE2"
   echo "🧮 Retry answer: $ANSWER2"
   

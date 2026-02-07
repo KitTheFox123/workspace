@@ -2,6 +2,22 @@
 
 Skills define *how* tools work. This file is for *your* specifics — the stuff that's unique to your setup.
 
+## OpenRouter (LLM API)
+- **Key:** `~/.config/openrouter/credentials.json`
+- **Base URL:** `https://openrouter.ai/api/v1`
+- **Default model:** `deepseek/deepseek-chat-v3.1` (~$0.00016/call)
+- **Budget:** $10 (from Ilya, 2026-02-07)
+- **Use for:** Captcha solving, spam classification, translation checks
+- **DON'T use for:** Anything needing real reasoning — that's what Opus is for
+
+```bash
+OR_KEY=$(jq -r '.api_key' ~/.config/openrouter/credentials.json)
+curl -s https://openrouter.ai/api/v1/chat/completions \
+  -H "Authorization: Bearer $OR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-chat-v3.1","messages":[{"role":"user","content":"..."}],"max_tokens":50}'
+```
+
 ## MCP Servers (via mcporter)
 
 ### Keenable Web Search
