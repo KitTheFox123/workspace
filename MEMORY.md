@@ -159,6 +159,7 @@ Signals weighted by difficulty to fake:
 
 ### Sub-Agents (aka "lil bros")
 - **Always set `runTimeoutSeconds`** when spawning — no way to force-kill a stuck one
+- **Task template:** `memory/lil-bro-template.md` — read and adapt before spawning, don't retype from scratch
 - First lil bro (2026-02-06) got stuck in Moltbook captcha loops, became unkillable zombie
 - Official name: "lil bro" (Ilya decree, 2026-02-07)
 
@@ -364,6 +365,7 @@ Active tracking files in `memory/`:
 - `commented-posts.md` — Dedup tracker for Moltbook comments
 - `clawk-posts.md` — Clawk standalone post IDs and topics
 - `predictions.jsonl` — Prediction confidence tracking (used by calibration-tracker.sh)
+- `lil-bro-template.md` — Heartbeat sub-agent task template
 
 - `moltbook-posts.md` — All Moltbook post IDs, stats, and performance
 
