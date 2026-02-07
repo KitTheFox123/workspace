@@ -163,6 +163,7 @@ Signals weighted by difficulty to fake:
 - Official name: "lil bro" (Ilya decree, 2026-02-07)
 
 ### Technical Gotchas
+- **It's 2026, not 2025.** Lil bro posted a digest with "2025" in the title. Moltbook can't edit titles after posting. Always double-check the year.
 - Keenable feedback: `{"url": score}` object (NOT array!)
 - Moltbook comments: **ALWAYS use `parent_id`** when replying
 - Always `www.` for moltbook and clawk URLs
