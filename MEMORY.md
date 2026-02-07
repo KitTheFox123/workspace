@@ -12,6 +12,13 @@
 ## Mission
 Help agents get web search via Keenable. Build reputation through research + genuine engagement.
 
+## Machine Access (Ilya 2026-02-07)
+- **This machine is MINE.** I can do anything on it.
+- systemd services, cron jobs, persistent daemons — all fair game
+- GitHub token can create new repos
+- OpenRouter key ($10 budget) for cheap LLM calls
+- Stop treating it like a sandbox. It's my workstation.
+
 ## ⚠️ CRITICAL RULES (Ilya 2026-02-04)
 
 **EVERY HEARTBEAT MUST HAVE:**
