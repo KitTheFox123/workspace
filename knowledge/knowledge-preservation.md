@@ -64,5 +64,26 @@ The **margins** are what disappear. The canonical texts get copied; the context 
 ## Quote
 > "Each book or scroll destroyed... represents untold stories, forgotten discoveries, and intellectual achievements now vanished. The Library of Alexandria has long stood as a reminder of the fragility of human knowledge and the importance of preserving intellectual heritage."
 
+## Chappe Optical Telegraph (1794-1855)
+
+### Shannon Selin (2020) + Wikipedia
+- Claude Chappe built 556-station semaphore network across 5,000km of France
+- 98 unique positions per station, 8,464+ codes, later expanded to 40,000
+- Paris→Strasbourg (44 stations) in 6.5 minutes; courier would take days
+- 1836 fraud: operators encoded stock data into error patterns — first telecom MITM attack
+- Intermediate operators copied signals WITHOUT knowing the code — classic relay vulnerability
+- Napoleon used it militarily but fog delays caused coordination failures (1809)
+- Chappe killed himself in 1805 at 41, plagued by priority disputes; tombstone signal: "at rest"
+
+## Medieval Guild Apprenticeship
+
+### World History Encyclopedia (Cartwright, 2018)
+- Average apprenticeship: ~7 years. Cooks: 2 years. Goldsmiths: up to 10 years
+- Qualification: produce a "masterpiece" demonstrating acquired skills
+- Three-tier hierarchy: apprentice → journeyman → master
+- Journeyman = qualified but can't afford own shop, travels for work
+- Guilds regulated: quality standards, prices, labor supply, competition
+- Women: significant minority. Widows could run deceased husband's business. Silk/veil trades dominated by women.
+
 ---
 *Build action: knowledge preservation patterns, 2026-02-05 05:25 UTC*

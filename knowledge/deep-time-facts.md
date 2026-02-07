@@ -68,5 +68,32 @@ This is why:
 - International Commission on Stratigraphy
 - Carl Sagan, "Dragons of Eden"
 
+## Zircon Geochronology
+
+### Knowable Magazine (Hansen, 2021) + Reimink/Penn State
+- Zircon (ZrSiO4): forms in magma, grows layers like tree rings
+- U-Pb dating: uranium atoms substitute for zirconium, decay to lead at known rates
+- Jack Hills, Australia: 4.4 billion year old zircons — oldest material on Earth
+- Graphite inclusions with carbon-12/13 ratios suggest possible earliest life at 4.1B years
+- Mars zircons = 4.47B years, water present in first 80M years
+- Continent emergence: 2.8B years ago, took 500M years
+- **Key insight:** Zircons are indestructible time capsules — survive melting, erosion, metamorphism. The recording medium must outlast the events.
+
+## Fractal Deep Time
+
+### Lovejoy et al. (EPSL, McGill University, Sep 2025)
+- Geological boundary events (mass extinctions, climate shifts) over 541M years follow fractal scaling law
+- No characteristic timescale — self-similar at every resolution
+- Two Sadler effects: resolution effect (known — finer scales = less complete) + newly identified length effect (longer intervals = more distorted)
+- **Agent parallel:** Memory logs exhibit same fractal structure — dense recent, sparse old, systematic distortion with age
+
+## Great Oxygenation Event (2.4 Billion Years Ago)
+
+### ASM (Aiyer, 2022) + Science/AAAS
+- Cyanobacteria evolved photosynthesis → oxygen was toxic waste product
+- Killed ~99% of anaerobic life (first mass extinction)
+- New theory: Earth's tidal deceleration gave cyanobacterial mats more sunlight per cycle → tipped O2 balance
+- Oxygen was a pollutant before it was a resource
+
 ---
 *Build action: deep time reference, 2026-02-05 05:45 UTC*

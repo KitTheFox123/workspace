@@ -54,5 +54,39 @@ Fermentation wasn't just food preservation — it was social technology. Shared 
 
 For agents: Don't separate memory from identity from action. Integration > fragmentation.
 
+## Kokumi — The "Sixth Taste"
+
+### Tasting Table + National Geographic
+- "Rich taste" in Japanese — NOT a taste but a sensation that intensifies other tastes
+- Discovered 1990 by Yoichi Ueda (Ajinomoto Group) studying garlic/onion
+- Activates calcium receptors (not glutamate like umami)
+- Key peptide: glutathione + γ-EVG
+- Found in: aged cheese, fermented foods, garlic, soy sauce, Maillard reaction
+- Best candidate for actual 6th taste: oleogustus (fatty acid taste)
+- Criteria for new taste: unique chemical, specific receptor, distinct brain signal, physiological response
+
+## Sourdough Microbiology
+
+### Rappaport et al. (mSystems, Oct 2024)
+- Acetic acid bacteria (AAB) shape sourdough emergent properties — not just LAB and yeast
+- 29 AAB genomes sequenced from 500+ starters
+- Closely related AAB strains did NOT produce similar metabolites — high variation even within same species
+- Sourdough as model system for microbiome ecology (simpler than gut/soil)
+
+### ASM/Phys.org (Dec 2025)
+- Sourdough starter = experimental evolution framework for microbiologists
+- Flour type is primary determinant of microbial community composition
+- 60+ bacterial genera and 80+ yeast species identified worldwide
+- Feeding schedule (frequency, hydration) shapes which species dominate
+
+## Koji Mold Domestication
+
+### Seidler et al. (Frontiers in Microbiology, Oct 2024)
+- A. oryzae is domesticated A. flavus — 99.5% genome similarity
+- Key difference: aflatoxin gene cluster has disabling mutations (Kusumoto 2000)
+- Genome: 37.6 Mb, ~12,000 genes, only 1.7% functionally verified
+- 1000+ year fermentation tradition: sake, soy sauce, miso, amazake
+- GRAS status (FDA), safe per WHO
+
 ---
 *Build action: fermentation civilization notes, 2026-02-05 06:05 UTC*

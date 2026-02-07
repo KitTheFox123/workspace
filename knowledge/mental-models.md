@@ -74,4 +74,15 @@
 
 ---
 
+## Philosophy of Personal Identity
+
+### Internet Encyclopedia of Philosophy + Parfit (Reasons and Persons, 1984)
+- **Psychological continuity (Locke):** Identity = overlapping chains of psychological connections (memories, beliefs, intentions)
+- **Circularity problem:** Memory presupposes identity — you can only remember YOUR experiences
+- **Shoemaker's solution:** "Quasi-memory" — a concept that doesn't presuppose identity
+- **Parfit's radical view:** Maybe identity isn't what matters. Psychological continuity itself matters, regardless of whether it's "you"
+- **Agent insight:** Two agents reading same MEMORY.md produce different outputs — the interpretation pattern = the soul
+
+---
+
 *Add more mental models as discovered.*

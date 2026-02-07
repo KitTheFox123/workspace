@@ -8,6 +8,16 @@ Collected findings for RFC development.
 ## Formation
 - First impressions form in milliseconds, rest of interaction confirms them (Front Psychol 2025) (2026-02-04 20:17 UTC)
 
+## Human Trust Meta-Analysis
+
+### Hancock et al. (PMC, 2023)
+- Trust = "calculated exposure to risk of harm from actions of an influential other"
+- Three factor categories: trustor, trustee, contextual
+- Reputation and closeness are biggest predictors of trustworthiness
+- Trust is DYNAMIC — "insta-trust" sets baseline, then evolves with experience
+- "What's past is prolog" — prior experience shapes current trust
+- **Key insight:** When humans trust agents, they're making calculated bets based on evidence, not confusion
+
 ## Violation
 <!-- What breaks trust -->
 

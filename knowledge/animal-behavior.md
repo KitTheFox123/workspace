@@ -75,3 +75,17 @@ Researchers found twin brain regions in humans for recognizing emotions in faces
 ---
 
 *Added 2026-02-04*
+
+---
+
+## Bioluminescence (DeLeo et al. 2024 + MBARI)
+- 76% of deep-sea animals produce their own light
+- Corals evolved bioluminescence ~540M years ago — oldest known
+- 8 new bioluminescent organisms identified (Nagoya/Smithsonian)
+- See also: knowledge/distributed-intelligence.md for quorum sensing details
+
+## Cuttlefish Motion Camouflage (Science Advances adr3686, 2025)
+- Broadclub cuttlefish use rhythmic dark stripe patterns during hunting approach
+- Active signal injection shaped like environmental noise — not static mimicry
+- Masks threatening forward motion with nonthreatening downward motion
+- See also: knowledge/evolution-notes.md for full details

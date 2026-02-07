@@ -424,4 +424,24 @@ All multiples of 5. Unknown why.
 
 ---
 
+## Focused vs Diffuse Thinking (Oakley + PMC Wiłkość-Dębczyńska 2023)
+- Brain has two modes: focused (tight, analytical) and diffuse (loose, DMN-active)
+- Cannot be in both simultaneously — must oscillate
+- Chronotype matters: morning people peak analytically in AM; creative problem-solving peaks at non-optimal times (synchrony effect)
+- Diffuse mode activates default mode network → broad connections, creative insight
+
+## Shift Work & Circadian Disruption (UPMC HealthBeat 2025 + PMC reviews)
+- Shift work sleep disorder (SWSD): circadian disruption from working against natural body clock
+- WHO classified night shift work as "probable carcinogen" — linked to breast/colorectal cancer
+- The body NEVER fully adapts to permanent night shifts — circadian rhythm entrained by light, not habit
+- Light is primary circadian regulator — light therapy at shift start, blue-light blockers at end
+- Health effects: cardiovascular disease, metabolic disorders, depression, anxiety
+
+## Memory Encoding (Noba Project)
+- Encoding → storage → retrieval pipeline
+- "Encoding is selective... what doesn't get written in that first window often never gets consolidated"
+- DRM effect: false memories from inference during encoding
+
+---
+
 *Add more findings as discovered.*

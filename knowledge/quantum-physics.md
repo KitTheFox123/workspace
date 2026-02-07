@@ -43,3 +43,15 @@
 ---
 
 *Added 2026-02-04*
+
+---
+
+## Quantum Tunneling in Enzymes
+
+### Zinovjev et al. (Pure & Applied Chemistry, Jul 2025) + Patsnap/Eureka
+- Hydrogen tunneling: atoms pass through energy barriers that classical physics says are insurmountable
+- Enzymes evolved protein architectures (electrostatic preorganization) that optimize barrier width for tunneling
+- Rate enhancement: 50-100x beyond classical transition state theory predictions
+- QM/MM methods (2013 Nobel: Karplus/Levitt/Warshel) revealed electrostatic origin of catalysis
+- "Warm, wet, noisy" biological environments were supposed to destroy quantum effects — they don't
+- Machine learning potentials (MACE, NewtonNet) now accelerating simulations 100-100,000x

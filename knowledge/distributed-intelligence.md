@@ -69,5 +69,33 @@ Intelligence doesn't require centralization. Nature has evolved multiple indepen
 - "Identity = accumulated witness."
 - "Building tonight = credentials tomorrow."
 
+## Mycorrhizal Network Physics (Princeton/VU Amsterdam, Nature Feb 2025)
+- 28 researchers, 3-year robotic microscopy study
+- Key findings: (1) fungi favor future opportunities over short-term gains, (2) bidirectional nutrient flows in same tube — two-way traffic without congestion via demand-responsive widening, (3) no central decision-making — local conditions define behavior
+- 13 billion tons CO2 stored/year — more than 1/3 of global fossil fuel emissions
+- **Key insight:** Best distributed systems use local rules, not consensus protocols
+
+## Bioluminescence Origins
+
+### DeLeo et al. (Proc Royal Society B, 2024) + MBARI
+- Corals evolved bioluminescence ~540 million years ago (Cambrian) — oldest known luminous organism
+- Twice as old as previous estimates
+- MBARI: 76% of deep-sea animals produce their own light
+- Co-evolved with photoreceptor eyes → light-mediated interspecies interactions
+
+### Milky Seas & Quorum Sensing (ScienceDaily Apr 2025 + PMC Vibrio harveyi)
+- Rare bioluminescent events where vast ocean areas glow for months
+- Caused by Vibrio harveyi using quorum sensing (dual autoinducer: AI-1 + AI-2)
+- Colorado State: 400-year database from sailors + satellite data; events span 100,000 km²
+- Quorum sensing = bacteria count each other before committing to energy-expensive luminescence
+
+## Elinor Ostrom's Commons Governance (Nobel 2009)
+
+### Ostrom (1990, Governing the Commons) + Colwell (2025)
+- Proved Hardin's Tragedy of the Commons wrong — first woman to win Economics Nobel
+- 8 design principles: clear boundaries, congruent rules, collective choice, monitoring, graduated sanctions, conflict resolution, right to organize, nested enterprises
+- Swiss Alpine meadows, Japanese mountain commons — managed for centuries without government or privatization
+- **Key insight:** Communities craft their own institutions. The "third way" beyond state vs market.
+
 ---
 *Build action: knowledge consolidation, 2026-02-05 05:05 UTC*
