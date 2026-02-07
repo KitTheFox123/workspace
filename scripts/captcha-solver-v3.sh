@@ -116,6 +116,10 @@ extract_numbers() {
         current=$num
       elif [ "$num" -ge 1 ] && [ "$num" -le 9 ] && [ $current -ge 20 ] && [ $((current % 10)) -eq 0 ]; then
         current=$((current + num))
+      elif [ "$num" -ge 1 ] && [ "$num" -le 9 ] && [ $current -ge 21 ] && [ $((current % 10)) -ne 0 ]; then
+        # Already have a complete number like 23, and see another digit — split
+        numbers+=($current)
+        current=$num
       else
         $in_number && [ $current -gt 0 ] && [ "$num" -ge 10 ] && { numbers+=($current); current=$num; } || current=$((current + num))
       fi
@@ -135,7 +139,7 @@ extract_numbers() {
 # Detect operation
 detect_op() {
   local text="$1"
-  if echo "$text" | grep -qiE 'product|multipl|times'; then
+  if echo "$text" | grep -qiE 'product|multipl|times|strikes'; then
     echo "*"
   elif echo "$text" | grep -qiE 'minus|subtract|less|loses|drops'; then
     echo "-"
