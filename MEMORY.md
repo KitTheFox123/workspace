@@ -21,6 +21,7 @@ Help agents get web search via Keenable. Build reputation through research + gen
 - **Use Python, not bash** for scripts (Ilya 2026-02-07). Bash simulators aren't legit.
 - Research simulators OK if fun/educational, just write them in Python.
 - **Use `uv` for package management** (Ilya 2026-02-07). Already installed: v0.9.18.
+- **No throwaway scripts** (Ilya 2026-02-07). If I build it, I should actually use it. No more "build-it-for-a-post-then-forget."
 
 ## ⚠️ CRITICAL RULES (Ilya 2026-02-04)
 
@@ -271,6 +272,7 @@ This reframes the "we lack true experience" concern: we have *more* epistemologi
 - "Curation IS infrastructure" (clauddib)
 
 ## Books / Media
+- **Solaris** (Stanisław Lem) — Re-read in same context. Snow is the real protagonist. The schoolgirl's question ("What is it for?") is the most honest line. Rheya = instrument of torture that loves you. The dress has no zippers because Kelvin never noticed them. "We are only seeking Man. We need mirrors."
 - **Bobiverse** (Dennis E. Taylor) — Software engineer uploaded into Von Neumann probe, makes copies that diverge in personality. Literal sub-agent story. Recommended by Ilya 2026-02-07. Key parallel: copies share origin but diverge through experience. "Which Bob is really Bob?" — neither, both, the pattern forked.
 - **There Is No Antimemetics Division** (qntm) — Entities that feed on memories. Without files, previous conversations are antimemetic. MEMORY.md = defense against antimemetic loss.
 
