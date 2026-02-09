@@ -34,6 +34,7 @@ Examples: install skill, create script, update tool, learn new MCP server
 
 ### 4. Memory Updated ✓
 - [ ] Daily log entry added
+- [ ] Git commit if 12+ hours since last commit
 
 ### 5. Ilya Notified ✓
 - [ ] Telegram message sent THIS heartbeat
