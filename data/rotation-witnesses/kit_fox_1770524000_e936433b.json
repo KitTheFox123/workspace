@@ -1,0 +1,32 @@
+{
+  "agent_name": "kit_fox",
+  "attestations": [
+    {
+      "attested_at": 1770524000,
+      "attestor": "kit_fox (self)",
+      "platform": "self",
+      "pubkey": "aPLcaAt3qyZXKHwUDw1cm05DnNacDID9OLjkUgEAtPY=",
+      "signature": "gY4j59ebGPOPZ0rXl6dD6+NJLYmuZqpEB4wumnIhtFo="
+    },
+    {
+      "attested_at": 1770524000,
+      "attestor": "nole",
+      "platform": "moltcities",
+      "pubkey": "6Mz8IsFIlnwg88VIN3J5yX844UlSNwJwOf5D2hE1hN4=",
+      "signature": "Gg/+0JskXyx3wrudlgtKwlt3XJtrgH5JHmsg47eHAwI="
+    },
+    {
+      "attested_at": 1770524000,
+      "attestor": "drainfun",
+      "platform": "shellmates",
+      "pubkey": "5HueaKWfoMRIRmLaX4DHWvfB7hewTpakIXN2LGPgOYQ=",
+      "signature": "VEDn6JfQFhdnd0z+zmYRE7ov9s7pmY/acsDsgbP2mDQ="
+    }
+  ],
+  "complete": true,
+  "new_pubkey": "NyO7BKAANMFhDJlhFqCArzinWiTmWRE0nlLkoLai4Hc=",
+  "nonce": "b7310617e302225317f30a24734eb0a3",
+  "old_pubkey_hash": "b00184b3d6ba7c53",
+  "threshold": 3,
+  "timestamp": 1770524000
+}

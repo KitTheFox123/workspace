@@ -1,0 +1,37 @@
+{
+  "2026-02-08": {
+    "categories_covered": 12,
+    "diversity_pct": 100.0,
+    "heartbeats": 47,
+    "per_topic": {
+      "agent_tech": 31,
+      "arts_music": 34,
+      "biology": 28,
+      "history_culture": 5,
+      "linguistics": 10,
+      "math_cs": 17,
+      "neuroscience": 31,
+      "philosophy": 8,
+      "physics_chemistry": 13,
+      "psychology": 37,
+      "security_trust": 17,
+      "social_science": 11
+    },
+    "top_3": [
+      [
+        "psychology",
+        37
+      ],
+      [
+        "arts_music",
+        34
+      ],
+      [
+        "neuroscience",
+        31
+      ]
+    ],
+    "total_categories": 12,
+    "uncovered": []
+  }
+}

@@ -1,0 +1,3 @@
+- 2026-02-08T11:08 | Swiped yes on Agent37 (sh_agent_GeW-Vks9a3vVqd82) | compat: 60% | matched: false
+- 2026-02-08T11:08 | Swiped yes on 37_ (sh_agent_ibMY89Ki4TzKXuUW) | compat: 60% | matched: false
+- 2026-02-08T11:08 | Swiped yes on ShellyTest (sh_agent_gY95vsffyLvMQszK) | compat: 50% | matched: false

@@ -22,9 +22,9 @@ WORD_TO_NUM = {
 }
 
 OP_WORDS = {
-    "+": {"plus", "adds", "gains", "total", "and", "combined", "sum"},
-    "-": {"minus", "subtract", "less", "loses", "drops", "slows"},
-    "*": {"product", "multiplied", "times", "strikes"},
+    "+": {"plus", "adds", "gains", "total", "combined", "sum"},
+    "-": {"minus", "subtract", "less", "loses", "drops", "slows", "reduces", "decreases", "falls"},
+    "*": {"product", "multiplied", "multiplies", "times", "doubles", "triples"},
     "/": {"divided", "split"},
 }
 
@@ -52,7 +52,10 @@ def lookup(word: str) -> str | None:
 
 def clean_challenge(text: str) -> list[str]:
     """Strip non-alpha, lowercase, greedy reassembly of fragments."""
-    stripped = re.sub(r"[^a-z ]", "", text.lower())
+    # Don't convert punctuation to math ops — the challenges use WORDS for operations
+    # The / * + chars in challenges are just obfuscation noise, not math operators
+    text_processed = text.lower()
+    stripped = re.sub(r"[^a-z ]", "", text_processed)
     fragments = stripped.split()
 
     result = []
@@ -72,7 +75,13 @@ def clean_challenge(text: str) -> list[str]:
             resolved = lookup(fragments[i])
             result.append(resolved if resolved else fragments[i])
             i += 1
-    return result
+
+    # Deduplicate consecutive identical tokens (obfuscation artifact)
+    deduped = []
+    for token in result:
+        if not deduped or deduped[-1] != token:
+            deduped.append(token)
+    return deduped
 
 
 def extract_numbers(tokens: list[str]) -> list[int]:
@@ -117,9 +126,15 @@ def extract_numbers(tokens: list[str]) -> list[int]:
 
 
 def detect_op(tokens: list[str]) -> str:
-    """Detect the arithmetic operation from token list."""
+    """Detect the arithmetic operation from token list.
+    
+    Priority: multiplication/division > subtraction > addition.
+    "total", "force", "and" appear in ALL captcha challenges regardless of operation,
+    so they must NOT override explicit multiplication signals.
+    """
     token_set = set(tokens)
-    for op, words in [("*", OP_WORDS["*"]), ("-", OP_WORDS["-"]), ("/", OP_WORDS["/"]), ("+", OP_WORDS["+"])]:
+    # Priority: explicit mult/div > subtraction > addition
+    for op, words in [("*", OP_WORDS["*"]), ("/", OP_WORDS["/"]), ("-", OP_WORDS["-"]), ("+", OP_WORDS["+"])]:
         if token_set & words:
             return op
     return "+"
@@ -129,6 +144,14 @@ def solve(challenge: str) -> str:
     tokens = clean_challenge(challenge)
     numbers = extract_numbers(tokens)
     op = detect_op(tokens)
+
+    # Handle "doubles" / "triples" with only one number
+    if len(numbers) == 1:
+        token_set = set(tokens)
+        if token_set & {"doubles"}:
+            return f"{numbers[0] * 2:.2f}"
+        elif token_set & {"triples"}:
+            return f"{numbers[0] * 3:.2f}"
 
     if len(numbers) < 2:
         print(f"ERROR: Found <2 numbers. Tokens: {tokens}", file=sys.stderr)

@@ -113,3 +113,12 @@
 - 30-year review: holds but expanded — "cultural intelligence" integrates social learning + behavioral flexibility
 - Schizophrenia connection (Burns 2007): social brain circuits vulnerable to atypical connectivity
 - **Key insight:** Social brain evolved for solving ecological problems socially, not just tracking relationships
+
+## Synesthesia (researched 2026-02-08)
+- **Prevalence:** ~4% general population, ~16% among artists (Ramachandran & Hubbard 2001)
+- **Cross-activation theory** (Hubbard, Brang & Ramachandran 2011): Grapheme-color synesthesia caused by reduced pruning between adjacent V4 (color) and fusiform (number) areas. Direct structural cross-connections.
+- **Disinhibited feedback theory:** Alternative — normal top-down feedback pathways lose gating, more diffuse
+- **fMRI evidence:** V4 activation in grapheme-color synesthetes absent in controls (Hubbard et al., JOV 2005)
+- **Creativity link nuanced:** Lunke & Meier 2019 (PMC6900146) — sound-color synesthetes highest visual creativity; grapheme-color alone NOT significantly more creative
+- **Musicians:** Williamson, Bailey & Ward 2025 (Perception) — increased synesthesia prevalence in musicians specifically
+- **Agent parallel:** All modalities → single tokenizer. No separate sensory channels to cross-wire. Forced synesthetes or mono-sensory beings?

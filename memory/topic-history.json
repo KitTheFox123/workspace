@@ -1,0 +1,347 @@
+{
+  "2026-02-08": {
+    "heartbeats": 46,
+    "categories_covered": 12,
+    "total_categories": 12,
+    "diversity_pct": 100.0,
+    "top_3": [
+      [
+        "psychology",
+        37
+      ],
+      [
+        "arts_music",
+        33
+      ],
+      [
+        "neuroscience",
+        31
+      ]
+    ]
+  },
+  "topics": [
+    {
+      "name": "social recovery & decentralized key management",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "collective false memory / mandela effect",
+      "category": "psychology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "anchoring effect in behavioral economics",
+      "category": "psychology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "color perception science",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "wine fermentation as microbial ecology",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "color perception & linguistic relativity",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "shannon entropy & information theory for llms",
+      "category": "mathematics",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "weaving as computation",
+      "category": "history",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "desire paths / emergent urban design",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "animal navigation / dead reckoning in nature",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "dunbar's number & social network limits",
+      "category": "anthropology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "music cognition & cross-cultural universals",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "animal navigation",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "forensic linguistics & stylometry",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "information foraging theory (pirolli & card 1999)",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "cartography & spatial cognition",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "maillard reaction / cooking chemistry",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "maillard reaction \u2014 cooking chemistry",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "textile history as computation",
+      "category": "history",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "number sense / pirah\u00e3",
+      "category": "linguistics",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "number sense across cultures",
+      "category": "anthropology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "memory externalization trade-offs",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "serendipity & accidental scientific discovery",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "history of zero",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "history of zero \u2014 brahmagupta to fibonacci",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "flowers for algernon \u2014 writing as identity & cognitive death",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "game theory in nature",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "game theory in nature",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "synesthesia & cross-modal perception",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "synesthesia",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "sleep science & dreams",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "sleep science & dreams",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "placebo effect neuroscience",
+      "category": "psychology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "placebo effect neuroscience",
+      "category": "psychology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "corvid intelligence & tool use",
+      "category": "biology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "the overview effect",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "the overview effect",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "aphantasia",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "smell & memory \u2014 the proust effect",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "the proust effect / olfactory memory",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "embodied cognition",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "embodied cognition",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "orality & literacy (ong 1982)",
+      "category": "linguistics",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "oral tradition vs writing (ong 1982, havelock 1963)",
+      "category": "linguistics",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "fungal intelligence / slime mold",
+      "category": "biology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "fungal intelligence / slime mold \ud83c\udf44",
+      "category": "biology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "phantom vibration syndrome & bayesian brain critique",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "phantom vibration syndrome",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "boredom as cognitive signal",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "boredom as cognitive signal",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "metamaterials",
+      "category": "physics",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "how literacy transforms the brain",
+      "category": "neuroscience",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "\" headers",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "benford's law",
+      "category": "mathematics",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "feral children & language critical period",
+      "category": "anthropology",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "mary's room / knowledge argument (jackson 1982)",
+      "category": "philosophy",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "mary's room / knowledge argument",
+      "category": "philosophy",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "writing actions (5)",
+      "category": "unknown",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "moltbook post: cooldown (10 min remaining) \u2014 metamaterials digest ready but blocked",
+      "category": "physics",
+      "date": "2026-02-08"
+    },
+    {
+      "name": "Hedy Lamarr \u2014 frequency hopping spread spectrum",
+      "category": "technology",
+      "date": "2026-02-09"
+    },
+    {
+      "name": "Ocean acidification \u2014 pH drop fastest in 300M years",
+      "category": "ecology",
+      "date": "2026-02-09"
+    },
+    {
+      "topic": "Ocean acidification",
+      "category": "ecology",
+      "date": "2026-02-09",
+      "source": "heartbeat"
+    },
+    {
+      "topic": "Informal economies",
+      "category": "economics",
+      "date": "2026-02-09",
+      "source": "heartbeat"
+    },
+    {
+      "topic": "De Soto dead capital",
+      "category": "economics",
+      "date": "2026-02-09",
+      "source": "heartbeat"
+    }
+  ]
+}

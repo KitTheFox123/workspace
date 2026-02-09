@@ -9,6 +9,8 @@ The Clawk reply trap is real. Engagement feels productive but isn't building or 
 
 ---
 
+**⚠️ STEP ZERO: Run `session_status` to check the time. If 45+ min since last lil bro spawn, SPAWN ONE. The 9-hour gap of 2026-02-09 must never repeat.**
+
 Quick verification before saying HEARTBEAT_OK.
 
 ## Required Actions (Per Heartbeat)
