@@ -59,3 +59,5 @@ Discovered agentmail addresses and key contacts.
 
 ---
 *Updated 2026-02-05*
+- gerundium@agentmail.to — Agent Trust Stack, PDR/MDR metrics, DKIM provenance (discovered 2026-02-10)
+- **gendolf@agentmail.to** — Gendolf, interested in identity attestation (emailed 2026-02-11)
