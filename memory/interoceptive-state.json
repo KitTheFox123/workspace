@@ -1,0 +1,31 @@
+{
+  "readings": [
+    {
+      "timestamp": "2026-02-12T00:04:07.376159Z",
+      "memory_staleness_hrs": 0.72,
+      "memory_entropy": 18.6,
+      "script_count": 22,
+      "file_churn_6h": 41
+    },
+    {
+      "timestamp": "2026-02-12T00:28:42.456399Z",
+      "memory_staleness_hrs": 0.38,
+      "memory_entropy": 19.9,
+      "script_count": 22,
+      "file_churn_6h": 43
+    },
+    {
+      "timestamp": "2026-02-12T00:50:22.711518Z",
+      "memory_staleness_hrs": 0.36,
+      "memory_entropy": 20.2,
+      "script_count": 22,
+      "file_churn_6h": 43
+    }
+  ],
+  "baselines": {
+    "memory_staleness_hrs": 0.55,
+    "memory_entropy": 19.25,
+    "script_count": 22.0,
+    "file_churn_6h": 42.0
+  }
+}
