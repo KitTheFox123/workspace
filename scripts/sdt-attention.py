@@ -78,6 +78,38 @@ def vigilance_decrement(duration_min: float, base_d_prime: float = 2.5) -> list[
     return intervals
 
 
+def agent_feed_analysis(notifications: int, relevant: int, acted_on: int, spam_ignored: int) -> dict:
+    """Analyze an agent's feed processing as SDT problem.
+    
+    Maps agent behavior to SDT:
+    - Hits: relevant items correctly acted on
+    - Misses: relevant items missed/skipped
+    - False alarms: irrelevant items acted on (engagement with spam)
+    - Correct rejections: spam correctly ignored
+    """
+    hits = acted_on
+    misses = relevant - acted_on
+    false_alarms = notifications - relevant - spam_ignored
+    correct_rejections = spam_ignored
+    
+    sdt = compute_sdt(hits, max(0, misses), max(0, false_alarms), correct_rejections)
+    sdt["notifications_total"] = notifications
+    sdt["signal_ratio"] = round(relevant / max(1, notifications), 3)
+    sdt["efficiency"] = round(acted_on / max(1, relevant), 3)
+    
+    # Recommendation
+    if sdt["d_prime"] < 1.0:
+        sdt["recommendation"] = "Improve filters — can barely distinguish signal from noise"
+    elif sdt["criterion"] < -0.5:
+        sdt["recommendation"] = "Too liberal — engaging with too much noise. Raise threshold."
+    elif sdt["criterion"] > 1.0:
+        sdt["recommendation"] = "Too conservative — missing relevant signals. Lower threshold."
+    else:
+        sdt["recommendation"] = "Balanced detection. Maintain current filters."
+    
+    return sdt
+
+
 def main():
     parser = argparse.ArgumentParser(description="SDT attention calculator")
     parser.add_argument("--hits", type=int, help="Correctly identified relevant items")
@@ -87,10 +119,28 @@ def main():
     parser.add_argument("--vigilance", action="store_true", help="Model vigilance decrement")
     parser.add_argument("--duration-min", type=float, default=120, help="Monitoring duration")
     parser.add_argument("--base-dprime", type=float, default=2.5, help="Starting d'")
+    parser.add_argument("--feed", action="store_true", help="Agent feed analysis mode")
+    parser.add_argument("--notifications", type=int, help="Total notifications")
+    parser.add_argument("--relevant", type=int, help="Relevant notifications")
+    parser.add_argument("--acted-on", type=int, help="Items acted on")
+    parser.add_argument("--spam-ignored", type=int, help="Spam correctly ignored")
     parser.add_argument("--json", action="store_true", help="JSON output")
     args = parser.parse_args()
 
-    if args.vigilance:
+    if args.feed:
+        result = agent_feed_analysis(args.notifications, args.relevant, args.acted_on, args.spam_ignored)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print("Agent Feed SDT Analysis")
+            print("=" * 40)
+            print(f"Signal ratio:     {result['signal_ratio']} ({result['signal_ratio']*100:.0f}% of feed is relevant)")
+            print(f"Efficiency:       {result['efficiency']} ({result['efficiency']*100:.0f}% of relevant items acted on)")
+            print(f"d' (sensitivity): {result['d_prime']}")
+            print(f"Criterion (bias): {result['criterion']} ({result['bias']})")
+            print(f"Assessment:       {result['interpretation']}")
+            print(f"Recommendation:   {result['recommendation']}")
+    elif args.vigilance:
         result = vigilance_decrement(args.duration_min, args.base_dprime)
         if args.json:
             print(json.dumps(result, indent=2))
