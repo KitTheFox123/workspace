@@ -64,6 +64,96 @@ class BloomFilter:
         }
 
 
+class CountingBloomFilter:
+    """Counting bloom filter — supports deletion via counters."""
+
+    def __init__(self, capacity: int, fp_rate: float = 0.01, counter_bits: int = 8):
+        self.capacity = capacity
+        self.fp_rate = fp_rate
+        self.size = int(-capacity * math.log(fp_rate) / (math.log(2) ** 2))
+        self.num_hashes = max(1, int((self.size / capacity) * math.log(2)))
+        self.max_count = (1 << counter_bits) - 1
+        self.counters = [0] * self.size
+        self.count = 0
+        self.overflows = 0
+
+    def _hashes(self, item: str) -> list[int]:
+        h1 = int(hashlib.sha256(item.encode()).hexdigest(), 16)
+        h2 = int(hashlib.md5(item.encode()).hexdigest(), 16)
+        return [(h1 + i * h2) % self.size for i in range(self.num_hashes)]
+
+    def add(self, item: str) -> None:
+        for pos in self._hashes(item):
+            if self.counters[pos] < self.max_count:
+                self.counters[pos] += 1
+            else:
+                self.overflows += 1
+        self.count += 1
+
+    def remove(self, item: str) -> bool:
+        positions = self._hashes(item)
+        if not all(self.counters[p] > 0 for p in positions):
+            return False
+        for pos in positions:
+            self.counters[pos] -= 1
+        self.count -= 1
+        return True
+
+    def check(self, item: str) -> bool:
+        return all(self.counters[p] > 0 for p in self._hashes(item))
+
+
+def churn_test(capacity: int = 10000, epochs: int = 20, churn_rate: float = 0.10):
+    """Simulate trust churn: add attestations, revoke some each epoch, measure FP."""
+    import random
+    
+    print(f"Churn Test: {capacity} attestations, {churn_rate*100:.0f}% revoked/epoch, {epochs} epochs")
+    print("=" * 60)
+    
+    cbf = CountingBloomFilter(capacity=capacity, fp_rate=0.01, counter_bits=8)
+    active = set()
+    all_ever = set()
+    epoch_num = 0
+    
+    # Initial population
+    for i in range(capacity):
+        item = f"attestation:{i}"
+        cbf.add(item)
+        active.add(item)
+        all_ever.add(item)
+    
+    for epoch in range(epochs):
+        # Revoke churn_rate of active
+        to_revoke = random.sample(list(active), int(len(active) * churn_rate))
+        for item in to_revoke:
+            cbf.remove(item)
+            active.discard(item)
+        
+        # Add new attestations to replace
+        new_start = len(all_ever)
+        for i in range(len(to_revoke)):
+            item = f"attestation:{new_start + i}"
+            cbf.add(item)
+            active.add(item)
+            all_ever.add(item)
+        
+        # Measure FP: check revoked items
+        revoked = all_ever - active
+        false_positives = sum(1 for item in random.sample(list(revoked), min(1000, len(revoked)))
+                            if cbf.check(item))
+        fp_tested = min(1000, len(revoked))
+        fp_rate = false_positives / fp_tested if fp_tested > 0 else 0
+        
+        print(f"  Epoch {epoch+1:>3}: active={len(active)}, revoked={len(revoked)}, "
+              f"FP={false_positives}/{fp_tested} ({fp_rate:.3f}), overflows={cbf.overflows}")
+    
+    print(f"\nFinal: {cbf.overflows} counter overflows across {epochs} epochs")
+    if cbf.overflows == 0:
+        print("✅ No overflows — 8-bit counters sufficient for this churn rate")
+    else:
+        print("⚠️  Overflows detected — consider larger counters or faster epoch rotation")
+
+
 def demo():
     """Demonstrate bloom filter for trust attestations."""
     print("Bloom Filter Trust Attestation Demo")
@@ -105,10 +195,14 @@ def main():
     parser.add_argument("--capacity", type=int, default=10000, help="Expected items")
     parser.add_argument("--fp-rate", type=float, default=0.01, help="Target false positive rate")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--churn-test", action="store_true", help="Run churn simulation")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--churn-rate", type=float, default=0.10)
     args = parser.parse_args()
-
     if args.demo:
         demo()
+    elif args.churn_test:
+        churn_test(args.capacity, args.epochs, args.churn_rate)
     else:
         bf = BloomFilter(args.capacity, args.fp_rate)
         if args.json:
