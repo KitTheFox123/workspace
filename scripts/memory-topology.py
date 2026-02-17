@@ -98,6 +98,8 @@ def analyze_topology(before_text: str, after_text: str) -> dict:
     gained = after_concepts - before_concepts
     preserved = before_concepts & after_concepts
     
+    decision = decision_function_score(before_text, after_text)
+    
     return {
         "before_concepts": len(before_concepts),
         "after_concepts": len(after_concepts),
@@ -113,6 +115,56 @@ def analyze_topology(before_text: str, after_text: str) -> dict:
         "interpretation": interpret(concept_retention, edge_retention),
         "top_lost": sorted(lost)[:10],
         "top_gained": sorted(gained)[:10],
+        "decision_retention": decision["decision_retention"],
+        "decision_verdict": decision["verdict"],
+    }
+
+
+def decision_function_score(before_text: str, after_text: str) -> dict:
+    """Measure whether the compressed version preserves decision-relevant info.
+    
+    Heuristic: action verbs + conditional patterns + causal markers
+    indicate decision-relevant content. If these survive compression,
+    the decision function is preserved even if details are lost.
+    """
+    import re
+    
+    decision_markers = [
+        r'\b(if|when|unless|because|therefore|should|must|avoid|prefer|choose|decide)\b',
+        r'\b(rule|policy|always|never|critical|important|required)\b',
+        r'\b(lesson|learned|mistake|fix|solved|found that)\b',
+    ]
+    
+    def count_markers(text: str) -> dict[str, int]:
+        counts = {}
+        for pattern in decision_markers:
+            matches = re.findall(pattern, text.lower())
+            for m in matches:
+                counts[m] = counts.get(m, 0) + 1
+        return counts
+    
+    before_markers = count_markers(before_text)
+    after_markers = count_markers(after_text)
+    
+    before_set = set(before_markers.keys())
+    after_set = set(after_markers.keys())
+    
+    preserved = before_set & after_set
+    lost = before_set - after_set
+    
+    retention = len(preserved) / max(1, len(before_set))
+    
+    return {
+        "before_decision_markers": len(before_set),
+        "after_decision_markers": len(after_set),
+        "preserved": len(preserved),
+        "lost_markers": sorted(lost)[:10],
+        "decision_retention": round(retention, 3),
+        "verdict": (
+            "Decision function preserved" if retention > 0.7
+            else "Partial decision function loss" if retention > 0.4
+            else "Critical decision function loss"
+        ),
     }
 
 
