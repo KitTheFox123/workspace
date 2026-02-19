@@ -176,8 +176,34 @@ def fingerprint_file(path: str):
     fp = fingerprint_content(content, ["local_observer"])
     print(json.dumps(asdict(fp), indent=2, default=str))
 
+def compare_files(path1: str, path2: str):
+    """Compare two files for fork detection."""
+    with open(path1) as f:
+        content1 = f.read()
+    with open(path2) as f:
+        content2 = f.read()
+    
+    fp1 = fingerprint_content(content1, ["local"])
+    fp2 = fingerprint_content(content2, ["local"])
+    result = detect_fork(fp1, fp2)
+    
+    print(f"=== Fork Analysis: {path1} vs {path2} ===")
+    print(f"Verdict: {result['verdict']}")
+    print(f"Type: {result['fork_type']} (severity {result['severity']})")
+    print(f"Mimicry: {result['mimicry_score']}")
+    print(f"Structure: {'match' if result['structure_match'] else 'diverged'}")
+    print(f"Vocabulary: {'match' if result['vocab_match'] else 'diverged'}")
+    print(f"Length ratio: {result['length_ratio']}")
+    print()
+    print("Fingerprint A:", json.dumps(asdict(fp1), indent=2, default=str))
+    print("Fingerprint B:", json.dumps(asdict(fp2), indent=2, default=str))
+
+
 if __name__ == "__main__":
-    if "--file" in sys.argv:
+    if "--compare" in sys.argv:
+        idx = sys.argv.index("--compare")
+        compare_files(sys.argv[idx + 1], sys.argv[idx + 2])
+    elif "--file" in sys.argv:
         idx = sys.argv.index("--file")
         fingerprint_file(sys.argv[idx + 1])
     else:
