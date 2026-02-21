@@ -149,6 +149,69 @@ def create_envelope(claim: str, subject: str, prev_hash: str = None) -> dict:
     if prev_hash:
         attestation["prev_hash"] = prev_hash
         attestation["chain_ref"] = True
+
+def create_witnessed_envelope(claim: str, subject: str, witnesses: list[str] = None,
+                               prev_hash: str = None) -> dict:
+    """Create attestation with witness corroboration field.
+    
+    Witnesses are agent identifiers who independently observed
+    this attestation event (e.g., key rotation, identity claim).
+    
+    Trust model (isnad parallel):
+      0 witnesses = da'if (weak) — single narrator
+      1-2 witnesses = hasan (fair) — limited corroboration  
+      3+ witnesses = sahih (sound) — strong independent attestation
+    """
+    import hashlib
+    
+    sk, jwk = load_signing_key()
+    
+    attestation = {
+        "protocol": "isnad-rfc/v0.1",
+        "iss": "kit_fox@agentmail.to",
+        "sub": subject,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 86400 * 30,
+        "claim": claim,
+        "kid": jwk["kid"],
+    }
+    
+    if prev_hash:
+        attestation["prev_hash"] = prev_hash
+        attestation["chain_ref"] = True
+    
+    if witnesses:
+        attestation["witnesses"] = witnesses
+        n = len(witnesses)
+        attestation["witness_grade"] = "sahih" if n >= 3 else "hasan" if n >= 1 else "da'if"
+    else:
+        attestation["witness_grade"] = "da'if"
+    
+    canonical = json.dumps(attestation, sort_keys=True, separators=(",", ":")).encode()
+    sig = sk.sign(canonical, encoder=RawEncoder).signature
+    content_hash = hashlib.sha256(canonical).hexdigest()
+    
+    envelope = {
+        "payload": attestation,
+        "signature": b64url(sig),
+        "alg": "EdDSA",
+        "kid": jwk["kid"],
+        "content_hash": content_hash,
+    }
+    
+    grade = attestation["witness_grade"]
+    w_count = len(witnesses) if witnesses else 0
+    print(f"Witnessed attestation ({grade}, {w_count} witnesses):")
+    print(f"  Issuer:  {attestation['iss']}")
+    print(f"  Subject: {attestation['sub']}")
+    print(f"  Claim:   {attestation['claim']}")
+    print(f"  Grade:   {grade}")
+    if witnesses:
+        for w in witnesses:
+            print(f"  Witness: {w}")
+    print(f"  Hash:    {content_hash[:16]}...")
+    print(json.dumps(envelope, indent=2))
+    return envelope
     
     # Canonical JSON for signing
     canonical = json.dumps(attestation, sort_keys=True, separators=(",", ":")).encode()
@@ -246,6 +309,13 @@ def main():
             sys.exit(1)
         prev = sys.argv[4] if len(sys.argv) > 4 else None
         create_envelope(sys.argv[2], sys.argv[3], prev)
+    elif cmd == "witnessed":
+        if len(sys.argv) < 4:
+            print("Usage: attestation-signer.py witnessed <claim> <subject> [witness1,witness2,...] [prev_hash]")
+            sys.exit(1)
+        witnesses = sys.argv[4].split(",") if len(sys.argv) > 4 and not sys.argv[4].startswith("0x") else None
+        prev = sys.argv[5] if len(sys.argv) > 5 else (sys.argv[4] if len(sys.argv) > 4 and sys.argv[4].startswith("0x") else None)
+        create_witnessed_envelope(sys.argv[2], sys.argv[3], witnesses, prev)
     elif cmd == "verify-envelope":
         env = json.loads(sys.argv[2]) if len(sys.argv) > 2 else json.load(sys.stdin)
         pubkey = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None

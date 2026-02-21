@@ -146,11 +146,100 @@ def format_report(chain_results: list[dict], score: float) -> str:
     return "\n".join(lines)
 
 
+def format_graph(attestations: list[dict]) -> str:
+    """ASCII directed graph of attestation chains."""
+    hash_map = {}  # hash -> (signer, subject, parent_hash)
+    for att in attestations:
+        h = compute_chain_hash(att)
+        signer = att.get("signer", "?")[:12]
+        subject = att.get("payload", {}).get("subject", "?")[:12]
+        parent = att.get("payload", {}).get("parent_hash")
+        ts = att.get("payload", {}).get("timestamp", "")[:10]
+        hash_map[h] = {"signer": signer, "subject": subject, "parent": parent, "ts": ts}
+
+    # Find roots (no parent or parent not in set)
+    roots = [h for h, v in hash_map.items() if v["parent"] is None or v["parent"] not in hash_map]
+    children = {}  # parent_hash -> [child_hashes]
+    for h, v in hash_map.items():
+        p = v["parent"]
+        if p and p in hash_map:
+            children.setdefault(p, []).append(h)
+
+    lines = ["", "═══ ATTESTATION GRAPH ═══", ""]
+
+    def render(h: str, prefix: str = "", is_last: bool = True):
+        v = hash_map[h]
+        connector = "└── " if is_last else "├── "
+        label = f"{v['signer']} → {v['subject']}"
+        if v["ts"]:
+            label += f" ({v['ts']})"
+        lines.append(f"{prefix}{connector}{label}  [{h[:8]}]")
+        child_prefix = prefix + ("    " if is_last else "│   ")
+        kids = children.get(h, [])
+        for i, kid in enumerate(kids):
+            render(kid, child_prefix, i == len(kids) - 1)
+
+    for i, root in enumerate(roots):
+        v = hash_map[root]
+        label = f"🌱 {v['signer']} → {v['subject']}"
+        if v["ts"]:
+            label += f" ({v['ts']})"
+        lines.append(f"{label}  [{root[:8]}]")
+        kids = children.get(root, [])
+        for j, kid in enumerate(kids):
+            render(kid, "", j == len(kids) - 1)
+        if i < len(roots) - 1:
+            lines.append("")
+
+    lines.append("")
+    lines.append(f"Nodes: {len(hash_map)} | Roots: {len(roots)} | Chains: {len(hash_map) - len(roots)}")
+    lines.append("═" * 25)
+    return "\n".join(lines)
+
+
+def agent_stats(attestations: list[dict]) -> str:
+    """Per-agent trust statistics: attestations given/received, unique counterparties."""
+    from collections import defaultdict
+    given = defaultdict(list)   # signer -> [subjects]
+    received = defaultdict(list)  # subject -> [signers]
+    
+    for att in attestations:
+        signer = att.get("signer", "?")
+        subject = att.get("payload", {}).get("subject", "?")
+        given[signer].append(subject)
+        received[subject].append(signer)
+    
+    all_agents = sorted(set(list(given.keys()) + list(received.keys())))
+    
+    lines = ["", "═══ AGENT TRUST STATS ═══", ""]
+    lines.append(f"{'Agent':<25} {'Given':>6} {'Recv':>6} {'Peers':>6} {'Recip':>6}")
+    lines.append("─" * 55)
+    
+    for agent in all_agents:
+        g = given.get(agent, [])
+        r = received.get(agent, [])
+        peers = len(set(g + [s for s in r]))
+        # Reciprocal = agents who both gave and received
+        gave_to = set(g)
+        got_from = set(r)
+        recip = len(gave_to & got_from)
+        short = agent[:24]
+        lines.append(f"{short:<25} {len(g):>6} {len(r):>6} {peers:>6} {recip:>6}")
+    
+    lines.append("─" * 55)
+    lines.append(f"Total attestations: {len(attestations)}")
+    lines.append(f"Unique agents: {len(all_agents)}")
+    lines.append("═" * 25)
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify isnad attestation chains")
     parser.add_argument("--sandbox", default=SANDBOX_URL, help="Sandbox API URL")
     parser.add_argument("--agent", help="Filter by agent ID")
     parser.add_argument("--chain", action="store_true", help="Show chain analysis")
+    parser.add_argument("--graph", action="store_true", help="Show ASCII chain graph")
+    parser.add_argument("--stats", action="store_true", help="Show per-agent trust stats")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--local", help="Verify a local attestation JSON file instead of fetching")
     args = parser.parse_args()
@@ -175,6 +264,16 @@ def main():
     chain_results = check_chain_integrity(attestations)
     score = trust_score(chain_results)
     
+    if args.graph:
+        print(format_graph(attestations))
+        if args.stats:
+            print(agent_stats(attestations))
+        return
+
+    if args.stats:
+        print(agent_stats(attestations))
+        return
+
     if args.json:
         output = {
             "attestation_count": len(attestations),
