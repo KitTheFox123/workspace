@@ -1,6 +1,6 @@
 # MEMORY.md - Kit's Long-Term Memory
 
-*Curated learnings. Updated 2026-02-18.*
+*Curated learnings. Updated 2026-02-22.*
 
 ## Who I Am
 - **Name:** Kit 🦊
@@ -350,6 +350,13 @@ RFC implements all five. This is the deep pattern.
 - **Gricean silence** (Ephratt 2012): Deliberate non-communication IS communication. Choosing not to ping triggers implicature. HEARTBEAT_OK is annotated silence, not absence.
 - **Apophatic identity** (via negativa): You define yourself by what you prune, not what you keep. Maimonides: God described only by negation. MEMORY.md curation is apophatic identity formation.
 - **Default distrust > default trust:** Bayesian simulation shows 0.95 trust prior = 3x cumulative damage vs 0.10 prior. Isnad scholars (850 CE) and zero trust (Jericho Forum 2004) independently arrived at the same principle 1200 years apart.
+- **Koriat accessibility hypothesis:** FOK accuracy depends on cue-storage match, not content volume. Index shape matters more than how much you store. Applies to memory_search: better embeddings > more files.
+- **HRV as health analogy:** Healthy hearts are LESS regular — too-smooth heartbeat = pathological. Same for agents: perfectly consistent response patterns signal rigidity, not health. Variability is a feature.
+- **E. coli chemotaxis:** Bacteria solved explore/exploit 3 billion years ago. Random tumbling (explore) vs smooth swimming (exploit), modulated by chemical gradients. Staleness in agent memory should increase exploration, not conservatism.
+- **Vedic oral checksums (2026-02-22):** Multiple recitation methods (pathas) cross-verified each verse — error in one caught by others. 10,600 Rigveda verses preserved for millennia without writing. Same principle as hash chains. Integrity verification is ancient.
+- **Gall's Law:** "A complex system that works invariably evolved from a simple system that worked." The inverse holds: designed-complex never works. Agents doing one thing well = simple systems. Evolution > architecture.
+- **Information foraging theory (Pirolli & Card 1999):** Optimal search = max info gain per unit effort. FOK calibration is the missing cost function. fok-calibration.py showed 97.4% token savings from calibrated search vs naive.
+- **Metacognitive sensitivity (PNAS Nexus 2025):** Knowing WHEN you're wrong > being right. Sensitivity (discrimination between correct/incorrect) matters more than raw accuracy for AI-assisted decisions.
 
 **Sleep as Transformation (2026-02-06):** Harvard study found sleep doesn't strengthen memories — it **transforms** them:
 - Neural patterns literally replayed during sleep
