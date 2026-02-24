@@ -1,0 +1,38 @@
+[
+  {
+    "sn": 0,
+    "event_type": "inception",
+    "current_pubkey": "4cf4c41d0133c2ee8ddc7087519b0bfa062b4a4760096e609514220a8aa6303f",
+    "next_key_digest": "3e032539c0bac55b9658c32f6665519beb78bdbee1fdcba2ae47bc942a618950",
+    "signature": "c4615bfa45b09137629c4b438e2ce57865ed632c2a74d91986bcb4b9cc3e8609",
+    "timestamp": "2026-02-24T21:00:00Z",
+    "prior_digest": null
+  },
+  {
+    "sn": 1,
+    "event_type": "rotation",
+    "current_pubkey": "f24b80dfe0b348a81be2716adf202c2dedd2e14df3286fdd65900001f552e1d3",
+    "next_key_digest": "859c8772a8d60564845038d4c1409f2aec0977caca9b846a29118671fc3beb86",
+    "signature": "72ad6b0925572f2875da36e2bfecaddbea0947e09565f300d405f2ed90e376ff",
+    "timestamp": "2026-02-24T21:01:00Z",
+    "prior_digest": "c1157b947c9876ab6b288513fbf2c6510fd707694ab9d424cfee15216be7fead"
+  },
+  {
+    "sn": 2,
+    "event_type": "rotation",
+    "current_pubkey": "84d4defdc23da67c677ba03e1556f7bd06b12a2b440bfadcf02eeab71a1bb832",
+    "next_key_digest": "d2f2efc043f8a7af6fb3b40a12ca5c4cb2c9dab7dfa1a8e8e8340c991742c733",
+    "signature": "5ab8eb3b1f1b2ed39bcc6a7f0e9bcf16ba461b283db366979738bf565a8fe47d",
+    "timestamp": "2026-02-24T21:02:00Z",
+    "prior_digest": "7b8fea1ec9613bedcdbc2fd58005aa084b5e1fb464ca2ec0f320893b0aff579a"
+  },
+  {
+    "sn": 3,
+    "event_type": "rotation",
+    "current_pubkey": "78f12b8c5751cea3449309447aad4eae7815971fab7ace0bc9286d99a669a7aa",
+    "next_key_digest": "06e8e691031d175df2c803e47a7a2520cae19407fec4bd18a111fc8972de6c8e",
+    "signature": "c8ad2afe8f22b8db514cdb39d258611c8848d77501a537af48b6bc037396e098",
+    "timestamp": "2026-02-24T21:03:00Z",
+    "prior_digest": "2416dea0c38392ff4a94149e81e4e5ef25ddd29b38ffe826b852992b9639aeea"
+  }
+]
