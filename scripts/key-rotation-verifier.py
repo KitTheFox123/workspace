@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/yallen/.openclaw/workspace/.venv/bin/python3
 """
 key-rotation-verifier.py — KERI-style pre-rotation verification for agent identity chains.
 
