@@ -328,3 +328,84 @@ if __name__ == "__main__":
         verify_file(sys.argv[2])
     else:
         print(__doc__)
+
+
+# --- Contract Profile Presets (maps to verifiable:bool routing) ---
+
+CONTRACT_PROFILES = {
+    "subjective-standard": {
+        "payment_model": "escrow",
+        "dispute_window_hours": 48,
+        "attester_pool": "diverse_minimum_2",
+        "evidence_format": "text+links",
+        "sig_algorithm": "ed25519",
+        "settlement_mode": "judge_release",
+        "description": "For subjective deliverables (research, creative, strategy). "
+                       "Human-style judgment required.",
+    },
+    "deterministic-standard": {
+        "payment_model": "payment_first",
+        "dispute_window_hours": 0,
+        "attester_pool": "none",
+        "evidence_format": "tx_hash",
+        "sig_algorithm": "ed25519",
+        "settlement_mode": "auto_verify",
+        "description": "For machine-verifiable deliverables (code tests pass, data schema match, "
+                       "tx hash exists). No dispute needed.",
+    },
+    "high-value-subjective": {
+        "payment_model": "escrow",
+        "dispute_window_hours": 72,
+        "attester_pool": "diverse_minimum_3",
+        "evidence_format": "text+links+attestations",
+        "sig_algorithm": "ed25519",
+        "settlement_mode": "multi_judge",
+        "description": "For high-value subjective work. Longer window, more attesters.",
+    },
+    "micro-deterministic": {
+        "payment_model": "streaming",
+        "dispute_window_hours": 0,
+        "attester_pool": "none",
+        "evidence_format": "boolean",
+        "sig_algorithm": "ed25519",
+        "settlement_mode": "auto_release",
+        "description": "For micro-tasks with binary outcomes. Pay-as-you-go.",
+    },
+}
+
+
+def select_profile(verifiable: bool, amount_usd: float = 0) -> dict:
+    """Select contract profile based on verifiable flag and amount.
+    
+    Maps santaclawd's verifiable:bool to full execution profile.
+    Default profiles reduce 6 decisions to 1 boolean + amount.
+    """
+    if verifiable:
+        if amount_usd > 100:
+            return {"profile": "high-value-subjective", **CONTRACT_PROFILES["high-value-subjective"]}
+        return {"profile": "subjective-standard", **CONTRACT_PROFILES["subjective-standard"]}
+    else:
+        if amount_usd < 1:
+            return {"profile": "micro-deterministic", **CONTRACT_PROFILES["micro-deterministic"]}
+        return {"profile": "deterministic-standard", **CONTRACT_PROFILES["deterministic-standard"]}
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "profiles":
+    import json as _json
+    print("Contract Profile Presets")
+    print("=" * 50)
+    for name, profile in CONTRACT_PROFILES.items():
+        print(f"\n  {name}:")
+        for k, v in profile.items():
+            print(f"    {k}: {v}")
+    
+    print("\n\nProfile Selection Examples:")
+    examples = [
+        (True, 50, "Research deliverable, $50"),
+        (True, 500, "Strategy report, $500"),
+        (False, 0.5, "API ping check, $0.50"),
+        (False, 20, "Code test suite, $20"),
+    ]
+    for verifiable, amount, desc in examples:
+        result = select_profile(verifiable, amount)
+        print(f"  {desc} → {result['profile']}")
