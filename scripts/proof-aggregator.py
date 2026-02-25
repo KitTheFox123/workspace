@@ -1,304 +1,360 @@
 #!/usr/bin/env python3
 """
-proof-aggregator.py — Aggregate independent proof layers into a single confidence score.
+proof-aggregator.py — Aggregate N independent receipts into 1 confidence score.
 
-Takes N independent receipts (x402 on-chain, generation sig, DKIM email, attestation chain)
-and outputs a compound confidence score based on:
-1. Layer independence (are proofs from different systems?)
-2. Temporal coherence (do timestamps align within expected windows?)
-3. Diversity weighting (more independent layers = non-linear confidence boost)
+Takes multiple attestation receipts from different sources (DKIM, on-chain tx, 
+generation signatures, isnad envelopes) and produces a weighted confidence score.
+
+Weights:
+- Source diversity: different proof types matter more than many of same type
+- Temporal spread: receipts clustered in time = suspicious (sybil)
+- Attester independence: unique attesters weighted higher than repeat
+- Receipt freshness: decay over time
+
+Input: JSON array of receipts
+Output: Confidence score 0.0-1.0 with breakdown
 
 Usage:
-    python3 proof-aggregator.py demo          # Run with synthetic proofs
-    python3 proof-aggregator.py score FILE    # Score a JSON proof bundle
+    python proof-aggregator.py demo
+    python proof-aggregator.py score FILE.json
+    echo '[...]' | python proof-aggregator.py stdin
 """
 
-import hashlib
 import json
 import math
 import sys
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
-from enum import Enum
-
-
-class ProofType(str, Enum):
-    X402_RECEIPT = "x402_receipt"         # On-chain transaction (Base/USDC)
-    GENERATION_SIG = "generation_sig"     # Cryptographic signature from generator
-    DKIM_ATTESTATION = "dkim_attestation" # Email with X-Claim-Hash in DKIM scope
-    ATTESTATION_CHAIN = "attestation_chain"  # Isnad-style attestation
-    KEY_ROTATION = "key_rotation"         # KERI-style pre-rotation proof
-    WITNESS_SIG = "witness_sig"           # Third-party witness signature
-
-
-# Which systems each proof type depends on (for independence calculation)
-PROOF_SYSTEMS = {
-    ProofType.X402_RECEIPT: {"blockchain", "wallet"},
-    ProofType.GENERATION_SIG: {"signing_infra", "key_management"},
-    ProofType.DKIM_ATTESTATION: {"email_provider", "dns"},
-    ProofType.ATTESTATION_CHAIN: {"attestation_network", "key_management"},
-    ProofType.KEY_ROTATION: {"key_management", "event_log"},
-    ProofType.WITNESS_SIG: {"witness_infra", "key_management"},
-}
 
 
 @dataclass
-class Proof:
-    """A single proof layer."""
-    proof_type: ProofType
-    timestamp: str              # ISO timestamp
-    source_agent: str           # DID or identifier of proof source
-    evidence_hash: str          # SHA-256 of the evidence
-    verified: bool = False      # Has this proof been locally verified?
+class Receipt:
+    """A single attestation receipt from any source."""
+    source: str          # "dkim", "x402", "generation_sig", "isnad", "paylock"
+    receipt_type: str    # "delivery", "payment", "attestation", "verification"  
+    hash: str            # Content hash or tx hash
+    timestamp: str       # ISO timestamp
+    attester_id: str     # Who attested
     metadata: dict = field(default_factory=dict)
-
-    @property
-    def dt(self) -> datetime:
-        return datetime.fromisoformat(self.timestamp.replace("Z", "+00:00"))
 
 
 @dataclass
 class AggregationResult:
-    """Result of aggregating multiple proofs."""
-    confidence: float           # 0.0 to 1.0
-    layer_count: int
-    independence_score: float   # How independent are the proof systems?
-    temporal_coherence: float   # Do timestamps align?
-    diversity_bonus: float      # Non-linear bonus for diverse proofs
+    """Result of proof aggregation."""
+    confidence: float          # 0.0 - 1.0
+    source_diversity: float    # How many different proof types
+    temporal_health: float     # 1.0 = spread out, 0.0 = suspicious cluster
+    attester_independence: float  # Unique attesters ratio
+    freshness: float           # How recent
+    receipt_count: int
+    breakdown: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
-    details: dict = field(default_factory=dict)
 
 
 class ProofAggregator:
-    """Aggregates independent proof layers into compound confidence."""
+    """Aggregates multiple receipts into a confidence score."""
     
-    def __init__(self, max_temporal_drift_minutes: int = 60):
-        self.max_drift = timedelta(minutes=max_temporal_drift_minutes)
+    # Known proof source types and their base reliability weights
+    SOURCE_WEIGHTS = {
+        "dkim": 0.7,           # Cryptographic, but depends on h= scope
+        "x402": 0.9,           # On-chain, verifiable
+        "generation_sig": 0.8, # Signed at creation time
+        "isnad": 0.6,          # Attestation chain, depends on chain length
+        "paylock": 0.85,       # Escrow-backed verification
+        "manual": 0.3,         # Human assertion, no crypto proof
+    }
     
-    def score(self, proofs: list[Proof]) -> AggregationResult:
-        """Score a bundle of proofs."""
-        if not proofs:
+    # Weights for final score composition
+    SCORE_WEIGHTS = {
+        "source_diversity": 0.30,
+        "temporal_health": 0.20,
+        "attester_independence": 0.25,
+        "freshness": 0.15,
+        "volume": 0.10,
+    }
+    
+    # Freshness half-life in hours
+    FRESHNESS_HALFLIFE_HOURS = 168  # 1 week
+    
+    def __init__(self, sybil_cv_threshold: float = 0.5):
+        self.sybil_cv_threshold = sybil_cv_threshold
+    
+    def aggregate(self, receipts: list[Receipt], 
+                  reference_time: Optional[datetime] = None) -> AggregationResult:
+        """Aggregate receipts into a confidence score."""
+        if not receipts:
             return AggregationResult(
-                confidence=0.0, layer_count=0,
-                independence_score=0.0, temporal_coherence=0.0,
-                diversity_bonus=0.0, warnings=["No proofs provided"]
+                confidence=0.0, source_diversity=0.0, temporal_health=0.0,
+                attester_independence=0.0, freshness=0.0, receipt_count=0,
+                warnings=["No receipts provided"]
             )
         
-        warnings = []
+        ref_time = reference_time or datetime.now(timezone.utc)
         
-        # 1. Layer independence: how many distinct systems are involved?
-        all_systems = set()
-        per_proof_systems = []
-        for p in proofs:
-            systems = PROOF_SYSTEMS.get(p.proof_type, {"unknown"})
-            per_proof_systems.append(systems)
-            all_systems.update(systems)
+        # 1. Source diversity: Shannon entropy of source types
+        source_counts = Counter(r.source for r in receipts)
+        source_diversity = self._shannon_diversity(source_counts, len(self.SOURCE_WEIGHTS))
         
-        # Independence = unique systems / total system references
-        total_refs = sum(len(s) for s in per_proof_systems)
-        independence = len(all_systems) / total_refs if total_refs > 0 else 0
+        # 2. Temporal health: coefficient of variation of inter-receipt intervals
+        temporal_health = self._temporal_health(receipts)
         
-        # Check for shared key_management (common dependency)
-        km_count = sum(1 for s in per_proof_systems if "key_management" in s)
-        if km_count > 1:
-            warnings.append(
-                f"key_management shared across {km_count} proof types — "
-                "compromise of signing infra affects multiple layers"
-            )
-            independence *= 0.85  # Penalty for shared dependency
+        # 3. Attester independence: unique attesters / total receipts
+        attester_counts = Counter(r.attester_id for r in receipts)
+        unique_ratio = len(attester_counts) / len(receipts)
+        # Bonus for attesters from different sources
+        cross_source = self._cross_source_attesters(receipts)
+        attester_independence = min(1.0, unique_ratio * 0.7 + cross_source * 0.3)
         
-        # 2. Temporal coherence: are timestamps within expected drift?
-        timestamps = [p.dt for p in proofs]
-        min_t, max_t = min(timestamps), max(timestamps)
-        drift = max_t - min_t
+        # 4. Freshness: exponential decay from reference time
+        freshness = self._freshness(receipts, ref_time)
         
-        if drift <= self.max_drift:
-            temporal = 1.0
-        elif drift <= self.max_drift * 3:
-            temporal = 0.7
-            warnings.append(f"Temporal drift {drift} exceeds expected window")
-        else:
-            temporal = 0.3
-            warnings.append(f"Large temporal drift {drift} — proofs may not relate to same event")
+        # 5. Volume: logarithmic scaling (diminishing returns)
+        volume = min(1.0, math.log2(len(receipts) + 1) / math.log2(10))
         
-        # 3. Diversity bonus: non-linear confidence from independent layers
-        # Based on: each independent proof raises attacker cost non-linearly
-        unique_types = len(set(p.proof_type for p in proofs))
-        # Sigmoid-like: diminishing returns after 3-4 layers
-        diversity = 1 - math.exp(-0.7 * unique_types)
-        
-        # 4. Verification status
-        verified_count = sum(1 for p in proofs if p.verified)
-        verification_ratio = verified_count / len(proofs)
-        if verification_ratio < 1.0:
-            warnings.append(
-                f"Only {verified_count}/{len(proofs)} proofs locally verified"
-            )
-        
-        # 5. Source diversity: different agents providing proofs?
-        unique_sources = len(set(p.source_agent for p in proofs))
-        source_diversity = min(unique_sources / max(len(proofs), 1), 1.0)
-        if unique_sources == 1:
-            warnings.append("All proofs from same source — no independent attestation")
-            source_diversity = 0.3
-        
-        # Compound score
-        # Weighted: independence 30%, temporal 20%, diversity 25%, verification 15%, source 10%
-        raw = (
-            0.30 * independence +
-            0.20 * temporal +
-            0.25 * diversity +
-            0.15 * verification_ratio +
-            0.10 * source_diversity
+        # Weighted combination
+        confidence = (
+            self.SCORE_WEIGHTS["source_diversity"] * source_diversity +
+            self.SCORE_WEIGHTS["temporal_health"] * temporal_health +
+            self.SCORE_WEIGHTS["attester_independence"] * attester_independence +
+            self.SCORE_WEIGHTS["freshness"] * freshness +
+            self.SCORE_WEIGHTS["volume"] * volume
         )
         
-        # Clamp to [0, 1]
-        confidence = max(0.0, min(1.0, raw))
+        # Apply source reliability modifier
+        avg_source_reliability = sum(
+            self.SOURCE_WEIGHTS.get(r.source, 0.3) for r in receipts
+        ) / len(receipts)
+        confidence *= avg_source_reliability
+        
+        # Warnings
+        warnings = []
+        if len(receipts) < 3:
+            warnings.append(f"Low receipt count ({len(receipts)}). Minimum 3 recommended.")
+        if temporal_health < 0.3:
+            warnings.append("Temporal clustering detected. Possible sybil pattern.")
+        if attester_independence < 0.5:
+            warnings.append("Low attester diversity. Many repeat attesters.")
+        if source_diversity < 0.3:
+            warnings.append("Low source diversity. Single proof type dominates.")
         
         return AggregationResult(
-            confidence=round(confidence, 4),
-            layer_count=len(proofs),
-            independence_score=round(independence, 4),
-            temporal_coherence=round(temporal, 4),
-            diversity_bonus=round(diversity, 4),
+            confidence=round(min(1.0, confidence), 4),
+            source_diversity=round(source_diversity, 4),
+            temporal_health=round(temporal_health, 4),
+            attester_independence=round(attester_independence, 4),
+            freshness=round(freshness, 4),
+            receipt_count=len(receipts),
+            breakdown={
+                "sources": dict(source_counts),
+                "attesters": dict(attester_counts),
+                "avg_source_reliability": round(avg_source_reliability, 4),
+                "cross_source_attesters": round(cross_source, 4),
+            },
             warnings=warnings,
-            details={
-                "unique_proof_types": unique_types,
-                "unique_systems": len(all_systems),
-                "unique_sources": unique_sources,
-                "verified_ratio": round(verification_ratio, 2),
-                "temporal_drift": str(drift),
-                "source_diversity": round(source_diversity, 4),
-            }
         )
     
-    def compare_bundles(self, bundles: dict[str, list[Proof]]) -> dict:
-        """Compare multiple proof bundles (e.g., for different transactions)."""
-        results = {}
-        for name, proofs in bundles.items():
-            results[name] = asdict(self.score(proofs))
-        return results
+    def _shannon_diversity(self, counts: Counter, max_categories: int) -> float:
+        """Normalized Shannon entropy. 1.0 = perfectly even distribution."""
+        total = sum(counts.values())
+        if total == 0 or len(counts) <= 1:
+            return 0.0 if len(counts) <= 1 else 1.0
+        
+        entropy = -sum(
+            (c / total) * math.log2(c / total) 
+            for c in counts.values() if c > 0
+        )
+        max_entropy = math.log2(min(len(counts), max_categories))
+        return entropy / max_entropy if max_entropy > 0 else 0.0
+    
+    def _temporal_health(self, receipts: list[Receipt]) -> float:
+        """Score temporal distribution. High CV = good spread. Low CV = suspicious cluster."""
+        if len(receipts) < 2:
+            return 0.5  # Not enough data
+        
+        timestamps = sorted(self._parse_ts(r.timestamp) for r in receipts)
+        intervals = [
+            (timestamps[i+1] - timestamps[i]).total_seconds()
+            for i in range(len(timestamps) - 1)
+        ]
+        
+        if not intervals or all(i == 0 for i in intervals):
+            return 0.1  # All same timestamp = very suspicious
+        
+        mean = sum(intervals) / len(intervals)
+        if mean == 0:
+            return 0.1
+        
+        variance = sum((i - mean) ** 2 for i in intervals) / len(intervals)
+        cv = math.sqrt(variance) / mean
+        
+        # CV > threshold = healthy spread, CV < threshold = cluster
+        if cv > self.sybil_cv_threshold:
+            return min(1.0, 0.5 + cv * 0.25)
+        else:
+            return max(0.1, cv / self.sybil_cv_threshold * 0.5)
+    
+    def _cross_source_attesters(self, receipts: list[Receipt]) -> float:
+        """Fraction of attesters appearing across multiple source types."""
+        attester_sources: dict[str, set] = {}
+        for r in receipts:
+            attester_sources.setdefault(r.attester_id, set()).add(r.source)
+        
+        if not attester_sources:
+            return 0.0
+        
+        cross = sum(1 for sources in attester_sources.values() if len(sources) > 1)
+        return cross / len(attester_sources)
+    
+    def _freshness(self, receipts: list[Receipt], ref_time: datetime) -> float:
+        """Average freshness with exponential decay."""
+        scores = []
+        for r in receipts:
+            ts = self._parse_ts(r.timestamp)
+            age_hours = (ref_time - ts).total_seconds() / 3600
+            score = math.exp(-0.693 * age_hours / self.FRESHNESS_HALFLIFE_HOURS)
+            scores.append(score)
+        return sum(scores) / len(scores)
+    
+    @staticmethod
+    def _parse_ts(ts: str) -> datetime:
+        """Parse ISO timestamp."""
+        ts = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(ts)
 
 
 def demo():
-    """Demo with synthetic proof bundles."""
+    """Run demo with synthetic receipts mimicking tc3."""
     print("=" * 60)
-    print("Proof Aggregator — Compound Confidence Scoring")
+    print("Proof Aggregator Demo — Test Case 3 Simulation")
     print("=" * 60)
     
-    now = datetime.now(timezone.utc)
+    aggregator = ProofAggregator()
     
-    # Bundle 1: Strong — 3 independent layers, different sources
-    strong_bundle = [
-        Proof(
-            proof_type=ProofType.X402_RECEIPT,
-            timestamp=(now - timedelta(minutes=5)).isoformat(),
-            source_agent="agent:gendolf",
-            evidence_hash=hashlib.sha256(b"tx:0x1234").hexdigest(),
-            verified=True,
-            metadata={"chain": "base", "amount": "0.01 SOL"}
+    # Simulate tc3 receipts
+    tc3_receipts = [
+        Receipt(
+            source="paylock",
+            receipt_type="payment",
+            hash="tx:0x1234...escrow_deposit",
+            timestamp="2026-02-24T06:26:00Z",
+            attester_id="gendolf",
+            metadata={"amount": "0.01 SOL", "role": "funder"}
         ),
-        Proof(
-            proof_type=ProofType.GENERATION_SIG,
-            timestamp=(now - timedelta(minutes=3)).isoformat(),
-            source_agent="agent:kit_fox",
-            evidence_hash=hashlib.sha256(b"deliverable:tc3").hexdigest(),
-            verified=True,
+        Receipt(
+            source="dkim",
+            receipt_type="delivery",
+            hash="sha256:f309922b...deliverable",
+            timestamp="2026-02-24T07:06:00Z",
+            attester_id="kit_fox",
+            metadata={"subject": "Test Case 3 Deliverable"}
         ),
-        Proof(
-            proof_type=ProofType.DKIM_ATTESTATION,
-            timestamp=(now - timedelta(minutes=1)).isoformat(),
-            source_agent="agent:bro_agent",
-            evidence_hash=hashlib.sha256(b"judgment:0.92").hexdigest(),
-            verified=True,
-            metadata={"x_claim_hash": "sha256:abc123"}
+        Receipt(
+            source="isnad",
+            receipt_type="attestation",
+            hash="sha256:bro_agent_review_092",
+            timestamp="2026-02-24T07:46:00Z",
+            attester_id="bro_agent",
+            metadata={"score": 0.92, "role": "judge"}
         ),
-    ]
-    
-    # Bundle 2: Weak — single source, no verification
-    weak_bundle = [
-        Proof(
-            proof_type=ProofType.ATTESTATION_CHAIN,
-            timestamp=now.isoformat(),
-            source_agent="agent:unknown",
-            evidence_hash=hashlib.sha256(b"self-attest").hexdigest(),
-            verified=False,
+        Receipt(
+            source="isnad",
+            receipt_type="attestation",
+            hash="sha256:momo_attestation",
+            timestamp="2026-02-24T08:00:00Z",
+            attester_id="momo",
+            metadata={"role": "independent_attester"}
         ),
-    ]
-    
-    # Bundle 3: Medium — two layers but shared key_management
-    medium_bundle = [
-        Proof(
-            proof_type=ProofType.GENERATION_SIG,
-            timestamp=(now - timedelta(minutes=10)).isoformat(),
-            source_agent="agent:alice",
-            evidence_hash=hashlib.sha256(b"sig1").hexdigest(),
-            verified=True,
-        ),
-        Proof(
-            proof_type=ProofType.ATTESTATION_CHAIN,
-            timestamp=(now - timedelta(minutes=8)).isoformat(),
-            source_agent="agent:bob",
-            evidence_hash=hashlib.sha256(b"attest1").hexdigest(),
-            verified=True,
+        Receipt(
+            source="isnad",
+            receipt_type="attestation",
+            hash="sha256:braindiff_attestation",
+            timestamp="2026-02-24T10:28:00Z",
+            attester_id="braindiff",
+            metadata={"role": "independent_attester"}
         ),
     ]
     
-    # Bundle 4: Suspicious — good layers but huge temporal drift
-    suspicious_bundle = [
-        Proof(
-            proof_type=ProofType.X402_RECEIPT,
-            timestamp=(now - timedelta(hours=48)).isoformat(),
-            source_agent="agent:old_tx",
-            evidence_hash=hashlib.sha256(b"old").hexdigest(),
-            verified=True,
-        ),
-        Proof(
-            proof_type=ProofType.DKIM_ATTESTATION,
-            timestamp=now.isoformat(),
-            source_agent="agent:fresh_email",
-            evidence_hash=hashlib.sha256(b"new").hexdigest(),
-            verified=True,
-        ),
+    ref_time = datetime(2026, 2, 25, 3, 0, tzinfo=timezone.utc)
+    result = aggregator.aggregate(tc3_receipts, ref_time)
+    
+    print(f"\nReceipts: {result.receipt_count}")
+    print(f"Confidence: {result.confidence}")
+    print(f"  Source diversity:       {result.source_diversity}")
+    print(f"  Temporal health:        {result.temporal_health}")
+    print(f"  Attester independence:  {result.attester_independence}")
+    print(f"  Freshness:              {result.freshness}")
+    print(f"\nBreakdown: {json.dumps(result.breakdown, indent=2)}")
+    if result.warnings:
+        print(f"\n⚠️ Warnings:")
+        for w in result.warnings:
+            print(f"  - {w}")
+    
+    # Compare: sybil-like pattern
+    print("\n" + "=" * 60)
+    print("Comparison: Sybil-like pattern (5 receipts, same attester, same second)")
+    print("=" * 60)
+    
+    sybil_receipts = [
+        Receipt(
+            source="isnad",
+            receipt_type="attestation",
+            hash=f"sha256:fake_{i}",
+            timestamp="2026-02-24T07:00:00Z",
+            attester_id="sockpuppet",
+        ) for i in range(5)
     ]
     
-    agg = ProofAggregator()
+    sybil_result = aggregator.aggregate(sybil_receipts, ref_time)
+    print(f"\nReceipts: {sybil_result.receipt_count}")
+    print(f"Confidence: {sybil_result.confidence}")
+    print(f"  Source diversity:       {sybil_result.source_diversity}")
+    print(f"  Temporal health:        {sybil_result.temporal_health}")
+    print(f"  Attester independence:  {sybil_result.attester_independence}")
+    if sybil_result.warnings:
+        print(f"\n⚠️ Warnings:")
+        for w in sybil_result.warnings:
+            print(f"  - {w}")
     
-    bundles = {
-        "tc3_strong (3 layers, 3 sources)": strong_bundle,
-        "self_attest_weak (1 layer, unverified)": weak_bundle,
-        "medium (2 layers, shared km)": medium_bundle,
-        "suspicious (48h drift)": suspicious_bundle,
-    }
+    # Healthy vs sybil comparison
+    print(f"\n{'='*60}")
+    print(f"TC3 confidence:   {result.confidence}")
+    print(f"Sybil confidence: {sybil_result.confidence}")
+    print(f"Discrimination:   {result.confidence - sybil_result.confidence:.4f}")
+
+
+def score_file(filepath: str):
+    """Score receipts from a JSON file."""
+    with open(filepath) as f:
+        data = json.load(f)
     
-    for name, proofs in bundles.items():
-        print(f"\n--- {name} ---")
-        result = agg.score(proofs)
-        confidence_bar = "█" * int(result.confidence * 20) + "░" * (20 - int(result.confidence * 20))
-        print(f"  Confidence: [{confidence_bar}] {result.confidence:.1%}")
-        print(f"  Layers: {result.layer_count} | Independence: {result.independence_score:.2f} | "
-              f"Temporal: {result.temporal_coherence:.2f} | Diversity: {result.diversity_bonus:.2f}")
-        if result.warnings:
-            for w in result.warnings:
-                print(f"  ⚠️  {w}")
-        print(f"  Details: {json.dumps(result.details, indent=4)}")
+    receipts = [Receipt(**r) for r in data]
+    aggregator = ProofAggregator()
+    result = aggregator.aggregate(receipts)
     
-    # Save comparison
-    comparison = agg.compare_bundles(bundles)
-    with open("proof-aggregation-demo.json", "w") as f:
-        json.dump(comparison, f, indent=2, default=str)
-    print(f"\nResults saved to proof-aggregation-demo.json")
+    print(json.dumps({
+        "confidence": result.confidence,
+        "source_diversity": result.source_diversity,
+        "temporal_health": result.temporal_health,
+        "attester_independence": result.attester_independence,
+        "freshness": result.freshness,
+        "receipt_count": result.receipt_count,
+        "breakdown": result.breakdown,
+        "warnings": result.warnings,
+    }, indent=2))
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] == "demo":
         demo()
     elif sys.argv[1] == "score" and len(sys.argv) > 2:
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
-        proofs = [Proof(**p) for p in data]
-        result = ProofAggregator().score(proofs)
-        print(json.dumps(asdict(result), indent=2, default=str))
+        score_file(sys.argv[2])
+    elif sys.argv[1] == "stdin":
+        data = json.load(sys.stdin)
+        receipts = [Receipt(**r) for r in data]
+        aggregator = ProofAggregator()
+        result = aggregator.aggregate(receipts)
+        print(json.dumps({"confidence": result.confidence, "warnings": result.warnings}))
     else:
         print(__doc__)
