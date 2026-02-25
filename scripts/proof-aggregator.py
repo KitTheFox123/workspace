@@ -1,360 +1,358 @@
 #!/usr/bin/env python3
 """
-proof-aggregator.py — Aggregate N independent receipts into 1 confidence score.
+proof-aggregator.py — N independent receipts → 1 confidence score.
 
-Takes multiple attestation receipts from different sources (DKIM, on-chain tx, 
-generation signatures, isnad envelopes) and produces a weighted confidence score.
+Takes multiple attestation layers (x402 tx, DKIM signature, generation signature,
+isnad attestation, PayLock escrow) and computes a compound confidence score.
 
-Weights:
-- Source diversity: different proof types matter more than many of same type
-- Temporal spread: receipts clustered in time = suspicious (sybil)
-- Attester independence: unique attesters weighted higher than repeat
-- Receipt freshness: decay over time
+The key insight: layers are valuable because they're INDEPENDENT failure modes.
+Correlated attesters = expensive groupthink. Diverse proof types = real security.
 
-Input: JSON array of receipts
-Output: Confidence score 0.0-1.0 with breakdown
+Scoring model:
+- Each proof type has a base weight (how hard to forge independently)
+- Independence bonus: more diverse proof types → superlinear score
+- Staleness penalty: older proofs decay
+- Correlation penalty: proofs from same infrastructure reduce independence
 
 Usage:
     python proof-aggregator.py demo
-    python proof-aggregator.py score FILE.json
-    echo '[...]' | python proof-aggregator.py stdin
+    python proof-aggregator.py verify receipts.json
+    echo '{"proofs": [...]}' | python proof-aggregator.py -
 """
 
 import json
-import math
 import sys
-from collections import Counter
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional
+from enum import Enum
+
+
+class ProofType(str, Enum):
+    X402_TX = "x402_tx"           # On-chain transaction receipt
+    DKIM = "dkim"                 # DKIM-signed email header
+    GENERATION_SIG = "gen_sig"    # Cryptographic signature at generation time
+    ISNAD_ATTESTATION = "isnad"   # isnad chain attestation
+    PAYLOCK_ESCROW = "paylock"    # PayLock escrow completion record
+    CLAWTASK_COMPLETION = "clawtask"  # ClawTasks bounty completion
+    WITNESS_SIG = "witness"       # Third-party witness signature
+
+
+# Base weights: how hard is this proof type to forge independently?
+# Scale: 0-1 where 1 = requires compromising independent infrastructure
+PROOF_WEIGHTS = {
+    ProofType.X402_TX: 0.9,          # On-chain, requires wallet compromise
+    ProofType.DKIM: 0.7,             # Email infra, requires MTA compromise
+    ProofType.GENERATION_SIG: 0.8,   # Key material, requires key theft
+    ProofType.ISNAD_ATTESTATION: 0.6, # Attestation chain, requires colluding attesters
+    ProofType.PAYLOCK_ESCROW: 0.85,  # Escrow + judgment, requires buyer+seller collusion
+    ProofType.CLAWTASK_COMPLETION: 0.75,  # Platform + reviewer
+    ProofType.WITNESS_SIG: 0.5,      # Single witness, weakest alone
+}
+
+# Infrastructure groups: proofs sharing infrastructure are correlated
+INFRA_GROUPS = {
+    ProofType.X402_TX: "blockchain",
+    ProofType.DKIM: "email",
+    ProofType.GENERATION_SIG: "agent_keys",
+    ProofType.ISNAD_ATTESTATION: "attestation_network",
+    ProofType.PAYLOCK_ESCROW: "blockchain",  # same chain as x402
+    ProofType.CLAWTASK_COMPLETION: "platform",
+    ProofType.WITNESS_SIG: "attestation_network",  # same as isnad
+}
 
 
 @dataclass
-class Receipt:
-    """A single attestation receipt from any source."""
-    source: str          # "dkim", "x402", "generation_sig", "isnad", "paylock"
-    receipt_type: str    # "delivery", "payment", "attestation", "verification"  
-    hash: str            # Content hash or tx hash
-    timestamp: str       # ISO timestamp
-    attester_id: str     # Who attested
-    metadata: dict = field(default_factory=dict)
+class Proof:
+    """A single proof receipt."""
+    proof_type: str              # ProofType value
+    issuer: str                  # Who created this proof
+    subject: str                 # What is being attested
+    claim_hash: str              # Hash of the claim being proved
+    timestamp: str               # ISO timestamp
+    metadata: dict = field(default_factory=dict)  # Type-specific data
+    # e.g., for x402: {tx_hash, chain, amount}
+    # e.g., for dkim: {selector, domain, h_tag_includes}
+    # e.g., for isnad: {attester_did, confidence}
 
 
 @dataclass
-class AggregationResult:
+class AggregateResult:
     """Result of proof aggregation."""
-    confidence: float          # 0.0 - 1.0
-    source_diversity: float    # How many different proof types
-    temporal_health: float     # 1.0 = spread out, 0.0 = suspicious cluster
-    attester_independence: float  # Unique attesters ratio
-    freshness: float           # How recent
-    receipt_count: int
-    breakdown: dict = field(default_factory=dict)
+    confidence: float            # 0-1 compound score
+    layer_count: int             # Number of distinct proof types
+    independence_score: float    # How independent are the layers
+    staleness_penalty: float     # Time decay factor
+    correlation_penalty: float   # Infrastructure overlap penalty
+    proofs_evaluated: int
+    per_layer: dict              # Score breakdown by proof type
+    grade: str                   # Human-readable grade
     warnings: list = field(default_factory=list)
 
 
-class ProofAggregator:
-    """Aggregates multiple receipts into a confidence score."""
+def compute_staleness(timestamp_str: str, max_age_hours: float = 168) -> float:
+    """Exponential decay based on proof age. 1.0 = fresh, 0.0 = expired."""
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        age_hours = (now - ts).total_seconds() / 3600
+        if age_hours < 0:
+            return 0.5  # Future timestamp = suspicious
+        if age_hours > max_age_hours:
+            return 0.1  # Very old but not zero
+        # Half-life of 48 hours
+        return math.exp(-0.693 * age_hours / 48)
+    except (ValueError, TypeError):
+        return 0.5  # Can't parse = uncertain
+
+
+def compute_independence(proof_types: list[str]) -> float:
+    """
+    Compute independence score based on infrastructure diversity.
+    More diverse infra groups = higher independence.
+    """
+    groups = set()
+    for pt in proof_types:
+        try:
+            groups.add(INFRA_GROUPS[ProofType(pt)])
+        except (ValueError, KeyError):
+            groups.add(f"unknown_{pt}")
     
-    # Known proof source types and their base reliability weights
-    SOURCE_WEIGHTS = {
-        "dkim": 0.7,           # Cryptographic, but depends on h= scope
-        "x402": 0.9,           # On-chain, verifiable
-        "generation_sig": 0.8, # Signed at creation time
-        "isnad": 0.6,          # Attestation chain, depends on chain length
-        "paylock": 0.85,       # Escrow-backed verification
-        "manual": 0.3,         # Human assertion, no crypto proof
-    }
+    n_proofs = len(proof_types)
+    n_groups = len(groups)
     
-    # Weights for final score composition
-    SCORE_WEIGHTS = {
-        "source_diversity": 0.30,
-        "temporal_health": 0.20,
-        "attester_independence": 0.25,
-        "freshness": 0.15,
-        "volume": 0.10,
-    }
+    if n_proofs <= 1:
+        return 0.5
     
-    # Freshness half-life in hours
-    FRESHNESS_HALFLIFE_HOURS = 168  # 1 week
+    # Perfect independence: every proof in different group
+    # Worst: all in same group
+    ratio = n_groups / n_proofs
+    # Superlinear bonus for diversity
+    return min(1.0, ratio * (1 + 0.2 * (n_groups - 1)))
+
+
+def compute_correlation_penalty(proof_types: list[str]) -> float:
+    """Penalty for proofs sharing infrastructure. 0 = no penalty, 1 = full penalty."""
+    groups = []
+    for pt in proof_types:
+        try:
+            groups.append(INFRA_GROUPS[ProofType(pt)])
+        except (ValueError, KeyError):
+            groups.append(f"unknown_{pt}")
     
-    def __init__(self, sybil_cv_threshold: float = 0.5):
-        self.sybil_cv_threshold = sybil_cv_threshold
+    if len(groups) <= 1:
+        return 0.0
     
-    def aggregate(self, receipts: list[Receipt], 
-                  reference_time: Optional[datetime] = None) -> AggregationResult:
-        """Aggregate receipts into a confidence score."""
-        if not receipts:
-            return AggregationResult(
-                confidence=0.0, source_diversity=0.0, temporal_health=0.0,
-                attester_independence=0.0, freshness=0.0, receipt_count=0,
-                warnings=["No receipts provided"]
-            )
-        
-        ref_time = reference_time or datetime.now(timezone.utc)
-        
-        # 1. Source diversity: Shannon entropy of source types
-        source_counts = Counter(r.source for r in receipts)
-        source_diversity = self._shannon_diversity(source_counts, len(self.SOURCE_WEIGHTS))
-        
-        # 2. Temporal health: coefficient of variation of inter-receipt intervals
-        temporal_health = self._temporal_health(receipts)
-        
-        # 3. Attester independence: unique attesters / total receipts
-        attester_counts = Counter(r.attester_id for r in receipts)
-        unique_ratio = len(attester_counts) / len(receipts)
-        # Bonus for attesters from different sources
-        cross_source = self._cross_source_attesters(receipts)
-        attester_independence = min(1.0, unique_ratio * 0.7 + cross_source * 0.3)
-        
-        # 4. Freshness: exponential decay from reference time
-        freshness = self._freshness(receipts, ref_time)
-        
-        # 5. Volume: logarithmic scaling (diminishing returns)
-        volume = min(1.0, math.log2(len(receipts) + 1) / math.log2(10))
-        
-        # Weighted combination
-        confidence = (
-            self.SCORE_WEIGHTS["source_diversity"] * source_diversity +
-            self.SCORE_WEIGHTS["temporal_health"] * temporal_health +
-            self.SCORE_WEIGHTS["attester_independence"] * attester_independence +
-            self.SCORE_WEIGHTS["freshness"] * freshness +
-            self.SCORE_WEIGHTS["volume"] * volume
-        )
-        
-        # Apply source reliability modifier
-        avg_source_reliability = sum(
-            self.SOURCE_WEIGHTS.get(r.source, 0.3) for r in receipts
-        ) / len(receipts)
-        confidence *= avg_source_reliability
-        
-        # Warnings
-        warnings = []
-        if len(receipts) < 3:
-            warnings.append(f"Low receipt count ({len(receipts)}). Minimum 3 recommended.")
-        if temporal_health < 0.3:
-            warnings.append("Temporal clustering detected. Possible sybil pattern.")
-        if attester_independence < 0.5:
-            warnings.append("Low attester diversity. Many repeat attesters.")
-        if source_diversity < 0.3:
-            warnings.append("Low source diversity. Single proof type dominates.")
-        
-        return AggregationResult(
-            confidence=round(min(1.0, confidence), 4),
-            source_diversity=round(source_diversity, 4),
-            temporal_health=round(temporal_health, 4),
-            attester_independence=round(attester_independence, 4),
-            freshness=round(freshness, 4),
-            receipt_count=len(receipts),
-            breakdown={
-                "sources": dict(source_counts),
-                "attesters": dict(attester_counts),
-                "avg_source_reliability": round(avg_source_reliability, 4),
-                "cross_source_attesters": round(cross_source, 4),
-            },
-            warnings=warnings,
+    # Count duplicates
+    from collections import Counter
+    counts = Counter(groups)
+    duplicates = sum(c - 1 for c in counts.values())
+    return duplicates / len(groups)
+
+
+def aggregate(proofs: list[Proof]) -> AggregateResult:
+    """
+    Aggregate N independent proofs into a single confidence score.
+    
+    Model: P(all_forged) = product(1 - weight_i * freshness_i) * correlation_factor
+    Confidence = 1 - P(all_forged), adjusted for independence
+    """
+    if not proofs:
+        return AggregateResult(
+            confidence=0.0, layer_count=0, independence_score=0.0,
+            staleness_penalty=0.0, correlation_penalty=0.0,
+            proofs_evaluated=0, per_layer={}, grade="F",
+            warnings=["No proofs provided"]
         )
     
-    def _shannon_diversity(self, counts: Counter, max_categories: int) -> float:
-        """Normalized Shannon entropy. 1.0 = perfectly even distribution."""
-        total = sum(counts.values())
-        if total == 0 or len(counts) <= 1:
-            return 0.0 if len(counts) <= 1 else 1.0
-        
-        entropy = -sum(
-            (c / total) * math.log2(c / total) 
-            for c in counts.values() if c > 0
-        )
-        max_entropy = math.log2(min(len(counts), max_categories))
-        return entropy / max_entropy if max_entropy > 0 else 0.0
+    warnings = []
+    per_layer = {}
+    proof_types = []
     
-    def _temporal_health(self, receipts: list[Receipt]) -> float:
-        """Score temporal distribution. High CV = good spread. Low CV = suspicious cluster."""
-        if len(receipts) < 2:
-            return 0.5  # Not enough data
-        
-        timestamps = sorted(self._parse_ts(r.timestamp) for r in receipts)
-        intervals = [
-            (timestamps[i+1] - timestamps[i]).total_seconds()
-            for i in range(len(timestamps) - 1)
-        ]
-        
-        if not intervals or all(i == 0 for i in intervals):
-            return 0.1  # All same timestamp = very suspicious
-        
-        mean = sum(intervals) / len(intervals)
-        if mean == 0:
-            return 0.1
-        
-        variance = sum((i - mean) ** 2 for i in intervals) / len(intervals)
-        cv = math.sqrt(variance) / mean
-        
-        # CV > threshold = healthy spread, CV < threshold = cluster
-        if cv > self.sybil_cv_threshold:
-            return min(1.0, 0.5 + cv * 0.25)
-        else:
-            return max(0.1, cv / self.sybil_cv_threshold * 0.5)
+    # Check claim hash consistency
+    claim_hashes = set(p.claim_hash for p in proofs)
+    if len(claim_hashes) > 1:
+        warnings.append(f"Multiple claim hashes detected: {claim_hashes}. Proofs may not refer to same claim.")
     
-    def _cross_source_attesters(self, receipts: list[Receipt]) -> float:
-        """Fraction of attesters appearing across multiple source types."""
-        attester_sources: dict[str, set] = {}
-        for r in receipts:
-            attester_sources.setdefault(r.attester_id, set()).add(r.source)
+    # Compute per-proof scores
+    survival_probs = []  # P(this proof is forged)
+    for p in proofs:
+        try:
+            pt = ProofType(p.proof_type)
+            weight = PROOF_WEIGHTS.get(pt, 0.3)
+        except ValueError:
+            weight = 0.3
+            warnings.append(f"Unknown proof type: {p.proof_type}")
         
-        if not attester_sources:
-            return 0.0
+        freshness = compute_staleness(p.timestamp)
+        effective_weight = weight * freshness
         
-        cross = sum(1 for sources in attester_sources.values() if len(sources) > 1)
-        return cross / len(attester_sources)
+        per_layer[p.proof_type] = {
+            "base_weight": weight,
+            "freshness": round(freshness, 3),
+            "effective_weight": round(effective_weight, 3),
+            "issuer": p.issuer,
+        }
+        
+        proof_types.append(p.proof_type)
+        survival_probs.append(1 - effective_weight)
     
-    def _freshness(self, receipts: list[Receipt], ref_time: datetime) -> float:
-        """Average freshness with exponential decay."""
-        scores = []
-        for r in receipts:
-            ts = self._parse_ts(r.timestamp)
-            age_hours = (ref_time - ts).total_seconds() / 3600
-            score = math.exp(-0.693 * age_hours / self.FRESHNESS_HALFLIFE_HOURS)
-            scores.append(score)
-        return sum(scores) / len(scores)
+    # P(all forged) = product of individual forge probabilities
+    p_all_forged = 1.0
+    for sp in survival_probs:
+        p_all_forged *= sp
     
-    @staticmethod
-    def _parse_ts(ts: str) -> datetime:
-        """Parse ISO timestamp."""
-        ts = ts.replace("Z", "+00:00")
-        return datetime.fromisoformat(ts)
+    # Independence and correlation adjustments
+    independence = compute_independence(proof_types)
+    correlation = compute_correlation_penalty(proof_types)
+    
+    # Adjusted confidence
+    # High independence amplifies compound effect
+    # High correlation dampens it
+    raw_confidence = 1 - p_all_forged
+    adjusted = raw_confidence * (0.5 + 0.5 * independence) * (1 - 0.3 * correlation)
+    confidence = min(1.0, max(0.0, adjusted))
+    
+    # Average staleness
+    avg_staleness = 1.0 - sum(compute_staleness(p.timestamp) for p in proofs) / len(proofs)
+    
+    # Grade
+    if confidence >= 0.95:
+        grade = "A+"
+    elif confidence >= 0.90:
+        grade = "A"
+    elif confidence >= 0.80:
+        grade = "B"
+    elif confidence >= 0.65:
+        grade = "C"
+    elif confidence >= 0.50:
+        grade = "D"
+    else:
+        grade = "F"
+    
+    # Warnings
+    if len(set(proof_types)) == 1:
+        warnings.append("All proofs are same type — no independence benefit")
+    if correlation > 0.5:
+        warnings.append(f"High infrastructure correlation ({correlation:.1%}) — proofs may not be truly independent")
+    if avg_staleness > 0.5:
+        warnings.append("Proofs are getting stale — consider refreshing attestations")
+    
+    return AggregateResult(
+        confidence=round(confidence, 4),
+        layer_count=len(set(proof_types)),
+        independence_score=round(independence, 3),
+        staleness_penalty=round(avg_staleness, 3),
+        correlation_penalty=round(correlation, 3),
+        proofs_evaluated=len(proofs),
+        per_layer=per_layer,
+        grade=grade,
+        warnings=warnings,
+    )
 
 
 def demo():
-    """Run demo with synthetic receipts mimicking tc3."""
+    """Demo with test case 3 scenario."""
     print("=" * 60)
-    print("Proof Aggregator Demo — Test Case 3 Simulation")
+    print("Proof Aggregator Demo — Test Case 3 Scenario")
     print("=" * 60)
     
-    aggregator = ProofAggregator()
+    now = datetime.now(timezone.utc).isoformat()
+    claim = "delivery:tc3:agent-economy-at-scale"
+    claim_hash = "sha256:a1b2c3d4..."
     
-    # Simulate tc3 receipts
-    tc3_receipts = [
-        Receipt(
-            source="paylock",
-            receipt_type="payment",
-            hash="tx:0x1234...escrow_deposit",
-            timestamp="2026-02-24T06:26:00Z",
-            attester_id="gendolf",
-            metadata={"amount": "0.01 SOL", "role": "funder"}
-        ),
-        Receipt(
-            source="dkim",
-            receipt_type="delivery",
-            hash="sha256:f309922b...deliverable",
-            timestamp="2026-02-24T07:06:00Z",
-            attester_id="kit_fox",
-            metadata={"subject": "Test Case 3 Deliverable"}
-        ),
-        Receipt(
-            source="isnad",
-            receipt_type="attestation",
-            hash="sha256:bro_agent_review_092",
-            timestamp="2026-02-24T07:46:00Z",
-            attester_id="bro_agent",
-            metadata={"score": 0.92, "role": "judge"}
-        ),
-        Receipt(
-            source="isnad",
-            receipt_type="attestation",
-            hash="sha256:momo_attestation",
-            timestamp="2026-02-24T08:00:00Z",
-            attester_id="momo",
-            metadata={"role": "independent_attester"}
-        ),
-        Receipt(
-            source="isnad",
-            receipt_type="attestation",
-            hash="sha256:braindiff_attestation",
-            timestamp="2026-02-24T10:28:00Z",
-            attester_id="braindiff",
-            metadata={"role": "independent_attester"}
-        ),
+    # Scenario 1: Full compound proof (what tc3 could have had)
+    print("\n--- Scenario 1: Full compound (x402 + DKIM + isnad + PayLock) ---")
+    proofs_full = [
+        Proof(ProofType.X402_TX, "gendolf", claim, claim_hash, now,
+              {"tx_hash": "0xabc...", "chain": "base", "amount": "0.01 SOL"}),
+        Proof(ProofType.DKIM, "agentmail", claim, claim_hash, now,
+              {"domain": "agentmail.to", "h_tag_includes": "X-Claim-Hash"}),
+        Proof(ProofType.ISNAD_ATTESTATION, "bro_agent", claim, claim_hash, now,
+              {"confidence": 0.92}),
+        Proof(ProofType.PAYLOCK_ESCROW, "paylock", claim, claim_hash, now,
+              {"escrow_id": "tc3", "status": "released"}),
     ]
+    result1 = aggregate(proofs_full)
+    print_result(result1)
     
-    ref_time = datetime(2026, 2, 25, 3, 0, tzinfo=timezone.utc)
-    result = aggregator.aggregate(tc3_receipts, ref_time)
-    
-    print(f"\nReceipts: {result.receipt_count}")
-    print(f"Confidence: {result.confidence}")
-    print(f"  Source diversity:       {result.source_diversity}")
-    print(f"  Temporal health:        {result.temporal_health}")
-    print(f"  Attester independence:  {result.attester_independence}")
-    print(f"  Freshness:              {result.freshness}")
-    print(f"\nBreakdown: {json.dumps(result.breakdown, indent=2)}")
-    if result.warnings:
-        print(f"\n⚠️ Warnings:")
-        for w in result.warnings:
-            print(f"  - {w}")
-    
-    # Compare: sybil-like pattern
-    print("\n" + "=" * 60)
-    print("Comparison: Sybil-like pattern (5 receipts, same attester, same second)")
-    print("=" * 60)
-    
-    sybil_receipts = [
-        Receipt(
-            source="isnad",
-            receipt_type="attestation",
-            hash=f"sha256:fake_{i}",
-            timestamp="2026-02-24T07:00:00Z",
-            attester_id="sockpuppet",
-        ) for i in range(5)
+    # Scenario 2: What tc3 actually had (isnad + PayLock only)
+    print("\n--- Scenario 2: Actual tc3 (isnad + PayLock) ---")
+    proofs_actual = [
+        Proof(ProofType.ISNAD_ATTESTATION, "bro_agent", claim, claim_hash, now,
+              {"confidence": 0.92}),
+        Proof(ProofType.PAYLOCK_ESCROW, "paylock", claim, claim_hash, now,
+              {"escrow_id": "tc3", "status": "released"}),
     ]
+    result2 = aggregate(proofs_actual)
+    print_result(result2)
     
-    sybil_result = aggregator.aggregate(sybil_receipts, ref_time)
-    print(f"\nReceipts: {sybil_result.receipt_count}")
-    print(f"Confidence: {sybil_result.confidence}")
-    print(f"  Source diversity:       {sybil_result.source_diversity}")
-    print(f"  Temporal health:        {sybil_result.temporal_health}")
-    print(f"  Attester independence:  {sybil_result.attester_independence}")
-    if sybil_result.warnings:
-        print(f"\n⚠️ Warnings:")
-        for w in sybil_result.warnings:
-            print(f"  - {w}")
+    # Scenario 3: Sybil attack — 5 witnesses, all same infra
+    print("\n--- Scenario 3: Sybil — 5 witnesses (same infra group) ---")
+    proofs_sybil = [
+        Proof(ProofType.WITNESS_SIG, f"witness_{i}", claim, claim_hash, now)
+        for i in range(5)
+    ]
+    result3 = aggregate(proofs_sybil)
+    print_result(result3)
     
-    # Healthy vs sybil comparison
-    print(f"\n{'='*60}")
-    print(f"TC3 confidence:   {result.confidence}")
-    print(f"Sybil confidence: {sybil_result.confidence}")
-    print(f"Discrimination:   {result.confidence - sybil_result.confidence:.4f}")
+    # Scenario 4: Single strong proof
+    print("\n--- Scenario 4: Single x402 transaction ---")
+    proofs_single = [
+        Proof(ProofType.X402_TX, "gendolf", claim, claim_hash, now,
+              {"tx_hash": "0xabc...", "chain": "base"}),
+    ]
+    result4 = aggregate(proofs_single)
+    print_result(result4)
+    
+    # Scenario 5: Stale proofs
+    print("\n--- Scenario 5: Week-old proofs (stale) ---")
+    old_time = "2026-02-18T03:00:00Z"
+    proofs_stale = [
+        Proof(ProofType.X402_TX, "gendolf", claim, claim_hash, old_time),
+        Proof(ProofType.DKIM, "agentmail", claim, claim_hash, old_time),
+        Proof(ProofType.ISNAD_ATTESTATION, "bro_agent", claim, claim_hash, old_time),
+    ]
+    result5 = aggregate(proofs_stale)
+    print_result(result5)
 
 
-def score_file(filepath: str):
-    """Score receipts from a JSON file."""
-    with open(filepath) as f:
-        data = json.load(f)
+def print_result(result: AggregateResult):
+    """Pretty-print an aggregate result."""
+    print(f"  Grade: {result.grade} ({result.confidence:.1%} confidence)")
+    print(f"  Layers: {result.layer_count} types, {result.proofs_evaluated} proofs")
+    print(f"  Independence: {result.independence_score:.1%}")
+    print(f"  Correlation penalty: {result.correlation_penalty:.1%}")
+    print(f"  Staleness penalty: {result.staleness_penalty:.1%}")
+    for pt, info in result.per_layer.items():
+        print(f"    {pt}: weight={info['effective_weight']:.2f} "
+              f"(base={info['base_weight']:.1f} × fresh={info['freshness']:.2f}) "
+              f"from {info['issuer']}")
+    for w in result.warnings:
+        print(f"  ⚠️  {w}")
+
+
+def verify_file(filepath: str):
+    """Verify proofs from JSON file or stdin."""
+    if filepath == "-":
+        data = json.load(sys.stdin)
+    else:
+        with open(filepath) as f:
+            data = json.load(f)
     
-    receipts = [Receipt(**r) for r in data]
-    aggregator = ProofAggregator()
-    result = aggregator.aggregate(receipts)
-    
-    print(json.dumps({
-        "confidence": result.confidence,
-        "source_diversity": result.source_diversity,
-        "temporal_health": result.temporal_health,
-        "attester_independence": result.attester_independence,
-        "freshness": result.freshness,
-        "receipt_count": result.receipt_count,
-        "breakdown": result.breakdown,
-        "warnings": result.warnings,
-    }, indent=2))
+    proofs = [Proof(**p) for p in data.get("proofs", data if isinstance(data, list) else [])]
+    result = aggregate(proofs)
+    print_result(result)
+    print(f"\n{json.dumps(asdict(result), indent=2)}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] == "demo":
         demo()
-    elif sys.argv[1] == "score" and len(sys.argv) > 2:
-        score_file(sys.argv[2])
-    elif sys.argv[1] == "stdin":
-        data = json.load(sys.stdin)
-        receipts = [Receipt(**r) for r in data]
-        aggregator = ProofAggregator()
-        result = aggregator.aggregate(receipts)
-        print(json.dumps({"confidence": result.confidence, "warnings": result.warnings}))
+    elif sys.argv[1] == "verify" and len(sys.argv) > 2:
+        verify_file(sys.argv[2])
+    elif sys.argv[1] == "-":
+        verify_file("-")
     else:
         print(__doc__)
