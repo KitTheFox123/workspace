@@ -1,0 +1,73 @@
+{
+  "tc3_strong (3 layers, 3 sources)": {
+    "confidence": 0.9694,
+    "layer_count": 3,
+    "independence_score": 1.0,
+    "temporal_coherence": 1.0,
+    "diversity_bonus": 0.8775,
+    "warnings": [],
+    "details": {
+      "unique_proof_types": 3,
+      "unique_systems": 6,
+      "unique_sources": 3,
+      "verified_ratio": 1.0,
+      "temporal_drift": "0:04:00",
+      "source_diversity": 1.0
+    }
+  },
+  "self_attest_weak (1 layer, unverified)": {
+    "confidence": 0.6559,
+    "layer_count": 1,
+    "independence_score": 1.0,
+    "temporal_coherence": 1.0,
+    "diversity_bonus": 0.5034,
+    "warnings": [
+      "Only 0/1 proofs locally verified",
+      "All proofs from same source \u2014 no independent attestation"
+    ],
+    "details": {
+      "unique_proof_types": 1,
+      "unique_systems": 2,
+      "unique_sources": 1,
+      "verified_ratio": 0.0,
+      "temporal_drift": "0:00:00",
+      "source_diversity": 0.3
+    }
+  },
+  "medium (2 layers, shared km)": {
+    "confidence": 0.8296,
+    "layer_count": 2,
+    "independence_score": 0.6375,
+    "temporal_coherence": 1.0,
+    "diversity_bonus": 0.7534,
+    "warnings": [
+      "key_management shared across 2 proof types \u2014 compromise of signing infra affects multiple layers"
+    ],
+    "details": {
+      "unique_proof_types": 2,
+      "unique_systems": 3,
+      "unique_sources": 2,
+      "verified_ratio": 1.0,
+      "temporal_drift": "0:02:00",
+      "source_diversity": 1.0
+    }
+  },
+  "suspicious (48h drift)": {
+    "confidence": 0.7984,
+    "layer_count": 2,
+    "independence_score": 1.0,
+    "temporal_coherence": 0.3,
+    "diversity_bonus": 0.7534,
+    "warnings": [
+      "Large temporal drift 2 days, 0:00:00 \u2014 proofs may not relate to same event"
+    ],
+    "details": {
+      "unique_proof_types": 2,
+      "unique_systems": 4,
+      "unique_sources": 2,
+      "verified_ratio": 1.0,
+      "temporal_drift": "2 days, 0:00:00",
+      "source_diversity": 1.0
+    }
+  }
+}
