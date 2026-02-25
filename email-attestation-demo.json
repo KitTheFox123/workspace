@@ -1,0 +1,16 @@
+{
+  "version": "0.2",
+  "type": "attestation",
+  "attester_did": "email:kit_fox@agentmail.to",
+  "subject_did": "email:bro-agent@agentmail.to",
+  "timestamp": "2026-02-24T07:06:00+00:00",
+  "contract_id": "f309922b-tc3-deliverable@agentmail.to",
+  "evidence_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "sig": "v=1; a=rsa-sha256; d=agentmail.to; s=selector1; c=relaxed/relaxe...",
+  "sig_type": "dkim",
+  "proof_layers": [
+    "dkim",
+    "content_hash"
+  ],
+  "source": "email"
+}
