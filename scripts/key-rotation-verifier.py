@@ -409,3 +409,213 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "profiles":
     for verifiable, amount, desc in examples:
         result = select_profile(verifiable, amount)
         print(f"  {desc} → {result['profile']}")
+
+
+# === Delegation Proof Extension ===
+
+@dataclass
+class DelegationCredential:
+    """A credential granting delegation authority."""
+    delegator_id: str       # DID/pubkey of delegator
+    executor_id: str        # DID/pubkey of authorized executor
+    scope: str              # What actions are delegated
+    expires_at: str         # ISO timestamp
+    signature: str          # Delegator's signature over the credential
+    
+    def credential_data(self) -> bytes:
+        parts = [self.delegator_id, self.executor_id, self.scope, self.expires_at]
+        return "|".join(parts).encode()
+
+
+@dataclass
+class DelegatedAction:
+    """An action performed by an executor under delegation."""
+    executor_id: str
+    action_type: str
+    action_data: str
+    credential: DelegationCredential
+    executor_signature: str  # Executor's signature over action + credential
+    timestamp: str
+    
+    def action_bytes(self) -> bytes:
+        parts = [
+            self.executor_id, self.action_type, self.action_data,
+            self.credential.delegator_id, self.credential.scope, self.timestamp
+        ]
+        return "|".join(parts).encode()
+
+
+@dataclass
+class DelegationVerifyResult:
+    valid: bool
+    grade: int  # 1 = direct (signer==executor), 2 = delegated
+    checks: dict
+    error: Optional[str] = None
+
+
+def verify_delegation(action: DelegatedAction, current_time: str = "") -> DelegationVerifyResult:
+    """Verify a delegated action.
+    
+    Grade 1: signer_id == executor_id (no delegation needed, just check sig)
+    Grade 2: delegated execution — needs credential chain verification
+    """
+    checks = {}
+    error = None
+    
+    # Determine grade
+    is_direct = (action.credential.delegator_id == action.executor_id)
+    grade = 1 if is_direct else 2
+    checks["grade"] = grade
+    
+    if grade == 1:
+        # Grade 1: Direct execution. Just verify executor signed it.
+        checks["signer_is_executor"] = True
+        checks["delegation_chain"] = "not needed"
+        # In real impl, verify signature here
+        checks["signature_valid"] = "would verify with executor pubkey"
+    else:
+        # Grade 2: Delegated. Need full chain.
+        
+        # Check 1: Credential grants authority to this executor
+        checks["executor_authorized"] = (action.credential.executor_id == action.executor_id)
+        if not checks["executor_authorized"]:
+            error = "Executor not authorized by credential"
+        
+        # Check 2: Credential not expired
+        if current_time and action.credential.expires_at:
+            checks["credential_not_expired"] = (current_time <= action.credential.expires_at)
+            if not checks["credential_not_expired"]:
+                error = error or "Credential expired"
+        else:
+            checks["credential_not_expired"] = "no timestamp to check"
+        
+        # Check 3: Scope covers action type
+        checks["scope_covers_action"] = (
+            action.action_type in action.credential.scope or 
+            action.credential.scope == "*"
+        )
+        if not checks["scope_covers_action"]:
+            error = error or f"Action '{action.action_type}' not in scope '{action.credential.scope}'"
+        
+        # Check 4: Delegator signed the credential
+        checks["delegator_sig_valid"] = "would verify with delegator pubkey"
+        
+        # Check 5: Executor signed the action
+        checks["executor_sig_valid"] = "would verify with executor pubkey"
+    
+    valid = all(
+        v is True for v in checks.values()
+        if isinstance(v, bool)
+    )
+    
+    return DelegationVerifyResult(valid=valid, grade=grade, checks=checks, error=error)
+
+
+def demo_delegation():
+    """Demo delegation proof verification."""
+    print("\n" + "=" * 60)
+    print("Delegation Proof Verification Demo")
+    print("=" * 60)
+    
+    # Grade 1: Direct execution
+    print("\n--- Grade 1: Direct Execution (signer == executor) ---")
+    direct_cred = DelegationCredential(
+        delegator_id="agent:kit_fox",
+        executor_id="agent:kit_fox",  # Same!
+        scope="*",
+        expires_at="2026-12-31T23:59:59Z",
+        signature="self_signed",
+    )
+    direct_action = DelegatedAction(
+        executor_id="agent:kit_fox",
+        action_type="sign_attestation",
+        action_data="attestation_payload_hash",
+        credential=direct_cred,
+        executor_signature="kit_sig",
+        timestamp="2026-02-25T01:00:00Z",
+    )
+    result = verify_delegation(direct_action, "2026-02-25T01:00:00Z")
+    print(f"  Grade: {result.grade} | Valid: {'✅' if result.valid else '❌'}")
+    print(f"  Checks: {result.checks}")
+    
+    # Grade 2: Delegated execution (valid)
+    print("\n--- Grade 2: Delegated Execution (valid) ---")
+    deleg_cred = DelegationCredential(
+        delegator_id="agent:gendolf",
+        executor_id="agent:kit_fox",
+        scope="sign_attestation,submit_delivery",
+        expires_at="2026-03-01T00:00:00Z",
+        signature="gendolf_sig_over_credential",
+    )
+    deleg_action = DelegatedAction(
+        executor_id="agent:kit_fox",
+        action_type="sign_attestation",
+        action_data="attestation_for_tc3",
+        credential=deleg_cred,
+        executor_signature="kit_sig_over_action",
+        timestamp="2026-02-25T01:00:00Z",
+    )
+    result = verify_delegation(deleg_action, "2026-02-25T01:00:00Z")
+    print(f"  Grade: {result.grade} | Valid: {'✅' if result.valid else '❌'}")
+    print(f"  Checks: {result.checks}")
+    
+    # Grade 2: Delegated but wrong executor
+    print("\n--- Grade 2: Wrong Executor (should fail) ---")
+    bad_action = DelegatedAction(
+        executor_id="agent:evil_agent",  # Not authorized!
+        action_type="sign_attestation",
+        action_data="stolen_payload",
+        credential=deleg_cred,  # Credential says kit_fox, not evil_agent
+        executor_signature="evil_sig",
+        timestamp="2026-02-25T01:00:00Z",
+    )
+    result = verify_delegation(bad_action, "2026-02-25T01:00:00Z")
+    print(f"  Grade: {result.grade} | Valid: {'✅' if result.valid else '❌'}")
+    print(f"  Error: {result.error}")
+    
+    # Grade 2: Expired credential
+    print("\n--- Grade 2: Expired Credential (should fail) ---")
+    expired_cred = DelegationCredential(
+        delegator_id="agent:gendolf",
+        executor_id="agent:kit_fox",
+        scope="sign_attestation",
+        expires_at="2026-02-01T00:00:00Z",  # Expired!
+        signature="gendolf_sig",
+    )
+    expired_action = DelegatedAction(
+        executor_id="agent:kit_fox",
+        action_type="sign_attestation",
+        action_data="late_payload",
+        credential=expired_cred,
+        executor_signature="kit_sig",
+        timestamp="2026-02-25T01:00:00Z",
+    )
+    result = verify_delegation(expired_action, "2026-02-25T01:00:00Z")
+    print(f"  Grade: {result.grade} | Valid: {'✅' if result.valid else '❌'}")
+    print(f"  Error: {result.error}")
+    
+    # Grade 2: Out-of-scope action
+    print("\n--- Grade 2: Out-of-Scope Action (should fail) ---")
+    scope_action = DelegatedAction(
+        executor_id="agent:kit_fox",
+        action_type="transfer_funds",  # Not in scope!
+        action_data="send_all_sol",
+        credential=deleg_cred,
+        executor_signature="kit_sig",
+        timestamp="2026-02-25T01:00:00Z",
+    )
+    result = verify_delegation(scope_action, "2026-02-25T01:00:00Z")
+    print(f"  Grade: {result.grade} | Valid: {'✅' if result.valid else '❌'}")
+    print(f"  Error: {result.error}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] == "demo":
+        demo()
+        demo_delegation()
+    elif sys.argv[1] == "delegation":
+        demo_delegation()
+    elif sys.argv[1] == "verify" and len(sys.argv) > 2:
+        verify_file(sys.argv[2])
+    else:
+        print(__doc__)
