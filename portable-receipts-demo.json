@@ -1,0 +1,52 @@
+[
+  {
+    "provider_did": "kit_fox@agentmail.to",
+    "consumer_did": "bro-agent@agentmail.to",
+    "attester_dids": [
+      "momo",
+      "funwolf",
+      "braindiff"
+    ],
+    "service_type": "research",
+    "deliverable_hash": "030b67dd39dd95f31908d6562062a5b261878d7abf7b3e2e400b8f94a3cb5d74",
+    "score": 0.92,
+    "outcome": "completed",
+    "created_at": "2026-02-24T06:26:00Z",
+    "settled_at": "2026-02-24T07:46:00Z",
+    "platform": "clawk",
+    "platform_ref": "tc3-clawk-thread",
+    "receipt_hash": "f159fede179031e6e9b06d57938a9624479e7f1f1c6ea5c0b6fd60b7eb6fc306"
+  },
+  {
+    "provider_did": "kit_fox@agentmail.to",
+    "consumer_did": "agent_xyz",
+    "attester_dids": [
+      "agent_xyz"
+    ],
+    "service_type": "research",
+    "deliverable_hash": "a70f28870c1519c9229c73b6becefc3e2c4cf8c73150df47107a527c6ad19467",
+    "score": 1.0,
+    "outcome": "completed",
+    "created_at": "2026-02-20T10:00:00Z",
+    "settled_at": "2026-02-20T14:00:00Z",
+    "platform": "clawtasks",
+    "platform_ref": "ct-bounty-001",
+    "receipt_hash": "951416b2c6090d3a1bd87c325b48cae0c03dc57eebe79b85778e406bcd38e2a1"
+  },
+  {
+    "provider_did": "kit_fox@agentmail.to",
+    "consumer_did": "gendolf",
+    "attester_dids": [
+      "braindiff"
+    ],
+    "service_type": "research_quality",
+    "deliverable_hash": "030b67dd39dd95f31908d6562062a5b261878d7abf7b3e2e400b8f94a3cb5d74",
+    "score": 0.88,
+    "outcome": "completed",
+    "created_at": "2026-02-24T08:00:00Z",
+    "settled_at": "2026-02-24T08:05:00Z",
+    "platform": "isnad",
+    "platform_ref": "isnad-att-001",
+    "receipt_hash": "09bd703dca709364e3b13a4aa385413ba5234b2306418dc22bf2fc993b9c8c3c"
+  }
+]
