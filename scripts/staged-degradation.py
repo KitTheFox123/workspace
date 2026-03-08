@@ -1,196 +1,157 @@
 #!/usr/bin/env python3
-"""staged-degradation.py — ATC-inspired graceful degradation for agent trust.
+"""staged-degradation.py — Agent failure mode simulator.
 
-Models 4-stage degradation (Normal → Warn → Degrade → Halt) based on
-NASA ATC graceful degradation research (Edwards & Lee 2018). Binary
-halt loses work; silent continuation loses trust. Staged degradation
-preserves both.
+Models four failure modes from safety-critical systems:
+- Fail-silent: no signal, just stops (most agents today)
+- Fail-safe: halt to known safe state (dead man's switch)
+- Fail-soft: reduced operations, gate new authorizations
+- Fail-operational: redundancy maintains full capability
 
-Each stage has: allowed actions, notification requirements, escalation
-conditions, and de-escalation paths.
+Based on aviation safety taxonomy + santaclawd's warn state proposal.
 
 Usage:
-    python3 staged-degradation.py [--demo] [--evaluate SCORE]
+    python3 staged-degradation.py [--demo] [--mode MODE] [--ttl HOURS]
 """
 
 import argparse
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
+from enum import Enum
 from datetime import datetime, timezone
-from enum import IntEnum
-from typing import List, Optional
 
 
-class DegradationLevel(IntEnum):
-    NORMAL = 0
-    WARN = 1
-    DEGRADE = 2
-    HALT = 3
-
-
-@dataclass
-class DegradationStage:
-    level: int
-    name: str
-    description: str
-    allowed_actions: List[str]
-    blocked_actions: List[str]
-    notifications: List[str]
-    escalation_condition: str
-    deescalation_condition: str
-    atc_parallel: str
-
-
-STAGES = [
-    DegradationStage(
-        level=0,
-        name="NORMAL",
-        description="Full operational authority within scope",
-        allowed_actions=["read", "write", "execute", "delegate", "communicate"],
-        blocked_actions=[],
-        notifications=["routine heartbeat log"],
-        escalation_condition="Three-signal verdict detects anomaly (any signal failing)",
-        deescalation_condition="N/A (already normal)",
-        atc_parallel="Normal operations, full sector capacity"
-    ),
-    DegradationStage(
-        level=1,
-        name="WARN",
-        description="Scope-constrained ops, no new authorizations, principal notified",
-        allowed_actions=["read", "write", "execute_existing", "communicate"],
-        blocked_actions=["delegate", "new_authorizations", "scope_expansion"],
-        notifications=["principal alert", "action log frequency doubled"],
-        escalation_condition="Warn persists > TTL/2 without principal acknowledgment",
-        deescalation_condition="Principal acknowledges + anomaly resolves within TTL/2",
-        atc_parallel="Reduced capacity, increased separation, supervisor notified"
-    ),
-    DegradationStage(
-        level=2,
-        name="DEGRADE",
-        description="Read-only plus existing commitments, no new work",
-        allowed_actions=["read", "complete_in_progress", "communicate_status"],
-        blocked_actions=["write_new", "execute_new", "delegate", "external_actions"],
-        notifications=["principal urgent alert", "continuous action logging"],
-        escalation_condition="Degrade persists > TTL without principal re-signing scope",
-        deescalation_condition="Principal re-signs scope cert with fresh TTL",
-        atc_parallel="Manual backup mode, traffic management initiatives active"
-    ),
-    DegradationStage(
-        level=3,
-        name="HALT",
-        description="No actions, signed halt attestation, await principal",
-        allowed_actions=["emit_halt_attestation", "respond_to_principal_query"],
-        blocked_actions=["all_autonomous_actions"],
-        notifications=["halt attestation signed and published", "principal emergency alert"],
-        escalation_condition="N/A (terminal state)",
-        deescalation_condition="Principal issues new scope cert + reviews halt cause",
-        atc_parallel="Sector closed, traffic rerouted to adjacent sectors"
-    ),
-]
+class FailureMode(Enum):
+    SILENT = "fail-silent"
+    SAFE = "fail-safe"
+    SOFT = "fail-soft"
+    OPERATIONAL = "fail-operational"
 
 
 @dataclass
-class TrustSignals:
-    """Three-signal verdict inputs."""
-    liveness: bool  # Heartbeat active
-    intent: bool    # Scope-commit matches actions
-    drift: float    # CUSUM drift score (0.0 = no drift, 1.0 = max drift)
+class DegradationState:
+    mode: str
+    scope_level: str  # full, reduced, minimal, none
+    new_auth_allowed: bool
+    existing_ops_allowed: bool
+    notification_sent: bool
+    principal_renewal_required: bool
+    ttl_remaining_hours: float
+    redundancy_active: bool
 
 
-def evaluate_degradation(signals: TrustSignals, current_level: int = 0) -> dict:
-    """Determine degradation level from three-signal verdict."""
+class DegradationSimulator:
+    """Simulates staged degradation for agent scope management."""
     
-    # Scoring
-    issues = []
-    if not signals.liveness:
-        issues.append("liveness_failure")
-    if not signals.intent:
-        issues.append("intent_mismatch")
-    if signals.drift > 0.7:
-        issues.append("high_drift")
-    elif signals.drift > 0.4:
-        issues.append("moderate_drift")
+    def __init__(self, ttl_hours: float = 24.0, warn_threshold: float = 0.25):
+        self.ttl_hours = ttl_hours
+        self.warn_threshold = warn_threshold  # fraction of TTL remaining
+        self.states: list[DegradationState] = []
     
-    # Level determination
-    if len(issues) == 0:
-        target_level = DegradationLevel.NORMAL
-        diagnosis = "All signals healthy"
-    elif len(issues) == 1 and "moderate_drift" in issues:
-        target_level = DegradationLevel.WARN
-        diagnosis = f"Single moderate anomaly: {issues[0]}"
-    elif len(issues) == 1:
-        target_level = DegradationLevel.WARN if "high_drift" not in issues else DegradationLevel.DEGRADE
-        diagnosis = f"Single failure: {issues[0]}"
-    elif len(issues) == 2:
-        target_level = DegradationLevel.DEGRADE
-        diagnosis = f"Multiple failures: {', '.join(issues)}"
-    else:
-        target_level = DegradationLevel.HALT
-        diagnosis = f"Critical: {', '.join(issues)}"
+    def compute_state(self, hours_elapsed: float, mode: FailureMode) -> DegradationState:
+        remaining = max(0, self.ttl_hours - hours_elapsed)
+        fraction = remaining / self.ttl_hours if self.ttl_hours > 0 else 0
+        
+        if mode == FailureMode.SILENT:
+            if remaining <= 0:
+                return DegradationState("fail-silent", "none", False, False, False, False, 0, False)
+            return DegradationState("fail-silent", "full", True, True, False, False, remaining, False)
+        
+        elif mode == FailureMode.SAFE:
+            if remaining <= 0:
+                return DegradationState("fail-safe", "none", False, False, True, True, 0, False)
+            return DegradationState("fail-safe", "full", True, True, False, False, remaining, False)
+        
+        elif mode == FailureMode.SOFT:
+            if remaining <= 0:
+                return DegradationState("fail-soft", "minimal", False, False, True, True, 0, False)
+            elif fraction <= self.warn_threshold:
+                # Warn state: gate new auth, continue existing
+                return DegradationState("fail-soft", "reduced", False, True, True, True, remaining, False)
+            return DegradationState("fail-soft", "full", True, True, False, False, remaining, False)
+        
+        elif mode == FailureMode.OPERATIONAL:
+            if remaining <= 0:
+                return DegradationState("fail-operational", "full", True, True, True, True, 0, True)
+            return DegradationState("fail-operational", "full", True, True, False, False, remaining, False)
+        
+        raise ValueError(f"Unknown mode: {mode}")
     
-    # Never skip levels (gradual escalation)
-    if target_level > current_level + 1:
-        actual_level = current_level + 1
-        note = f"Escalating one step (target={STAGES[target_level].name}, actual={STAGES[actual_level].name})"
-    else:
-        actual_level = target_level
-        note = None
+    def simulate(self, mode: FailureMode, steps: int = 10) -> list[dict]:
+        """Simulate degradation over TTL."""
+        results = []
+        for i in range(steps + 1):
+            hours = (i / steps) * self.ttl_hours * 1.2  # Go 20% past TTL
+            state = self.compute_state(hours, mode)
+            results.append({
+                "hour": round(hours, 1),
+                "ttl_fraction": round(max(0, 1 - hours / self.ttl_hours), 2),
+                **asdict(state)
+            })
+        return results
     
-    stage = STAGES[actual_level]
-    
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "signals": {
-            "liveness": signals.liveness,
-            "intent": signals.intent,
-            "drift": signals.drift,
-        },
-        "diagnosis": diagnosis,
-        "issues": issues,
-        "previous_level": STAGES[current_level].name,
-        "target_level": STAGES[target_level].name,
-        "actual_level": stage.name,
-        "note": note,
-        "stage": asdict(stage),
-    }
+    def compare_all(self) -> dict:
+        """Compare all failure modes at key time points."""
+        points = [0, 0.5, 0.75, 0.95, 1.0, 1.1]  # fractions of TTL
+        comparison = {}
+        
+        for mode in FailureMode:
+            comparison[mode.value] = []
+            for frac in points:
+                hours = frac * self.ttl_hours
+                state = self.compute_state(hours, mode)
+                comparison[mode.value].append({
+                    "ttl_fraction": round(1 - frac, 2),
+                    "scope": state.scope_level,
+                    "new_auth": state.new_auth_allowed,
+                    "existing_ops": state.existing_ops_allowed,
+                    "notified": state.notification_sent
+                })
+        
+        return comparison
 
 
 def demo():
-    """Run demo scenarios."""
-    scenarios = [
-        ("Healthy agent", TrustSignals(True, True, 0.1), 0),
-        ("Slight drift", TrustSignals(True, True, 0.5), 0),
-        ("High drift", TrustSignals(True, True, 0.8), 0),
-        ("Liveness failure", TrustSignals(False, True, 0.2), 0),
-        ("Intent mismatch + drift", TrustSignals(True, False, 0.6), 0),
-        ("Everything failing", TrustSignals(False, False, 0.9), 0),
-        ("Escalation from WARN", TrustSignals(False, False, 0.9), 1),
-    ]
+    sim = DegradationSimulator(ttl_hours=24.0, warn_threshold=0.25)
     
-    print("=" * 60)
-    print("STAGED DEGRADATION DEMO (ATC-inspired)")
-    print("=" * 60)
+    print("=" * 65)
+    print("STAGED DEGRADATION SIMULATOR")
+    print("TTL: 24h | Warn threshold: 25% remaining (6h)")
+    print("=" * 65)
     
-    for name, signals, current in scenarios:
-        result = evaluate_degradation(signals, current)
-        print(f"\n--- {name} ---")
-        print(f"  Signals: L={signals.liveness} I={signals.intent} D={signals.drift:.1f}")
-        print(f"  From: {result['previous_level']} → {result['actual_level']}")
-        print(f"  Diagnosis: {result['diagnosis']}")
-        if result['note']:
-            print(f"  Note: {result['note']}")
-        print(f"  Allowed: {', '.join(result['stage']['allowed_actions'])}")
-        print(f"  Blocked: {', '.join(result['stage']['blocked_actions'])}")
-        print(f"  ATC parallel: {result['stage']['atc_parallel']}")
+    for mode in FailureMode:
+        print(f"\n--- {mode.value.upper()} ---")
+        results = sim.simulate(mode, steps=6)
+        print(f"{'Hour':>6} {'TTL%':>5} {'Scope':>12} {'NewAuth':>8} {'ExistOps':>9} {'Notify':>7}")
+        for r in results:
+            print(f"{r['hour']:>6} {r['ttl_fraction']:>5} {r['scope_level']:>12} "
+                  f"{'✓' if r['new_auth_allowed'] else '✗':>8} "
+                  f"{'✓' if r['existing_ops_allowed'] else '✗':>9} "
+                  f"{'✓' if r['notification_sent'] else '✗':>7}")
+    
+    print("\n" + "=" * 65)
+    print("KEY INSIGHT:")
+    print("  fail-silent: most agents today. No signal. Worst case.")
+    print("  fail-safe: binary halt. Loses work. Railway brakes model.")
+    print("  fail-soft: BEST for agents. Staged. Gates new auth at warn.")
+    print("  fail-operational: requires redundancy (N=3f+1). Expensive.")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ATC-inspired staged degradation")
+    parser = argparse.ArgumentParser(description="Agent failure mode simulator")
     parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--mode", choices=[m.value for m in FailureMode])
+    parser.add_argument("--ttl", type=float, default=24.0)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     
-    if args.json:
-        print(json.dumps([asdict(s) for s in STAGES], indent=2))
+    if args.mode:
+        sim = DegradationSimulator(ttl_hours=args.ttl)
+        mode = FailureMode(args.mode)
+        results = sim.simulate(mode)
+        print(json.dumps(results, indent=2))
+    elif args.json:
+        sim = DegradationSimulator(ttl_hours=args.ttl)
+        print(json.dumps(sim.compare_all(), indent=2))
     else:
         demo()
