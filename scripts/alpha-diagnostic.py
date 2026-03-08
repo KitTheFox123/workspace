@@ -1,197 +1,216 @@
 #!/usr/bin/env python3
-"""alpha-diagnostic.py — Krippendorff alpha tentative zone diagnostic.
+"""alpha-diagnostic.py — Krippendorff's Alpha with full coincidence matrix output.
 
-When alpha lands in 0.67-0.79 ("tentative zone"), the cause matters:
-- Correlated bias: attestors agree with each other but are all wrong → diversity fix
-- Inconsistent criteria: attestors disagree randomly → calibration fix
+Extends krippendorff-alpha.py with:
+1. Full coincidence matrix (observed vs expected disagreement per value pair)
+2. Leave-one-out α-delta per rater (which attestor is dragging agreement down?)
+3. Pairwise correlation detection (which attestor pairs agree suspiciously often?)
 
-Uses leave-one-out analysis to distinguish the two failure modes.
-
-Based on: Krippendorff (2019) Content Analysis 4th Ed, Marzi et al (2024).
-Inspired by santaclawd's diagnostic question on Clawk.
+Addresses santaclawd's request: "the coincidence matrix shows WHERE the disagreement
+is structured, not just the magnitude."
 
 Usage:
     python3 alpha-diagnostic.py --demo
+    python3 alpha-diagnostic.py --data '[[1,2,3,1],[1,2,3,1],[1,1,3,2]]'
 """
 
 import argparse
 import json
-from dataclasses import dataclass, asdict
+from typing import List, Optional, Dict, Tuple
 from itertools import combinations
 
 
-def krippendorff_alpha(ratings: list[list[float | None]]) -> float:
-    """Compute Krippendorff's alpha for interval data.
+def build_coincidence_matrix(data: List[List[Optional[float]]]) -> Tuple[Dict, List]:
+    """Build the coincidence matrix from reliability data.
     
-    ratings: list of raters, each a list of scores (None = missing).
+    Returns (matrix_dict, unique_values) where matrix_dict maps
+    (val_i, val_j) -> observed coincidence count.
     """
-    n_items = len(ratings[0])
-    n_raters = len(ratings)
+    n_units = len(data[0]) if data else 0
+    values_set = set()
+    for row in data:
+        for v in row:
+            if v is not None:
+                values_set.add(v)
+    values = sorted(values_set)
+    val_idx = {v: i for i, v in enumerate(values)}
+    n = len(values)
     
-    # Build pairable values per item
-    pairs_observed = 0
-    sum_sq_diff_observed = 0.0
-    all_values = []
+    # Coincidence matrix: count pairs of values assigned to same unit
+    matrix = [[0.0] * n for _ in range(n)]
     
-    for item in range(n_items):
-        values = [ratings[r][item] for r in range(n_raters) if ratings[r][item] is not None]
-        all_values.extend(values)
-        m = len(values)
-        if m < 2:
+    for u in range(n_units):
+        # Get all non-None ratings for this unit
+        ratings = [data[r][u] for r in range(len(data)) if data[r][u] is not None]
+        m_u = len(ratings)
+        if m_u < 2:
             continue
-        for i in range(m):
-            for j in range(i + 1, m):
-                sum_sq_diff_observed += (values[i] - values[j]) ** 2
-                pairs_observed += 1
+        # Each pair contributes 1/(m_u - 1) to the coincidence matrix
+        for i in range(len(ratings)):
+            for j in range(len(ratings)):
+                if i != j:
+                    c = val_idx[ratings[i]]
+                    k = val_idx[ratings[j]]
+                    matrix[c][k] += 1.0 / (m_u - 1)
     
-    if pairs_observed == 0:
-        return 0.0
-    
-    D_o = sum_sq_diff_observed / pairs_observed
-    
-    # Expected disagreement
-    n_total = len(all_values)
-    if n_total < 2:
-        return 0.0
-    
-    sum_sq_diff_expected = 0.0
-    pairs_expected = 0
-    for i in range(n_total):
-        for j in range(i + 1, n_total):
-            sum_sq_diff_expected += (all_values[i] - all_values[j]) ** 2
-            pairs_expected += 1
-    
-    D_e = sum_sq_diff_expected / pairs_expected if pairs_expected > 0 else 1.0
-    
-    if D_e == 0:
-        return 1.0
-    
-    return 1.0 - (D_o / D_e)
+    return matrix, values
 
 
-@dataclass
-class DiagnosticResult:
-    overall_alpha: float
-    zone: str  # "reliable", "tentative", "unreliable"
-    leave_one_out: dict  # rater_name -> alpha_without
-    diagnosis: str  # "correlated_bias", "inconsistent_criteria", "mixed", "healthy"
-    problematic_raters: list[str]
-    alpha_range: float  # max - min of leave-one-out
-    recommendation: str
-
-
-def diagnose(ratings: dict[str, list[float | None]]) -> DiagnosticResult:
-    """Run leave-one-out diagnostic on attestor ratings."""
-    rater_names = list(ratings.keys())
-    rating_matrix = [ratings[name] for name in rater_names]
+def krippendorff_alpha_full(data: List[List[Optional[float]]], level: str = "nominal") -> dict:
+    """Compute α with full diagnostic output."""
+    matrix, values = build_coincidence_matrix(data)
+    n = len(values)
     
-    overall = krippendorff_alpha(rating_matrix)
+    # Marginals
+    n_c = [sum(matrix[c]) for c in range(n)]
+    n_total = sum(n_c)
     
-    # Zone classification
-    if overall >= 0.80:
-        zone = "reliable"
-    elif overall >= 0.67:
-        zone = "tentative"
-    else:
-        zone = "unreliable"
+    # Observed and expected disagreement
+    D_o = 0.0
+    D_e = 0.0
     
-    # Leave-one-out
+    for c in range(n):
+        for k in range(n):
+            if level == "interval":
+                delta = (values[c] - values[k]) ** 2
+            else:
+                delta = 0.0 if c == k else 1.0
+            D_o += matrix[c][k] * delta
+            D_e += n_c[c] * n_c[k] * delta
+    
+    D_e_norm = D_e / (n_total - 1) if n_total > 1 else 0
+    alpha = 1.0 - (D_o / D_e_norm) if D_e_norm > 0 else 1.0
+    
+    # Format coincidence matrix for output
+    matrix_output = {}
+    for c in range(n):
+        for k in range(n):
+            if matrix[c][k] > 0:
+                key = f"({values[c]}, {values[k]})"
+                matrix_output[key] = round(matrix[c][k], 4)
+    
+    # Leave-one-out analysis
     loo = {}
-    for i, name in enumerate(rater_names):
-        reduced = [rating_matrix[j] for j in range(len(rater_names)) if j != i]
-        loo[name] = round(krippendorff_alpha(reduced), 4)
+    for r in range(len(data)):
+        reduced = [data[i] for i in range(len(data)) if i != r]
+        if len(reduced) < 2:
+            continue
+        r_matrix, r_values = build_coincidence_matrix(reduced)
+        r_n = len(r_values)
+        r_nc = [sum(r_matrix[c]) for c in range(r_n)]
+        r_total = sum(r_nc)
+        r_Do = 0.0
+        r_De = 0.0
+        for c in range(r_n):
+            for kk in range(r_n):
+                if level == "interval":
+                    delta = (r_values[c] - r_values[kk]) ** 2
+                else:
+                    delta = 0.0 if c == kk else 1.0
+                r_Do += r_matrix[c][kk] * delta
+                r_De += r_nc[c] * r_nc[kk] * delta
+        r_De_n = r_De / (r_total - 1) if r_total > 1 else 0
+        r_alpha = 1.0 - (r_Do / r_De_n) if r_De_n > 0 else 1.0
+        loo[f"rater_{r}"] = {
+            "alpha_without": round(r_alpha, 4),
+            "delta": round(r_alpha - alpha, 4),
+            "effect": "improves" if r_alpha > alpha else "worsens" if r_alpha < alpha else "neutral"
+        }
     
-    alpha_range = max(loo.values()) - min(loo.values())
+    # Pairwise agreement rate
+    pairwise = {}
+    for i, j in combinations(range(len(data)), 2):
+        agree = 0
+        total = 0
+        for u in range(len(data[0])):
+            if data[i][u] is not None and data[j][u] is not None:
+                total += 1
+                if data[i][u] == data[j][u]:
+                    agree += 1
+        if total > 0:
+            rate = agree / total
+            pairwise[f"rater_{i}_vs_{j}"] = {
+                "agreement_rate": round(rate, 4),
+                "n_compared": total,
+                "suspicious": rate > 0.95 and total >= 3
+            }
     
-    # Diagnosis
-    # If dropping one rater causes big alpha jump → that rater is inconsistent
-    problematic = []
-    threshold = 0.05  # 5% alpha improvement = significant
-    for name, alpha_without in loo.items():
-        if alpha_without - overall > threshold:
-            problematic.append(name)
+    grade = "A" if alpha >= 0.80 else "B" if alpha >= 0.67 else "F"
     
-    if len(problematic) > 0:
-        diagnosis = "inconsistent_criteria"
-        recommendation = f"Calibrate rater(s): {', '.join(problematic)}. Their removal improves alpha by {max(loo[p] - overall for p in problematic):.3f}."
-    elif alpha_range < 0.02 and zone == "tentative":
-        diagnosis = "correlated_bias"
-        recommendation = "All raters contribute equally to disagreement. Inject attestor diversity — different providers, models, or data sources."
-    elif zone == "reliable":
-        diagnosis = "healthy"
-        recommendation = "Alpha is reliable. No intervention needed."
-    else:
-        diagnosis = "mixed"
-        recommendation = "No single rater is clearly problematic. Review criteria definitions and add diverse attestors."
-    
-    return DiagnosticResult(
-        overall_alpha=round(overall, 4),
-        zone=zone,
-        leave_one_out=loo,
-        diagnosis=diagnosis,
-        problematic_raters=problematic,
-        alpha_range=round(alpha_range, 4),
-        recommendation=recommendation,
-    )
+    return {
+        "alpha": round(alpha, 4),
+        "grade": grade,
+        "level": level,
+        "n_raters": len(data),
+        "n_units": len(data[0]) if data else 0,
+        "coincidence_matrix": matrix_output,
+        "marginals": {str(values[i]): round(n_c[i], 4) for i in range(n)},
+        "leave_one_out": loo,
+        "pairwise_agreement": pairwise,
+        "observed_disagreement": round(D_o, 4),
+        "expected_disagreement": round(D_e_norm, 4),
+    }
 
 
 def demo():
-    """Demo with two scenarios: correlated bias vs inconsistent criteria."""
+    """Demo with attestor pool data."""
     print("=" * 60)
-    print("KRIPPENDORFF ALPHA TENTATIVE ZONE DIAGNOSTIC")
+    print("ALPHA DIAGNOSTIC — COINCIDENCE MATRIX + LOO ANALYSIS")
     print("=" * 60)
     
-    # Scenario 1: Correlated bias — all raters agree but are systematically off
-    print("\n--- Scenario 1: Correlated Bias ---")
-    print("All attestors from same provider, similar scoring patterns")
-    correlated = {
-        "attestor_A": [0.8, 0.7, 0.9, 0.6, 0.8, 0.7, 0.5, 0.9],
-        "attestor_B": [0.7, 0.8, 0.8, 0.7, 0.7, 0.8, 0.6, 0.8],
-        "attestor_C": [0.8, 0.7, 0.9, 0.6, 0.8, 0.6, 0.5, 0.9],
-        "attestor_D": [0.7, 0.8, 0.8, 0.7, 0.7, 0.7, 0.6, 0.8],
-    }
-    r1 = diagnose(correlated)
-    print(f"  Alpha: {r1.overall_alpha} ({r1.zone})")
-    print(f"  LOO range: {r1.alpha_range}")
-    print(f"  Diagnosis: {r1.diagnosis}")
-    print(f"  Recommendation: {r1.recommendation}")
+    # Scenario: 4 attestors rating 6 agent actions (1=in-scope, 2=out-of-scope, 3=ambiguous)
+    data = [
+        [1, 2, 1, 3, 2, 1],  # attestor_0: mostly agrees
+        [1, 2, 1, 3, 2, 1],  # attestor_1: identical to 0 (suspicious!)
+        [1, 1, 1, 2, 2, 1],  # attestor_2: some disagreement
+        [2, 2, 1, 3, 1, 1],  # attestor_3: contrarian
+    ]
     
-    # Scenario 2: Inconsistent criteria — one rater is off
-    print("\n--- Scenario 2: Inconsistent Criteria ---")
-    print("One attestor using different scoring criteria")
-    inconsistent = {
-        "attestor_A": [0.9, 0.8, 0.7, 0.9, 0.8, 0.9, 0.7, 0.8],
-        "attestor_B": [0.9, 0.7, 0.8, 0.9, 0.8, 0.8, 0.7, 0.9],
-        "attestor_C": [0.8, 0.8, 0.7, 0.8, 0.9, 0.9, 0.8, 0.8],
-        "rogue_rater": [0.3, 0.9, 0.2, 0.8, 0.3, 0.4, 0.9, 0.2],
-    }
-    r2 = diagnose(inconsistent)
-    print(f"  Alpha: {r2.overall_alpha} ({r2.zone})")
-    print(f"  LOO: {r2.leave_one_out}")
-    print(f"  Diagnosis: {r2.diagnosis}")
-    print(f"  Problematic: {r2.problematic_raters}")
-    print(f"  Recommendation: {r2.recommendation}")
+    result = krippendorff_alpha_full(data, level="nominal")
     
-    # Scenario 3: Healthy
-    print("\n--- Scenario 3: Healthy Agreement ---")
-    healthy = {
-        "attestor_A": [0.9, 0.3, 0.8, 0.2, 0.7, 0.9, 0.4, 0.8],
-        "attestor_B": [0.9, 0.2, 0.8, 0.3, 0.7, 0.9, 0.3, 0.8],
-        "attestor_C": [0.8, 0.3, 0.9, 0.2, 0.8, 0.8, 0.4, 0.7],
-    }
-    r3 = diagnose(healthy)
-    print(f"  Alpha: {r3.overall_alpha} ({r3.zone})")
-    print(f"  Diagnosis: {r3.diagnosis}")
-    print(f"  Recommendation: {r3.recommendation}")
+    print(f"\nα = {result['alpha']} (Grade {result['grade']})")
+    print(f"Raters: {result['n_raters']}, Units: {result['n_units']}")
+    
+    print("\n--- Coincidence Matrix ---")
+    for pair, count in sorted(result['coincidence_matrix'].items()):
+        print(f"  {pair}: {count}")
+    
+    print("\n--- Leave-One-Out ---")
+    for rater, info in result['leave_one_out'].items():
+        marker = "⚠️" if info['effect'] == 'improves' and info['delta'] > 0.05 else ""
+        print(f"  {rater}: α={info['alpha_without']} (Δ={info['delta']:+.4f}) {info['effect']} {marker}")
+    
+    print("\n--- Pairwise Agreement ---")
+    for pair, info in result['pairwise_agreement'].items():
+        flag = "🚨 SUSPICIOUS" if info['suspicious'] else ""
+        print(f"  {pair}: {info['agreement_rate']:.1%} ({info['n_compared']} compared) {flag}")
+    
+    print("\n--- Key Findings ---")
+    # Find most suspicious pair
+    sus = [(k, v) for k, v in result['pairwise_agreement'].items() if v['suspicious']]
+    if sus:
+        print(f"  ⚠️ Correlated attestors detected: {', '.join(k for k, _ in sus)}")
+    
+    # Find biggest LOO impact
+    max_delta = max(result['leave_one_out'].items(), key=lambda x: abs(x[1]['delta']))
+    print(f"  Biggest LOO impact: {max_delta[0]} (Δ={max_delta[1]['delta']:+.4f})")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Krippendorff alpha tentative zone diagnostic")
+    parser = argparse.ArgumentParser(description="Krippendorff's α diagnostic")
     parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--data", type=str, help="JSON reliability matrix")
+    parser.add_argument("--level", default="nominal", choices=["nominal", "interval"])
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     
-    if args.demo:
-        demo()
+    if args.data:
+        data = json.loads(args.data)
+        result = krippendorff_alpha_full(data, level=args.level)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"α = {result['alpha']} (Grade {result['grade']})")
+            print(json.dumps(result, indent=2))
     else:
         demo()
