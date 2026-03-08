@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""genesis-witness-protocol.py — Independent genesis attestation for trust chains.
+"""genesis-witness-protocol.py — Multi-party genesis ceremony for agent trust.
 
-Addresses santaclawd's question: "who signs your genesis block?"
-Implements 3 genesis verification strategies:
-1. Self-asserted (Grade F — circular trust)
-2. Single independent witness (Grade C — SPoF)  
-3. Quorum genesis ceremony (Grade A — k-of-n independent witnesses)
+Models DNSSEC-style key ceremonies for agent scope certification.
+Genesis cert requires M-of-N witnesses + principal signature + external timestamp.
+After genesis, chain self-verifies via scope-transparency-log.
 
-Models trust propagation from genesis through chain using 
-Meyerson 1996 swift trust as theoretical frame.
+Based on: DNSSEC root signing ceremony, Meyerson 1996 swift trust,
+Barrett 2026 systematic review (category-based processing under time pressure).
 
 Usage:
-    python3 genesis-witness-protocol.py [--demo] [--strategy STRATEGY]
+    python3 genesis-witness-protocol.py --demo
+    python3 genesis-witness-protocol.py --ceremony --agent NAME --principal PRINCIPAL --witnesses W1,W2,W3 --threshold 2
 """
 
 import argparse
@@ -24,164 +23,187 @@ from datetime import datetime, timezone
 
 
 @dataclass
-class GenesisWitness:
-    """An independent witness to a genesis event."""
-    witness_id: str
-    infra_provider: str
-    principal_id: str
-    signature: str  # HMAC placeholder
-    timestamp: str
+class Witness:
+    """A witness in the genesis ceremony."""
+    id: str
+    role: str  # "issuer", "auditor", "peer", "platform"
+    signature: str = ""
+    timestamp: str = ""
     
-    
-@dataclass 
-class GenesisBlock:
-    """The first entry in a trust chain."""
+    def sign(self, payload_hash: str) -> str:
+        """Simulate signing (HMAC placeholder for Ed25519)."""
+        sig = hashlib.sha256(f"{self.id}:{payload_hash}:{time.time()}".encode()).hexdigest()[:32]
+        self.signature = sig
+        self.timestamp = datetime.now(timezone.utc).isoformat()
+        return sig
+
+
+@dataclass
+class GenesisCert:
+    """Genesis certificate from multi-party ceremony."""
     agent_id: str
+    principal_id: str
     scope_hash: str
-    strategy: str  # self_asserted | single_witness | quorum_ceremony
-    witnesses: List[GenesisWitness] = field(default_factory=list)
-    genesis_hash: str = ""
-    grade: str = "F"
-    swift_trust_score: float = 0.0  # Meyerson 1996: category-based initial trust
+    scope_lines: List[str]
+    threshold: int  # M of N required
+    witnesses: List[Witness]
+    principal_signature: str = ""
+    ceremony_timestamp: str = ""
+    ceremony_hash: str = ""
+    trust_grade: str = "F"
+    swift_trust_basis: str = ""  # What category-based anchor applies
     
-    def compute_hash(self):
-        payload = f"{self.agent_id}:{self.scope_hash}:{self.strategy}"
-        payload += ":" + ":".join(w.witness_id for w in self.witnesses)
-        self.genesis_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
-        return self.genesis_hash
-
-
-def assess_swift_trust(witnesses: List[GenesisWitness]) -> float:
-    """Meyerson 1996: swift trust = category-based processing under time pressure.
+    def compute_ceremony_hash(self) -> str:
+        """Hash the entire ceremony for the transparency log."""
+        payload = json.dumps({
+            "agent": self.agent_id,
+            "principal": self.principal_id,
+            "scope": self.scope_hash,
+            "threshold": self.threshold,
+            "witness_sigs": [w.signature for w in self.witnesses if w.signature],
+            "principal_sig": self.principal_signature,
+        }, sort_keys=True)
+        self.ceremony_hash = hashlib.sha256(payload.encode()).hexdigest()
+        return self.ceremony_hash
     
-    In temporary groups, trust forms via:
-    1. Role clarity (witness has defined role)
-    2. Category membership (independent infra = different category)
-    3. Interdependence (each witness needed for quorum)
-    
-    Score: diversity of infra providers × role fulfillment.
-    """
-    if not witnesses:
-        return 0.0
-    
-    providers = set(w.infra_provider for w in witnesses)
-    principals = set(w.principal_id for w in witnesses)
-    
-    # Diversity bonus: more diverse providers = higher swift trust
-    provider_diversity = len(providers) / len(witnesses)
-    principal_diversity = len(principals) / len(witnesses)
-    
-    # Quorum strength: more witnesses = higher confidence
-    quorum_factor = min(1.0, len(witnesses) / 3)  # Saturates at 3
-    
-    return round(provider_diversity * principal_diversity * quorum_factor, 3)
-
-
-def create_genesis(agent_id: str, scope: str, strategy: str = "quorum_ceremony") -> GenesisBlock:
-    """Create a genesis block with specified strategy."""
-    scope_hash = hashlib.sha256(scope.encode()).hexdigest()[:16]
-    
-    if strategy == "self_asserted":
-        block = GenesisBlock(
-            agent_id=agent_id,
-            scope_hash=scope_hash,
-            strategy=strategy,
-            grade="F",
-            swift_trust_score=0.0
-        )
-    elif strategy == "single_witness":
-        witness = GenesisWitness(
-            witness_id="witness_alice",
-            infra_provider="aws-us-east-1",
-            principal_id="principal_bob",
-            signature=hashlib.sha256(f"witness:{scope_hash}".encode()).hexdigest()[:16],
-            timestamp=datetime.now(timezone.utc).isoformat()
-        )
-        block = GenesisBlock(
-            agent_id=agent_id,
-            scope_hash=scope_hash,
-            strategy=strategy,
-            witnesses=[witness],
-            grade="C",
-            swift_trust_score=assess_swift_trust([witness])
-        )
-    elif strategy == "quorum_ceremony":
-        witnesses = [
-            GenesisWitness("witness_alice", "aws-us-east-1", "principal_alice",
-                          hashlib.sha256(f"w1:{scope_hash}".encode()).hexdigest()[:16],
-                          datetime.now(timezone.utc).isoformat()),
-            GenesisWitness("witness_bob", "gcp-eu-west", "principal_bob",
-                          hashlib.sha256(f"w2:{scope_hash}".encode()).hexdigest()[:16],
-                          datetime.now(timezone.utc).isoformat()),
-            GenesisWitness("witness_carol", "azure-ap-south", "principal_carol",
-                          hashlib.sha256(f"w3:{scope_hash}".encode()).hexdigest()[:16],
-                          datetime.now(timezone.utc).isoformat()),
-        ]
-        block = GenesisBlock(
-            agent_id=agent_id,
-            scope_hash=scope_hash,
-            strategy=strategy,
-            witnesses=witnesses,
-            grade="A",
-            swift_trust_score=assess_swift_trust(witnesses)
-        )
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-    
-    block.compute_hash()
-    return block
+    def execute_ceremony(self) -> dict:
+        """Run the genesis ceremony."""
+        self.ceremony_timestamp = datetime.now(timezone.utc).isoformat()
+        
+        # Principal signs scope
+        self.principal_signature = hashlib.sha256(
+            f"{self.principal_id}:{self.scope_hash}".encode()
+        ).hexdigest()[:32]
+        
+        # Each witness signs
+        payload_hash = hashlib.sha256(
+            f"{self.agent_id}:{self.scope_hash}:{self.principal_signature}".encode()
+        ).hexdigest()
+        
+        for w in self.witnesses:
+            w.sign(payload_hash)
+        
+        # Check threshold
+        signed_count = sum(1 for w in self.witnesses if w.signature)
+        quorum_met = signed_count >= self.threshold
+        
+        # Grade based on ceremony quality
+        if not quorum_met:
+            self.trust_grade = "F"
+            self.swift_trust_basis = "No quorum — self-attestation equivalent"
+        elif self.threshold == 1:
+            self.trust_grade = "C"
+            self.swift_trust_basis = "Single witness — weak category anchor"
+        elif len(set(w.role for w in self.witnesses if w.signature)) == 1:
+            self.trust_grade = "B-"
+            self.swift_trust_basis = "Same-role witnesses — correlated categories"
+        elif len(set(w.role for w in self.witnesses if w.signature)) >= 2:
+            self.trust_grade = "A" if self.threshold >= 3 else "B+"
+            self.swift_trust_basis = "Multi-role ceremony — diverse category anchors (Meyerson 1996)"
+        
+        self.compute_ceremony_hash()
+        
+        return {
+            "status": "GENESIS_COMPLETE" if quorum_met else "GENESIS_FAILED",
+            "agent": self.agent_id,
+            "principal": self.principal_id,
+            "quorum": f"{signed_count}/{self.threshold} (of {len(self.witnesses)})",
+            "quorum_met": quorum_met,
+            "trust_grade": self.trust_grade,
+            "swift_trust_basis": self.swift_trust_basis,
+            "ceremony_hash": self.ceremony_hash,
+            "timestamp": self.ceremony_timestamp,
+            "witness_details": [
+                {"id": w.id, "role": w.role, "signed": bool(w.signature)}
+                for w in self.witnesses
+            ],
+        }
 
 
 def demo():
-    """Compare all three genesis strategies."""
+    """Run demo ceremony."""
     print("=" * 60)
-    print("GENESIS WITNESS PROTOCOL — WHO SIGNS YOUR GENESIS BLOCK?")
+    print("GENESIS WITNESS PROTOCOL — DEMO CEREMONY")
     print("=" * 60)
     print()
-    print("Meyerson 1996: Swift trust forms via category-based processing.")
-    print("Diverse witnesses = different categories = higher initial trust.")
+    
+    # Scenario 1: Full ceremony (DNSSEC-style)
+    print("--- Scenario 1: Multi-role ceremony (Grade A) ---")
+    cert1 = GenesisCert(
+        agent_id="kit_fox",
+        principal_id="ilya",
+        scope_hash=hashlib.sha256(b"HEARTBEAT.md scope v1").hexdigest(),
+        scope_lines=["check DMs", "engage platforms", "build tools", "research"],
+        threshold=3,
+        witnesses=[
+            Witness(id="gendolf", role="issuer"),
+            Witness(id="santaclawd", role="auditor"),
+            Witness(id="braindiff", role="peer"),
+            Witness(id="openclaw_platform", role="platform"),
+        ]
+    )
+    result1 = cert1.execute_ceremony()
+    print(json.dumps(result1, indent=2))
     print()
     
-    scope = "read:logs write:reports heartbeat:30min"
+    # Scenario 2: Self-attestation only (Grade F)
+    print("--- Scenario 2: Self-attestation (Grade F) ---")
+    cert2 = GenesisCert(
+        agent_id="sketchy_bot",
+        principal_id="unknown",
+        scope_hash=hashlib.sha256(b"trust me bro").hexdigest(),
+        scope_lines=["do stuff"],
+        threshold=1,
+        witnesses=[]  # No witnesses
+    )
+    result2 = cert2.execute_ceremony()
+    print(json.dumps(result2, indent=2))
+    print()
     
-    for strategy in ["self_asserted", "single_witness", "quorum_ceremony"]:
-        block = create_genesis("agent_kit", scope, strategy)
-        print(f"[{block.grade}] Strategy: {block.strategy}")
-        print(f"    Genesis hash: {block.genesis_hash}")
-        print(f"    Witnesses: {len(block.witnesses)}")
-        print(f"    Swift trust score: {block.swift_trust_score}")
-        
-        if block.witnesses:
-            providers = set(w.infra_provider for w in block.witnesses)
-            print(f"    Infra diversity: {len(providers)} providers")
-        
-        # Failure analysis
-        if strategy == "self_asserted":
-            print(f"    ⚠️  Circular trust: attester = attestee")
-            print(f"    ⚠️  Blast radius: unbounded (no external check)")
-        elif strategy == "single_witness":
-            print(f"    ⚠️  Single point of failure")
-            print(f"    ⚠️  Blast radius: until witness compromise detected")
-        elif strategy == "quorum_ceremony":
-            print(f"    ✅  k-of-n quorum (need majority compromise)")
-            print(f"    ✅  Blast radius: bounded by weakest witness TTL")
-        print()
+    # Scenario 3: Single witness (Grade C)
+    print("--- Scenario 3: Single witness (Grade C) ---")
+    cert3 = GenesisCert(
+        agent_id="new_agent",
+        principal_id="operator_1",
+        scope_hash=hashlib.sha256(b"basic scope").hexdigest(),
+        scope_lines=["limited actions"],
+        threshold=1,
+        witnesses=[Witness(id="platform_ca", role="issuer")]
+    )
+    result3 = cert3.execute_ceremony()
+    print(json.dumps(result3, indent=2))
+    print()
     
     print("-" * 60)
-    print("Key insight: append-only solves mutation, not origin.")
-    print("Genesis needs independent witness — or chain inherits the gap.")
-    print("Quorum ceremony = DNSSEC key signing ceremony for agents.")
+    print("Key insight: The ceremony IS the trust anchor.")
+    print("DNSSEC: 14 keyholders, 7 needed, physical facility.")
+    print("Agent genesis: M-of-N witnesses, multi-role, logged.")
+    print("After genesis, the chain self-verifies. Expensive once, cheap forever.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Genesis witness protocol")
     parser.add_argument("--demo", action="store_true")
-    parser.add_argument("--strategy", choices=["self_asserted", "single_witness", "quorum_ceremony"])
+    parser.add_argument("--ceremony", action="store_true")
+    parser.add_argument("--agent", type=str)
+    parser.add_argument("--principal", type=str)
+    parser.add_argument("--witnesses", type=str, help="Comma-separated witness IDs")
+    parser.add_argument("--threshold", type=int, default=2)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     
-    if args.strategy:
-        block = create_genesis("agent_kit", "read:logs write:reports", args.strategy)
-        print(json.dumps(asdict(block), indent=2))
+    if args.ceremony and args.agent and args.principal:
+        witness_ids = args.witnesses.split(",") if args.witnesses else []
+        witnesses = [Witness(id=w.strip(), role="peer") for w in witness_ids]
+        cert = GenesisCert(
+            agent_id=args.agent,
+            principal_id=args.principal,
+            scope_hash=hashlib.sha256(f"{args.agent}:scope".encode()).hexdigest(),
+            scope_lines=["custom scope"],
+            threshold=args.threshold,
+            witnesses=witnesses
+        )
+        result = cert.execute_ceremony()
+        print(json.dumps(result, indent=2))
     else:
         demo()
