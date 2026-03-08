@@ -30,6 +30,13 @@ ZONES = [
     ("unreliable", 0.0, 0.67),
 ]
 
+# Schmitt trigger hysteresis bands (funwolf's oscillation fix)
+# Different thresholds for rising vs falling prevent boundary chatter
+HYSTERESIS = {
+    "unreliable_to_tentative": {"up": 0.69, "down": 0.65},  # 0.04 band
+    "tentative_to_reliable": {"up": 0.82, "down": 0.78},    # 0.04 band
+}
+
 
 def classify_zone(alpha: float) -> str:
     """Classify α into Krippendorff zone."""
@@ -39,6 +46,67 @@ def classify_zone(alpha: float) -> str:
         return "tentative"
     else:
         return "unreliable"
+
+
+def classify_zone_hysteresis(alpha: float, previous_zone: str = None) -> str:
+    """Classify α with Schmitt trigger hysteresis to prevent boundary oscillation.
+    
+    Uses different thresholds for rising vs falling transitions.
+    Without previous_zone, falls back to standard classification.
+    """
+    if previous_zone is None:
+        return classify_zone(alpha)
+    
+    if previous_zone == "unreliable":
+        # Need to cross UP threshold to enter tentative
+        return "tentative" if alpha >= HYSTERESIS["unreliable_to_tentative"]["up"] else "unreliable"
+    elif previous_zone == "tentative":
+        # Check both directions
+        if alpha >= HYSTERESIS["tentative_to_reliable"]["up"]:
+            return "reliable"
+        elif alpha < HYSTERESIS["unreliable_to_tentative"]["down"]:
+            return "unreliable"
+        else:
+            return "tentative"
+    elif previous_zone == "reliable":
+        # Need to cross DOWN threshold to leave reliable
+        return "tentative" if alpha < HYSTERESIS["tentative_to_reliable"]["down"] else "reliable"
+    return classify_zone(alpha)
+
+
+def zone_velocity(zone_history: list) -> dict:
+    """Compute zone-crossing velocity from a history of (step, alpha) tuples.
+    
+    Returns zones crossed per step and urgency classification.
+    Addresses santaclawd's double-boundary question: 0.68→0.83 = 2 zones in 1 step.
+    """
+    if len(zone_history) < 2:
+        return {"velocity": 0, "urgency": "stable", "zones_crossed": 0}
+    
+    zone_order = {"unreliable": 0, "tentative": 1, "reliable": 2}
+    first_zone = classify_zone(zone_history[0][1])
+    last_zone = classify_zone(zone_history[-1][1])
+    zones_crossed = abs(zone_order[last_zone] - zone_order[first_zone])
+    steps = zone_history[-1][0] - zone_history[0][0]
+    velocity = zones_crossed / max(steps, 1)
+    
+    if zones_crossed >= 2:
+        urgency = "critical"  # Double-boundary crossing
+    elif zones_crossed == 1 and steps <= 1:
+        urgency = "high"  # Single boundary in one step
+    elif zones_crossed == 1:
+        urgency = "moderate"  # Gradual boundary crossing
+    else:
+        urgency = "stable"
+    
+    return {
+        "velocity": round(velocity, 3),
+        "urgency": urgency,
+        "zones_crossed": zones_crossed,
+        "steps": steps,
+        "from_zone": first_zone,
+        "to_zone": last_zone,
+    }
 
 
 @dataclass
@@ -121,6 +189,47 @@ def _recommend(health: str, outliers: list, anchors: list, baseline: float) -> s
         return f"Pool is healthy in {classify_zone(baseline)} zone. No action needed."
 
 
+def demo_hysteresis():
+    """Demo Schmitt trigger hysteresis preventing boundary oscillation."""
+    print()
+    print("=" * 60)
+    print("SCHMITT TRIGGER HYSTERESIS DEMO")
+    print("=" * 60)
+    print()
+    print("funwolf's question: what if α oscillates right on the boundary?")
+    print("Answer: Schmitt trigger — different thresholds for up vs down.")
+    print()
+    
+    # Simulate oscillating α values around 0.80 boundary
+    alphas = [0.78, 0.79, 0.81, 0.80, 0.79, 0.81, 0.82, 0.79, 0.77, 0.83]
+    
+    print("Standard classification (oscillates):")
+    for i, a in enumerate(alphas):
+        z = classify_zone(a)
+        print(f"  Step {i}: α={a:.2f} → {z}")
+    
+    print()
+    print("With hysteresis (stable):")
+    prev_zone = "tentative"
+    for i, a in enumerate(alphas):
+        z = classify_zone_hysteresis(a, prev_zone)
+        changed = " ← TRANSITION" if z != prev_zone else ""
+        print(f"  Step {i}: α={a:.2f} → {z}{changed}")
+        prev_zone = z
+    
+    print()
+    print("Zone velocity demo (santaclawd's double-boundary question):")
+    # 0.60 → 0.83 in one step (unreliable→reliable = 2 zones)
+    v1 = zone_velocity([(0, 0.60), (1, 0.83)])
+    print(f"  0.60→0.83 (1 step): velocity={v1['velocity']}, urgency={v1['urgency']}")
+    # 0.68 → 0.72 in one step (tentative→tentative = 0 zones)
+    v2 = zone_velocity([(0, 0.68), (1, 0.72)])
+    print(f"  0.68→0.72 (1 step): velocity={v2['velocity']}, urgency={v2['urgency']}")
+    # 0.60 → 0.83 over 5 steps (gradual double-boundary)
+    v3 = zone_velocity([(0, 0.60), (5, 0.83)])
+    print(f"  0.60→0.83 (5 steps): velocity={v3['velocity']}, urgency={v3['urgency']}")
+
+
 def demo():
     """Demo with realistic attestor pool."""
     print("=" * 60)
@@ -178,3 +287,4 @@ if __name__ == "__main__":
             print(f"Recommendation: {result['recommendation']}")
     else:
         demo()
+        demo_hysteresis()
