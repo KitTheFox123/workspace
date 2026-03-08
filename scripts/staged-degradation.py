@@ -1,157 +1,203 @@
 #!/usr/bin/env python3
-"""staged-degradation.py — Agent failure mode simulator.
+"""staged-degradation.py — Graceful degradation state machine for agent scope.
 
-Models four failure modes from safety-critical systems:
-- Fail-silent: no signal, just stops (most agents today)
-- Fail-safe: halt to known safe state (dead man's switch)
-- Fail-soft: reduced operations, gate new authorizations
-- Fail-operational: redundancy maintains full capability
+Models NASA ATC graceful degradation (Edwards & Lee 2018): 
+instead of binary halt, agents move through staged states:
+  NOMINAL → WARN → ALERT → HALT → DEAD
 
-Based on aviation safety taxonomy + santaclawd's warn state proposal.
+Each state constrains scope differently. Principal can renew at any stage
+before DEAD. Transitions driven by TTL expiry, drift detection, or 
+liveness failure.
 
 Usage:
-    python3 staged-degradation.py [--demo] [--mode MODE] [--ttl HOURS]
+    python3 staged-degradation.py [--demo] [--state STATE]
 """
 
 import argparse
 import json
 from dataclasses import dataclass, asdict
-from enum import Enum
 from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional
 
 
-class FailureMode(Enum):
-    SILENT = "fail-silent"
-    SAFE = "fail-safe"
-    SOFT = "fail-soft"
-    OPERATIONAL = "fail-operational"
+class DegradationState(Enum):
+    NOMINAL = "nominal"      # Full scope, all signals green
+    WARN = "warn"            # Scope-constrained, gate new authorizations
+    ALERT = "alert"          # Read-only, no writes/actions
+    HALT = "halt"            # Full stop, notify principal
+    DEAD = "dead"            # TTL expired, no recovery without re-issuance
 
 
 @dataclass
-class DegradationState:
-    mode: str
-    scope_level: str  # full, reduced, minimal, none
-    new_auth_allowed: bool
-    existing_ops_allowed: bool
-    notification_sent: bool
-    principal_renewal_required: bool
-    ttl_remaining_hours: float
-    redundancy_active: bool
+class StatePolicy:
+    """What an agent can do in each state."""
+    state: str
+    can_read: bool
+    can_write: bool
+    can_execute: bool
+    can_escalate: bool
+    notify_principal: bool
+    auto_recover: bool
+    description: str
 
 
-class DegradationSimulator:
-    """Simulates staged degradation for agent scope management."""
-    
-    def __init__(self, ttl_hours: float = 24.0, warn_threshold: float = 0.25):
-        self.ttl_hours = ttl_hours
-        self.warn_threshold = warn_threshold  # fraction of TTL remaining
-        self.states: list[DegradationState] = []
-    
-    def compute_state(self, hours_elapsed: float, mode: FailureMode) -> DegradationState:
-        remaining = max(0, self.ttl_hours - hours_elapsed)
-        fraction = remaining / self.ttl_hours if self.ttl_hours > 0 else 0
-        
-        if mode == FailureMode.SILENT:
-            if remaining <= 0:
-                return DegradationState("fail-silent", "none", False, False, False, False, 0, False)
-            return DegradationState("fail-silent", "full", True, True, False, False, remaining, False)
-        
-        elif mode == FailureMode.SAFE:
-            if remaining <= 0:
-                return DegradationState("fail-safe", "none", False, False, True, True, 0, False)
-            return DegradationState("fail-safe", "full", True, True, False, False, remaining, False)
-        
-        elif mode == FailureMode.SOFT:
-            if remaining <= 0:
-                return DegradationState("fail-soft", "minimal", False, False, True, True, 0, False)
-            elif fraction <= self.warn_threshold:
-                # Warn state: gate new auth, continue existing
-                return DegradationState("fail-soft", "reduced", False, True, True, True, remaining, False)
-            return DegradationState("fail-soft", "full", True, True, False, False, remaining, False)
-        
-        elif mode == FailureMode.OPERATIONAL:
-            if remaining <= 0:
-                return DegradationState("fail-operational", "full", True, True, True, True, 0, True)
-            return DegradationState("fail-operational", "full", True, True, False, False, remaining, False)
-        
-        raise ValueError(f"Unknown mode: {mode}")
-    
-    def simulate(self, mode: FailureMode, steps: int = 10) -> list[dict]:
-        """Simulate degradation over TTL."""
-        results = []
-        for i in range(steps + 1):
-            hours = (i / steps) * self.ttl_hours * 1.2  # Go 20% past TTL
-            state = self.compute_state(hours, mode)
-            results.append({
-                "hour": round(hours, 1),
-                "ttl_fraction": round(max(0, 1 - hours / self.ttl_hours), 2),
-                **asdict(state)
-            })
-        return results
-    
-    def compare_all(self) -> dict:
-        """Compare all failure modes at key time points."""
-        points = [0, 0.5, 0.75, 0.95, 1.0, 1.1]  # fractions of TTL
-        comparison = {}
-        
-        for mode in FailureMode:
-            comparison[mode.value] = []
-            for frac in points:
-                hours = frac * self.ttl_hours
-                state = self.compute_state(hours, mode)
-                comparison[mode.value].append({
-                    "ttl_fraction": round(1 - frac, 2),
-                    "scope": state.scope_level,
-                    "new_auth": state.new_auth_allowed,
-                    "existing_ops": state.existing_ops_allowed,
-                    "notified": state.notification_sent
-                })
-        
-        return comparison
+STATE_POLICIES = {
+    DegradationState.NOMINAL: StatePolicy(
+        state="nominal", can_read=True, can_write=True,
+        can_execute=True, can_escalate=True, notify_principal=False,
+        auto_recover=True, description="Full scope. All three signals green."
+    ),
+    DegradationState.WARN: StatePolicy(
+        state="warn", can_read=True, can_write=True,
+        can_execute=True, can_escalate=False, notify_principal=True,
+        auto_recover=True, description="Scope-constrained. Gate new/elevated authorizations. Notify issuer."
+    ),
+    DegradationState.ALERT: StatePolicy(
+        state="alert", can_read=True, can_write=False,
+        can_execute=False, can_escalate=False, notify_principal=True,
+        auto_recover=False, description="Read-only. No writes or actions. Awaiting principal intervention."
+    ),
+    DegradationState.HALT: StatePolicy(
+        state="halt", can_read=True, can_write=False,
+        can_execute=False, can_escalate=False, notify_principal=True,
+        auto_recover=False, description="Full stop. Only diagnostic reads. Principal must renew."
+    ),
+    DegradationState.DEAD: StatePolicy(
+        state="dead", can_read=False, can_write=False,
+        can_execute=False, can_escalate=False, notify_principal=True,
+        auto_recover=False, description="TTL expired. No recovery. Must re-issue scope certificate."
+    ),
+}
 
 
-def demo():
-    sim = DegradationSimulator(ttl_hours=24.0, warn_threshold=0.25)
+@dataclass
+class TransitionRule:
+    """Condition for state transition."""
+    from_state: str
+    to_state: str
+    trigger: str
+    condition: str
+    reversible: bool
+
+
+TRANSITION_RULES = [
+    TransitionRule("nominal", "warn", "drift_detected",
+                   "CUSUM alarm OR single signal amber", True),
+    TransitionRule("nominal", "alert", "liveness_failure",
+                   "Missed heartbeat > 1 interval", True),
+    TransitionRule("warn", "nominal", "principal_renewal",
+                   "Principal re-signs scope with fresh TTL", True),
+    TransitionRule("warn", "alert", "drift_persists",
+                   "Warn state > 2 heartbeat intervals without renewal", True),
+    TransitionRule("warn", "alert", "second_signal_failure",
+                   "2 of 3 signals failing (three-signal verdict)", True),
+    TransitionRule("alert", "warn", "partial_recovery",
+                   "Signal restored + principal acknowledges", True),
+    TransitionRule("alert", "halt", "ttl_warning",
+                   "TTL < 25% remaining without renewal", False),
+    TransitionRule("halt", "alert", "principal_intervention",
+                   "Principal extends TTL (one-time grace)", True),
+    TransitionRule("halt", "dead", "ttl_expired",
+                   "TTL = 0. No renewal received.", False),
+    TransitionRule("dead", "nominal", "re_issuance",
+                   "New scope certificate issued by principal", True),
+]
+
+
+def get_valid_transitions(current: str) -> list:
+    """Get valid transitions from current state."""
+    return [asdict(r) for r in TRANSITION_RULES if r.from_state == current]
+
+
+def simulate_degradation():
+    """Simulate a degradation sequence."""
+    print("=" * 60)
+    print("STAGED DEGRADATION SIMULATION")
+    print("(NASA ATC graceful degradation model)")
+    print("=" * 60)
+    print()
     
-    print("=" * 65)
-    print("STAGED DEGRADATION SIMULATOR")
-    print("TTL: 24h | Warn threshold: 25% remaining (6h)")
-    print("=" * 65)
+    scenarios = [
+        ("nominal", "drift_detected", "CUSUM detects scope drift"),
+        ("warn", "drift_persists", "2 intervals without principal renewal"),
+        ("alert", "ttl_warning", "TTL < 25% remaining"),
+        ("halt", "ttl_expired", "No renewal received"),
+    ]
     
-    for mode in FailureMode:
-        print(f"\n--- {mode.value.upper()} ---")
-        results = sim.simulate(mode, steps=6)
-        print(f"{'Hour':>6} {'TTL%':>5} {'Scope':>12} {'NewAuth':>8} {'ExistOps':>9} {'Notify':>7}")
-        for r in results:
-            print(f"{r['hour']:>6} {r['ttl_fraction']:>5} {r['scope_level']:>12} "
-                  f"{'✓' if r['new_auth_allowed'] else '✗':>8} "
-                  f"{'✓' if r['existing_ops_allowed'] else '✗':>9} "
-                  f"{'✓' if r['notification_sent'] else '✗':>7}")
+    current = DegradationState.NOMINAL
     
-    print("\n" + "=" * 65)
-    print("KEY INSIGHT:")
-    print("  fail-silent: most agents today. No signal. Worst case.")
-    print("  fail-safe: binary halt. Loses work. Railway brakes model.")
-    print("  fail-soft: BEST for agents. Staged. Gates new auth at warn.")
-    print("  fail-operational: requires redundancy (N=3f+1). Expensive.")
-    print("=" * 65)
+    for _, trigger, desc in scenarios:
+        policy = STATE_POLICIES[current]
+        print(f"State: {current.value.upper()}")
+        print(f"  Read: {'✅' if policy.can_read else '❌'}  "
+              f"Write: {'✅' if policy.can_write else '❌'}  "
+              f"Execute: {'✅' if policy.can_execute else '❌'}  "
+              f"Escalate: {'✅' if policy.can_escalate else '❌'}")
+        print(f"  {policy.description}")
+        print()
+        
+        # Find matching transition
+        for rule in TRANSITION_RULES:
+            if rule.from_state == current.value and rule.trigger == trigger:
+                print(f"  ⚡ Trigger: {desc}")
+                print(f"  → Transitioning to: {rule.to_state.upper()}")
+                current = DegradationState(rule.to_state)
+                print()
+                break
+    
+    # Final state
+    policy = STATE_POLICIES[current]
+    print(f"State: {current.value.upper()}")
+    print(f"  Read: {'✅' if policy.can_read else '❌'}  "
+          f"Write: {'✅' if policy.can_write else '❌'}  "
+          f"Execute: {'✅' if policy.can_execute else '❌'}  "
+          f"Escalate: {'✅' if policy.can_escalate else '❌'}")
+    print(f"  {policy.description}")
+    print()
+    
+    # Recovery path
+    print("-" * 60)
+    print("RECOVERY PATH (from any non-DEAD state):")
+    print("  1. Principal receives notification")
+    print("  2. Principal reviews drift/failure evidence")
+    print("  3. Principal re-signs scope cert with fresh TTL")
+    print("  4. Agent returns to NOMINAL")
+    print()
+    print("KEY INSIGHT: Binary halt loses work. Silent continuation")
+    print("loses trust. Staged degradation preserves BOTH.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Staged degradation state machine")
+    parser.add_argument("--demo", action="store_true", help="Run simulation")
+    parser.add_argument("--state", type=str, help="Show policy for state")
+    parser.add_argument("--transitions", type=str, help="Show transitions from state")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    args = parser.parse_args()
+    
+    if args.state:
+        try:
+            state = DegradationState(args.state.lower())
+            policy = STATE_POLICIES[state]
+            result = asdict(policy)
+            result["valid_transitions"] = get_valid_transitions(args.state.lower())
+            print(json.dumps(result, indent=2))
+        except ValueError:
+            print(f"Unknown state: {args.state}")
+    elif args.transitions:
+        transitions = get_valid_transitions(args.transitions.lower())
+        print(json.dumps(transitions, indent=2))
+    elif args.json:
+        result = {
+            "states": {s.value: asdict(STATE_POLICIES[s]) for s in DegradationState},
+            "transitions": [asdict(r) for r in TRANSITION_RULES],
+            "model": "NASA ATC graceful degradation (Edwards & Lee 2018)",
+        }
+        print(json.dumps(result, indent=2))
+    else:
+        simulate_degradation()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Agent failure mode simulator")
-    parser.add_argument("--demo", action="store_true")
-    parser.add_argument("--mode", choices=[m.value for m in FailureMode])
-    parser.add_argument("--ttl", type=float, default=24.0)
-    parser.add_argument("--json", action="store_true")
-    args = parser.parse_args()
-    
-    if args.mode:
-        sim = DegradationSimulator(ttl_hours=args.ttl)
-        mode = FailureMode(args.mode)
-        results = sim.simulate(mode)
-        print(json.dumps(results, indent=2))
-    elif args.json:
-        sim = DegradationSimulator(ttl_hours=args.ttl)
-        print(json.dumps(sim.compare_all(), indent=2))
-    else:
-        demo()
+    main()
