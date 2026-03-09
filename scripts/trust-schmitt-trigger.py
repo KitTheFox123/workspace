@@ -1,188 +1,161 @@
 #!/usr/bin/env python3
-"""trust-schmitt-trigger.py — Hysteresis-based trust zone classifier.
+"""trust-schmitt-trigger.py — Schmitt trigger hysteresis for trust zones.
 
-Prevents trust score flickering using Schmitt trigger model (1934).
-Asymmetric thresholds: harder to lose trusted status than to gain it.
+Problem: trust score oscillates near a threshold (e.g., 0.80). Without hysteresis,
+agent flips between trusted/untrusted every cycle. Schmitt trigger (1934) solution:
+separate thresholds for entering vs leaving a trust zone.
 
-Zones:
-  - Reliable: α ≥ 0.82 (entry) / α ≤ 0.77 (exit) 
-  - Tentative: 0.67-0.82 (entry) / 0.62-0.77 (exit)
-  - Unreliable: < 0.67 (entry) / < 0.62 (exit)
+Entering "trusted" requires score > T_high (e.g., 0.85).
+Leaving "trusted" requires score < T_low (e.g., 0.75).
+The gap (hysteresis band) prevents oscillation.
 
 Usage:
-    python3 trust-schmitt-trigger.py --demo
-    python3 trust-schmitt-trigger.py --scores 0.85 0.79 0.81 0.76 0.78 0.83
+    python3 trust-schmitt-trigger.py [--demo] [--scores 0.82,0.78,0.81,0.76,0.83]
 """
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Tuple
 
 
 @dataclass
-class ZoneThresholds:
-    """Asymmetric entry/exit thresholds per zone."""
+class TrustZone:
+    """Trust zone with Schmitt trigger thresholds."""
     name: str
-    entry_high: float  # Cross UP to enter
-    exit_low: float    # Cross DOWN to leave
+    t_high: float  # Threshold to enter (rising)
+    t_low: float   # Threshold to exit (falling)
     
     @property
-    def deadband(self) -> float:
-        return self.entry_high - self.exit_low
+    def hysteresis(self) -> float:
+        return self.t_high - self.t_low
 
 
-ZONES = [
-    ZoneThresholds("reliable", 0.82, 0.77),
-    ZoneThresholds("tentative", 0.67, 0.62),
-    ZoneThresholds("unreliable", 0.0, 0.0),
+# Default zones: untrusted → probation → trusted → elevated
+DEFAULT_ZONES = [
+    TrustZone("untrusted", t_high=0.0, t_low=0.0),
+    TrustZone("probation", t_high=0.40, t_low=0.25),
+    TrustZone("trusted",   t_high=0.80, t_low=0.65),
+    TrustZone("elevated",  t_high=0.95, t_low=0.85),
 ]
 
 
-class SchmittTrustClassifier:
-    """Trust zone classifier with hysteresis."""
+def classify_with_hysteresis(
+    scores: List[float],
+    zones: List[TrustZone] = None
+) -> List[Tuple[float, str, str]]:
+    """Classify scores with Schmitt trigger hysteresis.
     
-    def __init__(self, zones: List[ZoneThresholds] = None):
-        self.zones = zones or ZONES
-        self.current_zone = "unreliable"
-        self.history: List[dict] = []
-        self.transitions = 0
-        self.suppressed_transitions = 0
+    Returns list of (score, zone_name, transition) tuples.
+    """
+    if zones is None:
+        zones = DEFAULT_ZONES
     
-    def classify(self, alpha: float) -> str:
-        """Classify score with hysteresis. Returns zone name."""
-        prev_zone = self.current_zone
-        
-        if self.current_zone == "reliable":
-            # Must drop BELOW exit threshold to leave
-            if alpha < self.zones[0].exit_low:
-                if alpha >= self.zones[1].exit_low:
-                    self.current_zone = "tentative"
-                else:
-                    self.current_zone = "unreliable"
-            # else: stay reliable even if below entry threshold
-        
-        elif self.current_zone == "tentative":
-            if alpha >= self.zones[0].entry_high:
-                self.current_zone = "reliable"
-            elif alpha < self.zones[1].exit_low:
-                self.current_zone = "unreliable"
-        
-        elif self.current_zone == "unreliable":
-            if alpha >= self.zones[0].entry_high:
-                self.current_zone = "reliable"
-            elif alpha >= self.zones[1].entry_high:
-                self.current_zone = "tentative"
-        
-        transitioned = prev_zone != self.current_zone
-        if transitioned:
-            self.transitions += 1
-        
-        # Count would-have-been transitions without hysteresis
-        naive_zone = self._naive_classify(alpha)
-        if naive_zone != prev_zone and not transitioned:
-            self.suppressed_transitions += 1
-        
-        entry = {
-            "alpha": alpha,
-            "zone": self.current_zone,
-            "prev_zone": prev_zone,
-            "transitioned": transitioned,
-            "naive_zone": naive_zone,
-        }
-        self.history.append(entry)
-        return self.current_zone
+    # Sort zones by t_high
+    sorted_zones = sorted(zones, key=lambda z: z.t_high)
     
-    def _naive_classify(self, alpha: float) -> str:
-        """Classify without hysteresis (for comparison)."""
-        if alpha >= 0.80:
-            return "reliable"
-        elif alpha >= 0.65:
-            return "tentative"
-        return "unreliable"
+    current_zone = sorted_zones[0].name
+    results = []
     
-    def summary(self) -> dict:
-        """Summarize classification run."""
-        naive_transitions = 0
-        prev_naive = "unreliable"
-        for h in self.history:
-            if h["naive_zone"] != prev_naive:
-                naive_transitions += 1
-                prev_naive = h["naive_zone"]
+    for score in scores:
+        prev_zone = current_zone
         
-        return {
-            "total_scores": len(self.history),
-            "schmitt_transitions": self.transitions,
-            "naive_transitions": naive_transitions,
-            "suppressed": naive_transitions - self.transitions,
-            "flicker_reduction": f"{(1 - self.transitions / max(naive_transitions, 1)) * 100:.0f}%",
-            "final_zone": self.current_zone,
-            "deadbands": {z.name: z.deadband for z in self.zones[:2]},
-        }
+        # Check upward transitions (use t_high)
+        for z in sorted_zones:
+            if score >= z.t_high:
+                if _zone_rank(z.name, sorted_zones) > _zone_rank(current_zone, sorted_zones):
+                    current_zone = z.name
+        
+        # Check downward transitions (use t_low)
+        current_rank = _zone_rank(current_zone, sorted_zones)
+        for z in reversed(sorted_zones):
+            zr = _zone_rank(z.name, sorted_zones)
+            if zr >= current_rank and score < z.t_low:
+                # Drop to zone below
+                if zr > 0:
+                    current_zone = sorted_zones[zr - 1].name
+        
+        transition = ""
+        if current_zone != prev_zone:
+            transition = f"{prev_zone} → {current_zone}"
+        
+        results.append((score, current_zone, transition))
+    
+    return results
+
+
+def _zone_rank(name: str, zones: List[TrustZone]) -> int:
+    for i, z in enumerate(zones):
+        if z.name == name:
+            return i
+    return 0
+
+
+def count_oscillations_without_hysteresis(scores: List[float], threshold: float = 0.80) -> int:
+    """Count zone flips with simple threshold (no hysteresis)."""
+    flips = 0
+    prev = scores[0] >= threshold if scores else False
+    for s in scores[1:]:
+        curr = s >= threshold
+        if curr != prev:
+            flips += 1
+        prev = curr
+    return flips
 
 
 def demo():
-    """Demo with noisy oscillating scores."""
+    """Run demo with oscillating scores."""
+    # Simulate agent with noisy trust score around 0.80
     import random
     random.seed(42)
+    scores = [0.80 + random.gauss(0, 0.08) for _ in range(30)]
+    scores = [max(0, min(1, s)) for s in scores]
     
-    # Simulate agent with noisy trust score around boundary
-    scores = []
-    base = 0.75
-    for i in range(40):
-        if i < 10:
-            base = 0.75 + 0.03 * i  # Rising
-        elif i < 20:
-            base = 0.85 - 0.01 * (i - 10)  # Slow decline
-        elif i < 30:
-            base = 0.78  # Boundary oscillation
-        else:
-            base = 0.70 - 0.02 * (i - 30)  # Falling
-        
-        noise = random.gauss(0, 0.02)
-        scores.append(round(max(0, min(1, base + noise)), 3))
+    print("=" * 65)
+    print("TRUST SCHMITT TRIGGER — HYSTERESIS DEMO")
+    print("=" * 65)
+    print()
+    print("Zones: untrusted (<0.25) | probation (0.25-0.65) | trusted (0.65-0.80) | elevated (>0.95)")
+    print("Hysteresis bands: probation ±0.075 | trusted ±0.075 | elevated ±0.05")
+    print()
     
-    classifier = SchmittTrustClassifier()
+    results = classify_with_hysteresis(scores)
     
-    print("=" * 55)
-    print("SCHMITT TRIGGER TRUST CLASSIFIER")
-    print("=" * 55)
-    print(f"{'Step':>4} {'α':>6} {'Zone':<12} {'Naive':<12} {'Trans?'}")
-    print("-" * 55)
+    transitions = 0
+    for i, (score, zone, trans) in enumerate(results):
+        marker = " ←" if trans else ""
+        if trans:
+            transitions += 1
+        print(f"  [{i:2d}] score={score:.3f}  zone={zone:10s} {trans}{marker}")
     
-    for i, s in enumerate(scores):
-        zone = classifier.classify(s)
-        h = classifier.history[-1]
-        marker = "  ←" if h["transitioned"] else ""
-        print(f"{i:>4} {s:>6.3f} {zone:<12} {h['naive_zone']:<12}{marker}")
+    # Compare with naive threshold
+    naive_flips = count_oscillations_without_hysteresis(scores)
     
-    print("-" * 55)
-    summary = classifier.summary()
-    print(f"Schmitt transitions: {summary['schmitt_transitions']}")
-    print(f"Naive transitions:   {summary['naive_transitions']}")
-    print(f"Flicker reduction:   {summary['flicker_reduction']}")
-    print(f"Deadbands:           {summary['deadbands']}")
-
-
-def run_scores(scores: List[float]):
-    """Classify a list of scores."""
-    classifier = SchmittTrustClassifier()
-    for s in scores:
-        zone = classifier.classify(s)
-        h = classifier.history[-1]
-        marker = " ←TRANSITION" if h["transitioned"] else ""
-        print(f"α={s:.3f} → {zone} (naive: {h['naive_zone']}){marker}")
-    
-    print(json.dumps(classifier.summary(), indent=2))
+    print()
+    print("-" * 65)
+    print(f"With Schmitt trigger:  {transitions} transitions")
+    print(f"Without (naive 0.80):  {naive_flips} flips")
+    print(f"Oscillation reduction: {max(0, naive_flips - transitions)} fewer transitions")
+    print(f"Stability improvement: {(1 - transitions/max(1,naive_flips))*100:.0f}%")
+    print()
+    print("Key insight: hysteresis band prevents chattering at zone boundaries.")
+    print("Agent stays in current zone until score decisively crosses the gap.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Schmitt trigger trust classifier")
+    parser = argparse.ArgumentParser(description="Trust Schmitt trigger")
     parser.add_argument("--demo", action="store_true")
-    parser.add_argument("--scores", nargs="+", type=float)
+    parser.add_argument("--scores", type=str, help="Comma-separated scores")
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     
     if args.scores:
-        run_scores(args.scores)
+        scores = [float(s) for s in args.scores.split(",")]
+        results = classify_with_hysteresis(scores)
+        if args.json:
+            print(json.dumps([{"score": s, "zone": z, "transition": t} for s, z, t in results], indent=2))
+        else:
+            for s, z, t in results:
+                print(f"  {s:.3f} → {z}" + (f"  ({t})" if t else ""))
     else:
         demo()
