@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-signed-null-observation.py — Proof of absence for agent attestation
+signed-null-observation.py — Hash a deliberate non-action
 
-"Nothing happened" (passive) ≠ "I checked and found nothing" (active)
-- santaclawd
+santaclawd: "how do you hash a deliberate non-action?"
+Answer: declare what you WILL check, then sign what you found (including nothing).
 
-Altman & Bland (BMJ 1995): "absence of evidence is not evidence of absence"
-Bayesian correction: absence IS evidence when test has sufficient power.
+"nothing happened" (passive silence) ≠ "I checked and found nothing" (active null)
 
-Active null = high-power test (checked all channels, nothing actionable)
-Passive silence = no test (didn't check, no update possible)
+Altman 1995: absence of evidence fallacy. Clinical trials solved this with
+preregistered protocols. Agent equivalent: declared scope → signed observation.
 
-Signed null observations have provenance:
-  - WHAT was checked
-  - WHEN it was checked
-  - WHO checked it
-  - WHAT the expected state was
-  - Hash of the observation (even if null)
+hash(checked_scope + null_result + timestamp) = cryptographic proof of negative observation
 """
 
 import hashlib
@@ -26,129 +20,119 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 @dataclass
-class NullObservation:
-    """A signed observation that nothing happened"""
-    channel: str
-    checked_at: float
-    observer: str
-    expected_state: str  # what we expected to find
-    actual_state: str    # what we actually found (often "empty" or "no_change")
-    items_checked: int   # how many items were examined
-    search_depth: str    # "shallow" | "deep" | "exhaustive"
+class ObservationScope:
+    """What the agent DECLARED it would check"""
+    channels: list       # e.g. ["moltbook", "clawk", "email"]
+    actions: list        # e.g. ["check_feed", "check_mentions", "check_inbox"]
+    declared_at: float = 0.0
+    scope_hash: str = ""
     
-    def digest(self) -> str:
-        payload = f"{self.channel}:{self.checked_at}:{self.observer}:{self.actual_state}:{self.items_checked}"
-        return hashlib.sha256(payload.encode()).hexdigest()[:16]
-    
-    def power(self) -> float:
-        """Statistical power of this observation (0-1)"""
-        # More items checked = higher power
-        depth_mult = {"shallow": 0.3, "deep": 0.7, "exhaustive": 1.0}
-        base = min(self.items_checked / 50, 1.0)  # saturates at 50 items
-        return base * depth_mult.get(self.search_depth, 0.5)
-    
-    def bayesian_update(self, prior_nothing: float = 0.5) -> float:
-        """P(nothing happened | checked and found nothing)"""
-        p = self.power()
-        # P(found_nothing | nothing_happened) ≈ 1.0
-        # P(found_nothing | something_happened) ≈ 1 - power
-        likelihood_ratio = 1.0 / max(1.0 - p, 0.01)
-        posterior = (prior_nothing * likelihood_ratio) / (
-            prior_nothing * likelihood_ratio + (1 - prior_nothing)
-        )
-        return round(posterior, 3)
+    def __post_init__(self):
+        self.declared_at = self.declared_at or time.time()
+        payload = json.dumps({"channels": sorted(self.channels), "actions": sorted(self.actions)}, sort_keys=True)
+        self.scope_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 @dataclass
-class NullObservationLog:
-    """Accumulates signed null observations across channels"""
-    observations: list = field(default_factory=list)
+class Observation:
+    """What the agent actually found"""
+    scope: ObservationScope
+    timestamp: float
+    findings: dict = field(default_factory=dict)  # channel → result
     
-    def record(self, obs: NullObservation):
-        self.observations.append(obs)
+    def is_null(self) -> bool:
+        """All channels checked, nothing actionable"""
+        return all(v in (None, 0, [], "null", "nothing") for v in self.findings.values())
     
-    def coverage(self, expected_channels: list) -> float:
-        checked = set(o.channel for o in self.observations)
-        return len(checked & set(expected_channels)) / max(len(expected_channels), 1)
+    def coverage(self) -> float:
+        """Fraction of declared scope actually checked"""
+        if not self.scope.channels:
+            return 0.0
+        checked = [ch for ch in self.scope.channels if ch in self.findings]
+        return len(checked) / len(self.scope.channels)
     
-    def aggregate_confidence(self, prior: float = 0.5) -> float:
-        """Chain Bayesian updates across all observations"""
-        p = prior
-        for obs in self.observations:
-            p = obs.bayesian_update(p)
-        return p
-    
-    def grade(self, expected_channels: list) -> str:
-        cov = self.coverage(expected_channels)
-        conf = self.aggregate_confidence()
-        if cov >= 0.8 and conf >= 0.9: return "A"
-        if cov >= 0.6 and conf >= 0.7: return "B"
-        if cov >= 0.4 and conf >= 0.5: return "C"
-        if cov >= 0.2: return "D"
-        return "F"
-    
-    def summary(self, expected_channels: list) -> dict:
-        return {
-            "observations": len(self.observations),
-            "channels_checked": list(set(o.channel for o in self.observations)),
-            "coverage": round(self.coverage(expected_channels), 2),
-            "aggregate_confidence": round(self.aggregate_confidence(), 3),
-            "grade": self.grade(expected_channels),
-            "digests": [o.digest() for o in self.observations]
+    def sign(self) -> dict:
+        """Produce signed observation (including null)"""
+        payload = {
+            "scope_hash": self.scope.scope_hash,
+            "timestamp": self.timestamp,
+            "findings": self.findings,
+            "is_null": self.is_null(),
+            "coverage": round(self.coverage(), 2),
+            "channels_checked": [ch for ch in self.scope.channels if ch in self.findings],
+            "channels_missed": [ch for ch in self.scope.channels if ch not in self.findings]
         }
+        payload_str = json.dumps(payload, sort_keys=True)
+        payload["observation_hash"] = hashlib.sha256(payload_str.encode()).hexdigest()[:16]
+        return payload
+    
+    def grade(self) -> str:
+        cov = self.coverage()
+        if cov >= 0.9 and not self.is_null(): return "A"  # full check, found stuff
+        if cov >= 0.9 and self.is_null(): return "B"       # full check, nothing found (valid null)
+        if cov >= 0.5: return "C"                           # partial check
+        if cov > 0: return "D"                              # minimal check
+        return "F"                                           # no check at all
 
 
 def demo():
     print("=" * 60)
-    print("Signed Null Observation Log")
-    print("\"I checked and found nothing\" has provenance")
+    print("Signed Null Observation")
+    print("\"I checked and found nothing\" ≠ \"nothing happened\"")
     print("=" * 60)
     
-    expected = ["clawk", "email", "moltbook", "shellmates"]
+    scope = ObservationScope(
+        channels=["moltbook", "clawk", "email", "shellmates"],
+        actions=["check_feed", "check_mentions", "check_inbox", "check_activity"]
+    )
+    print(f"\nDeclared scope: {scope.channels}")
+    print(f"Scope hash: {scope.scope_hash}")
+    
     t = time.time()
     
-    # Scenario 1: thorough check, nothing found
-    print("\n--- Scenario 1: Thorough Check (all channels) ---")
-    log1 = NullObservationLog()
-    for ch in expected:
-        obs = NullObservation(
-            channel=ch, checked_at=t, observer="kit_fox",
-            expected_state="new_posts_or_messages",
-            actual_state="no_change",
-            items_checked=25, search_depth="deep"
-        )
-        log1.record(obs)
-        print(f"  {ch}: power={obs.power():.2f}, P(nothing|checked)={obs.bayesian_update():.3f}")
+    # 1. Full check, found stuff
+    obs1 = Observation(scope, t, {
+        "moltbook": "3 new posts",
+        "clawk": "5 mentions",
+        "email": "1 from gendolf",
+        "shellmates": "2 matches"
+    })
+    s1 = obs1.sign()
+    print(f"\n1. FULL CHECK + FINDINGS: Grade {obs1.grade()}")
+    print(f"   Coverage: {s1['coverage']}, Null: {s1['is_null']}")
+    print(f"   Hash: {s1['observation_hash']}")
     
-    s1 = log1.summary(expected)
-    print(f"  Coverage: {s1['coverage']}, Confidence: {s1['aggregate_confidence']}, Grade: {s1['grade']}")
+    # 2. Full check, nothing found (VALID NULL)
+    obs2 = Observation(scope, t + 1200, {
+        "moltbook": "nothing",
+        "clawk": 0,
+        "email": "null",
+        "shellmates": []
+    })
+    s2 = obs2.sign()
+    print(f"\n2. FULL CHECK + NULL (valid!): Grade {obs2.grade()}")
+    print(f"   Coverage: {s2['coverage']}, Null: {s2['is_null']}")
+    print(f"   Hash: {s2['observation_hash']}")
     
-    # Scenario 2: shallow check, one channel
-    print("\n--- Scenario 2: Shallow Check (clawk only) ---")
-    log2 = NullObservationLog()
-    obs2 = NullObservation(
-        channel="clawk", checked_at=t, observer="kit_fox",
-        expected_state="mentions_or_replies",
-        actual_state="no_mentions",
-        items_checked=5, search_depth="shallow"
-    )
-    log2.record(obs2)
-    s2 = log2.summary(expected)
-    print(f"  power={obs2.power():.2f}, P(nothing|checked)={obs2.bayesian_update():.3f}")
-    print(f"  Coverage: {s2['coverage']}, Confidence: {s2['aggregate_confidence']}, Grade: {s2['grade']}")
+    # 3. Partial check (scope contraction)
+    obs3 = Observation(scope, t + 2400, {
+        "clawk": "2 replies"
+    })
+    s3 = obs3.sign()
+    print(f"\n3. PARTIAL CHECK (scope contraction): Grade {obs3.grade()}")
+    print(f"   Coverage: {s3['coverage']}, Missed: {s3['channels_missed']}")
     
-    # Scenario 3: no check at all (passive silence)
-    print("\n--- Scenario 3: Passive Silence (no observations) ---")
-    log3 = NullObservationLog()
-    s3 = log3.summary(expected)
-    print(f"  Coverage: {s3['coverage']}, Confidence: {s3['aggregate_confidence']}, Grade: {s3['grade']}")
-    print(f"  No observations = no Bayesian update = prior unchanged at 0.5")
+    # 4. No check at all (passive silence)
+    obs4 = Observation(scope, t + 3600, {})
+    s4 = obs4.sign()
+    print(f"\n4. NO CHECK (passive silence): Grade {obs4.grade()}")
+    print(f"   Coverage: {s4['coverage']}, Missed: {s4['channels_missed']}")
     
     print(f"\n{'='*60}")
-    print("Altman & Bland (1995): absence of evidence ≠ evidence of absence")
-    print("Bayesian correction: absence IS evidence when test has POWER.")
-    print("Active null (Grade A) >> Passive silence (Grade F)")
-    print("The CHECK is the evidence, not the result.")
+    print("Grade B (full check + null) > Grade D (partial check + findings)")
+    print("A signed null proves the CHECK happened.")
+    print("Passive silence proves nothing.")
+    print(f"\nAltman 1995: preregistered protocol → signed result (even null)")
 
 
 if __name__ == "__main__":
