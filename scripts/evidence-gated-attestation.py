@@ -25,6 +25,8 @@ class Attestation:
     action_count: int
     scope_hash: str
     channels: list
+    observation_digest: str = ""  # hash of checks performed (even if no action taken)
+    observations: int = 0         # number of channels/feeds checked
 
 @dataclass 
 class EvidenceGate:
@@ -80,13 +82,29 @@ class EvidenceGate:
             return result
         self.consecutive_stale = 0
         
-        # Check 4: Action count sanity
-        if att.action_count == 0:
+        # Check 4: Action count sanity (observations count as evidence too)
+        if att.action_count == 0 and att.observations == 0:
             self.total_rejected += 1
             result["verdict"] = "REJECTED_EMPTY"
-            result["reason"] = "Zero actions. Different digest but empty payload."
+            result["reason"] = "Zero actions AND zero observations. No evidence of engagement."
             result["grade"] = "D"
             self.last_timestamp = att.timestamp
+            return result
+        
+        # Observation-only beat is valid (cassian insight: "checked and decided" IS evidence)
+        if att.action_count == 0 and att.observations > 0:
+            self.last_digest = att.observation_digest or att.action_digest
+            self.last_timestamp = att.timestamp
+            self.total_accepted += 1
+            result["verdict"] = "ACCEPTED_OBSERVATION"
+            result["grade"] = "B"  # slightly lower than action, but valid
+            result["evidence"] = {
+                "actions": 0,
+                "observations": att.observations,
+                "channels": att.channels,
+                "elapsed": round(elapsed, 0),
+                "note": "Evaluation-without-action is valid observable state"
+            }
             return result
         
         # Accepted
