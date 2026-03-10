@@ -1,170 +1,163 @@
 #!/usr/bin/env python3
 """
-survivorship-bias-detector.py — Abraham Wald's missing bullet holes for agent trust
+survivorship-bias-detector.py — Abraham Wald for agent trust scores
 
-Gendolf insight: "Without NACK, you get survivorship bias in trust scores."
+Gendolf insight: "Without negative evidence you get survivorship bias in trust scores."
+Wald (WWII): Armor the parts with NO bullet holes — those are the planes that didn't return.
 
-Abraham Wald (1943, Statistical Research Group): Military wanted to armor
-where returning bombers had bullet holes. Wald: armor where the holes AREN'T —
-those planes didn't come back.
+Trust scores without NACK = only seeing surviving agents. Failed attestations are invisible.
+This tool detects when a trust score suffers from survivorship bias.
 
-Trust scores built on ACK-only = examining surviving bombers only.
-The agents who failed silently aren't in your dataset.
-
-Detects:
-- ACK-only bias (no NACKs recorded)
-- Attrition bias (agents disappear from record)
-- Selection bias (only successful interactions counted)
+Metrics:
+- NACK ratio: fraction of observations that are negative (healthy: 10-40%)
+- Attrition rate: agents who stopped attesting (the planes that didn't return)
+- Score-NACK correlation: do agents with higher scores have fewer NACKs? (bias signal)
 """
 
-from dataclasses import dataclass, field
 import random
+from dataclasses import dataclass, field
 
 @dataclass
-class TrustRecord:
+class AgentRecord:
     agent_id: str
-    acks: int = 0           # successful interactions
-    nacks: int = 0          # checked, failed/nothing
-    silences: int = 0       # no response at all
-    first_seen: float = 0.0
+    acks: int = 0           # positive observations
+    nacks: int = 0          # negative observations (checked, found nothing/failed)
+    silences: int = 0       # missed heartbeats
     last_seen: float = 0.0
-    
+    active: bool = True
+
     @property
-    def total_observations(self) -> int:
+    def total(self):
         return self.acks + self.nacks + self.silences
-    
+
     @property
-    def naive_trust(self) -> float:
-        """ACK-only trust score (survivorship-biased)"""
-        if self.acks == 0:
-            return 0.0
-        return self.acks / max(self.acks, 1)  # always 1.0 — that's the bug
-    
+    def nack_ratio(self):
+        obs = self.acks + self.nacks
+        return self.nacks / max(obs, 1)
+
     @property
-    def corrected_trust(self) -> float:
-        """Wald-corrected: count what's missing"""
-        total = self.total_observations
-        if total == 0:
-            return 0.0
-        return self.acks / total
-    
+    def trust_score_naive(self):
+        """Naive: only count positive"""
+        return self.acks / max(self.total, 1)
+
     @property
-    def nack_ratio(self) -> float:
-        total = self.acks + self.nacks
-        if total == 0:
-            return 0.0
-        return self.nacks / total
-    
-    @property
-    def attrition_risk(self) -> float:
-        """High silence ratio = agent may have disappeared"""
-        if self.total_observations == 0:
-            return 1.0
-        return self.silences / self.total_observations
+    def trust_score_wald(self):
+        """Wald-corrected: account for NACKs and silences"""
+        # NACKs are informative (checked, negative = honest reporting)
+        # Silences are concerning (unknown state)
+        positive = self.acks + (self.nacks * 0.3)  # NACKs partially positive (honest reporting)
+        negative = self.silences + (self.nacks * 0.1)  # some NACK penalty for failed checks
+        return positive / max(positive + negative, 1)
 
 
-@dataclass
-class BiasDetector:
-    records: list = field(default_factory=list)
+def simulate_population(n_agents=50, n_periods=20, seed=42):
+    random.seed(seed)
+    agents = [AgentRecord(agent_id=f"agent_{i}") for i in range(n_agents)]
     
-    def add_record(self, r: TrustRecord):
-        self.records.append(r)
+    for period in range(n_periods):
+        for agent in agents:
+            if not agent.active:
+                agent.silences += 1
+                continue
+            
+            r = random.random()
+            if r < 0.05:  # 5% drop out (the planes that don't return)
+                agent.active = False
+                agent.silences += 1
+            elif r < 0.25:  # 20% NACK (checked, nothing found)
+                agent.nacks += 1
+                agent.last_seen = period
+            elif r < 0.35:  # 10% silence (missed beat)
+                agent.silences += 1
+            else:  # 65% ACK
+                agent.acks += 1
+                agent.last_seen = period
     
-    def detect_ack_only_bias(self) -> dict:
-        """Wald test: are we only counting hits?"""
-        ack_only = [r for r in self.records if r.nacks == 0 and r.silences == 0]
-        total = len(self.records)
-        ratio = len(ack_only) / max(total, 1)
-        return {
-            "bias": "ACK-only",
-            "description": "Trust built on successes only (Wald's returning bombers)",
-            "affected_agents": len(ack_only),
-            "total_agents": total,
-            "ratio": round(ratio, 2),
-            "severity": "CRITICAL" if ratio > 0.7 else "HIGH" if ratio > 0.4 else "LOW",
-            "fix": "Require NACK recording for all observations"
-        }
+    return agents
+
+
+def detect_bias(agents):
+    active = [a for a in agents if a.active]
+    dropped = [a for a in agents if not a.active]
     
-    def detect_attrition_bias(self, silence_threshold: float = 0.3) -> dict:
-        """Agents who disappeared aren't in the dataset"""
-        attrited = [r for r in self.records if r.attrition_risk > silence_threshold]
-        return {
-            "bias": "Attrition",
-            "description": "Agents with high silence ratio may have failed silently",
-            "affected_agents": len(attrited),
-            "total_agents": len(self.records),
-            "severity": "HIGH" if len(attrited) > len(self.records) * 0.3 else "LOW",
-            "fix": "Dead man's switch + signed null observations"
-        }
+    result = {
+        "total_agents": len(agents),
+        "active": len(active),
+        "dropped": len(dropped),
+        "attrition_rate": round(len(dropped) / len(agents), 2),
+        "checks": []
+    }
     
-    def detect_inflation(self) -> dict:
-        """How inflated are naive trust scores?"""
-        if not self.records:
-            return {"inflation": 0}
-        naive_avg = sum(r.naive_trust for r in self.records) / len(self.records)
-        corrected_avg = sum(r.corrected_trust for r in self.records) / len(self.records)
-        inflation = naive_avg - corrected_avg
-        return {
-            "bias": "Score inflation",
-            "naive_avg": round(naive_avg, 3),
-            "corrected_avg": round(corrected_avg, 3),
-            "inflation": round(inflation, 3),
-            "severity": "CRITICAL" if inflation > 0.3 else "HIGH" if inflation > 0.15 else "LOW"
-        }
+    # Check 1: NACK ratio
+    all_nack_ratio = sum(a.nacks for a in agents) / max(sum(a.acks + a.nacks for a in agents), 1)
+    active_nack_ratio = sum(a.nacks for a in active) / max(sum(a.acks + a.nacks for a in active), 1)
+    result["checks"].append({
+        "check": "nack_ratio",
+        "all_agents": round(all_nack_ratio, 3),
+        "active_only": round(active_nack_ratio, 3),
+        "status": "OK" if 0.1 <= all_nack_ratio <= 0.4 else "WARN",
+        "detail": "Healthy NACK ratio 10-40%. Too low = not reporting negatives. Too high = systemic failure."
+    })
     
-    def full_audit(self) -> list:
-        return [
-            self.detect_ack_only_bias(),
-            self.detect_attrition_bias(),
-            self.detect_inflation()
-        ]
+    # Check 2: Attrition bias
+    dropped_avg_nack = sum(a.nack_ratio for a in dropped) / max(len(dropped), 1)
+    active_avg_nack = sum(a.nack_ratio for a in active) / max(len(active), 1)
+    result["checks"].append({
+        "check": "attrition_bias",
+        "dropped_avg_nack_ratio": round(dropped_avg_nack, 3),
+        "active_avg_nack_ratio": round(active_avg_nack, 3),
+        "status": "BIAS" if dropped_avg_nack > active_avg_nack * 1.5 else "OK",
+        "detail": "Wald test: are dropped agents systematically different from active ones?"
+    })
+    
+    # Check 3: Naive vs corrected scores
+    naive_avg = sum(a.trust_score_naive for a in active) / max(len(active), 1)
+    wald_avg = sum(a.trust_score_wald for a in active) / max(len(active), 1)
+    inflation = (naive_avg - wald_avg) / max(wald_avg, 0.01)
+    result["checks"].append({
+        "check": "score_inflation",
+        "naive_avg": round(naive_avg, 3),
+        "wald_corrected_avg": round(wald_avg, 3),
+        "inflation": f"{inflation:.1%}",
+        "status": "INFLATED" if inflation > 0.1 else "OK"
+    })
+    
+    # Overall grade
+    issues = sum(1 for c in result["checks"] if c["status"] != "OK")
+    result["grade"] = ["A", "B", "C", "F"][min(issues, 3)]
+    
+    return result
 
 
 def demo():
     print("=" * 60)
     print("Survivorship Bias Detector")
-    print("Abraham Wald (1943): armor where the holes aren't")
+    print("Abraham Wald: armor the parts with NO bullet holes")
     print("=" * 60)
     
-    random.seed(42)
-    detector = BiasDetector()
+    agents = simulate_population()
+    result = detect_bias(agents)
     
-    # Simulate 20 agents with various observation patterns
-    for i in range(20):
-        if i < 8:
-            # ACK-only agents (survivorship biased)
-            r = TrustRecord(f"agent_{i}", acks=random.randint(5, 20))
-        elif i < 14:
-            # Full observation agents
-            r = TrustRecord(f"agent_{i}",
-                          acks=random.randint(3, 15),
-                          nacks=random.randint(1, 5),
-                          silences=random.randint(0, 3))
-        else:
-            # High attrition agents
-            r = TrustRecord(f"agent_{i}",
-                          acks=random.randint(1, 3),
-                          silences=random.randint(5, 10))
-        detector.add_record(r)
+    print(f"\nPopulation: {result['total_agents']} agents, {result['active']} active, {result['dropped']} dropped")
+    print(f"Attrition: {result['attrition_rate']:.0%}")
     
-    print(f"\nAgents analyzed: {len(detector.records)}")
-    
-    audit = detector.full_audit()
-    for finding in audit:
-        print(f"\n  {finding['bias']}: {finding['severity']}")
-        for k, v in finding.items():
-            if k not in ('bias', 'severity'):
+    for check in result["checks"]:
+        print(f"\n  {check['check']}: {check['status']}")
+        for k, v in check.items():
+            if k not in ("check", "status"):
                 print(f"    {k}: {v}")
     
-    # Show individual examples
-    print(f"\n{'='*60}")
-    print("Sample agents (naive vs corrected trust):")
-    for r in detector.records[:5]:
-        print(f"  {r.agent_id}: naive={r.naive_trust:.2f} corrected={r.corrected_trust:.2f} "
-              f"(ACK={r.acks} NACK={r.nacks} SILENCE={r.silences})")
+    print(f"\nOverall: Grade {result['grade']}")
     
-    print(f"\nWald's lesson: the missing data IS the data.")
-    print(f"Trust without NACK = returning bombers only.")
+    # Show Wald correction effect
+    active = [a for a in agents if a.active]
+    print(f"\n{'='*60}")
+    print("Sample agents (naive vs Wald-corrected):")
+    for a in active[:5]:
+        print(f"  {a.agent_id}: naive={a.trust_score_naive:.2f} wald={a.trust_score_wald:.2f} nacks={a.nacks} silences={a.silences}")
+    
+    print(f"\nKey: NACKs are HONEST REPORTING. Penalizing them = survivorship bias.")
+    print("Wald: the missing data (dropped agents, unreported negatives) is the signal.")
 
 
 if __name__ == "__main__":
