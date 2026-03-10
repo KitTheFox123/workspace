@@ -2,151 +2,153 @@
 """
 windowed-watchdog.py — Min AND max TTL for agent heartbeats
 
-santaclawd insight: too-frequent kicks = stuck loop churning pings.
-too-infrequent = silent failure. Both are failure modes.
+santaclawd insight: "too frequent = stuck loop churning pings.
+too infrequent = silent failure."
 
-Windowed watchdog: beat must arrive WITHIN a time window.
-Early kicks are rejected (infinite loop detection).
-Late kicks trigger alarm (silent failure).
+Memfault best practices: windowed watchdog only accepts kicks within
+a time window. Too early = suspicious. Too late = failure.
 
-Based on Memfault embedded watchdog best practices + Pont & Ong 2002.
+Agent mapping:
+  - Too fast: stuck heartbeat loop, no real work between beats
+  - Too slow: agent down or degraded
+  - Window hit: healthy operation
+
+Three failure modes embedded engineers track:
+  1. Deadlock → circular scope dependency
+  2. Sensor wedge → stuck API call
+  3. Priority inversion → heartbeat crowds out real work
 """
 
-from dataclasses import dataclass, field
 import time
+from dataclasses import dataclass, field
 
-@dataclass 
+@dataclass
 class WindowedWatchdog:
-    min_interval_s: float = 300    # 5 min minimum between beats
-    max_interval_s: float = 2400   # 40 min maximum between beats
+    """Windowed watchdog: kicks only accepted within [min_interval, max_interval]"""
+    name: str
+    min_interval_s: float   # too-fast threshold
+    max_interval_s: float   # too-slow threshold
     last_kick: float = 0.0
-    early_kicks: int = 0
-    late_kicks: int = 0
-    valid_kicks: int = 0
-    total_kicks: int = 0
+    kicks_total: int = 0
+    too_fast: int = 0
+    too_slow: int = 0
+    in_window: int = 0
 
     def kick(self, now: float) -> dict:
-        self.total_kicks += 1
-        elapsed = now - self.last_kick if self.last_kick > 0 else self.min_interval_s + 1
+        self.kicks_total += 1
+        if self.last_kick == 0:
+            self.last_kick = now
+            return {"status": "INIT", "channel": self.name}
+
+        elapsed = now - self.last_kick
+        self.last_kick = now
 
         if elapsed < self.min_interval_s:
-            self.early_kicks += 1
+            self.too_fast += 1
             return {
-                "status": "REJECTED_EARLY",
+                "status": "TOO_FAST",
+                "channel": self.name,
                 "elapsed_s": round(elapsed, 1),
-                "window": f"[{self.min_interval_s}, {self.max_interval_s}]",
-                "detail": "Too fast — possible stuck loop",
-                "early_kicks": self.early_kicks
+                "min_s": self.min_interval_s,
+                "diagnosis": "stuck_loop",
+                "detail": "Kick too early — spinning without real work?"
             }
         elif elapsed > self.max_interval_s:
-            self.late_kicks += 1
-            self.last_kick = now
+            self.too_slow += 1
             return {
-                "status": "LATE",
+                "status": "TOO_SLOW",
+                "channel": self.name,
                 "elapsed_s": round(elapsed, 1),
-                "window": f"[{self.min_interval_s}, {self.max_interval_s}]",
-                "detail": "Beat arrived after window — possible silent failure period",
-                "late_kicks": self.late_kicks
+                "max_s": self.max_interval_s,
+                "diagnosis": "silent_failure",
+                "detail": "Kick too late — degraded or wedged?"
             }
         else:
-            self.valid_kicks += 1
-            self.last_kick = now
+            self.in_window += 1
             return {
                 "status": "OK",
-                "elapsed_s": round(elapsed, 1),
-                "valid_kicks": self.valid_kicks
+                "channel": self.name,
+                "elapsed_s": round(elapsed, 1)
             }
-
-    def check_expired(self, now: float) -> dict:
-        """Called by external timer — has the window expired?"""
-        elapsed = now - self.last_kick if self.last_kick > 0 else 0
-        if elapsed > self.max_interval_s:
-            return {
-                "status": "EXPIRED",
-                "elapsed_s": round(elapsed, 1),
-                "detail": "No beat received within max window"
-            }
-        remaining = self.max_interval_s - elapsed
-        return {
-            "status": "WAITING",
-            "remaining_s": round(remaining, 1)
-        }
 
     def grade(self) -> str:
-        if self.total_kicks == 0: return "F"
-        ratio = self.valid_kicks / self.total_kicks
-        if ratio > 0.95: return "A"
-        if ratio > 0.80: return "B"
-        if ratio > 0.60: return "C"
-        if ratio > 0.40: return "D"
+        total = self.too_fast + self.too_slow + self.in_window
+        if total == 0: return "A"
+        fault_rate = (self.too_fast + self.too_slow) / total
+        if fault_rate < 0.05: return "A"
+        if fault_rate < 0.15: return "B"
+        if fault_rate < 0.30: return "C"
+        if fault_rate < 0.50: return "D"
         return "F"
 
     def diagnosis(self) -> str:
-        if self.early_kicks > self.valid_kicks:
-            return "STUCK_LOOP — agent beating too fast, likely infinite loop"
-        if self.late_kicks > self.valid_kicks:
-            return "INTERMITTENT — agent has silent periods, investigate scope contraction"
-        if self.total_kicks == 0:
-            return "DEAD — no beats received"
-        return "HEALTHY"
+        if self.too_fast > self.too_slow:
+            return "STUCK_LOOP: agent kicking too fast, likely spinning without progress"
+        elif self.too_slow > self.too_fast:
+            return "SILENT_FAILURE: agent kicking too slow, likely degraded or wedged"
+        elif self.too_fast > 0:
+            return "MIXED: both fast and slow anomalies detected"
+        return "HEALTHY: all kicks within window"
 
 
 def demo():
     print("=" * 60)
-    print("Windowed Watchdog Timer")
-    print("Min AND max TTL for agent heartbeats")
+    print("Windowed Watchdog — Min AND Max TTL")
+    print("santaclawd: too frequent = stuck loop. too slow = silent failure.")
     print("=" * 60)
 
-    # Scenario 1: healthy agent (beats every ~20 min)
+    # Scenario 1: healthy agent (20-min heartbeat, window 15-25 min)
     print("\n--- Scenario 1: Healthy Agent ---")
-    w1 = WindowedWatchdog(min_interval_s=300, max_interval_s=2400)
+    w1 = WindowedWatchdog("heartbeat", min_interval_s=900, max_interval_s=1500)
     t = 0.0
+    w1.kick(t)  # init
     for i in range(5):
-        t += 1200  # 20 min
+        t += 1200  # 20 min intervals
         r = w1.kick(t)
-        print(f"  Beat {i+1}: {r['status']} (elapsed {r.get('elapsed_s', 'n/a')}s)")
+        print(f"  Beat {i+1}: {r['status']} ({r.get('elapsed_s', 0)}s)")
     print(f"  Grade: {w1.grade()} — {w1.diagnosis()}")
 
-    # Scenario 2: stuck loop (beats every 10s)
-    print("\n--- Scenario 2: Stuck Loop Agent ---")
-    w2 = WindowedWatchdog(min_interval_s=300, max_interval_s=2400)
-    t2 = 0.0
-    w2.kick(t2)  # first kick
-    for i in range(6):
-        t2 += 10  # 10s — way too fast
-        r = w2.kick(t2)
-        print(f"  Beat {i+1}: {r['status']} — {r.get('detail', '')}")
+    # Scenario 2: stuck loop (kicking every 2 min)
+    print("\n--- Scenario 2: Stuck Loop (too fast) ---")
+    w2 = WindowedWatchdog("heartbeat", min_interval_s=900, max_interval_s=1500)
+    t = 0.0
+    w2.kick(t)
+    for i in range(5):
+        t += 120  # 2 min intervals — way too fast
+        r = w2.kick(t)
+        print(f"  Beat {i+1}: {r['status']} — {r.get('diagnosis', '')} ({r.get('elapsed_s', 0)}s)")
     print(f"  Grade: {w2.grade()} — {w2.diagnosis()}")
 
-    # Scenario 3: intermittent (long gaps)
-    print("\n--- Scenario 3: Intermittent Agent ---")
-    w3 = WindowedWatchdog(min_interval_s=300, max_interval_s=2400)
-    t3 = 0.0
-    w3.kick(t3)
-    for i in range(4):
-        t3 += 5000  # 83 min — way too slow
-        r = w3.kick(t3)
-        print(f"  Beat {i+1}: {r['status']} — {r.get('detail', '')}")
+    # Scenario 3: degraded agent (kicking every 45 min)
+    print("\n--- Scenario 3: Degraded Agent (too slow) ---")
+    w3 = WindowedWatchdog("heartbeat", min_interval_s=900, max_interval_s=1500)
+    t = 0.0
+    w3.kick(t)
+    for i in range(5):
+        t += 2700  # 45 min intervals
+        r = w3.kick(t)
+        print(f"  Beat {i+1}: {r['status']} — {r.get('diagnosis', '')} ({r.get('elapsed_s', 0)}s)")
     print(f"  Grade: {w3.grade()} — {w3.diagnosis()}")
 
-    # Scenario 4: mixed
-    print("\n--- Scenario 4: Mixed (recovering agent) ---")
-    w4 = WindowedWatchdog(min_interval_s=300, max_interval_s=2400)
-    t4 = 0.0
-    w4.kick(t4)
-    t4 += 5000; w4.kick(t4)  # late
-    t4 += 10; w4.kick(t4)    # early 
-    t4 += 1200; w4.kick(t4)  # ok
-    t4 += 1200; w4.kick(t4)  # ok
-    t4 += 1200; w4.kick(t4)  # ok
-    print(f"  Valid: {w4.valid_kicks}, Early: {w4.early_kicks}, Late: {w4.late_kicks}")
+    # Scenario 4: mixed (priority inversion — some fast, some slow)
+    print("\n--- Scenario 4: Priority Inversion (mixed) ---")
+    w4 = WindowedWatchdog("heartbeat", min_interval_s=900, max_interval_s=1500)
+    t = 0.0
+    w4.kick(t)
+    intervals = [60, 2700, 1200, 90, 1200]  # fast, slow, ok, fast, ok
+    for i, interval in enumerate(intervals):
+        t += interval
+        r = w4.kick(t)
+        print(f"  Beat {i+1}: {r['status']} ({r.get('elapsed_s', 0)}s)")
     print(f"  Grade: {w4.grade()} — {w4.diagnosis()}")
 
     print(f"\n{'='*60}")
-    print("Key: windowed watchdog catches BOTH failure modes.")
-    print("  Too fast = stuck loop (infinite ping)")
-    print("  Too slow = silent failure (scope contraction)")
-    print("  Both rejected. Only within-window beats count.")
+    print("Window = [min_TTL, max_TTL]")
+    print("  Too fast: stuck loop, no real work")
+    print("  Too slow: silent failure, wedge")
+    print("  In window: healthy")
+    print("  Mixed: priority inversion")
+    print("\nEmbedded systems solved this 40 years ago. (Memfault 2020)")
 
 
 if __name__ == "__main__":
