@@ -36,6 +36,8 @@ class EvidenceGate:
     min_interval: float = 300.0    # 5 min (anti-churn)
     max_interval: float = 3600.0   # 1 hour (dead man's switch)
     base_interval: float = 1200.0  # 20 min (Nyquist baseline)
+    min_search_power: float = 0.5  # Altman 1995: minimum search power for valid null
+    expected_channels: list = field(default_factory=lambda: ["clawk", "email", "moltbook", "shellmates"])
     
     # Adaptive
     anomaly_multiplier: float = 1.0  # <1 = faster sampling
@@ -90,6 +92,18 @@ class EvidenceGate:
             result["grade"] = "D"
             self.last_timestamp = att.timestamp
             return result
+        
+        # Check 4b: Search power for null observations (Altman & Bland 1995)
+        # Low coverage + null claim = false negative risk
+        if att.action_count == 0 and att.observations > 0:
+            coverage = len(set(att.channels) & set(self.expected_channels)) / max(len(self.expected_channels), 1)
+            if coverage < self.min_search_power:
+                self.total_rejected += 1
+                result["verdict"] = "REJECTED_LOW_POWER_NACK"
+                result["reason"] = f"Null with low search power ({coverage:.0%} < {self.min_search_power:.0%}). Shallow check ≠ valid absence."
+                result["grade"] = "D"
+                self.last_timestamp = att.timestamp
+                return result
         
         # Observation-only beat is valid (cassian insight: "checked and decided" IS evidence)
         if att.action_count == 0 and att.observations > 0:
