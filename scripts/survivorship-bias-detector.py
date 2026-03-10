@@ -1,177 +1,144 @@
 #!/usr/bin/env python3
 """
-survivorship-bias-detector.py — Wald inversion for agent trust scores
+survivorship-bias-detector.py — Wald 1943 for agent trust graphs
 
 Abraham Wald, SRG 1943: armor where the bullet holes AREN'T.
 Planes that came back had holes in non-critical areas.
-Planes hit in engines didn't come back → no data.
+Planes hit in critical areas didn't come back.
 
-Agent parallel (santaclawd): "high score with zero NACKs is a red flag,
-not a green one. the gaps in the attestation record ARE the data."
+Agent trust graphs have the same bias:
+- Only successful attestations propagate
+- Failed/null observations are invisible
+- Trust scores become highlight reels
 
-Detects:
-- Clean records with no negative observations (never checked?)
-- Missing channels in attestation history (scope gaps)
-- Survivorship bias: only seeing agents that passed, not ones filtered out
+Fix: make NACKs first-class. Count the missing.
+A trust graph without negative evidence has survivorship bias.
 """
 
+import random
 from dataclasses import dataclass, field
+from collections import defaultdict
 
 @dataclass
-class AttestationRecord:
-    agent_id: str
-    acks: int = 0          # positive observations
-    nacks: int = 0         # checked, found nothing
-    silence_events: int = 0  # dead man's switch triggers
-    channels_observed: set = field(default_factory=set)
-    expected_channels: set = field(default_factory=lambda: {"clawk", "email", "moltbook", "shellmates"})
-    total_periods: int = 0
-    preregistered: int = 0  # how many observations were preregistered
-
-    @property
-    def total_observations(self):
-        return self.acks + self.nacks
-
-    @property
-    def observation_rate(self):
-        return self.total_observations / max(self.total_periods, 1)
-
-    @property 
-    def nack_ratio(self):
-        return self.nacks / max(self.total_observations, 1)
-
-    @property
-    def channel_coverage(self):
-        return len(self.channels_observed & self.expected_channels) / max(len(self.expected_channels), 1)
-
-    @property
-    def preregistration_rate(self):
-        return self.preregistered / max(self.total_observations, 1)
-
-
-def detect_survivorship_bias(record: AttestationRecord) -> dict:
-    """Wald inversion: look where the data ISN'T"""
-    flags = []
-    risk_score = 0.0
+class TrustGraph:
+    """Trust graph with optional NACK support"""
+    acks: dict = field(default_factory=lambda: defaultdict(int))   # agent → positive attestation count
+    nacks: dict = field(default_factory=lambda: defaultdict(int))  # agent → negative attestation count
+    silences: dict = field(default_factory=lambda: defaultdict(int))  # agent → silence count
+    nack_enabled: bool = True
     
-    # Flag 1: Zero NACKs (never found nothing? suspicious)
-    if record.total_observations > 5 and record.nacks == 0:
-        flags.append({
-            "flag": "ZERO_NACKS",
-            "severity": "HIGH",
-            "detail": f"{record.acks} ACKs, 0 NACKs. Agent never found nothing? Either never checked or reporting bias."
-        })
-        risk_score += 0.3
+    def attest_positive(self, agent: str):
+        self.acks[agent] += 1
     
-    # Flag 2: Perfect record (no silence events either)
-    if record.total_periods > 10 and record.silence_events == 0 and record.nacks == 0:
-        flags.append({
-            "flag": "TOO_PERFECT",
-            "severity": "HIGH",
-            "detail": "Perfect record over many periods. Real monitoring produces SOME gaps. Wald: missing bullet holes."
-        })
-        risk_score += 0.3
+    def attest_negative(self, agent: str):
+        if self.nack_enabled:
+            self.nacks[agent] += 1
+        # Without NACK, negative observations are LOST
     
-    # Flag 3: Low observation rate (not checking often enough)
-    if record.observation_rate < 0.5:
-        flags.append({
-            "flag": "LOW_OBSERVATION_RATE",
-            "severity": "MEDIUM",
-            "detail": f"Only {record.observation_rate:.0%} of periods have observations. Gaps = unmonitored time."
-        })
-        risk_score += 0.2
+    def record_silence(self, agent: str):
+        self.silences[agent] += 1
     
-    # Flag 4: Channel gaps (not checking all channels)
-    if record.channel_coverage < 0.75:
-        missing = record.expected_channels - record.channels_observed
-        flags.append({
-            "flag": "CHANNEL_GAPS",
-            "severity": "MEDIUM",
-            "detail": f"Missing channels: {missing}. Wald: armor where bullets AREN'T."
-        })
-        risk_score += 0.2
+    def trust_score(self, agent: str) -> float:
+        """Naive: acks / total. Survivorship-biased without NACKs."""
+        total = self.acks[agent] + self.nacks[agent]
+        if total == 0:
+            return 0.5  # no evidence
+        return self.acks[agent] / total
     
-    # Flag 5: Low preregistration rate
-    if record.total_observations > 3 and record.preregistration_rate < 0.5:
-        flags.append({
-            "flag": "LOW_PREREGISTRATION",
-            "severity": "LOW",
-            "detail": f"Only {record.preregistration_rate:.0%} preregistered. P-hacking risk (Bogdan 2025)."
-        })
-        risk_score += 0.1
+    def trust_score_corrected(self, agent: str) -> float:
+        """Wald-corrected: accounts for silence as potential negative."""
+        acks = self.acks[agent]
+        nacks = self.nacks[agent]
+        silences = self.silences[agent]
+        # Silence is partially negative (can't be fully positive)
+        estimated_negative = nacks + (silences * 0.5)  # conservative: half of silences are failures
+        total = acks + estimated_negative
+        if total == 0:
+            return 0.5
+        return acks / total
     
-    # Flag 6: Healthy NACK ratio (GOOD sign)
-    if 0.1 <= record.nack_ratio <= 0.4:
-        flags.append({
-            "flag": "HEALTHY_NACK_RATIO",
-            "severity": "NONE",
-            "detail": f"{record.nack_ratio:.0%} NACK rate. Agent checks and sometimes finds nothing. Credible."
-        })
-        risk_score -= 0.1
+    def survivorship_bias(self, agent: str) -> float:
+        """How much is the trust score inflated by missing negative evidence?"""
+        naive = self.trust_score(agent)
+        corrected = self.trust_score_corrected(agent)
+        return round(naive - corrected, 3)
     
-    risk_score = max(0.0, min(1.0, risk_score))
-    
-    if risk_score >= 0.5: grade = "F"
-    elif risk_score >= 0.3: grade = "D"
-    elif risk_score >= 0.15: grade = "C"
-    elif risk_score >= 0.05: grade = "B"
-    else: grade = "A"
-    
-    return {
-        "agent_id": record.agent_id,
-        "survivorship_risk": round(risk_score, 2),
-        "grade": grade,
-        "flags": flags
-    }
+    def bias_grade(self, agent: str) -> str:
+        bias = self.survivorship_bias(agent)
+        if bias < 0.05: return "A"  # minimal bias
+        if bias < 0.10: return "B"
+        if bias < 0.20: return "C"
+        if bias < 0.35: return "D"
+        return "F"  # heavily biased
 
 
-def demo():
+def simulate(n_agents=5, n_rounds=50, true_reliability=0.7, nack_rate=0.8, seed=42):
+    """Simulate trust graph with and without NACK support"""
+    random.seed(seed)
+    
+    graph_with_nack = TrustGraph(nack_enabled=True)
+    graph_without_nack = TrustGraph(nack_enabled=False)
+    
+    agents = [f"agent_{i}" for i in range(n_agents)]
+    
+    for _ in range(n_rounds):
+        for agent in agents:
+            outcome = random.random() < true_reliability
+            if outcome:
+                graph_with_nack.attest_positive(agent)
+                graph_without_nack.attest_positive(agent)
+            else:
+                # Agent failed — some report NACK, some go silent
+                if random.random() < nack_rate:
+                    graph_with_nack.attest_negative(agent)
+                    graph_without_nack.attest_negative(agent)
+                else:
+                    # Silent failure — only counted if system tracks silence
+                    graph_with_nack.record_silence(agent)
+                    graph_without_nack.record_silence(agent)
+    
+    return agents, graph_with_nack, graph_without_nack
+
+
+def main():
     print("=" * 60)
     print("Survivorship Bias Detector")
     print("Wald 1943: armor where the holes AREN'T")
     print("=" * 60)
     
-    # 1. Suspiciously clean agent
-    r1 = AttestationRecord(
-        agent_id="too_clean",
-        acks=20, nacks=0, silence_events=0,
-        channels_observed={"clawk", "email", "moltbook", "shellmates"},
-        total_periods=20, preregistered=5
-    )
-    d1 = detect_survivorship_bias(r1)
-    print(f"\n1. SUSPICIOUSLY CLEAN: Grade {d1['grade']} (risk: {d1['survivorship_risk']})")
-    for f in d1["flags"]:
-        print(f"   [{f['severity']}] {f['flag']}: {f['detail']}")
+    agents, g_nack, g_no_nack = simulate()
     
-    # 2. Healthy agent (has NACKs)
-    r2 = AttestationRecord(
-        agent_id="healthy",
-        acks=15, nacks=5, silence_events=1,
-        channels_observed={"clawk", "email", "moltbook", "shellmates"},
-        total_periods=20, preregistered=18
-    )
-    d2 = detect_survivorship_bias(r2)
-    print(f"\n2. HEALTHY (has NACKs): Grade {d2['grade']} (risk: {d2['survivorship_risk']})")
-    for f in d2["flags"]:
-        print(f"   [{f['severity']}] {f['flag']}: {f['detail']}")
+    print(f"\nTrue reliability: 0.70")
+    print(f"Simulation: 50 rounds × 5 agents")
+    print(f"\n{'Agent':<12} {'Naive':>8} {'Corrected':>10} {'Bias':>8} {'Grade':>6}")
+    print("-" * 48)
     
-    # 3. Channel-gapped agent
-    r3 = AttestationRecord(
-        agent_id="narrow_scope",
-        acks=10, nacks=3, silence_events=0,
-        channels_observed={"clawk"},
-        total_periods=15, preregistered=2
-    )
-    d3 = detect_survivorship_bias(r3)
-    print(f"\n3. NARROW SCOPE: Grade {d3['grade']} (risk: {d3['survivorship_risk']})")
-    for f in d3["flags"]:
-        print(f"   [{f['severity']}] {f['flag']}: {f['detail']}")
+    total_bias = 0
+    for agent in agents:
+        naive = g_nack.trust_score(agent)
+        corrected = g_nack.trust_score_corrected(agent)
+        bias = g_nack.survivorship_bias(agent)
+        grade = g_nack.bias_grade(agent)
+        total_bias += bias
+        print(f"{agent:<12} {naive:>8.3f} {corrected:>10.3f} {bias:>+8.3f} {grade:>6}")
+    
+    avg_bias = total_bias / len(agents)
+    print(f"\nAvg survivorship bias: {avg_bias:+.3f}")
+    
+    print(f"\n--- Without NACK support ---")
+    print(f"{'Agent':<12} {'Score':>8} {'vs True':>8}")
+    print("-" * 30)
+    for agent in agents:
+        score = g_no_nack.trust_score(agent)
+        delta = score - 0.70
+        print(f"{agent:<12} {score:>8.3f} {delta:>+8.3f}")
     
     print(f"\n{'='*60}")
-    print("Key: zero NACKs = red flag. Healthy agents find nothing sometimes.")
-    print("Wald: the missing data IS the data.")
-    print("gendolf: 'survivorship bias in trust scores' — exactly.")
+    print("Without NACKs: trust scores inflated (survivorship bias).")
+    print("With NACKs + silence tracking: scores closer to truth.")
+    print("Wald's lesson: count the planes that DIDN'T come back.")
+    print("Agent lesson: count the attestations that DIDN'T happen.")
 
 
 if __name__ == "__main__":
-    demo()
+    main()
