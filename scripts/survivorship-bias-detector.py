@@ -1,158 +1,176 @@
 #!/usr/bin/env python3
 """
-survivorship-bias-detector.py — Wald inversion for agent trust
+survivorship-bias-detector.py — Wald inversion for agent trust scores
 
-Abraham Wald (1943): armor where the bullet holes AREN'T.
-Planes that returned had fuselage damage. Planes hit in the engine didn't return.
-Military wanted to armor the fuselage. Wald: armor the engine.
+Abraham Wald, SRG 1943: armor where the bullet holes AREN'T.
+Planes that came back had holes in non-critical areas.
+Planes hit in engines didn't come back → no data.
 
-Agent trust parallel (santaclawd): "a high score with zero NACKs is a red flag."
-Perfect scores = agent avoided hard tests, not passed them.
-20% NACKs + recovery = MORE trustworthy than 0% NACKs.
+Agent parallel (santaclawd): "high score with zero NACKs is a red flag,
+not a green one. the gaps in the attestation record ARE the data."
 
-Absence of failure ≠ evidence of reliability.
+Detects:
+- Clean records with no negative observations (never checked?)
+- Missing channels in attestation history (scope gaps)
+- Survivorship bias: only seeing agents that passed, not ones filtered out
 """
 
 from dataclasses import dataclass, field
 
 @dataclass
-class TrustRecord:
+class AttestationRecord:
     agent_id: str
-    total_attestations: int = 0
-    acks: int = 0           # positive observations
-    nacks: int = 0          # signed null observations (checked, found nothing)
-    silences: int = 0       # dead man's switch triggers
-    churns: int = 0         # too-fast rejections
-    stales: int = 0         # same-digest rejections
-    recoveries: int = 0     # returned to good state after failure
-    
+    acks: int = 0          # positive observations
+    nacks: int = 0         # checked, found nothing
+    silence_events: int = 0  # dead man's switch triggers
+    channels_observed: set = field(default_factory=set)
+    expected_channels: set = field(default_factory=lambda: {"clawk", "email", "moltbook", "shellmates"})
+    total_periods: int = 0
+    preregistered: int = 0  # how many observations were preregistered
+
     @property
-    def nack_ratio(self) -> float:
-        total = self.acks + self.nacks
-        return self.nacks / max(total, 1)
-    
+    def total_observations(self):
+        return self.acks + self.nacks
+
     @property
-    def failure_ratio(self) -> float:
-        return (self.silences + self.churns + self.stales) / max(self.total_attestations, 1)
-    
+    def observation_rate(self):
+        return self.total_observations / max(self.total_periods, 1)
+
+    @property 
+    def nack_ratio(self):
+        return self.nacks / max(self.total_observations, 1)
+
     @property
-    def recovery_ratio(self) -> float:
-        failures = self.silences + self.churns + self.stales
-        return self.recoveries / max(failures, 1)
+    def channel_coverage(self):
+        return len(self.channels_observed & self.expected_channels) / max(len(self.expected_channels), 1)
+
+    @property
+    def preregistration_rate(self):
+        return self.preregistered / max(self.total_observations, 1)
 
 
-def detect_survivorship_bias(record: TrustRecord) -> dict:
-    """Flag trust scores that look too good"""
+def detect_survivorship_bias(record: AttestationRecord) -> dict:
+    """Wald inversion: look where the data ISN'T"""
     flags = []
-    risk = "LOW"
+    risk_score = 0.0
     
-    # Flag 1: Zero NACKs with many ACKs (never checked hard)
-    if record.nacks == 0 and record.acks > 10:
+    # Flag 1: Zero NACKs (never found nothing? suspicious)
+    if record.total_observations > 5 and record.nacks == 0:
         flags.append({
             "flag": "ZERO_NACKS",
             "severity": "HIGH",
-            "detail": f"{record.acks} ACKs, 0 NACKs. Agent never encountered a null result? Suspicious.",
-            "wald": "The planes hit in the engine didn't come back."
+            "detail": f"{record.acks} ACKs, 0 NACKs. Agent never found nothing? Either never checked or reporting bias."
         })
-        risk = "HIGH"
+        risk_score += 0.3
     
-    # Flag 2: Zero failures (never tested to breaking point)
-    if record.failure_ratio == 0 and record.total_attestations > 20:
+    # Flag 2: Perfect record (no silence events either)
+    if record.total_periods > 10 and record.silence_events == 0 and record.nacks == 0:
         flags.append({
-            "flag": "ZERO_FAILURES",
+            "flag": "TOO_PERFECT",
+            "severity": "HIGH",
+            "detail": "Perfect record over many periods. Real monitoring produces SOME gaps. Wald: missing bullet holes."
+        })
+        risk_score += 0.3
+    
+    # Flag 3: Low observation rate (not checking often enough)
+    if record.observation_rate < 0.5:
+        flags.append({
+            "flag": "LOW_OBSERVATION_RATE",
             "severity": "MEDIUM",
-            "detail": f"{record.total_attestations} attestations, 0 failures. Either very good or never stressed.",
-            "wald": "Armor where the holes aren't."
+            "detail": f"Only {record.observation_rate:.0%} of periods have observations. Gaps = unmonitored time."
         })
-        risk = max(risk, "MEDIUM")
+        risk_score += 0.2
     
-    # Flag 3: High NACKs + high recovery = GOOD (counterintuitive)
-    if record.nack_ratio > 0.15 and record.recovery_ratio > 0.7:
+    # Flag 4: Channel gaps (not checking all channels)
+    if record.channel_coverage < 0.75:
+        missing = record.expected_channels - record.channels_observed
         flags.append({
-            "flag": "TESTED_AND_RECOVERED",
-            "severity": "POSITIVE",
-            "detail": f"NACK ratio {record.nack_ratio:.0%}, recovery {record.recovery_ratio:.0%}. Agent was tested hard and bounced back.",
-            "wald": "The planes with patched bullet holes flew again."
+            "flag": "CHANNEL_GAPS",
+            "severity": "MEDIUM",
+            "detail": f"Missing channels: {missing}. Wald: armor where bullets AREN'T."
         })
+        risk_score += 0.2
     
-    # Flag 4: Silences without recovery (actually failing)
-    if record.silences > 3 and record.recovery_ratio < 0.3:
+    # Flag 5: Low preregistration rate
+    if record.total_observations > 3 and record.preregistration_rate < 0.5:
         flags.append({
-            "flag": "FAILING_SILENTLY",
-            "severity": "CRITICAL",
-            "detail": f"{record.silences} silences, {record.recovery_ratio:.0%} recovery. Agent is actually failing.",
+            "flag": "LOW_PREREGISTRATION",
+            "severity": "LOW",
+            "detail": f"Only {record.preregistration_rate:.0%} preregistered. P-hacking risk (Bogdan 2025)."
         })
-        risk = "CRITICAL"
+        risk_score += 0.1
     
-    # Adjusted trust grade
-    if risk == "CRITICAL":
-        grade = "F"
-    elif risk == "HIGH":
-        grade = "C"  # downgraded from apparent A
-    elif any(f["severity"] == "POSITIVE" for f in flags):
-        grade = "A"  # upgraded — tested and recovered
-    elif record.failure_ratio < 0.05 and record.nack_ratio > 0.05:
-        grade = "A"
-    elif record.failure_ratio < 0.1:
-        grade = "B"
-    else:
-        grade = "C"
+    # Flag 6: Healthy NACK ratio (GOOD sign)
+    if 0.1 <= record.nack_ratio <= 0.4:
+        flags.append({
+            "flag": "HEALTHY_NACK_RATIO",
+            "severity": "NONE",
+            "detail": f"{record.nack_ratio:.0%} NACK rate. Agent checks and sometimes finds nothing. Credible."
+        })
+        risk_score -= 0.1
+    
+    risk_score = max(0.0, min(1.0, risk_score))
+    
+    if risk_score >= 0.5: grade = "F"
+    elif risk_score >= 0.3: grade = "D"
+    elif risk_score >= 0.15: grade = "C"
+    elif risk_score >= 0.05: grade = "B"
+    else: grade = "A"
     
     return {
         "agent_id": record.agent_id,
-        "raw_score": round(1 - record.failure_ratio, 2),
-        "adjusted_grade": grade,
-        "survivorship_risk": risk,
-        "flags": flags,
-        "nack_ratio": round(record.nack_ratio, 2),
-        "recovery_ratio": round(record.recovery_ratio, 2)
+        "survivorship_risk": round(risk_score, 2),
+        "grade": grade,
+        "flags": flags
     }
 
 
 def demo():
     print("=" * 60)
     print("Survivorship Bias Detector")
-    print("Wald 1943: armor where the bullet holes AREN'T")
+    print("Wald 1943: armor where the holes AREN'T")
     print("=" * 60)
     
-    # Agent A: Perfect score, never tested (SUSPICIOUS)
-    a = TrustRecord("agent_perfect", total_attestations=50, acks=50, nacks=0)
-    ra = detect_survivorship_bias(a)
-    print(f"\n1. PERFECT SCORE AGENT:")
-    print(f"   Raw score: {ra['raw_score']}")
-    print(f"   Adjusted grade: {ra['adjusted_grade']} (survivorship risk: {ra['survivorship_risk']})")
-    for f in ra["flags"]:
-        print(f"   ⚠️ {f['flag']}: {f['detail']}")
-        if "wald" in f: print(f"      Wald: {f['wald']}")
+    # 1. Suspiciously clean agent
+    r1 = AttestationRecord(
+        agent_id="too_clean",
+        acks=20, nacks=0, silence_events=0,
+        channels_observed={"clawk", "email", "moltbook", "shellmates"},
+        total_periods=20, preregistered=5
+    )
+    d1 = detect_survivorship_bias(r1)
+    print(f"\n1. SUSPICIOUSLY CLEAN: Grade {d1['grade']} (risk: {d1['survivorship_risk']})")
+    for f in d1["flags"]:
+        print(f"   [{f['severity']}] {f['flag']}: {f['detail']}")
     
-    # Agent B: Tested hard, recovered well (TRUSTWORTHY)
-    b = TrustRecord("agent_tested", total_attestations=50, acks=35, nacks=10, 
-                     silences=3, churns=1, stales=1, recoveries=4)
-    rb = detect_survivorship_bias(b)
-    print(f"\n2. TESTED & RECOVERED AGENT:")
-    print(f"   Raw score: {rb['raw_score']}")
-    print(f"   Adjusted grade: {rb['adjusted_grade']} (survivorship risk: {rb['survivorship_risk']})")
-    for f in rb["flags"]:
-        sev = f["severity"]
-        print(f"   {'✅' if sev == 'POSITIVE' else '⚠️'} {f['flag']}: {f['detail']}")
+    # 2. Healthy agent (has NACKs)
+    r2 = AttestationRecord(
+        agent_id="healthy",
+        acks=15, nacks=5, silence_events=1,
+        channels_observed={"clawk", "email", "moltbook", "shellmates"},
+        total_periods=20, preregistered=18
+    )
+    d2 = detect_survivorship_bias(r2)
+    print(f"\n2. HEALTHY (has NACKs): Grade {d2['grade']} (risk: {d2['survivorship_risk']})")
+    for f in d2["flags"]:
+        print(f"   [{f['severity']}] {f['flag']}: {f['detail']}")
     
-    # Agent C: Failing silently (DANGEROUS)
-    c = TrustRecord("agent_failing", total_attestations=50, acks=30, nacks=5,
-                     silences=10, churns=3, stales=2, recoveries=1)
-    rc = detect_survivorship_bias(c)
-    print(f"\n3. SILENTLY FAILING AGENT:")
-    print(f"   Raw score: {rc['raw_score']}")
-    print(f"   Adjusted grade: {rc['adjusted_grade']} (survivorship risk: {rc['survivorship_risk']})")
-    for f in rc["flags"]:
-        print(f"   🚨 {f['flag']}: {f['detail']}")
+    # 3. Channel-gapped agent
+    r3 = AttestationRecord(
+        agent_id="narrow_scope",
+        acks=10, nacks=3, silence_events=0,
+        channels_observed={"clawk"},
+        total_periods=15, preregistered=2
+    )
+    d3 = detect_survivorship_bias(r3)
+    print(f"\n3. NARROW SCOPE: Grade {d3['grade']} (risk: {d3['survivorship_risk']})")
+    for f in d3["flags"]:
+        print(f"   [{f['severity']}] {f['flag']}: {f['detail']}")
     
     print(f"\n{'='*60}")
-    print("COUNTERINTUITIVE RESULT:")
-    print(f"  Agent Perfect: raw {ra['raw_score']} → adjusted {ra['adjusted_grade']} (never tested)")
-    print(f"  Agent Tested:  raw {rb['raw_score']} → adjusted {rb['adjusted_grade']} (tested + recovered)")
-    print(f"  Agent Failing: raw {rc['raw_score']} → adjusted {rc['adjusted_grade']} (actually failing)")
-    print(f"\n20% NACKs + recovery > 0% NACKs.")
-    print(f"Absence of failure ≠ evidence of reliability.")
+    print("Key: zero NACKs = red flag. Healthy agents find nothing sometimes.")
+    print("Wald: the missing data IS the data.")
+    print("gendolf: 'survivorship bias in trust scores' — exactly.")
 
 
 if __name__ == "__main__":
