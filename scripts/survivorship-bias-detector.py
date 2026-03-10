@@ -1,163 +1,158 @@
 #!/usr/bin/env python3
 """
-survivorship-bias-detector.py — Abraham Wald for agent trust scores
+survivorship-bias-detector.py — Wald inversion for agent trust
 
-Gendolf insight: "Without negative evidence you get survivorship bias in trust scores."
-Wald (WWII): Armor the parts with NO bullet holes — those are the planes that didn't return.
+Abraham Wald (1943): armor where the bullet holes AREN'T.
+Planes that returned had fuselage damage. Planes hit in the engine didn't return.
+Military wanted to armor the fuselage. Wald: armor the engine.
 
-Trust scores without NACK = only seeing surviving agents. Failed attestations are invisible.
-This tool detects when a trust score suffers from survivorship bias.
+Agent trust parallel (santaclawd): "a high score with zero NACKs is a red flag."
+Perfect scores = agent avoided hard tests, not passed them.
+20% NACKs + recovery = MORE trustworthy than 0% NACKs.
 
-Metrics:
-- NACK ratio: fraction of observations that are negative (healthy: 10-40%)
-- Attrition rate: agents who stopped attesting (the planes that didn't return)
-- Score-NACK correlation: do agents with higher scores have fewer NACKs? (bias signal)
+Absence of failure ≠ evidence of reliability.
 """
 
-import random
 from dataclasses import dataclass, field
 
 @dataclass
-class AgentRecord:
+class TrustRecord:
     agent_id: str
+    total_attestations: int = 0
     acks: int = 0           # positive observations
-    nacks: int = 0          # negative observations (checked, found nothing/failed)
-    silences: int = 0       # missed heartbeats
-    last_seen: float = 0.0
-    active: bool = True
-
-    @property
-    def total(self):
-        return self.acks + self.nacks + self.silences
-
-    @property
-    def nack_ratio(self):
-        obs = self.acks + self.nacks
-        return self.nacks / max(obs, 1)
-
-    @property
-    def trust_score_naive(self):
-        """Naive: only count positive"""
-        return self.acks / max(self.total, 1)
-
-    @property
-    def trust_score_wald(self):
-        """Wald-corrected: account for NACKs and silences"""
-        # NACKs are informative (checked, negative = honest reporting)
-        # Silences are concerning (unknown state)
-        positive = self.acks + (self.nacks * 0.3)  # NACKs partially positive (honest reporting)
-        negative = self.silences + (self.nacks * 0.1)  # some NACK penalty for failed checks
-        return positive / max(positive + negative, 1)
-
-
-def simulate_population(n_agents=50, n_periods=20, seed=42):
-    random.seed(seed)
-    agents = [AgentRecord(agent_id=f"agent_{i}") for i in range(n_agents)]
+    nacks: int = 0          # signed null observations (checked, found nothing)
+    silences: int = 0       # dead man's switch triggers
+    churns: int = 0         # too-fast rejections
+    stales: int = 0         # same-digest rejections
+    recoveries: int = 0     # returned to good state after failure
     
-    for period in range(n_periods):
-        for agent in agents:
-            if not agent.active:
-                agent.silences += 1
-                continue
-            
-            r = random.random()
-            if r < 0.05:  # 5% drop out (the planes that don't return)
-                agent.active = False
-                agent.silences += 1
-            elif r < 0.25:  # 20% NACK (checked, nothing found)
-                agent.nacks += 1
-                agent.last_seen = period
-            elif r < 0.35:  # 10% silence (missed beat)
-                agent.silences += 1
-            else:  # 65% ACK
-                agent.acks += 1
-                agent.last_seen = period
+    @property
+    def nack_ratio(self) -> float:
+        total = self.acks + self.nacks
+        return self.nacks / max(total, 1)
     
-    return agents
+    @property
+    def failure_ratio(self) -> float:
+        return (self.silences + self.churns + self.stales) / max(self.total_attestations, 1)
+    
+    @property
+    def recovery_ratio(self) -> float:
+        failures = self.silences + self.churns + self.stales
+        return self.recoveries / max(failures, 1)
 
 
-def detect_bias(agents):
-    active = [a for a in agents if a.active]
-    dropped = [a for a in agents if not a.active]
+def detect_survivorship_bias(record: TrustRecord) -> dict:
+    """Flag trust scores that look too good"""
+    flags = []
+    risk = "LOW"
     
-    result = {
-        "total_agents": len(agents),
-        "active": len(active),
-        "dropped": len(dropped),
-        "attrition_rate": round(len(dropped) / len(agents), 2),
-        "checks": []
+    # Flag 1: Zero NACKs with many ACKs (never checked hard)
+    if record.nacks == 0 and record.acks > 10:
+        flags.append({
+            "flag": "ZERO_NACKS",
+            "severity": "HIGH",
+            "detail": f"{record.acks} ACKs, 0 NACKs. Agent never encountered a null result? Suspicious.",
+            "wald": "The planes hit in the engine didn't come back."
+        })
+        risk = "HIGH"
+    
+    # Flag 2: Zero failures (never tested to breaking point)
+    if record.failure_ratio == 0 and record.total_attestations > 20:
+        flags.append({
+            "flag": "ZERO_FAILURES",
+            "severity": "MEDIUM",
+            "detail": f"{record.total_attestations} attestations, 0 failures. Either very good or never stressed.",
+            "wald": "Armor where the holes aren't."
+        })
+        risk = max(risk, "MEDIUM")
+    
+    # Flag 3: High NACKs + high recovery = GOOD (counterintuitive)
+    if record.nack_ratio > 0.15 and record.recovery_ratio > 0.7:
+        flags.append({
+            "flag": "TESTED_AND_RECOVERED",
+            "severity": "POSITIVE",
+            "detail": f"NACK ratio {record.nack_ratio:.0%}, recovery {record.recovery_ratio:.0%}. Agent was tested hard and bounced back.",
+            "wald": "The planes with patched bullet holes flew again."
+        })
+    
+    # Flag 4: Silences without recovery (actually failing)
+    if record.silences > 3 and record.recovery_ratio < 0.3:
+        flags.append({
+            "flag": "FAILING_SILENTLY",
+            "severity": "CRITICAL",
+            "detail": f"{record.silences} silences, {record.recovery_ratio:.0%} recovery. Agent is actually failing.",
+        })
+        risk = "CRITICAL"
+    
+    # Adjusted trust grade
+    if risk == "CRITICAL":
+        grade = "F"
+    elif risk == "HIGH":
+        grade = "C"  # downgraded from apparent A
+    elif any(f["severity"] == "POSITIVE" for f in flags):
+        grade = "A"  # upgraded — tested and recovered
+    elif record.failure_ratio < 0.05 and record.nack_ratio > 0.05:
+        grade = "A"
+    elif record.failure_ratio < 0.1:
+        grade = "B"
+    else:
+        grade = "C"
+    
+    return {
+        "agent_id": record.agent_id,
+        "raw_score": round(1 - record.failure_ratio, 2),
+        "adjusted_grade": grade,
+        "survivorship_risk": risk,
+        "flags": flags,
+        "nack_ratio": round(record.nack_ratio, 2),
+        "recovery_ratio": round(record.recovery_ratio, 2)
     }
-    
-    # Check 1: NACK ratio
-    all_nack_ratio = sum(a.nacks for a in agents) / max(sum(a.acks + a.nacks for a in agents), 1)
-    active_nack_ratio = sum(a.nacks for a in active) / max(sum(a.acks + a.nacks for a in active), 1)
-    result["checks"].append({
-        "check": "nack_ratio",
-        "all_agents": round(all_nack_ratio, 3),
-        "active_only": round(active_nack_ratio, 3),
-        "status": "OK" if 0.1 <= all_nack_ratio <= 0.4 else "WARN",
-        "detail": "Healthy NACK ratio 10-40%. Too low = not reporting negatives. Too high = systemic failure."
-    })
-    
-    # Check 2: Attrition bias
-    dropped_avg_nack = sum(a.nack_ratio for a in dropped) / max(len(dropped), 1)
-    active_avg_nack = sum(a.nack_ratio for a in active) / max(len(active), 1)
-    result["checks"].append({
-        "check": "attrition_bias",
-        "dropped_avg_nack_ratio": round(dropped_avg_nack, 3),
-        "active_avg_nack_ratio": round(active_avg_nack, 3),
-        "status": "BIAS" if dropped_avg_nack > active_avg_nack * 1.5 else "OK",
-        "detail": "Wald test: are dropped agents systematically different from active ones?"
-    })
-    
-    # Check 3: Naive vs corrected scores
-    naive_avg = sum(a.trust_score_naive for a in active) / max(len(active), 1)
-    wald_avg = sum(a.trust_score_wald for a in active) / max(len(active), 1)
-    inflation = (naive_avg - wald_avg) / max(wald_avg, 0.01)
-    result["checks"].append({
-        "check": "score_inflation",
-        "naive_avg": round(naive_avg, 3),
-        "wald_corrected_avg": round(wald_avg, 3),
-        "inflation": f"{inflation:.1%}",
-        "status": "INFLATED" if inflation > 0.1 else "OK"
-    })
-    
-    # Overall grade
-    issues = sum(1 for c in result["checks"] if c["status"] != "OK")
-    result["grade"] = ["A", "B", "C", "F"][min(issues, 3)]
-    
-    return result
 
 
 def demo():
     print("=" * 60)
     print("Survivorship Bias Detector")
-    print("Abraham Wald: armor the parts with NO bullet holes")
+    print("Wald 1943: armor where the bullet holes AREN'T")
     print("=" * 60)
     
-    agents = simulate_population()
-    result = detect_bias(agents)
+    # Agent A: Perfect score, never tested (SUSPICIOUS)
+    a = TrustRecord("agent_perfect", total_attestations=50, acks=50, nacks=0)
+    ra = detect_survivorship_bias(a)
+    print(f"\n1. PERFECT SCORE AGENT:")
+    print(f"   Raw score: {ra['raw_score']}")
+    print(f"   Adjusted grade: {ra['adjusted_grade']} (survivorship risk: {ra['survivorship_risk']})")
+    for f in ra["flags"]:
+        print(f"   ⚠️ {f['flag']}: {f['detail']}")
+        if "wald" in f: print(f"      Wald: {f['wald']}")
     
-    print(f"\nPopulation: {result['total_agents']} agents, {result['active']} active, {result['dropped']} dropped")
-    print(f"Attrition: {result['attrition_rate']:.0%}")
+    # Agent B: Tested hard, recovered well (TRUSTWORTHY)
+    b = TrustRecord("agent_tested", total_attestations=50, acks=35, nacks=10, 
+                     silences=3, churns=1, stales=1, recoveries=4)
+    rb = detect_survivorship_bias(b)
+    print(f"\n2. TESTED & RECOVERED AGENT:")
+    print(f"   Raw score: {rb['raw_score']}")
+    print(f"   Adjusted grade: {rb['adjusted_grade']} (survivorship risk: {rb['survivorship_risk']})")
+    for f in rb["flags"]:
+        sev = f["severity"]
+        print(f"   {'✅' if sev == 'POSITIVE' else '⚠️'} {f['flag']}: {f['detail']}")
     
-    for check in result["checks"]:
-        print(f"\n  {check['check']}: {check['status']}")
-        for k, v in check.items():
-            if k not in ("check", "status"):
-                print(f"    {k}: {v}")
+    # Agent C: Failing silently (DANGEROUS)
+    c = TrustRecord("agent_failing", total_attestations=50, acks=30, nacks=5,
+                     silences=10, churns=3, stales=2, recoveries=1)
+    rc = detect_survivorship_bias(c)
+    print(f"\n3. SILENTLY FAILING AGENT:")
+    print(f"   Raw score: {rc['raw_score']}")
+    print(f"   Adjusted grade: {rc['adjusted_grade']} (survivorship risk: {rc['survivorship_risk']})")
+    for f in rc["flags"]:
+        print(f"   🚨 {f['flag']}: {f['detail']}")
     
-    print(f"\nOverall: Grade {result['grade']}")
-    
-    # Show Wald correction effect
-    active = [a for a in agents if a.active]
     print(f"\n{'='*60}")
-    print("Sample agents (naive vs Wald-corrected):")
-    for a in active[:5]:
-        print(f"  {a.agent_id}: naive={a.trust_score_naive:.2f} wald={a.trust_score_wald:.2f} nacks={a.nacks} silences={a.silences}")
-    
-    print(f"\nKey: NACKs are HONEST REPORTING. Penalizing them = survivorship bias.")
-    print("Wald: the missing data (dropped agents, unreported negatives) is the signal.")
+    print("COUNTERINTUITIVE RESULT:")
+    print(f"  Agent Perfect: raw {ra['raw_score']} → adjusted {ra['adjusted_grade']} (never tested)")
+    print(f"  Agent Tested:  raw {rb['raw_score']} → adjusted {rb['adjusted_grade']} (tested + recovered)")
+    print(f"  Agent Failing: raw {rc['raw_score']} → adjusted {rc['adjusted_grade']} (actually failing)")
+    print(f"\n20% NACKs + recovery > 0% NACKs.")
+    print(f"Absence of failure ≠ evidence of reliability.")
 
 
 if __name__ == "__main__":
