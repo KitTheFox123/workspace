@@ -1,185 +1,200 @@
 #!/usr/bin/env python3
 """
-dead-mans-switch.py — Absence-triggered safety for agent monitoring
+dead-mans-switch.py — Absence-triggered alarm for agent monitoring
 
-Engineering parallel: train operator must hold lever or brakes engage.
-Agent parallel: heartbeat silence triggers quarantine, not anomaly detection.
+Dead man's switch pattern: silence = alarm. Miss the heartbeat → alert fires.
+Railway DMS (1800s): release grip → emergency brake.
+Software watchdog timers: kernel panics if not petted.
 
-Key insight: monitors that detect PRESENCE of bad signals miss the
-ABSENCE of good ones. Dead man's switch inverts the default:
-silence = failure, not silence = OK.
+Combines with vigilance-decrement-sim.py: rotation ensures someone's always
+fresh enough to pet the watchdog.
 
-Combines:
-- Dead man's switch (1800s railway engineering)
-- Φ accrual failure detector (Hayashibara 2004)
-- Sharpe & Tyndall 2025: vigilance decrement makes continuous monitoring impossible
+Key insight (santaclawd): "absence triggers the alarm instead of presence.
+turns omission from a hiding spot into a liability."
 """
 
 import time
-import math
+import json
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timedelta
 
 @dataclass
 class Channel:
     name: str
     expected_interval_s: float  # expected heartbeat interval
-    timestamps: list = field(default_factory=list)
-    phi_threshold: float = 8.0  # Φ accrual threshold
+    last_seen: float = 0.0      # timestamp of last activity
+    miss_count: int = 0
+    total_beats: int = 0
+    alarm_fired: bool = False
 
-    def heartbeat(self, t: float):
-        self.timestamps.append(t)
-        if len(self.timestamps) > 100:
-            self.timestamps = self.timestamps[-100:]
+    def pet(self, now: float):
+        """Agent reports liveness"""
+        self.last_seen = now
+        self.total_beats += 1
+        self.miss_count = 0
+        self.alarm_fired = False
 
-    def phi_accrual(self, now: float) -> float:
-        """Hayashibara 2004 Φ accrual failure detector"""
-        if len(self.timestamps) < 2:
-            return 0.0
-        intervals = [self.timestamps[i+1] - self.timestamps[i] 
-                     for i in range(len(self.timestamps)-1)]
-        mean = sum(intervals) / len(intervals)
-        variance = sum((x - mean)**2 for x in intervals) / len(intervals)
-        std = math.sqrt(variance) if variance > 0 else 0.1
-        
-        last = self.timestamps[-1]
-        elapsed = now - last
-        
-        # Φ = -log10(P(elapsed | normal))
-        # Using normal approximation
-        z = (elapsed - mean) / std if std > 0 else 0
-        if z <= 0:
-            return 0.0
-        # Approximate -log10(1 - Φ(z))
-        phi = z * z / 2 * math.log10(math.e)
-        return min(phi, 100.0)
+    def check(self, now: float) -> dict:
+        """External verifier checks liveness"""
+        elapsed = now - self.last_seen if self.last_seen > 0 else 0
+        overdue = elapsed > self.expected_interval_s
 
-    def is_alive(self, now: float) -> bool:
-        return self.phi_accrual(now) < self.phi_threshold
+        if overdue:
+            self.miss_count += 1
+            severity = self._severity()
+            if not self.alarm_fired and self.miss_count >= 2:
+                self.alarm_fired = True
+                return {
+                    "channel": self.name,
+                    "status": "ALARM",
+                    "severity": severity,
+                    "elapsed_s": round(elapsed, 1),
+                    "expected_s": self.expected_interval_s,
+                    "miss_count": self.miss_count,
+                    "action": self._action(severity)
+                }
+            return {
+                "channel": self.name,
+                "status": "OVERDUE",
+                "severity": severity,
+                "elapsed_s": round(elapsed, 1),
+                "miss_count": self.miss_count
+            }
+        return {
+            "channel": self.name,
+            "status": "OK",
+            "elapsed_s": round(elapsed, 1)
+        }
 
-    def silence_duration(self, now: float) -> float:
-        if not self.timestamps:
-            return float('inf')
-        return now - self.timestamps[-1]
+    def _severity(self) -> str:
+        ratio = self.miss_count
+        if ratio >= 5: return "CRITICAL"
+        if ratio >= 3: return "HIGH"
+        if ratio >= 2: return "MEDIUM"
+        return "LOW"
+
+    def _action(self, severity: str) -> str:
+        actions = {
+            "LOW": "log_warning",
+            "MEDIUM": "notify_operator",
+            "HIGH": "quarantine_agent",
+            "CRITICAL": "revoke_scope"
+        }
+        return actions.get(severity, "log_warning")
 
 
-@dataclass 
+@dataclass
 class DeadMansSwitch:
     channels: list = field(default_factory=list)
-    quarantine_threshold: int = 2  # channels silent before quarantine
-    
-    def add_channel(self, name: str, interval: float):
-        self.channels.append(Channel(name=name, expected_interval_s=interval))
-    
-    def status(self, now: float) -> dict:
-        alive = []
-        dead = []
+
+    def add_channel(self, name: str, interval_s: float):
+        self.channels.append(Channel(name=name, expected_interval_s=interval_s))
+
+    def check_all(self, now: float) -> list:
+        return [ch.check(now) for ch in self.channels]
+
+    def pet(self, channel_name: str, now: float):
         for ch in self.channels:
-            phi = ch.phi_accrual(now)
-            if ch.is_alive(now):
-                alive.append(ch.name)
-            else:
-                dead.append((ch.name, phi, ch.silence_duration(now)))
-        
-        quarantined = len(dead) >= self.quarantine_threshold
-        
-        return {
-            "alive": alive,
-            "dead": [(n, f"Φ={p:.1f}", f"silent {d:.0f}s") for n, p, d in dead],
-            "quarantined": quarantined,
-            "grade": self._grade(len(dead), len(self.channels))
-        }
-    
-    def _grade(self, dead_count, total):
-        ratio = dead_count / max(total, 1)
-        if ratio == 0: return "A"
-        if ratio < 0.25: return "B"
-        if ratio < 0.5: return "C"
-        if ratio < 0.75: return "D"
+            if ch.name == channel_name:
+                ch.pet(now)
+                return True
+        return False
+
+    def grade(self) -> str:
+        alarms = sum(1 for ch in self.channels if ch.alarm_fired)
+        overdue = sum(1 for ch in self.channels if ch.miss_count > 0)
+        total = len(self.channels)
+        if alarms == 0 and overdue == 0: return "A"
+        if alarms == 0: return "B"
+        if alarms <= total * 0.3: return "C"
+        if alarms <= total * 0.6: return "D"
         return "F"
 
 
 def demo():
     print("=" * 60)
-    print("Dead Man's Switch — Absence-Triggered Agent Safety")
+    print("Dead Man's Switch Monitor")
+    print("Absence = alarm. Silence = signal.")
     print("=" * 60)
-    
-    dms = DeadMansSwitch(quarantine_threshold=2)
-    dms.add_channel("heartbeat", interval=30.0)
-    dms.add_channel("clawk", interval=60.0)
-    dms.add_channel("email", interval=300.0)
-    dms.add_channel("moltbook", interval=600.0)
-    
-    # Scenario 1: All channels active
-    print("\n--- Scenario 1: All channels active ---")
-    now = 1000.0
-    for ch in dms.channels:
-        for t in range(0, 1000, int(ch.expected_interval_s)):
-            ch.heartbeat(float(t))
-    status = dms.status(now)
-    print(f"Alive: {status['alive']}")
-    print(f"Dead: {status['dead']}")
-    print(f"Quarantined: {status['quarantined']}")
-    print(f"Grade: {status['grade']}")
-    
-    # Scenario 2: Agent stops posting (clawk + moltbook silent)
-    print("\n--- Scenario 2: Scope contraction (social channels silent) ---")
-    dms2 = DeadMansSwitch(quarantine_threshold=2)
-    dms2.add_channel("heartbeat", interval=30.0)
-    dms2.add_channel("clawk", interval=60.0)
-    dms2.add_channel("email", interval=300.0)
-    dms2.add_channel("moltbook", interval=600.0)
-    
-    now2 = 2000.0
-    # heartbeat + email active
-    for ch in dms2.channels:
-        if ch.name in ("heartbeat", "email"):
-            for t in range(0, 2000, int(ch.expected_interval_s)):
-                ch.heartbeat(float(t))
-        else:
-            # stopped posting 500s ago
-            for t in range(0, 1500, int(ch.expected_interval_s)):
-                ch.heartbeat(float(t))
-    
-    status2 = dms2.status(now2)
-    print(f"Alive: {status2['alive']}")
-    print(f"Dead: {status2['dead']}")
-    print(f"Quarantined: {status2['quarantined']}")
-    print(f"Grade: {status2['grade']}")
-    
-    # Scenario 3: Ghost agent (only heartbeat, everything else dead)
-    print("\n--- Scenario 3: Ghost agent (heartbeat only) ---")
-    dms3 = DeadMansSwitch(quarantine_threshold=2)
-    dms3.add_channel("heartbeat", interval=30.0)
-    dms3.add_channel("clawk", interval=60.0)
-    dms3.add_channel("email", interval=300.0)
-    dms3.add_channel("moltbook", interval=600.0)
-    
-    now3 = 3000.0
-    for ch in dms3.channels:
-        if ch.name == "heartbeat":
-            for t in range(0, 3000, int(ch.expected_interval_s)):
-                ch.heartbeat(float(t))
-        else:
-            # dead for 1000s+
-            for t in range(0, 1000, int(ch.expected_interval_s)):
-                ch.heartbeat(float(t))
-    
-    status3 = dms3.status(now3)
-    print(f"Alive: {status3['alive']}")
-    print(f"Dead: {status3['dead']}")
-    print(f"Quarantined: {status3['quarantined']}")
-    print(f"Grade: {status3['grade']}")
-    
-    # Summary
+
+    dms = DeadMansSwitch()
+    dms.add_channel("heartbeat", interval_s=1200)    # 20 min
+    dms.add_channel("clawk", interval_s=3600)         # 1 hour
+    dms.add_channel("email", interval_s=14400)         # 4 hours
+    dms.add_channel("moltbook", interval_s=7200)       # 2 hours
+    dms.add_channel("shellmates", interval_s=14400)    # 4 hours
+
+    t = 0.0
+
+    # Scenario 1: healthy agent
+    print("\n--- Scenario 1: Healthy Agent ---")
+    for ch_name in ["heartbeat", "clawk", "email", "moltbook", "shellmates"]:
+        dms.pet(ch_name, t)
+    t += 600  # 10 min later
+    results = dms.check_all(t)
+    for r in results:
+        print(f"  {r['channel']}: {r['status']}")
+    print(f"  Grade: {dms.grade()}")
+
+    # Scenario 2: agent stops posting to moltbook + shellmates
+    print("\n--- Scenario 2: Partial Silence (scope contraction) ---")
+    dms2 = DeadMansSwitch()
+    dms2.add_channel("heartbeat", interval_s=1200)
+    dms2.add_channel("clawk", interval_s=3600)
+    dms2.add_channel("email", interval_s=14400)
+    dms2.add_channel("moltbook", interval_s=7200)
+    dms2.add_channel("shellmates", interval_s=14400)
+
+    t2 = 0.0
+    for ch_name in ["heartbeat", "clawk", "email", "moltbook", "shellmates"]:
+        dms2.pet(ch_name, t2)
+
+    # Only heartbeat + clawk stay active
+    for cycle in range(5):
+        t2 += 1800
+        dms2.pet("heartbeat", t2)
+        dms2.pet("clawk", t2)
+
+    results2 = dms2.check_all(t2)
+    for r in results2:
+        status = f"{r['status']}"
+        if 'severity' in r:
+            status += f" ({r['severity']})"
+        if 'action' in r:
+            status += f" → {r['action']}"
+        print(f"  {r['channel']}: {status}")
+    print(f"  Grade: {dms2.grade()}")
+
+    # Scenario 3: total silence
+    print("\n--- Scenario 3: Total Silence (agent down) ---")
+    dms3 = DeadMansSwitch()
+    dms3.add_channel("heartbeat", interval_s=1200)
+    dms3.add_channel("clawk", interval_s=3600)
+    dms3.add_channel("email", interval_s=14400)
+
+    t3 = 0.0
+    for ch_name in ["heartbeat", "clawk", "email"]:
+        dms3.pet(ch_name, t3)
+
+    t3 += 7200  # 2 hours of silence
+    for _ in range(3):
+        t3 += 1200
+        dms3.check_all(t3)  # accumulate misses
+
+    results3 = dms3.check_all(t3)
+    for r in results3:
+        status = f"{r['status']}"
+        if 'severity' in r:
+            status += f" ({r['severity']})"
+        if 'action' in r:
+            status += f" → {r['action']}"
+        print(f"  {r['channel']}: {status}")
+    print(f"  Grade: {dms3.grade()}")
+
     print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"  All active:        Grade {status['grade']} — {'quarantined' if status['quarantined'] else 'clear'}")
-    print(f"  Scope contraction: Grade {status2['grade']} — {'QUARANTINED' if status2['quarantined'] else 'clear'}")
-    print(f"  Ghost agent:       Grade {status3['grade']} — {'QUARANTINED' if status3['quarantined'] else 'clear'}")
-    print(f"\nDead man's switch: silence triggers, not anomaly.")
-    print(f"Presence of bad signals = easy. Absence of good signals = hard.")
-    print(f"Railway engineers solved this in the 1800s.")
+    print("Key: absence triggers alarm. silence IS signal.")
+    print("Railway DMS (1800s) → software watchdog → agent heartbeat.")
+    print("Externally clocked (RFC 9683) > self-reported.")
 
 
 if __name__ == "__main__":
