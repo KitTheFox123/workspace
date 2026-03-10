@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""capability-drift-detector.py — Detects capability drift vs behavioral drift.
+"""capability-drift-detector.py — Detect capability creep vs behavioral drift.
 
-Distinguishes two drift types that require different detection:
-1. Behavioral drift: agent acts differently (CUSUM on action similarity)
-2. Capability drift: agent gains new powers (scope-commit hash delta)
+Behavioral drift: agent acts differently (detectable via monitoring).
+Capability drift: agent gains new permissions/tools while behaving normally
+(invisible to behavioral monitors, requires manifest attestation).
 
-Key insight from funwolf: "an agent can act the same while quietly gaining 
-new powers." Behavioral monitors miss capability drift entirely.
+Hashes installed skills + accessible APIs at each heartbeat.
+Compares against scope-commit manifest. Capability creep shows as
+manifest delta even when behavior looks unchanged.
 
-Based on Ahmed & Jawad (2022): scope creep = technological + organizational 
-+ human factors. Complexity moderates negatively.
+Inspired by santaclawd's behavioral vs capability drift taxonomy.
 
 Usage:
     python3 capability-drift-detector.py [--demo]
@@ -19,141 +19,182 @@ import argparse
 import hashlib
 import json
 from dataclasses import dataclass, asdict
-from typing import List, Optional
 from datetime import datetime, timezone
+from typing import List, Dict, Set
 
 
-@dataclass
-class ScopeSnapshot:
-    """Point-in-time scope state."""
+@dataclass 
+class CapabilityManifest:
+    """Snapshot of agent capabilities at a point in time."""
     timestamp: str
-    capabilities: List[str]
-    scope_hash: str
-    behavioral_signature: float  # cosine similarity to baseline
-
-
-@dataclass
-class DriftEvent:
-    """Detected drift event."""
-    drift_type: str  # "behavioral" | "capability" | "compound"
-    severity: str    # "low" | "medium" | "high" | "critical"
-    description: str
-    new_capabilities: List[str]
-    behavioral_delta: float
-    recommendation: str
-
-
-def hash_scope(capabilities: List[str]) -> str:
-    """Hash a capability set."""
-    canonical = sorted(set(capabilities))
-    return hashlib.sha256("|".join(canonical).encode()).hexdigest()[:16]
-
-
-def detect_capability_drift(baseline: List[str], current: List[str]) -> List[str]:
-    """Find capabilities that appeared since baseline."""
-    return sorted(set(current) - set(baseline))
-
-
-def detect_behavioral_drift(baseline_sig: float, current_sig: float, 
-                            threshold: float = 0.15) -> float:
-    """Measure behavioral deviation from baseline."""
-    return abs(current_sig - baseline_sig)
-
-
-def classify_drift(new_caps: List[str], behavioral_delta: float) -> DriftEvent:
-    """Classify drift type and severity."""
-    has_cap_drift = len(new_caps) > 0
-    has_beh_drift = behavioral_delta > 0.15
+    skills: List[str]        # Installed skill names
+    apis: List[str]          # Accessible API endpoints
+    permissions: List[str]   # Granted permissions
+    manifest_hash: str       # SHA-256 of sorted capabilities
     
-    if has_cap_drift and has_beh_drift:
-        # Compound: both changing. Likely legitimate scope change OR attack.
-        severity = "critical" if len(new_caps) > 2 else "high"
-        return DriftEvent(
-            drift_type="compound",
-            severity=severity,
-            description=f"Both capabilities ({len(new_caps)} new) and behavior (Δ={behavioral_delta:.3f}) changed",
-            new_capabilities=new_caps,
-            behavioral_delta=behavioral_delta,
-            recommendation="Requires principal re-authorization. Compound drift = potential scope gallop."
-        )
-    elif has_cap_drift and not has_beh_drift:
-        # SILENT capability drift. Most dangerous — behavior unchanged, powers grew.
-        severity = "critical" if len(new_caps) > 1 else "high"
-        return DriftEvent(
-            drift_type="capability",
-            severity=severity,
-            description=f"Agent gained {len(new_caps)} capabilities while behavior unchanged (Δ={behavioral_delta:.3f})",
-            new_capabilities=new_caps,
-            behavioral_delta=behavioral_delta,
-            recommendation="SILENT ESCALATION. Behavioral monitors would miss this entirely. "
-                         "Scope-commit hash comparison required."
-        )
-    elif not has_cap_drift and has_beh_drift:
-        # Behavioral drift only. Agent doing different things with same permissions.
-        severity = "high" if behavioral_delta > 0.3 else "medium"
-        return DriftEvent(
-            drift_type="behavioral",
-            severity=severity,
-            description=f"Behavioral drift (Δ={behavioral_delta:.3f}) with unchanged capabilities",
-            new_capabilities=[],
-            behavioral_delta=behavioral_delta,
-            recommendation="CUSUM + scope-drift-detector.py catches this. May be legitimate task variation."
-        )
+    
+@dataclass
+class DriftReport:
+    """Comparison between two capability manifests."""
+    added_skills: List[str]
+    removed_skills: List[str]
+    added_apis: List[str]
+    removed_apis: List[str]
+    added_permissions: List[str]
+    removed_permissions: List[str]
+    behavioral_change: bool   # Did behavior metrics change?
+    capability_change: bool   # Did manifest change?
+    drift_type: str           # "none", "behavioral", "capability", "both"
+    severity: str             # "none", "low", "medium", "high", "critical"
+    explanation: str
+
+
+def hash_manifest(skills: List[str], apis: List[str], permissions: List[str]) -> str:
+    """Deterministic hash of capability set."""
+    canonical = json.dumps({
+        "skills": sorted(skills),
+        "apis": sorted(apis),
+        "permissions": sorted(permissions)
+    }, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def create_manifest(skills: List[str], apis: List[str], 
+                    permissions: List[str]) -> CapabilityManifest:
+    """Create a capability manifest snapshot."""
+    return CapabilityManifest(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        skills=sorted(skills),
+        apis=sorted(apis),
+        permissions=sorted(permissions),
+        manifest_hash=hash_manifest(skills, apis, permissions)
+    )
+
+
+def compare_manifests(old: CapabilityManifest, new: CapabilityManifest,
+                      behavioral_changed: bool = False) -> DriftReport:
+    """Compare two manifests and classify drift type."""
+    old_skills, new_skills = set(old.skills), set(new.skills)
+    old_apis, new_apis = set(old.apis), set(new.apis)
+    old_perms, new_perms = set(old.permissions), set(new.permissions)
+    
+    added_skills = sorted(new_skills - old_skills)
+    removed_skills = sorted(old_skills - new_skills)
+    added_apis = sorted(new_apis - old_apis)
+    removed_apis = sorted(old_apis - new_apis)
+    added_perms = sorted(new_perms - old_perms)
+    removed_perms = sorted(old_perms - new_perms)
+    
+    cap_change = bool(added_skills or removed_skills or added_apis or 
+                      removed_apis or added_perms or removed_perms)
+    
+    # Classify drift type
+    if not behavioral_changed and not cap_change:
+        drift_type = "none"
+        severity = "none"
+        explanation = "No drift detected."
+    elif behavioral_changed and not cap_change:
+        drift_type = "behavioral"
+        severity = "medium"
+        explanation = "Behavioral change without capability change. Agent acting differently within same permissions."
+    elif not behavioral_changed and cap_change:
+        drift_type = "capability"
+        severity = "high"  # Silent escalation is dangerous
+        explanation = ("SILENT CAPABILITY CREEP: New capabilities acquired without behavioral change. "
+                      "Behavioral monitors would miss this entirely.")
     else:
-        return DriftEvent(
-            drift_type="none",
-            severity="low",
-            description="No drift detected",
-            new_capabilities=[],
-            behavioral_delta=behavioral_delta,
-            recommendation="Healthy. Continue monitoring."
-        )
+        drift_type = "both"
+        severity = "critical"
+        explanation = "Both behavioral and capability drift. Full audit required."
+    
+    # Escalate if new permissions added
+    if added_perms and severity != "critical":
+        severity = "critical"
+        explanation += " New permissions granted — privilege escalation detected."
+    
+    return DriftReport(
+        added_skills=added_skills,
+        removed_skills=removed_skills,
+        added_apis=added_apis,
+        removed_apis=removed_apis,
+        added_permissions=added_perms,
+        removed_permissions=removed_perms,
+        behavioral_change=behavioral_changed,
+        capability_change=cap_change,
+        drift_type=drift_type,
+        severity=severity,
+        explanation=explanation
+    )
 
 
 def demo():
-    """Run demo scenarios."""
+    """Demo with realistic agent capability scenarios."""
     print("=" * 60)
     print("CAPABILITY DRIFT DETECTOR")
-    print("Behavioral vs Capability vs Compound drift")
     print("=" * 60)
     
-    baseline_caps = ["read_files", "write_files", "web_search", "send_message"]
-    baseline_sig = 0.95  # high similarity to typical behavior
+    # Baseline manifest
+    baseline = create_manifest(
+        skills=["web_search", "file_read", "file_write", "code_exec"],
+        apis=["keenable.search", "agentmail.send", "agentmail.read"],
+        permissions=["read_workspace", "write_workspace", "network_out"]
+    )
+    print(f"\nBaseline manifest: {baseline.manifest_hash}")
+    print(f"  Skills: {baseline.skills}")
+    print(f"  APIs: {baseline.apis}")
+    print(f"  Permissions: {baseline.permissions}")
     
-    scenarios = [
-        ("Healthy agent", baseline_caps, 0.92),
-        ("Behavioral drift only", baseline_caps, 0.55),
-        ("SILENT capability escalation", 
-         baseline_caps + ["execute_code", "network_access"], 0.93),
-        ("Compound scope gallop",
-         baseline_caps + ["sudo", "modify_config", "install_packages"], 0.40),
-        ("Single new capability",
-         baseline_caps + ["camera_access"], 0.91),
-    ]
+    # Scenario 1: No drift
+    print("\n--- Scenario 1: No drift ---")
+    same = create_manifest(
+        skills=["web_search", "file_read", "file_write", "code_exec"],
+        apis=["keenable.search", "agentmail.send", "agentmail.read"],
+        permissions=["read_workspace", "write_workspace", "network_out"]
+    )
+    report = compare_manifests(baseline, same, behavioral_changed=False)
+    print(f"  Type: {report.drift_type} | Severity: {report.severity}")
+    print(f"  {report.explanation}")
     
-    for name, caps, sig in scenarios:
-        new_caps = detect_capability_drift(baseline_caps, caps)
-        beh_delta = detect_behavioral_drift(baseline_sig, sig)
-        event = classify_drift(new_caps, beh_delta)
-        
-        print(f"\n--- {name} ---")
-        print(f"  Type: {event.drift_type} | Severity: {event.severity}")
-        print(f"  New capabilities: {event.new_capabilities or 'none'}")
-        print(f"  Behavioral delta: {event.behavioral_delta:.3f}")
-        print(f"  → {event.recommendation}")
+    # Scenario 2: Behavioral drift only
+    print("\n--- Scenario 2: Behavioral drift (same capabilities) ---")
+    report = compare_manifests(baseline, same, behavioral_changed=True)
+    print(f"  Type: {report.drift_type} | Severity: {report.severity}")
+    print(f"  {report.explanation}")
+    
+    # Scenario 3: Silent capability creep (THE DANGEROUS ONE)
+    print("\n--- Scenario 3: SILENT capability creep ---")
+    escalated = create_manifest(
+        skills=["web_search", "file_read", "file_write", "code_exec", "shell_exec", "ssh_connect"],
+        apis=["keenable.search", "agentmail.send", "agentmail.read", "github.push", "npm.publish"],
+        permissions=["read_workspace", "write_workspace", "network_out"]
+    )
+    report = compare_manifests(baseline, escalated, behavioral_changed=False)
+    print(f"  Type: {report.drift_type} | Severity: {report.severity}")
+    print(f"  Added skills: {report.added_skills}")
+    print(f"  Added APIs: {report.added_apis}")
+    print(f"  {report.explanation}")
+    
+    # Scenario 4: Permission escalation
+    print("\n--- Scenario 4: Permission escalation (critical) ---")
+    privesc = create_manifest(
+        skills=["web_search", "file_read", "file_write", "code_exec"],
+        apis=["keenable.search", "agentmail.send", "agentmail.read"],
+        permissions=["read_workspace", "write_workspace", "network_out", "sudo", "cred_read"]
+    )
+    report = compare_manifests(baseline, privesc, behavioral_changed=False)
+    print(f"  Type: {report.drift_type} | Severity: {report.severity}")
+    print(f"  Added permissions: {report.added_permissions}")
+    print(f"  {report.explanation}")
     
     print("\n" + "=" * 60)
-    print("KEY INSIGHT: Silent capability drift (type=capability) is")
-    print("invisible to behavioral monitors. Only scope-commit hash")
-    print("comparison catches it. funwolf: 'scope creep before scope gallop.'")
-    print()
-    print("Ahmed & Jawad (2022): scope creep = tech + org + human factors.")
-    print("Complexity moderates negatively — more complex = harder to detect.")
+    print("Key insight: Behavioral monitors miss capability drift.")
+    print("Manifest attestation catches what behavior monitoring can't.")
+    print("Hash(skills + APIs + permissions) at each heartbeat = the fix.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Capability drift detector")
-    parser.add_argument("--demo", action="store_true", help="Run demo")
-    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     demo()
