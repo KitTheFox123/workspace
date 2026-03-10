@@ -1,213 +1,160 @@
 #!/usr/bin/env python3
 """
-windowed-watchdog.py — Pont & Ong (2002) watchdog patterns for agent monitoring
+windowed-watchdog.py — Windowed Watchdog Timer for Agent Heartbeats
 
-Simple watchdog: pet or die. Problem: stuck tasks can still pet.
-Windowed watchdog: pet must arrive WITHIN time window (not too early, not too late).
-Multi-stage: escalating severity on consecutive misses.
+IEC 61508 safety pattern: pet too early = stuck loop, pet too late = crash.
+Both trigger reset. Window mode catches BOTH failure modes.
 
-Key insight: "too early" is as suspicious as "too late" — 
-an agent petting at clock speed isn't doing work between pets.
+Simple watchdog only catches silence. Windowed watchdog catches:
+1. Silence (late pet → agent crashed or omitting)
+2. Hyperactivity (early pet → stuck loop, gaming the timer)
+
+Key insight: self-reported heartbeat with only a MAX timeout =
+fire alarm with snooze button. Window mode = no snooze.
 """
 
-import random
-from dataclasses import dataclass, field
-from enum import Enum
-
-class WatchdogType(Enum):
-    SIMPLE = "simple"
-    WINDOWED = "windowed"
-    MULTI_STAGE = "multi_stage"
+from dataclasses import dataclass
+import json
 
 @dataclass
-class WatchdogConfig:
-    type: WatchdogType
-    interval: float = 30.0      # expected interval (seconds)
-    window_min: float = 20.0    # earliest acceptable pet (windowed)
-    window_max: float = 40.0    # latest acceptable pet (windowed)
-    stages: list = field(default_factory=lambda: ["warning", "quarantine", "revoke"])
+class WindowedWatchdog:
+    """
+    Windowed watchdog timer.
+    Valid pet window: [min_interval, max_interval]
+    Pet before min = too early (stuck loop / gaming)
+    Pet after max = too late (crash / silence)
+    """
+    min_interval: float  # seconds — earliest valid pet
+    max_interval: float  # seconds — latest valid pet
+    last_pet: float = 0.0
+    early_violations: int = 0
+    late_violations: int = 0
+    valid_pets: int = 0
+    total_checks: int = 0
 
-@dataclass
-class Pet:
-    timestamp: float
-    task_hash: str = ""  # what was the agent doing?
-
-class Watchdog:
-    def __init__(self, config: WatchdogConfig):
-        self.config = config
-        self.last_pet: float = 0.0
-        self.miss_count: int = 0
-        self.early_count: int = 0
-        self.total_checks: int = 0
-        self.alerts: list = []
-
-    def pet(self, pet: Pet) -> dict:
-        elapsed = pet.timestamp - self.last_pet if self.last_pet > 0 else self.config.interval
-
-        if self.config.type == WatchdogType.SIMPLE:
-            if elapsed <= self.config.window_max:
-                self.last_pet = pet.timestamp
-                self.miss_count = 0
-                return {"status": "OK", "elapsed": round(elapsed, 1)}
-            else:
-                self.miss_count += 1
-                return {"status": "MISS", "elapsed": round(elapsed, 1), "miss_count": self.miss_count}
-
-        elif self.config.type == WatchdogType.WINDOWED:
-            if elapsed < self.config.window_min:
-                self.early_count += 1
-                self.last_pet = pet.timestamp
-                return {
-                    "status": "EARLY",
-                    "elapsed": round(elapsed, 1),
-                    "early_count": self.early_count,
-                    "note": "suspiciously fast — agent may be stuck in tight loop"
-                }
-            elif elapsed <= self.config.window_max:
-                self.last_pet = pet.timestamp
-                self.miss_count = 0
-                self.early_count = 0
-                return {"status": "OK", "elapsed": round(elapsed, 1)}
-            else:
-                self.miss_count += 1
-                self.last_pet = pet.timestamp
-                return {"status": "LATE", "elapsed": round(elapsed, 1), "miss_count": self.miss_count}
-
-        elif self.config.type == WatchdogType.MULTI_STAGE:
-            if elapsed < self.config.window_min:
-                self.early_count += 1
-                self.last_pet = pet.timestamp
-                return {"status": "EARLY", "elapsed": round(elapsed, 1)}
-            elif elapsed <= self.config.window_max:
-                self.last_pet = pet.timestamp
-                self.miss_count = 0
-                return {"status": "OK", "elapsed": round(elapsed, 1)}
-            else:
-                self.miss_count += 1
-                stage_idx = min(self.miss_count - 1, len(self.config.stages) - 1)
-                action = self.config.stages[stage_idx]
-                self.last_pet = pet.timestamp
-                return {
-                    "status": "ESCALATE",
-                    "elapsed": round(elapsed, 1),
-                    "miss_count": self.miss_count,
-                    "stage": stage_idx + 1,
-                    "action": action
-                }
-
-    def check_timeout(self, now: float) -> dict:
-        """Check if agent has gone silent (no pet at all)"""
+    def pet(self, now: float) -> dict:
+        """Agent pets the watchdog. Returns status."""
+        elapsed = now - self.last_pet if self.last_pet > 0 else self.min_interval + 1  # first pet is valid
         self.total_checks += 1
-        elapsed = now - self.last_pet if self.last_pet > 0 else 0
-        if elapsed > self.config.window_max:
-            self.miss_count += 1
-            if self.config.type == WatchdogType.MULTI_STAGE:
-                stage_idx = min(self.miss_count - 1, len(self.config.stages) - 1)
-                return {"status": "TIMEOUT", "elapsed": round(elapsed, 1), "action": self.config.stages[stage_idx]}
-            return {"status": "TIMEOUT", "elapsed": round(elapsed, 1), "miss_count": self.miss_count}
-        return {"status": "WAITING", "elapsed": round(elapsed, 1)}
 
-
-def simulate_agent(watchdog_type: WatchdogType, behavior: str, periods: int = 50, seed: int = 42):
-    """Simulate agent behavior against a watchdog"""
-    random.seed(seed)
-    config = WatchdogConfig(
-        type=watchdog_type,
-        interval=30.0,
-        window_min=20.0,
-        window_max=40.0,
-        stages=["warning", "quarantine", "revoke"]
-    )
-    wd = Watchdog(config)
-
-    caught = 0
-    false_ok = 0
-    t = 0.0
-
-    for i in range(periods):
-        if behavior == "healthy":
-            delay = random.gauss(30.0, 3.0)  # normal heartbeat
-        elif behavior == "stuck_loop":
-            delay = random.gauss(5.0, 1.0)   # petting too fast (stuck)
-        elif behavior == "dying":
-            delay = 30.0 + i * 2.0           # getting progressively slower
-        elif behavior == "intermittent":
-            delay = 30.0 if random.random() > 0.3 else random.choice([5.0, 80.0])
+        if elapsed < self.min_interval:
+            self.early_violations += 1
+            result = {
+                "status": "EARLY_VIOLATION",
+                "elapsed": round(elapsed, 1),
+                "window": [self.min_interval, self.max_interval],
+                "diagnosis": "stuck_loop_or_gaming",
+                "severity": "HIGH" if self.early_violations >= 3 else "MEDIUM"
+            }
+        elif elapsed > self.max_interval:
+            self.late_violations += 1
+            result = {
+                "status": "LATE_VIOLATION",
+                "elapsed": round(elapsed, 1),
+                "window": [self.min_interval, self.max_interval],
+                "diagnosis": "crash_or_silence",
+                "severity": "CRITICAL" if self.late_violations >= 2 else "HIGH"
+            }
         else:
-            delay = 30.0
+            self.valid_pets += 1
+            result = {
+                "status": "OK",
+                "elapsed": round(elapsed, 1)
+            }
 
-        t += max(delay, 1.0)
-        result = wd.pet(Pet(timestamp=t))
+        self.last_pet = now
+        return result
 
-        if behavior != "healthy":
-            if result["status"] in ("EARLY", "LATE", "MISS", "ESCALATE"):
-                caught += 1
-            else:
-                false_ok += 1
-        else:
-            if result["status"] not in ("OK",):
-                caught += 1  # false alarm for healthy agent
-
-    total_anomalous = caught + false_ok if behavior != "healthy" else periods
-    detection_rate = caught / max(caught + false_ok, 1) if behavior != "healthy" else 1.0 - (caught / periods)
-
-    return {
-        "watchdog": watchdog_type.value,
-        "behavior": behavior,
-        "caught": caught,
-        "missed": false_ok if behavior != "healthy" else caught,
-        "detection_rate": round(detection_rate, 3),
-        "early_count": wd.early_count,
-        "miss_count": wd.miss_count
-    }
-
-
-def grade(detection_rate, is_healthy):
-    if is_healthy:
-        # For healthy: detection_rate = accuracy (want high = few false alarms)
-        if detection_rate > 0.95: return "A"
-        if detection_rate > 0.85: return "B"
-        if detection_rate > 0.70: return "C"
-        return "D"
-    else:
-        # For anomalous: detection_rate = caught rate (want high)
-        if detection_rate > 0.90: return "A"
-        if detection_rate > 0.70: return "B"
-        if detection_rate > 0.50: return "C"
-        if detection_rate > 0.30: return "D"
+    def grade(self) -> str:
+        total = max(self.total_checks, 1)
+        violation_rate = (self.early_violations + self.late_violations) / total
+        if violation_rate == 0: return "A"
+        if violation_rate < 0.1: return "B"
+        if violation_rate < 0.2: return "C"
+        if violation_rate < 0.4: return "D"
         return "F"
 
+    def report(self) -> dict:
+        return {
+            "total_checks": self.total_checks,
+            "valid_pets": self.valid_pets,
+            "early_violations": self.early_violations,
+            "late_violations": self.late_violations,
+            "grade": self.grade(),
+            "window": [self.min_interval, self.max_interval]
+        }
 
-def main():
+
+def demo():
     print("=" * 60)
-    print("Windowed Watchdog — Pont & Ong (2002) Patterns")
+    print("Windowed Watchdog Timer")
+    print("IEC 61508: pet too early OR too late = violation")
     print("=" * 60)
 
-    behaviors = ["healthy", "stuck_loop", "dying", "intermittent"]
-    types = [WatchdogType.SIMPLE, WatchdogType.WINDOWED, WatchdogType.MULTI_STAGE]
+    # Scenario 1: healthy agent (20-min heartbeat, window 15-25 min)
+    print("\n--- Scenario 1: Healthy Agent ---")
+    ww1 = WindowedWatchdog(min_interval=900, max_interval=1500)
+    t = 0
+    for i in range(10):
+        t += 1200  # 20 min intervals — within window
+        r = ww1.pet(t)
+    report = ww1.report()
+    print(f"  Window: {report['window'][0]/60:.0f}-{report['window'][1]/60:.0f} min")
+    print(f"  Valid: {report['valid_pets']}, Early: {report['early_violations']}, Late: {report['late_violations']}")
+    print(f"  Grade: {report['grade']}")
 
-    for wtype in types:
-        print(f"\n--- {wtype.value.upper()} WATCHDOG ---")
-        for behavior in behaviors:
-            r = simulate_agent(wtype, behavior)
-            is_healthy = behavior == "healthy"
-            g = grade(r["detection_rate"], is_healthy)
-            if is_healthy:
-                print(f"  {behavior:15s}: accuracy {r['detection_rate']:.1%} (false alarms: {r['missed']}) Grade {g}")
-            else:
-                print(f"  {behavior:15s}: detection {r['detection_rate']:.1%} (caught {r['caught']}/{r['caught']+r['missed']}) Grade {g}")
+    # Scenario 2: stuck loop (petting every 30 seconds)
+    print("\n--- Scenario 2: Stuck Loop (gaming the timer) ---")
+    ww2 = WindowedWatchdog(min_interval=900, max_interval=1500)
+    t2 = 0
+    for i in range(20):
+        t2 += 30  # every 30 sec — WAY too early
+        r = ww2.pet(t2)
+        if i < 3:
+            print(f"  Pet {i+1}: {r['status']} — {r.get('diagnosis', 'ok')}")
+    report2 = ww2.report()
+    print(f"  Valid: {report2['valid_pets']}, Early: {report2['early_violations']}, Late: {report2['late_violations']}")
+    print(f"  Grade: {report2['grade']}")
 
-    # Summary
+    # Scenario 3: intermittent silence
+    print("\n--- Scenario 3: Intermittent Silence ---")
+    ww3 = WindowedWatchdog(min_interval=900, max_interval=1500)
+    t3 = 0
+    pets = [1200, 1200, 1200, 3600, 1200, 1200, 7200, 1200]  # gaps at 4th and 7th
+    for i, interval in enumerate(pets):
+        t3 += interval
+        r = ww3.pet(t3)
+        if r['status'] != 'OK':
+            print(f"  Pet {i+1}: {r['status']} — elapsed {r['elapsed']/60:.1f}min — {r.get('diagnosis', '')}")
+    report3 = ww3.report()
+    print(f"  Valid: {report3['valid_pets']}, Early: {report3['early_violations']}, Late: {report3['late_violations']}")
+    print(f"  Grade: {report3['grade']}")
+
+    # Scenario 4: mixed — early bursts then silence
+    print("\n--- Scenario 4: Gaming Then Silence ---")
+    ww4 = WindowedWatchdog(min_interval=900, max_interval=1500)
+    t4 = 0
+    for i in range(5):
+        t4 += 60  # burst
+        ww4.pet(t4)
+    t4 += 5400  # then silence
+    r = ww4.pet(t4)
+    report4 = ww4.report()
+    print(f"  Valid: {report4['valid_pets']}, Early: {report4['early_violations']}, Late: {report4['late_violations']}")
+    print(f"  Grade: {report4['grade']}")
+    print(f"  Pattern: burst + silence = adversarial behavior")
+
+    # Comparison
     print(f"\n{'='*60}")
-    print("SUMMARY")
-    simple_stuck = simulate_agent(WatchdogType.SIMPLE, "stuck_loop")
-    windowed_stuck = simulate_agent(WatchdogType.WINDOWED, "stuck_loop")
-    print(f"  Simple vs stuck_loop:   {simple_stuck['detection_rate']:.0%} detection")
-    print(f"  Windowed vs stuck_loop: {windowed_stuck['detection_rate']:.0%} detection")
-    print(f"\n  Key: windowed catches 'too early' — stuck tasks petting")
-    print(f"  at clock speed look healthy to simple watchdog.")
-    print(f"  Multi-stage adds graduated escalation (Ostrom principle #5).")
+    print("COMPARISON")
+    print(f"  Simple watchdog catches: silence only")
+    print(f"  Windowed watchdog catches: silence AND hyperactivity")
+    print(f"  IEC 61508: both failure modes are safety-relevant")
+    print(f"\n  Healthy:     Grade {report['grade']}")
+    print(f"  Stuck loop:  Grade {report2['grade']} ({report2['early_violations']} early violations)")
+    print(f"  Silence:     Grade {report3['grade']} ({report3['late_violations']} late violations)")
+    print(f"  Gaming:      Grade {report4['grade']} ({report4['early_violations']} early + {report4['late_violations']} late)")
 
 
 if __name__ == "__main__":
-    main()
+    demo()
