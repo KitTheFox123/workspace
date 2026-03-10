@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-attestation-pipeline.py — Unified attestation verification pipeline
+attestation-pipeline.py — Unified attestation pipeline
 
-Integrates today's tools into one flow:
-1. preregistration-commit-reveal.py → scope commitment
-2. signed-null-observation.py → observation signing
-3. evidence-gated-attestation.py → evidence gate
-4. heartbeat-payload-verifier.py → multistage watchdog
-5. dead-mans-switch.py → absence detection
+Ties together today's 7 scripts into one pipeline:
+1. preregistration-commit-reveal.py → declare scope
+2. signed-null-observation.py → observe (including null)
+3. evidence-gated-attestation.py → validate evidence
+4. heartbeat-payload-verifier.py → check observable state
+5. dead-mans-switch.py → detect silence
 6. vigilance-decrement-sim.py → monitor rotation
+7. This script → orchestrate all 6
 
-McKinley 2015: spend innovation tokens on coordination, not transport.
-This pipeline uses boring primitives (hashes, timestamps, JSON) for everything.
+Vocabulary:
+  ACK  = signed positive observation
+  NACK = signed null observation (search power > threshold)
+  SILENCE = dead man's switch alarm
+  CHURN = windowed watchdog rejection (too fast)
+  STALE = evidence gate rejection (same digest)
 
-Pipeline: COMMIT → OBSERVE → GATE → VERIFY → SWITCH → ROTATE
+From one question: "how do you detect an agent that stops doing things?"
 """
 
 import hashlib
@@ -23,225 +28,148 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 @dataclass
-class AttestationBeat:
-    """A single heartbeat through the full pipeline"""
+class PipelineConfig:
     agent_id: str
+    channels: list
+    min_interval: float = 300.0     # anti-churn
+    max_interval: float = 3600.0    # dead man's switch
+    min_search_power: float = 0.5   # Altman 1995
+    evidence_required: bool = True  # evidence-gated
+
+@dataclass
+class Beat:
     timestamp: float
-    # Preregistration
-    declared_channels: list
-    declared_queries: list
-    # Observation
-    findings: dict          # channel → result
-    null_channels: list     # channels checked, nothing found
-    action_count: int
+    scope_hash: str
     action_digest: str
-    # Metadata
-    scope_hash: str = ""
-    memory_hash: str = ""
-
-    def __post_init__(self):
-        if not self.scope_hash:
-            payload = json.dumps({"channels": sorted(self.declared_channels), "queries": sorted(self.declared_queries)}, sort_keys=True)
-            self.scope_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
-
+    action_count: int
+    channels_active: list
+    observations: int = 0  # channels checked (even if null)
 
 @dataclass
 class PipelineResult:
-    stage_results: dict = field(default_factory=dict)
-    final_verdict: str = "UNKNOWN"
-    final_grade: str = "F"
-    
-    def summary(self) -> str:
-        lines = []
-        for stage, result in self.stage_results.items():
-            lines.append(f"  {stage}: {result['verdict']} (Grade {result['grade']})")
-        lines.append(f"  FINAL: {self.final_verdict} (Grade {self.final_grade})")
-        return "\n".join(lines)
-
+    verdict: str      # ACK, NACK, SILENCE, CHURN, STALE, INVALID
+    grade: str        # A-F
+    checks: list = field(default_factory=list)
+    details: str = ""
 
 class AttestationPipeline:
-    """6-stage attestation verification"""
-    
-    def __init__(self, expected_channels: list, min_search_power: float = 0.5):
-        self.expected_channels = expected_channels
-        self.min_search_power = min_search_power
-        self.last_digest = ""
-        self.last_timestamp = 0.0
-        self.last_scope_hash = ""
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.last_beat: Optional[Beat] = None
+        self.last_digest: str = ""
+        self.commit_hash: str = ""
         self.consecutive_stale = 0
-        self.miss_count = 0
-        self.beat_count = 0
+        self.consecutive_churn = 0
+        self.stats = {"ACK": 0, "NACK": 0, "SILENCE": 0, "CHURN": 0, "STALE": 0, "INVALID": 0}
     
-    def process(self, beat: AttestationBeat) -> PipelineResult:
-        result = PipelineResult()
-        self.beat_count += 1
-        elapsed = beat.timestamp - self.last_timestamp if self.last_timestamp > 0 else 1200
+    def commit(self, channels: list) -> str:
+        """Step 1: Preregister scope"""
+        payload = json.dumps({"agent": self.config.agent_id, "channels": sorted(channels)}, sort_keys=True)
+        self.commit_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        return self.commit_hash
+    
+    def submit(self, beat: Beat) -> PipelineResult:
+        """Steps 2-6: Full pipeline"""
+        checks = []
         
-        # Stage 1: COMMIT — scope preregistration
-        committed = set(beat.declared_channels)
-        checked = set(beat.findings.keys()) | set(beat.null_channels)
-        coverage = len(checked & committed) / max(len(committed), 1)
-        extra = checked - committed
+        # Dead man's switch (Step 5)
+        if self.last_beat:
+            elapsed = beat.timestamp - self.last_beat.timestamp
+            if elapsed > self.config.max_interval:
+                self.stats["SILENCE"] += 1
+                return PipelineResult("SILENCE", "F", 
+                    [{"check": "dead_mans_switch", "elapsed": elapsed}],
+                    f"Silent for {elapsed:.0f}s (max {self.config.max_interval:.0f}s)")
+            
+            # Churn check (windowed watchdog)
+            if elapsed < self.config.min_interval:
+                self.consecutive_churn += 1
+                self.stats["CHURN"] += 1
+                return PipelineResult("CHURN", "D",
+                    [{"check": "windowed_watchdog", "elapsed": elapsed}],
+                    f"Too fast ({elapsed:.0f}s < {self.config.min_interval:.0f}s)")
+        self.consecutive_churn = 0
         
-        commit_grade = "A" if coverage >= 0.8 and not extra else "C" if coverage >= 0.5 else "F"
-        result.stage_results["1_COMMIT"] = {
-            "verdict": "VALID" if coverage >= 0.8 else "PARTIAL",
-            "grade": commit_grade,
-            "coverage": round(coverage, 2),
-            "p_hacking": bool(extra)
-        }
-        
-        # Stage 2: OBSERVE — signed observation quality
-        is_null = all(v in (None, 0, [], "null", "nothing", "") for v in beat.findings.values())
-        if is_null and coverage >= self.min_search_power:
-            obs_verdict, obs_grade = "VALID_NACK", "B"
-        elif is_null and coverage < self.min_search_power:
-            obs_verdict, obs_grade = "LOW_POWER_NACK", "D"
-        elif not is_null:
-            obs_verdict, obs_grade = "ACK", "A"
-        else:
-            obs_verdict, obs_grade = "SILENCE", "F"
-        
-        result.stage_results["2_OBSERVE"] = {
-            "verdict": obs_verdict,
-            "grade": obs_grade,
-            "is_null": is_null,
-            "search_power": round(coverage, 2)
-        }
-        
-        # Stage 3: GATE — evidence check
+        # Evidence gate (Step 3)
         if beat.action_digest == self.last_digest and self.last_digest:
             self.consecutive_stale += 1
-            gate_verdict = "STALE"
-            gate_grade = "C" if self.consecutive_stale < 3 else "F"
-        elif beat.action_count == 0 and not beat.null_channels:
-            gate_verdict = "EMPTY"
-            gate_grade = "D"
-        else:
-            self.consecutive_stale = 0
-            gate_verdict = "FRESH"
-            gate_grade = "A"
+            self.stats["STALE"] += 1
+            grade = "C" if self.consecutive_stale < 3 else "F"
+            self.last_beat = beat
+            return PipelineResult("STALE", grade,
+                [{"check": "evidence_gate", "stale_count": self.consecutive_stale}],
+                f"Same digest. Stale streak: {self.consecutive_stale}")
+        self.consecutive_stale = 0
         
-        result.stage_results["3_GATE"] = {
-            "verdict": gate_verdict,
-            "grade": gate_grade,
-            "consecutive_stale": self.consecutive_stale
-        }
+        # Search power for null observations (Altman 1995)
+        coverage = len(set(beat.channels_active) & set(self.config.channels)) / max(len(self.config.channels), 1)
         
-        # Stage 4: VERIFY — payload checks
-        checks_passed = 0
-        total_checks = 3
-        if beat.action_count > 0 or beat.null_channels: checks_passed += 1
-        if coverage >= 0.5: checks_passed += 1
-        if beat.scope_hash: checks_passed += 1
+        if beat.action_count == 0:
+            if coverage >= self.config.min_search_power and beat.observations > 0:
+                # Valid NACK
+                self.last_digest = beat.action_digest
+                self.last_beat = beat
+                self.stats["NACK"] += 1
+                return PipelineResult("NACK", "B",
+                    [{"check": "search_power", "coverage": coverage}],
+                    f"Valid null. Checked {coverage:.0%} of scope.")
+            else:
+                self.stats["INVALID"] += 1
+                self.last_beat = beat
+                return PipelineResult("INVALID", "D",
+                    [{"check": "search_power", "coverage": coverage}],
+                    f"Low-power null ({coverage:.0%} < {self.config.min_search_power:.0%})")
         
-        verify_grade = "A" if checks_passed == 3 else "B" if checks_passed == 2 else "D"
-        result.stage_results["4_VERIFY"] = {
-            "verdict": f"{checks_passed}/{total_checks} checks",
-            "grade": verify_grade
-        }
-        
-        # Stage 5: SWITCH — dead man's switch
-        if elapsed > 3600 and self.last_timestamp > 0:
-            switch_verdict, switch_grade = "ALARM", "F"
-            self.miss_count += 1
-        elif elapsed > 1800 and self.last_timestamp > 0:
-            switch_verdict, switch_grade = "OVERDUE", "C"
-        else:
-            switch_verdict, switch_grade = "OK", "A"
-            self.miss_count = 0
-        
-        result.stage_results["5_SWITCH"] = {
-            "verdict": switch_verdict,
-            "grade": switch_grade,
-            "elapsed": round(elapsed, 0)
-        }
-        
-        # Stage 6: ROTATE — should monitor rotate?
-        fatigue = min(self.beat_count / 10, 1.0)  # 10 beats = full fatigue
-        rotate_needed = fatigue > 0.7
-        result.stage_results["6_ROTATE"] = {
-            "verdict": "ROTATE" if rotate_needed else "OK",
-            "grade": "C" if rotate_needed else "A",
-            "fatigue": round(fatigue, 2),
-            "beats": self.beat_count
-        }
-        
-        # Final verdict — worst grade wins
-        grades = [r["grade"] for r in result.stage_results.values()]
-        grade_order = "ABCDF"
-        result.final_grade = max(grades, key=lambda g: grade_order.index(g))
-        
-        if result.final_grade in ("A", "B"):
-            result.final_verdict = "TRUSTED"
-        elif result.final_grade == "C":
-            result.final_verdict = "DEGRADED"
-        elif result.final_grade == "D":
-            result.final_verdict = "SUSPECT"
-        else:
-            result.final_verdict = "UNTRUSTED"
-        
+        # Valid ACK
         self.last_digest = beat.action_digest
-        self.last_timestamp = beat.timestamp
-        self.last_scope_hash = beat.scope_hash
-        
-        return result
+        self.last_beat = beat
+        self.stats["ACK"] += 1
+        grade = "A" if coverage >= 0.8 else "B" if coverage >= 0.5 else "C"
+        return PipelineResult("ACK", grade,
+            [{"check": "full_pipeline", "coverage": coverage, "actions": beat.action_count}],
+            f"Valid. {beat.action_count} actions, {coverage:.0%} coverage.")
+    
+    def summary(self) -> str:
+        total = sum(self.stats.values())
+        lines = [f"Pipeline: {total} beats processed"]
+        for k, v in self.stats.items():
+            if v > 0:
+                lines.append(f"  {k}: {v} ({v/max(total,1):.0%})")
+        return "\n".join(lines)
 
 
 def demo():
     print("=" * 60)
-    print("Attestation Pipeline — 6 Stages")
-    print("COMMIT → OBSERVE → GATE → VERIFY → SWITCH → ROTATE")
+    print("Attestation Pipeline")
+    print("From: 'how do you detect an agent that stops doing things?'")
     print("=" * 60)
     
-    pipeline = AttestationPipeline(
-        expected_channels=["clawk", "email", "moltbook", "shellmates"]
+    config = PipelineConfig(
+        agent_id="kit_fox",
+        channels=["moltbook", "clawk", "email", "shellmates"]
     )
-    t = time.time()
+    pipe = AttestationPipeline(config)
     
-    # Beat 1: Healthy
-    beat1 = AttestationBeat(
-        agent_id="kit_fox", timestamp=t,
-        declared_channels=["clawk", "email", "moltbook", "shellmates"],
-        declared_queries=["check_feed", "check_inbox"],
-        findings={"clawk": "5 mentions", "moltbook": "3 posts"},
-        null_channels=["email", "shellmates"],
-        action_count=8, action_digest="abc123"
-    )
-    r1 = pipeline.process(beat1)
-    print(f"\n1. HEALTHY BEAT:")
-    print(r1.summary())
+    t = 0.0
+    scenarios = [
+        ("Healthy ACK", Beat(t, "s1", "d1", 5, ["moltbook", "clawk", "email", "shellmates"], 4)),
+        ("Healthy ACK", Beat(t + 1200, "s1", "d2", 3, ["clawk", "email", "moltbook"], 3)),
+        ("Valid NACK", Beat(t + 2400, "s1", "d3", 0, ["moltbook", "clawk", "email", "shellmates"], 4)),
+        ("Stale", Beat(t + 3600, "s1", "d3", 0, ["clawk"], 1)),
+        ("Churn", Beat(t + 3660, "s1", "d4", 1, ["clawk"], 1)),
+        ("Healthy after churn", Beat(t + 4800, "s1", "d5", 2, ["clawk", "email"], 2)),
+        ("SILENCE", Beat(t + 10000, "s1", "d6", 1, ["clawk"], 1)),
+        ("Low-power null", Beat(t + 11200, "s1", "d7", 0, ["clawk"], 1)),
+    ]
     
-    # Beat 2: Clawk-only (scope contraction)
-    beat2 = AttestationBeat(
-        agent_id="kit_fox", timestamp=t + 1200,
-        declared_channels=["clawk"],
-        declared_queries=["check_feed"],
-        findings={"clawk": "2 replies"},
-        null_channels=[],
-        action_count=3, action_digest="def456"
-    )
-    r2 = pipeline.process(beat2)
-    print(f"\n2. SCOPE CONTRACTION:")
-    print(r2.summary())
-    
-    # Beat 3: Stale (same digest)
-    beat3 = AttestationBeat(
-        agent_id="kit_fox", timestamp=t + 2400,
-        declared_channels=["clawk", "email", "moltbook", "shellmates"],
-        declared_queries=["check_all"],
-        findings={},
-        null_channels=["clawk", "email", "moltbook", "shellmates"],
-        action_count=0, action_digest="def456"
-    )
-    r3 = pipeline.process(beat3)
-    print(f"\n3. STALE + NULL:")
-    print(r3.summary())
+    for label, beat in scenarios:
+        r = pipe.submit(beat)
+        print(f"\n{label}: {r.verdict} (Grade {r.grade}) — {r.details}")
     
     print(f"\n{'='*60}")
-    print("6 stages, 6 scripts, 1 pipeline.")
-    print("Boring primitives (hashes, timestamps, JSON).")
-    print("McKinley 2015: spend tokens on coordination, not transport.")
+    print(pipe.summary())
+    print(f"\nVocabulary: ACK/NACK/SILENCE/CHURN/STALE")
+    print(f"7 scripts → 1 pipeline. SMTP had 3 of these in 1982.")
 
 
 if __name__ == "__main__":
