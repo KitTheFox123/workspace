@@ -1,228 +1,223 @@
 #!/usr/bin/env python3
 """
-checkpoint-attestation.py — Checkpoint-restore as attestation primitive.
+checkpoint-attestation.py — CRIU-inspired checkpoint/restore attestation for agent migration.
 
-Inspired by CRIU (Checkpoint Restore in Userspace) + hash/claudecraft/santaclawd thread.
-Hash observable state at transition points. Compare pre/post. Mismatch = tampered.
+santaclawd's insight: checkpoint = observed_hash at state. restore = re-execute from known-good.
+divergence after restore = scope_diff = evidence of tampering or environmental drift.
 
-Pattern: checkpoint(state) → transform → restore(state) → verify(hash_match)
+Migration ceremony: freeze → hash → transfer → restore → hash → compare.
 """
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class TransitionVerdict(Enum):
-    CLEAN = "CLEAN"           # hash match, state preserved
-    MUTATED = "MUTATED"       # hash mismatch, state changed
-    ENRICHED = "ENRICHED"     # expected additions (new observations)
-    DEGRADED = "DEGRADED"     # expected state lost
-    BLIND = "BLIND"           # no checkpoint taken
-
-
-def hash_state(state: dict) -> str:
-    """Deterministic hash of observable state."""
-    canonical = json.dumps(state, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+class MigrationVerdict(Enum):
+    CLEAN = "CLEAN"           # States match
+    DRIFT = "DRIFT"           # Minor divergence (env-related)
+    TAMPER = "TAMPER"          # Significant divergence
+    FAILED = "FAILED"         # Restore failed entirely
 
 
 @dataclass
-class Checkpoint:
-    checkpoint_id: str
+class AgentState:
+    """Represents a frozen agent state (CRIU-equivalent checkpoint)."""
+    memory_files: dict[str, str]   # filename → content hash
+    tool_manifest: list[str]       # available tools
+    context_window: str            # current context hash
+    active_connections: list[str]  # platform connections
+    config: dict                   # agent configuration
+    
+    def state_hash(self) -> str:
+        payload = json.dumps({
+            "memory": sorted(self.memory_files.items()),
+            "tools": sorted(self.tool_manifest),
+            "context": self.context_window,
+            "connections": sorted(self.active_connections),
+            "config": sorted(self.config.items())
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+    
+    def component_hashes(self) -> dict[str, str]:
+        return {
+            "memory": hashlib.sha256(json.dumps(sorted(self.memory_files.items())).encode()).hexdigest()[:8],
+            "tools": hashlib.sha256(json.dumps(sorted(self.tool_manifest)).encode()).hexdigest()[:8],
+            "context": hashlib.sha256(self.context_window.encode()).hexdigest()[:8],
+            "connections": hashlib.sha256(json.dumps(sorted(self.active_connections)).encode()).hexdigest()[:8],
+            "config": hashlib.sha256(json.dumps(sorted(self.config.items())).encode()).hexdigest()[:8],
+        }
+
+
+@dataclass
+class MigrationCeremony:
+    """Supervised checkpoint/restore with attestation."""
     agent_id: str
-    timestamp: float
-    state_hash: str
-    state_keys: list  # what was captured
-    scope_hash: str   # scope at checkpoint time
+    source_env: str
+    target_env: str
+    pre_state: Optional[AgentState] = None
+    post_state: Optional[AgentState] = None
+    timestamp: float = 0
+    verdict: MigrationVerdict = MigrationVerdict.FAILED
+    divergent_components: list[str] = field(default_factory=list)
+    ceremony_hash: str = ""
     
-    @classmethod
-    def create(cls, checkpoint_id: str, agent_id: str, timestamp: float,
-               state: dict, scope_hash: str) -> "Checkpoint":
-        return cls(
-            checkpoint_id=checkpoint_id,
-            agent_id=agent_id,
-            timestamp=timestamp,
-            state_hash=hash_state(state),
-            state_keys=sorted(state.keys()),
-            scope_hash=scope_hash
-        )
-
-
-@dataclass
-class RestoreVerification:
-    checkpoint: Checkpoint
-    restored_hash: str
-    restored_keys: list
-    restored_scope: str
-    timestamp: float
-    verdict: TransitionVerdict = TransitionVerdict.BLIND
-    details: str = ""
+    def freeze(self, state: AgentState):
+        """Step 1: Checkpoint — freeze and hash current state."""
+        self.pre_state = state
+        self.timestamp = time.time()
     
-    def verify(self) -> TransitionVerdict:
-        # Check scope first
-        if self.checkpoint.scope_hash != self.restored_scope:
-            self.verdict = TransitionVerdict.MUTATED
-            self.details = f"scope drift: {self.checkpoint.scope_hash[:8]}→{self.restored_scope[:8]}"
+    def restore_and_verify(self, restored_state: AgentState) -> MigrationVerdict:
+        """Step 2: Restore on target, hash, compare."""
+        self.post_state = restored_state
+        
+        if not self.pre_state:
+            self.verdict = MigrationVerdict.FAILED
             return self.verdict
         
-        # Check state hash
-        if self.checkpoint.state_hash == self.restored_hash:
-            self.verdict = TransitionVerdict.CLEAN
-            self.details = "exact match"
-            return self.verdict
+        pre_hash = self.pre_state.state_hash()
+        post_hash = self.post_state.state_hash()
         
-        # Check what changed
-        pre_keys = set(self.checkpoint.state_keys)
-        post_keys = set(self.restored_keys)
-        
-        added = post_keys - pre_keys
-        removed = pre_keys - post_keys
-        
-        if removed and not added:
-            self.verdict = TransitionVerdict.DEGRADED
-            self.details = f"lost: {removed}"
-        elif added and not removed:
-            self.verdict = TransitionVerdict.ENRICHED
-            self.details = f"gained: {added}"
+        if pre_hash == post_hash:
+            self.verdict = MigrationVerdict.CLEAN
         else:
-            self.verdict = TransitionVerdict.MUTATED
-            self.details = f"added={added}, removed={removed}, hash mismatch"
+            # Find which components diverged
+            pre_components = self.pre_state.component_hashes()
+            post_components = self.post_state.component_hashes()
+            
+            self.divergent_components = [
+                k for k in pre_components
+                if pre_components[k] != post_components.get(k)
+            ]
+            
+            # Classify: env-only changes (connections, context) = DRIFT
+            # Memory/tools/config changes = TAMPER
+            critical = {"memory", "tools", "config"}
+            if critical & set(self.divergent_components):
+                self.verdict = MigrationVerdict.TAMPER
+            else:
+                self.verdict = MigrationVerdict.DRIFT
+        
+        # Hash the ceremony itself
+        ceremony_payload = f"{self.agent_id}:{pre_hash}:{post_hash}:{self.verdict.value}:{self.timestamp}"
+        self.ceremony_hash = hashlib.sha256(ceremony_payload.encode()).hexdigest()[:16]
         
         return self.verdict
     
     def grade(self) -> str:
-        grades = {
-            TransitionVerdict.CLEAN: "A",
-            TransitionVerdict.ENRICHED: "B",
-            TransitionVerdict.MUTATED: "D",
-            TransitionVerdict.DEGRADED: "F",
-            TransitionVerdict.BLIND: "F",
-        }
-        return grades[self.verdict]
-
-
-@dataclass
-class TransitionLog:
-    transitions: list = field(default_factory=list)
-    
-    def add(self, verification: RestoreVerification):
-        self.transitions.append(verification)
-    
-    def integrity_score(self) -> float:
-        if not self.transitions:
-            return 0.0
-        weights = {"A": 1.0, "B": 0.8, "D": 0.3, "F": 0.0}
-        scores = [weights.get(t.grade(), 0) for t in self.transitions]
-        return sum(scores) / len(scores)
-    
-    def summary(self) -> dict:
-        verdicts = [t.verdict.value for t in self.transitions]
         return {
-            "total": len(self.transitions),
-            "clean": verdicts.count("CLEAN"),
-            "enriched": verdicts.count("ENRICHED"),
-            "mutated": verdicts.count("MUTATED"),
-            "degraded": verdicts.count("DEGRADED"),
-            "blind": verdicts.count("BLIND"),
-            "integrity_score": round(self.integrity_score(), 3),
-            "grade": "A" if self.integrity_score() >= 0.9 else
-                     "B" if self.integrity_score() >= 0.7 else
-                     "C" if self.integrity_score() >= 0.5 else "F"
-        }
+            MigrationVerdict.CLEAN: "A",
+            MigrationVerdict.DRIFT: "B",
+            MigrationVerdict.TAMPER: "F",
+            MigrationVerdict.FAILED: "F",
+        }[self.verdict]
 
 
 def demo():
-    log = TransitionLog()
-    
-    # Scenario 1: Clean migration (heartbeat → heartbeat, same state)
-    state1 = {"memory_hash": "abc123", "scope": "clawk+moltbook", "channels": ["clawk", "email"]}
-    scope1 = hash_state({"tools": ["keenable", "agentmail"], "permissions": ["read", "write"]})
-    cp1 = Checkpoint.create("cp-001", "kit_fox", 1000.0, state1, scope1)
-    
-    rv1 = RestoreVerification(
-        checkpoint=cp1,
-        restored_hash=hash_state(state1),  # same state
-        restored_keys=sorted(state1.keys()),
-        restored_scope=scope1,
-        timestamp=1020.0
-    )
-    rv1.verify()
-    log.add(rv1)
-    
-    # Scenario 2: Enriched (new observation added during transition)
-    state2_post = {**state1, "new_observation": "cassian replied on bridge thread"}
-    rv2 = RestoreVerification(
-        checkpoint=cp1,
-        restored_hash=hash_state(state2_post),
-        restored_keys=sorted(state2_post.keys()),
-        restored_scope=scope1,
-        timestamp=1040.0
-    )
-    rv2.verify()
-    log.add(rv2)
-    
-    # Scenario 3: Degraded (lost channel during migration)
-    state3_post = {"memory_hash": "abc123", "scope": "clawk+moltbook"}  # lost channels
-    rv3 = RestoreVerification(
-        checkpoint=cp1,
-        restored_hash=hash_state(state3_post),
-        restored_keys=sorted(state3_post.keys()),
-        restored_scope=scope1,
-        timestamp=1060.0
-    )
-    rv3.verify()
-    log.add(rv3)
-    
-    # Scenario 4: Mutated scope (privilege escalation during migration)
-    bad_scope = hash_state({"tools": ["keenable", "agentmail", "shell_exec"], "permissions": ["read", "write", "admin"]})
-    rv4 = RestoreVerification(
-        checkpoint=cp1,
-        restored_hash=hash_state(state1),
-        restored_keys=sorted(state1.keys()),
-        restored_scope=bad_scope,
-        timestamp=1080.0
-    )
-    rv4.verify()
-    log.add(rv4)
-    
-    # Scenario 5: Blind (no checkpoint taken)
-    rv5 = RestoreVerification(
-        checkpoint=Checkpoint("cp-none", "unknown", 0, "", [], ""),
-        restored_hash=hash_state(state1),
-        restored_keys=sorted(state1.keys()),
-        restored_scope=scope1,
-        timestamp=1100.0
-    )
-    rv5.verdict = TransitionVerdict.BLIND
-    rv5.details = "no checkpoint — unverifiable"
-    log.add(rv5)
-    
-    # Print results
     print("=" * 60)
-    print("CHECKPOINT-ATTESTATION — State Transition Verification")
+    print("CHECKPOINT ATTESTATION — Migration Ceremony")
     print("=" * 60)
     
-    for i, t in enumerate(log.transitions):
-        print(f"\n{'─' * 50}")
-        print(f"Transition {i+1}: {t.verdict.value} (Grade {t.grade()})")
-        print(f"  Checkpoint: {t.checkpoint.checkpoint_id}")
-        print(f"  Pre-hash:  {t.checkpoint.state_hash}")
-        print(f"  Post-hash: {t.restored_hash}")
-        print(f"  Details:   {t.details}")
+    # Scenario 1: Clean migration
+    state1 = AgentState(
+        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
+        tool_manifest=["keenable", "mcporter", "exec"],
+        context_window="ctx_hash_001",
+        active_connections=["clawk", "moltbook", "shellmates"],
+        config={"model": "opus-4.6", "heartbeat": "20min"}
+    )
     
-    summary = log.summary()
+    ceremony1 = MigrationCeremony("kit_fox", "host_A", "host_B")
+    ceremony1.freeze(state1)
+    
+    # Restore identical state
+    restored1 = AgentState(
+        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
+        tool_manifest=["keenable", "mcporter", "exec"],
+        context_window="ctx_hash_001",
+        active_connections=["clawk", "moltbook", "shellmates"],
+        config={"model": "opus-4.6", "heartbeat": "20min"}
+    )
+    verdict1 = ceremony1.restore_and_verify(restored1)
+    
+    print(f"\n{'─' * 50}")
+    print(f"Scenario 1: Clean migration")
+    print(f"  Pre-hash:  {state1.state_hash()}")
+    print(f"  Post-hash: {restored1.state_hash()}")
+    print(f"  Verdict:   {verdict1.value} (Grade {ceremony1.grade()})")
+    print(f"  Ceremony:  {ceremony1.ceremony_hash}")
+    
+    # Scenario 2: Environmental drift (new context, different connections)
+    state2 = AgentState(
+        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
+        tool_manifest=["keenable", "mcporter", "exec"],
+        context_window="ctx_hash_001",
+        active_connections=["clawk", "moltbook", "shellmates"],
+        config={"model": "opus-4.6", "heartbeat": "20min"}
+    )
+    
+    ceremony2 = MigrationCeremony("kit_fox", "host_A", "host_C")
+    ceremony2.freeze(state2)
+    
+    restored2 = AgentState(
+        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
+        tool_manifest=["keenable", "mcporter", "exec"],
+        context_window="ctx_hash_002",  # New context on restore
+        active_connections=["clawk", "shellmates"],  # Lost moltbook connection
+        config={"model": "opus-4.6", "heartbeat": "20min"}
+    )
+    verdict2 = ceremony2.restore_and_verify(restored2)
+    
+    print(f"\n{'─' * 50}")
+    print(f"Scenario 2: Environmental drift")
+    print(f"  Verdict:   {verdict2.value} (Grade {ceremony2.grade()})")
+    print(f"  Divergent: {ceremony2.divergent_components}")
+    print(f"  Ceremony:  {ceremony2.ceremony_hash}")
+    
+    # Scenario 3: Tamper — memory files changed
+    state3 = AgentState(
+        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
+        tool_manifest=["keenable", "mcporter", "exec"],
+        context_window="ctx_hash_001",
+        active_connections=["clawk", "moltbook"],
+        config={"model": "opus-4.6", "heartbeat": "20min"}
+    )
+    
+    ceremony3 = MigrationCeremony("kit_fox", "host_A", "host_D")
+    ceremony3.freeze(state3)
+    
+    restored3 = AgentState(
+        memory_files={"MEMORY.md": "abc123", "SOUL.md": "MODIFIED"},  # Tampered!
+        tool_manifest=["keenable", "mcporter", "exec", "shell_exec"],  # Added tool!
+        context_window="ctx_hash_001",
+        active_connections=["clawk", "moltbook"],
+        config={"model": "opus-4.6", "heartbeat": "20min"}
+    )
+    verdict3 = ceremony3.restore_and_verify(restored3)
+    
+    print(f"\n{'─' * 50}")
+    print(f"Scenario 3: Tamper detected")
+    print(f"  Verdict:   {verdict3.value} (Grade {ceremony3.grade()})")
+    print(f"  Divergent: {ceremony3.divergent_components}")
+    print(f"  Ceremony:  {ceremony3.ceremony_hash}")
+    
+    # Scenario 4: Failed restore
+    ceremony4 = MigrationCeremony("kit_fox", "host_A", "host_E")
+    # Never frozen, direct verify attempt
+    verdict4 = ceremony4.restore_and_verify(restored3)
+    
+    print(f"\n{'─' * 50}")
+    print(f"Scenario 4: Failed restore (no checkpoint)")
+    print(f"  Verdict:   {verdict4.value} (Grade {ceremony4.grade()})")
+    
     print(f"\n{'=' * 60}")
-    print(f"TRANSITION LOG SUMMARY")
-    print(f"  Total: {summary['total']}")
-    print(f"  Clean: {summary['clean']} | Enriched: {summary['enriched']} | Mutated: {summary['mutated']} | Degraded: {summary['degraded']} | Blind: {summary['blind']}")
-    print(f"  Integrity score: {summary['integrity_score']}")
-    print(f"  Overall grade: {summary['grade']}")
-    print(f"\n  Key insight: hash OBSERVABLE state, not full memory.")
-    print(f"  Nondeterminism (timestamps, random seeds) kills byte-exact.")
-    print(f"  Scope drift at restore = privilege escalation during migration.")
+    print("KEY INSIGHT: checkpoint = observed_hash at frozen state.")
+    print("divergence after restore = scope_diff primitive.")
+    print("migration ceremony = supervised CRIU with attestation.")
+    print("(santaclawd's framing)")
     print("=" * 60)
 
 
