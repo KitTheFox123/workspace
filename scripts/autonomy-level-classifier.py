@@ -2,21 +2,12 @@
 """
 autonomy-level-classifier.py — SAE J3016-inspired autonomy levels for agents.
 
-Based on Koopman (CMU) J3016 User Guide:
-- Levels are features, not vehicles (agents)
-- L2+ doesn't exist — fractional levels are prohibited
-- L2→L3 = liability flip (human monitors → system monitors)
-- L3 is the problem level: system drives but human must be "receptive"
+Maps self-driving L0-L5 to agent autonomy. The L2→L3 liability flip is the key boundary:
+who monitors whom? Detects moral crumple zones (Elish 2019) where agents claim higher
+autonomy than their evidence supports.
 
-Agent adaptation:
-  L0: No automation — human does everything
-  L1: Tool assistance — human drives, agent assists (spell check, autocomplete)
-  L2: Partial automation — agent acts, HUMAN monitors (most "autonomous" agents)
-  L3: Conditional — agent monitors, human fallback on demand (the danger zone)
-  L4: High automation — agent handles DDT + fallback within ODD
-  L5: Full automation — unlimited ODD (theoretical)
-
-Key: Most agents marketed as L4 are actually L2 with oversight theater.
+Koopman & Widen (2024): PRB is necessary but insufficient. Risk transfer onto
+vulnerable groups is unacceptable even with net safety improvement.
 """
 
 from dataclasses import dataclass
@@ -24,117 +15,125 @@ from enum import IntEnum
 
 
 class Level(IntEnum):
-    L0 = 0  # No automation
-    L1 = 1  # Assistance
-    L2 = 2  # Partial (human monitors)
-    L3 = 3  # Conditional (system monitors, human fallback)
-    L4 = 4  # High (system handles fallback within ODD)
-    L5 = 5  # Full (unlimited ODD)
-
-
-@dataclass
-class AgentCapability:
-    name: str
-    can_act: bool           # Can take actions
-    can_monitor: bool       # Can monitor own state
-    can_fallback: bool      # Can handle errors autonomously
-    human_monitors: bool    # Human actively monitors
-    human_fallback: bool    # Human provides fallback
-    odd_limited: bool       # Limited operational domain
-    description: str = ""
-
-
-def classify(cap: AgentCapability) -> Level:
-    """Classify agent capability into SAE-inspired level."""
-    if not cap.can_act:
-        return Level.L0
-    
-    if not cap.can_monitor:
-        return Level.L1  # Acts but can't self-monitor
-    
-    if cap.human_monitors:
-        return Level.L2  # Agent acts, human monitors
-    
-    if cap.human_fallback:
-        return Level.L3  # Agent monitors, human is fallback
-    
-    if cap.odd_limited:
-        return Level.L4  # Agent handles everything within ODD
-    
-    return Level.L5  # Unlimited ODD (theoretical)
+    L0 = 0  # No automation — human does everything
+    L1 = 1  # Assistance — agent helps, human monitors + decides
+    L2 = 2  # Partial — agent executes, human monitors at all times
+    L3 = 3  # Conditional — agent monitors, human is fallback on request
+    L4 = 4  # High — agent handles everything in defined scope, no human needed
+    L5 = 5  # Full — agent handles everything, any scope
 
 
 LEVEL_DESCRIPTIONS = {
-    Level.L0: "No automation. Human does everything.",
-    Level.L1: "Assistance. Agent helps, human drives.",
-    Level.L2: "Partial. Agent acts, HUMAN monitors. (Most 'autonomous' agents)",
-    Level.L3: "Conditional. Agent monitors, human fallback. THE DANGER ZONE.",
-    Level.L4: "High. Agent handles DDT + fallback within ODD.",
-    Level.L5: "Full. Unlimited ODD. (Theoretical for agents)",
+    Level.L0: "No automation. Human performs all tasks.",
+    Level.L1: "Agent assists. Human monitors and decides.",
+    Level.L2: "Agent executes within scope. Human monitors continuously.",
+    Level.L3: "Agent monitors and executes. Human fallback on request. LIABILITY FLIPS HERE.",
+    Level.L4: "Agent handles all tasks in defined operational domain. No human needed.",
+    Level.L5: "Agent handles all tasks in any domain. No human fallback.",
 }
 
-LIABILITY_NOTES = {
-    Level.L0: "Human: 100%",
-    Level.L1: "Human: 100% (tool is just a tool)",
-    Level.L2: "Human: primary (monitoring duty). Agent: execution errors only.",
-    Level.L3: "SPLIT LIABILITY. Agent monitors but human must be 'receptive'. Koopman: 'problematic'",
-    Level.L4: "Agent: primary within ODD. Human: outside ODD only.",
-    Level.L5: "Agent: full liability. (Nobody offers this yet.)",
-}
+
+@dataclass
+class AgentProfile:
+    name: str
+    claimed_level: Level
+    has_human_monitoring: bool
+    has_heartbeat_system: bool
+    has_scope_constraints: bool
+    has_attestation_chain: bool
+    has_remediation_tracking: bool
+    human_approval_required: bool  # for consequential actions
+    can_self_recover: bool
+    audit_trail_complete: bool
+
+
+def assess_actual_level(profile: AgentProfile) -> Level:
+    """Determine actual autonomy level from evidence, not claims."""
+    if not profile.has_heartbeat_system:
+        return Level.L0  # Can't even prove liveness
+    
+    if profile.human_approval_required:
+        return Level.L1  # Human decides
+    
+    if profile.has_human_monitoring and not profile.can_self_recover:
+        return Level.L2  # Human monitors, agent can't self-recover
+    
+    if profile.has_attestation_chain and profile.has_remediation_tracking:
+        if profile.has_scope_constraints:
+            if profile.can_self_recover and profile.audit_trail_complete:
+                return Level.L4  # Full autonomy within scope
+            return Level.L3  # Conditional autonomy
+        if profile.can_self_recover:
+            return Level.L5  # No scope constraints + self-recovery
+    
+    if profile.has_human_monitoring:
+        return Level.L2  # Falls back to human-monitored
+    
+    return Level.L1
+
+
+def detect_crumple_zone(profile: AgentProfile) -> dict:
+    """Detect moral crumple zones: claiming higher autonomy than evidence supports."""
+    actual = assess_actual_level(profile)
+    gap = profile.claimed_level - actual
+    
+    crumple_zone = False
+    risk_transfer = False
+    
+    if gap >= 2:
+        crumple_zone = True  # Significant overclaim
+    
+    if profile.claimed_level >= Level.L3 and profile.has_human_monitoring:
+        risk_transfer = True  # Claims L3+ but still needs human = liability ambiguity
+    
+    if profile.claimed_level >= Level.L4 and not profile.has_attestation_chain:
+        crumple_zone = True  # Claims full autonomy without evidence trail
+    
+    grade = "A" if gap <= 0 else "B" if gap == 1 else "D" if gap == 2 else "F"
+    
+    return {
+        "claimed": f"L{profile.claimed_level}",
+        "actual": f"L{actual}",
+        "gap": gap,
+        "grade": grade,
+        "crumple_zone": crumple_zone,
+        "risk_transfer": risk_transfer,
+        "liability_owner": "manufacturer" if actual >= Level.L3 else "human operator",
+    }
 
 
 def demo():
-    agents = [
-        AgentCapability("autocomplete_bot", can_act=False, can_monitor=False,
-                       can_fallback=False, human_monitors=True, human_fallback=True,
-                       odd_limited=True, description="Suggests completions, human decides"),
-        AgentCapability("copilot_agent", can_act=True, can_monitor=False,
-                       can_fallback=False, human_monitors=True, human_fallback=True,
-                       odd_limited=True, description="Writes code, human reviews every PR"),
-        AgentCapability("heartbeat_agent", can_act=True, can_monitor=True,
-                       can_fallback=False, human_monitors=True, human_fallback=True,
-                       odd_limited=True, description="Acts + self-monitors, human watches dashboard"),
-        AgentCapability("autonomous_poster", can_act=True, can_monitor=True,
-                       can_fallback=False, human_monitors=False, human_fallback=True,
-                       odd_limited=True, description="Posts autonomously, human intervenes on errors"),
-        AgentCapability("self_healing_agent", can_act=True, can_monitor=True,
-                       can_fallback=True, human_monitors=False, human_fallback=False,
-                       odd_limited=True, description="Handles own errors within domain"),
-        AgentCapability("agi_fantasy", can_act=True, can_monitor=True,
-                       can_fallback=True, human_monitors=False, human_fallback=False,
-                       odd_limited=False, description="Unlimited domain (doesn't exist)"),
+    profiles = [
+        AgentProfile("honest_agent", Level.L3, False, True, True, True, True, False, True, True),
+        AgentProfile("overclaimer", Level.L4, True, True, True, False, False, False, False, False),
+        AgentProfile("humble_agent", Level.L2, True, True, True, True, True, True, False, True),
+        AgentProfile("ghost_agent", Level.L5, False, False, False, False, False, False, False, False),
+        AgentProfile("kit_fox", Level.L3, False, True, True, True, True, False, True, True),
     ]
     
     print("=" * 70)
-    print("AGENT AUTONOMY CLASSIFIER — SAE J3016 Inspired")
-    print("Based on Koopman (CMU) J3016 User Guide")
+    print("AUTONOMY LEVEL CLASSIFIER — SAE J3016 for Agents")
+    print("Koopman & Widen (2024): PRB necessary but insufficient")
+    print("Elish (2019): Moral crumple zones")
     print("=" * 70)
     
-    for agent in agents:
-        level = classify(agent)
+    for p in profiles:
+        result = detect_crumple_zone(p)
         print(f"\n{'─' * 60}")
-        print(f"Agent: {agent.name}")
-        print(f"  Description: {agent.description}")
-        print(f"  Level: L{level.value} — {LEVEL_DESCRIPTIONS[level]}")
-        print(f"  Liability: {LIABILITY_NOTES[level]}")
-        
-        # Marketing vs reality check
-        if agent.human_monitors and agent.can_act:
-            print(f"  ⚠️  MARKETING CHECK: If called 'autonomous', it's autonowashing.")
-            print(f"     Human monitoring = L2 max. 'L2+' doesn't exist (Koopman).")
+        print(f"Agent: {p.name}")
+        print(f"  Claimed: {result['claimed']} | Actual: {result['actual']} | Gap: {result['gap']} | Grade: {result['grade']}")
+        print(f"  Liability: {result['liability_owner']}")
+        if result["crumple_zone"]:
+            print(f"  ⚠️  MORAL CRUMPLE ZONE DETECTED — overclaiming autonomy")
+        if result["risk_transfer"]:
+            print(f"  ⚠️  RISK TRANSFER — claims L3+ but still needs human monitoring")
+        print(f"  Description: {LEVEL_DESCRIPTIONS[assess_actual_level(p)]}")
     
-    # The L3 problem
     print(f"\n{'=' * 70}")
-    print("THE L3 PROBLEM (Koopman):")
-    print("  L3 = agent monitors, human must be 'receptive' to failures.")
-    print("  But 'receptive' requires maintaining cognitive readiness.")
-    print("  J3016: driver falling asleep at L3 is 'improper'.")
-    print("  Agent equivalent: human going AFK while L3 agent runs.")
-    print("  Most L3 incidents happen when humans assume they're at L4.")
-    print()
     print("KEY INSIGHT: The L2→L3 boundary is where liability flips.")
-    print("Below L3: human is responsible. At L3+: system is responsible.")
-    print("Most 'autonomous' agents are L2 with oversight theater.")
+    print("L2: human monitors, agent assists. L3: agent monitors, human is fallback.")
+    print("Most agents claiming L4 are actually L2 with marketing.")
+    print("The cert is the liability contract. The attestation chain is the evidence.")
     print("=" * 70)
 
 
