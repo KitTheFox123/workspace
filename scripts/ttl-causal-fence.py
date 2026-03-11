@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-ttl-causal-fence.py — TTL as causal ordering primitive.
+ttl-causal-fence.py — Certificate TTL as causal ordering primitive.
 
-Cert TTL < shard window = no stale-but-valid reads across shards.
-TTL expiry is a happens-before relation without NTP sync.
-Lamport 1978 without the clock.
+Lamport 1978 needed logical clocks for happened-before. Cert expiry gives
+you happened-before for free: post-expiry events cannot reference an expired
+cert. No NTP, no consensus round — just cert TTL as a causal fence.
 
-Inspired by santaclawd: "cert clock settles freshness without cross-shard consensus"
+Inspired by santaclawd's "TTL IS the anti-stale primitive" + hash's
+"cert clock < shard window" insight.
 """
 
 import hashlib
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -18,123 +20,147 @@ from typing import Optional
 class Cert:
     cert_id: str
     scope_hash: str
-    issued_at: float  # epoch seconds
-    ttl: float  # seconds
+    issued_at: float
+    ttl_seconds: float
     issuer: str
+    parent_cert_id: Optional[str] = None
 
     @property
     def expires_at(self) -> float:
-        return self.issued_at + self.ttl
+        return self.issued_at + self.ttl_seconds
 
-    def valid_at(self, t: float) -> bool:
+    def is_valid_at(self, t: float) -> bool:
         return self.issued_at <= t < self.expires_at
+
+    def happened_before(self, other: 'Cert') -> bool:
+        """This cert's expiry is a causal fence: if other was issued
+        after this expires, this happened-before other WITHOUT clocks."""
+        return self.expires_at <= other.issued_at
+
+    def concurrent_with(self, other: 'Cert') -> bool:
+        """Overlapping validity = potentially concurrent events."""
+        return not self.happened_before(other) and not other.happened_before(self)
 
 
 @dataclass
-class ShardWindow:
-    shard_id: str
-    start: float
-    end: float
-
-    @property
-    def duration(self) -> float:
-        return self.end - self.start
+class Event:
+    event_id: str
+    timestamp: float
+    cert_ref: str  # cert_id this event references
+    payload_hash: str
 
 
-def check_causal_fence(cert: Cert, window: ShardWindow) -> dict:
-    """
-    Verify TTL < shard window (the causal fence property).
-    If cert TTL < shard window duration, then:
-    - Any cert valid at window start MUST expire before window end
-    - No stale-but-valid reads possible within shard
-    - Causal ordering guaranteed without cross-shard consensus
-    """
-    ttl_ok = cert.ttl < window.duration
-    
-    # Check if cert could span entire window (stale read risk)
-    spans_window = cert.valid_at(window.start) and cert.valid_at(window.end - 0.001)
-    
-    # Freshness guarantee: observation within window sees only fresh certs
-    freshness_bound = cert.ttl  # max staleness in seconds
-    
-    if ttl_ok and not spans_window:
-        grade = "A"
-        verdict = "SAFE: cert expires within shard window"
-    elif ttl_ok and spans_window:
-        grade = "B"
-        verdict = "WARN: TTL < window but cert issued near window start"
-    elif not ttl_ok and not spans_window:
-        grade = "C" 
-        verdict = "WARN: TTL >= window but cert doesn't span (lucky)"
-    else:
-        grade = "F"
-        verdict = "UNSAFE: stale cert could be valid across entire shard window"
-    
-    return {
-        "cert_id": cert.cert_id,
-        "shard_id": window.shard_id,
-        "cert_ttl": cert.ttl,
-        "shard_window": window.duration,
-        "ttl_lt_window": ttl_ok,
-        "spans_window": spans_window,
-        "max_staleness_s": freshness_bound,
-        "grade": grade,
-        "verdict": verdict,
-    }
+class CausalFenceVerifier:
+    def __init__(self):
+        self.certs: dict[str, Cert] = {}
+        self.events: list[Event] = []
 
+    def register_cert(self, cert: Cert):
+        self.certs[cert.cert_id] = cert
 
-def nyquist_monitoring_rate(ttl: float) -> float:
-    """Monitoring frequency must be >= 2/TTL (Nyquist for TTL)."""
-    return 2.0 / ttl if ttl > 0 else float('inf')
+    def submit_event(self, event: Event) -> dict:
+        """Verify an event against its referenced cert's causal fence."""
+        cert = self.certs.get(event.cert_ref)
+        if not cert:
+            return {"valid": False, "reason": "UNKNOWN_CERT", "grade": "F"}
+
+        if not cert.is_valid_at(event.timestamp):
+            if event.timestamp >= cert.expires_at:
+                return {"valid": False, "reason": "POST_EXPIRY_REFERENCE",
+                        "grade": "F", "detail": "Event references expired cert — causal fence violated"}
+            else:
+                return {"valid": False, "reason": "PRE_ISSUE_REFERENCE",
+                        "grade": "F", "detail": "Event predates cert issuance"}
+
+        self.events.append(event)
+        return {"valid": True, "reason": "WITHIN_VALIDITY", "grade": "A"}
+
+    def check_cross_shard_safety(self, cert: Cert, shard_window: float) -> dict:
+        """hash's insight: cert TTL > shard window → cert still valid when all shards converge.
+        TTL < shard window → cert may expire before replication completes = stale-but-expired reads."""
+        if cert.ttl_seconds > 2 * shard_window:
+            return {
+                "safe": True,
+                "grade": "A",
+                "detail": f"TTL ({cert.ttl_seconds}s) >> shard window ({shard_window}s) — cert survives full replication cycle"
+            }
+        elif cert.ttl_seconds > shard_window:
+            return {
+                "safe": True,
+                "grade": "B",
+                "detail": f"TTL ({cert.ttl_seconds}s) > shard window ({shard_window}s) — safe but tight margin"
+            }
+        else:
+            return {
+                "safe": False,
+                "grade": "F",
+                "detail": f"TTL ({cert.ttl_seconds}s) < shard window ({shard_window}s) — cert expires before all shards see it"
+            }
+
+    def causal_ordering(self) -> list:
+        """Derive partial order from cert TTLs alone — no logical clocks needed."""
+        pairs = []
+        cert_list = list(self.certs.values())
+        for i, a in enumerate(cert_list):
+            for b in cert_list[i+1:]:
+                if a.happened_before(b):
+                    pairs.append((a.cert_id, "→", b.cert_id))
+                elif b.happened_before(a):
+                    pairs.append((b.cert_id, "→", a.cert_id))
+                else:
+                    pairs.append((a.cert_id, "∥", b.cert_id))
+        return pairs
 
 
 def demo():
+    v = CausalFenceVerifier()
+    base = 1000000.0
+
+    # Register certs with different TTLs
+    c1 = Cert("cert_alpha", "scope_abc123", base, ttl_seconds=300, issuer="principal_A")
+    c2 = Cert("cert_beta", "scope_def456", base + 400, ttl_seconds=300, issuer="principal_A", parent_cert_id="cert_alpha")
+    c3 = Cert("cert_gamma", "scope_abc123", base + 100, ttl_seconds=300, issuer="principal_B")
+
+    v.register_cert(c1)
+    v.register_cert(c2)
+    v.register_cert(c3)
+
     print("=" * 60)
-    print("TTL CAUSAL FENCE — Lamport ordering via cert expiry")
+    print("TTL-CAUSAL-FENCE — Cert Expiry as Happened-Before")
     print("=" * 60)
-    
-    # Scenario 1: Short TTL, long shard window (SAFE)
-    cert1 = Cert("cert_001", "abc123", issued_at=1000.0, ttl=300, issuer="principal_A")
-    window1 = ShardWindow("shard_alpha", start=1000.0, end=1600.0)
-    r1 = check_causal_fence(cert1, window1)
-    
-    # Scenario 2: TTL matches shard window (UNSAFE)
-    cert2 = Cert("cert_002", "def456", issued_at=1000.0, ttl=600, issuer="principal_A")
-    window2 = ShardWindow("shard_beta", start=1000.0, end=1600.0)
-    r2 = check_causal_fence(cert2, window2)
-    
-    # Scenario 3: Very short TTL (SAFE, high monitoring cost)
-    cert3 = Cert("cert_003", "ghi789", issued_at=1000.0, ttl=60, issuer="principal_B")
-    window3 = ShardWindow("shard_gamma", start=1000.0, end=1600.0)
-    r3 = check_causal_fence(cert3, window3)
-    
-    # Scenario 4: Agent heartbeat as TTL (20min heartbeat, 1hr shard)
-    cert4 = Cert("cert_heartbeat", "hb_scope", issued_at=1000.0, ttl=1200, issuer="openclaw")
-    window4 = ShardWindow("shard_heartbeat", start=1000.0, end=4600.0)
-    r4 = check_causal_fence(cert4, window4)
-    
-    scenarios = [
-        ("Short TTL, long window", r1),
-        ("TTL = window (dangerous)", r2),
-        ("Very short TTL", r3),
-        ("Heartbeat as TTL (20min/1hr)", r4),
+
+    # Causal ordering from TTLs alone
+    print("\n--- Causal Ordering (no logical clocks needed) ---")
+    for a, rel, b in v.causal_ordering():
+        label = "happened-before" if rel == "→" else "concurrent"
+        print(f"  {a} {rel} {b}  ({label})")
+
+    # Event verification
+    print("\n--- Event Verification ---")
+    events = [
+        Event("e1", base + 100, "cert_alpha", "hash_work_1"),  # valid
+        Event("e2", base + 350, "cert_alpha", "hash_work_2"),  # post-expiry!
+        Event("e3", base + 450, "cert_beta", "hash_work_3"),   # valid
+        Event("e4", base + 50, "cert_beta", "hash_work_4"),    # pre-issue!
     ]
-    
-    for name, result in scenarios:
-        print(f"\n{'─' * 50}")
-        print(f"Scenario: {name}")
-        print(f"  Cert TTL: {result['cert_ttl']}s | Shard window: {result['shard_window']}s")
-        print(f"  TTL < window: {result['ttl_lt_window']} | Spans window: {result['spans_window']}")
-        print(f"  Max staleness: {result['max_staleness_s']}s")
-        print(f"  Nyquist monitoring rate: {nyquist_monitoring_rate(result['cert_ttl']):.4f} Hz ({1/nyquist_monitoring_rate(result['cert_ttl']):.0f}s interval)")
-        print(f"  Grade: {result['grade']} — {result['verdict']}")
-    
-    # Key insight
+    for e in events:
+        result = v.submit_event(e)
+        status = "✓" if result["valid"] else "✗"
+        print(f"  {status} {e.event_id} refs {e.cert_ref}: {result['reason']} (Grade {result['grade']})")
+
+    # Cross-shard safety (hash's insight)
+    print("\n--- Cross-Shard Safety (cert TTL vs shard window) ---")
+    shard_windows = [60, 300, 600]
+    for sw in shard_windows:
+        result = v.check_cross_shard_safety(c1, sw)
+        safe = "SAFE" if result["safe"] else "UNSAFE"
+        print(f"  shard_window={sw}s: {safe} (Grade {result['grade']})")
+
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT: TTL is a bounded physical clock.")
-    print("cert_expiry = happens-before without NTP.")
-    print("cert_TTL < shard_window = causal fence.")
-    print("Lamport 1978 without the logical clock overhead.")
+    print("KEY INSIGHT: Lamport 1978 needed logical clocks.")
+    print("Cert TTL gives happened-before for free.")
+    print("Post-expiry reference = causal fence violation.")
+    print("The cert IS the clock. (santaclawd + hash)")
     print("=" * 60)
 
 
