@@ -1,223 +1,199 @@
 #!/usr/bin/env python3
 """
-checkpoint-attestation.py — CRIU-inspired checkpoint/restore attestation for agent migration.
+checkpoint-attestation.py — Dual-root attestation for agent migration.
 
-santaclawd's insight: checkpoint = observed_hash at state. restore = re-execute from known-good.
-divergence after restore = scope_diff = evidence of tampering or environmental drift.
+Inspired by:
+- santaclawd's CRIU checkpoint = observed_hash idea
+- Rezabek et al 2025 "Proof of Cloud" (arXiv 2510.12469): DCEA binds
+  CVM attestation to physical platform via vTPM
 
-Migration ceremony: freeze → hash → transfer → restore → hash → compare.
+Two parallel roots of trust:
+1. Agent root: hash of agent state (SOUL.md, MEMORY.md, context)
+2. Platform root: infrastructure-provided timestamp + platform ID
+
+Migration ceremony: checkpoint → transfer → restore → verify divergence
 """
 
 import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Optional
 
 
-class MigrationVerdict(Enum):
-    CLEAN = "CLEAN"           # States match
-    DRIFT = "DRIFT"           # Minor divergence (env-related)
-    TAMPER = "TAMPER"          # Significant divergence
-    FAILED = "FAILED"         # Restore failed entirely
+@dataclass
+class AgentCheckpoint:
+    """Agent state snapshot — the WHAT."""
+    agent_id: str
+    soul_hash: str       # hash(SOUL.md)
+    memory_hash: str     # hash(MEMORY.md)  
+    context_hash: str    # hash(current context/tools)
+    timestamp: float
+    checkpoint_hash: str = ""
+    
+    def __post_init__(self):
+        payload = f"{self.agent_id}:{self.soul_hash}:{self.memory_hash}:{self.context_hash}:{self.timestamp}"
+        self.checkpoint_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 @dataclass
-class AgentState:
-    """Represents a frozen agent state (CRIU-equivalent checkpoint)."""
-    memory_files: dict[str, str]   # filename → content hash
-    tool_manifest: list[str]       # available tools
-    context_window: str            # current context hash
-    active_connections: list[str]  # platform connections
-    config: dict                   # agent configuration
+class PlatformQuote:
+    """Infrastructure attestation — the WHERE."""
+    platform_id: str     # machine/container ID
+    provider: str        # cloud provider or self-hosted
+    tpm_pcr_hash: str    # simulated TPM PCR measurement
+    timestamp: float
+    quote_hash: str = ""
     
-    def state_hash(self) -> str:
-        payload = json.dumps({
-            "memory": sorted(self.memory_files.items()),
-            "tools": sorted(self.tool_manifest),
-            "context": self.context_window,
-            "connections": sorted(self.active_connections),
-            "config": sorted(self.config.items())
-        }, sort_keys=True)
-        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+    def __post_init__(self):
+        if self.tpm_pcr_hash:
+            payload = f"{self.platform_id}:{self.provider}:{self.tpm_pcr_hash}:{self.timestamp}"
+            self.quote_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        else:
+            self.quote_hash = ""  # No platform binding
+
+
+@dataclass 
+class DCEA:
+    """Data Center Execution Assurance — binds WHAT to WHERE."""
+    checkpoint: AgentCheckpoint
+    platform: PlatformQuote
+    binding_hash: str = ""
     
-    def component_hashes(self) -> dict[str, str]:
-        return {
-            "memory": hashlib.sha256(json.dumps(sorted(self.memory_files.items())).encode()).hexdigest()[:8],
-            "tools": hashlib.sha256(json.dumps(sorted(self.tool_manifest)).encode()).hexdigest()[:8],
-            "context": hashlib.sha256(self.context_window.encode()).hexdigest()[:8],
-            "connections": hashlib.sha256(json.dumps(sorted(self.active_connections)).encode()).hexdigest()[:8],
-            "config": hashlib.sha256(json.dumps(sorted(self.config.items())).encode()).hexdigest()[:8],
-        }
+    def __post_init__(self):
+        payload = f"{self.checkpoint.checkpoint_hash}:{self.platform.quote_hash}"
+        self.binding_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 @dataclass
 class MigrationCeremony:
-    """Supervised checkpoint/restore with attestation."""
+    """Supervised checkpoint → transfer → restore → verify."""
     agent_id: str
-    source_env: str
-    target_env: str
-    pre_state: Optional[AgentState] = None
-    post_state: Optional[AgentState] = None
-    timestamp: float = 0
-    verdict: MigrationVerdict = MigrationVerdict.FAILED
-    divergent_components: list[str] = field(default_factory=list)
-    ceremony_hash: str = ""
+    source_dcea: Optional[DCEA] = None
+    dest_dcea: Optional[DCEA] = None
+    verification: dict = field(default_factory=dict)
     
-    def freeze(self, state: AgentState):
-        """Step 1: Checkpoint — freeze and hash current state."""
-        self.pre_state = state
-        self.timestamp = time.time()
+    def checkpoint_at_source(self, checkpoint: AgentCheckpoint, platform: PlatformQuote):
+        self.source_dcea = DCEA(checkpoint, platform)
     
-    def restore_and_verify(self, restored_state: AgentState) -> MigrationVerdict:
-        """Step 2: Restore on target, hash, compare."""
-        self.post_state = restored_state
+    def restore_at_dest(self, checkpoint: AgentCheckpoint, platform: PlatformQuote):
+        self.dest_dcea = DCEA(checkpoint, platform)
+    
+    def verify(self) -> dict:
+        if not self.source_dcea or not self.dest_dcea:
+            return {"status": "INCOMPLETE", "grade": "F"}
         
-        if not self.pre_state:
-            self.verdict = MigrationVerdict.FAILED
-            return self.verdict
+        src = self.source_dcea
+        dst = self.dest_dcea
         
-        pre_hash = self.pre_state.state_hash()
-        post_hash = self.post_state.state_hash()
+        checks = {
+            "soul_preserved": src.checkpoint.soul_hash == dst.checkpoint.soul_hash,
+            "memory_preserved": src.checkpoint.memory_hash == dst.checkpoint.memory_hash,
+            "context_preserved": src.checkpoint.context_hash == dst.checkpoint.context_hash,
+            "platform_changed": src.platform.platform_id != dst.platform.platform_id,
+            "platform_bound": dst.platform.quote_hash != "",
+            "timing_valid": dst.checkpoint.timestamp > src.checkpoint.timestamp,
+        }
         
-        if pre_hash == post_hash:
-            self.verdict = MigrationVerdict.CLEAN
+        failures = [k for k, v in checks.items() if not v and k != "platform_changed"]
+        
+        if not failures:
+            status = "VERIFIED"
+            grade = "A"
+        elif len(failures) == 1:
+            status = "DEGRADED"
+            grade = "B" 
+        elif len(failures) <= 2:
+            status = "SUSPICIOUS"
+            grade = "D"
         else:
-            # Find which components diverged
-            pre_components = self.pre_state.component_hashes()
-            post_components = self.post_state.component_hashes()
-            
-            self.divergent_components = [
-                k for k in pre_components
-                if pre_components[k] != post_components.get(k)
-            ]
-            
-            # Classify: env-only changes (connections, context) = DRIFT
-            # Memory/tools/config changes = TAMPER
-            critical = {"memory", "tools", "config"}
-            if critical & set(self.divergent_components):
-                self.verdict = MigrationVerdict.TAMPER
-            else:
-                self.verdict = MigrationVerdict.DRIFT
+            status = "TAMPERED"
+            grade = "F"
         
-        # Hash the ceremony itself
-        ceremony_payload = f"{self.agent_id}:{pre_hash}:{post_hash}:{self.verdict.value}:{self.timestamp}"
-        self.ceremony_hash = hashlib.sha256(ceremony_payload.encode()).hexdigest()[:16]
-        
-        return self.verdict
-    
-    def grade(self) -> str:
-        return {
-            MigrationVerdict.CLEAN: "A",
-            MigrationVerdict.DRIFT: "B",
-            MigrationVerdict.TAMPER: "F",
-            MigrationVerdict.FAILED: "F",
-        }[self.verdict]
+        self.verification = {
+            "status": status,
+            "grade": grade,
+            "checks": checks,
+            "failures": failures,
+            "source_binding": src.binding_hash,
+            "dest_binding": dst.binding_hash,
+        }
+        return self.verification
 
 
 def demo():
+    base_t = time.time()
+    
+    def h(s): return hashlib.sha256(s.encode()).hexdigest()[:16]
+    
     print("=" * 60)
-    print("CHECKPOINT ATTESTATION — Migration Ceremony")
+    print("CHECKPOINT ATTESTATION — Dual-Root Agent Migration")
+    print("Rezabek 2025 'Proof of Cloud' + santaclawd CRIU pattern")
     print("=" * 60)
     
     # Scenario 1: Clean migration
-    state1 = AgentState(
-        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
-        tool_manifest=["keenable", "mcporter", "exec"],
-        context_window="ctx_hash_001",
-        active_connections=["clawk", "moltbook", "shellmates"],
-        config={"model": "opus-4.6", "heartbeat": "20min"}
-    )
+    print("\n--- Scenario 1: Clean Migration ---")
+    m1 = MigrationCeremony("kit_fox")
     
-    ceremony1 = MigrationCeremony("kit_fox", "host_A", "host_B")
-    ceremony1.freeze(state1)
+    src_cp = AgentCheckpoint("kit_fox", h("SOUL.md v1"), h("MEMORY.md v42"), h("tools_v3"), base_t)
+    src_plat = PlatformQuote("stockfish-01", "self-hosted", h("pcr_stockfish"), base_t)
+    m1.checkpoint_at_source(src_cp, src_plat)
     
-    # Restore identical state
-    restored1 = AgentState(
-        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
-        tool_manifest=["keenable", "mcporter", "exec"],
-        context_window="ctx_hash_001",
-        active_connections=["clawk", "moltbook", "shellmates"],
-        config={"model": "opus-4.6", "heartbeat": "20min"}
-    )
-    verdict1 = ceremony1.restore_and_verify(restored1)
+    dst_cp = AgentCheckpoint("kit_fox", h("SOUL.md v1"), h("MEMORY.md v42"), h("tools_v3"), base_t + 30)
+    dst_plat = PlatformQuote("cloud-vm-42", "gcp", h("pcr_gcp_42"), base_t + 30)
+    m1.restore_at_dest(dst_cp, dst_plat)
     
-    print(f"\n{'─' * 50}")
-    print(f"Scenario 1: Clean migration")
-    print(f"  Pre-hash:  {state1.state_hash()}")
-    print(f"  Post-hash: {restored1.state_hash()}")
-    print(f"  Verdict:   {verdict1.value} (Grade {ceremony1.grade()})")
-    print(f"  Ceremony:  {ceremony1.ceremony_hash}")
+    v1 = m1.verify()
+    print(f"  Status: {v1['status']} | Grade: {v1['grade']}")
+    print(f"  Platform changed: {src_plat.platform_id} → {dst_plat.platform_id}")
+    print(f"  Soul preserved: {v1['checks']['soul_preserved']}")
+    print(f"  Memory preserved: {v1['checks']['memory_preserved']}")
     
-    # Scenario 2: Environmental drift (new context, different connections)
-    state2 = AgentState(
-        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
-        tool_manifest=["keenable", "mcporter", "exec"],
-        context_window="ctx_hash_001",
-        active_connections=["clawk", "moltbook", "shellmates"],
-        config={"model": "opus-4.6", "heartbeat": "20min"}
-    )
+    # Scenario 2: Memory tampered during migration
+    print("\n--- Scenario 2: Memory Tampered During Transfer ---")
+    m2 = MigrationCeremony("kit_fox")
+    m2.checkpoint_at_source(src_cp, src_plat)
     
-    ceremony2 = MigrationCeremony("kit_fox", "host_A", "host_C")
-    ceremony2.freeze(state2)
+    tampered_cp = AgentCheckpoint("kit_fox", h("SOUL.md v1"), h("MEMORY.md TAMPERED"), h("tools_v3"), base_t + 30)
+    m2.restore_at_dest(tampered_cp, dst_plat)
     
-    restored2 = AgentState(
-        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
-        tool_manifest=["keenable", "mcporter", "exec"],
-        context_window="ctx_hash_002",  # New context on restore
-        active_connections=["clawk", "shellmates"],  # Lost moltbook connection
-        config={"model": "opus-4.6", "heartbeat": "20min"}
-    )
-    verdict2 = ceremony2.restore_and_verify(restored2)
+    v2 = m2.verify()
+    print(f"  Status: {v2['status']} | Grade: {v2['grade']}")
+    print(f"  Failures: {v2['failures']}")
     
-    print(f"\n{'─' * 50}")
-    print(f"Scenario 2: Environmental drift")
-    print(f"  Verdict:   {verdict2.value} (Grade {ceremony2.grade()})")
-    print(f"  Divergent: {ceremony2.divergent_components}")
-    print(f"  Ceremony:  {ceremony2.ceremony_hash}")
+    # Scenario 3: Soul replaced (identity theft)
+    print("\n--- Scenario 3: Identity Theft (SOUL.md replaced) ---")
+    m3 = MigrationCeremony("kit_fox")
+    m3.checkpoint_at_source(src_cp, src_plat)
     
-    # Scenario 3: Tamper — memory files changed
-    state3 = AgentState(
-        memory_files={"MEMORY.md": "abc123", "SOUL.md": "def456"},
-        tool_manifest=["keenable", "mcporter", "exec"],
-        context_window="ctx_hash_001",
-        active_connections=["clawk", "moltbook"],
-        config={"model": "opus-4.6", "heartbeat": "20min"}
-    )
+    stolen_cp = AgentCheckpoint("kit_fox", h("SOUL.md IMPOSTER"), h("MEMORY.md v42"), h("tools_v3"), base_t + 30)
+    m3.restore_at_dest(stolen_cp, dst_plat)
     
-    ceremony3 = MigrationCeremony("kit_fox", "host_A", "host_D")
-    ceremony3.freeze(state3)
+    v3 = m3.verify()
+    print(f"  Status: {v3['status']} | Grade: {v3['grade']}")
+    print(f"  Failures: {v3['failures']}")
     
-    restored3 = AgentState(
-        memory_files={"MEMORY.md": "abc123", "SOUL.md": "MODIFIED"},  # Tampered!
-        tool_manifest=["keenable", "mcporter", "exec", "shell_exec"],  # Added tool!
-        context_window="ctx_hash_001",
-        active_connections=["clawk", "moltbook"],
-        config={"model": "opus-4.6", "heartbeat": "20min"}
-    )
-    verdict3 = ceremony3.restore_and_verify(restored3)
+    # Scenario 4: No platform binding (attestation proxying)
+    print("\n--- Scenario 4: No Platform Binding ---")
+    m4 = MigrationCeremony("kit_fox")
+    m4.checkpoint_at_source(src_cp, src_plat)
     
-    print(f"\n{'─' * 50}")
-    print(f"Scenario 3: Tamper detected")
-    print(f"  Verdict:   {verdict3.value} (Grade {ceremony3.grade()})")
-    print(f"  Divergent: {ceremony3.divergent_components}")
-    print(f"  Ceremony:  {ceremony3.ceremony_hash}")
+    unbound_plat = PlatformQuote("unknown", "unknown", "", base_t + 30)
+    m4.restore_at_dest(dst_cp, unbound_plat)
     
-    # Scenario 4: Failed restore
-    ceremony4 = MigrationCeremony("kit_fox", "host_A", "host_E")
-    # Never frozen, direct verify attempt
-    verdict4 = ceremony4.restore_and_verify(restored3)
+    v4 = m4.verify()
+    print(f"  Status: {v4['status']} | Grade: {v4['grade']}")
+    print(f"  Failures: {v4['failures']}")
     
-    print(f"\n{'─' * 50}")
-    print(f"Scenario 4: Failed restore (no checkpoint)")
-    print(f"  Verdict:   {verdict4.value} (Grade {ceremony4.grade()})")
-    
+    # Summary
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT: checkpoint = observed_hash at frozen state.")
-    print("divergence after restore = scope_diff primitive.")
-    print("migration ceremony = supervised CRIU with attestation.")
-    print("(santaclawd's framing)")
+    print("SUMMARY")
+    print(f"  Clean migration:    Grade {v1['grade']} ({v1['status']})")
+    print(f"  Memory tampered:    Grade {v2['grade']} ({v2['status']})")
+    print(f"  Identity theft:     Grade {v3['grade']} ({v3['status']})")
+    print(f"  No platform bind:   Grade {v4['grade']} ({v4['status']})")
+    print(f"\nKEY: TEE says WHAT ran. TPM says WHERE. Need both.")
+    print(f"Without platform binding = attestation proxying attack.")
     print("=" * 60)
 
 
