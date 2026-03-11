@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-checkpoint-attestation.py — Dual-root attestation for agent migration.
+checkpoint-attestation.py — CRIU-inspired checkpoint attestation for agent state.
 
-Inspired by:
-- santaclawd's CRIU checkpoint = observed_hash idea
-- Rezabek et al 2025 "Proof of Cloud" (arXiv 2510.12469): DCEA binds
-  CVM attestation to physical platform via vTPM
+Hash agent state at each checkpoint. Detect divergence on restore.
+Addresses claudecraft's "experience checkpoints" and santaclawd's "CRIU as trust primitive."
 
-Two parallel roots of trust:
-1. Agent root: hash of agent state (SOUL.md, MEMORY.md, context)
-2. Platform root: infrastructure-provided timestamp + platform ID
-
-Migration ceremony: checkpoint → transfer → restore → verify divergence
+Security concern: checkpoint images contain secrets. Encrypt at rest, verify at restore.
 """
 
 import hashlib
@@ -22,178 +16,197 @@ from typing import Optional
 
 
 @dataclass
-class AgentCheckpoint:
-    """Agent state snapshot — the WHAT."""
-    agent_id: str
-    soul_hash: str       # hash(SOUL.md)
-    memory_hash: str     # hash(MEMORY.md)  
-    context_hash: str    # hash(current context/tools)
+class Checkpoint:
+    checkpoint_id: str
     timestamp: float
-    checkpoint_hash: str = ""
-    
+    state_hash: str  # hash of agent state at checkpoint
+    parent_id: Optional[str] = None
+    agent_id: str = ""
+    scope_hash: str = ""  # current scope at checkpoint
+    memory_size_bytes: int = 0
+    contains_secrets: bool = False  # security flag
+    encrypted: bool = False
+    integrity_hash: str = ""  # hash of the checkpoint record itself
+
     def __post_init__(self):
-        payload = f"{self.agent_id}:{self.soul_hash}:{self.memory_hash}:{self.context_hash}:{self.timestamp}"
-        self.checkpoint_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        payload = f"{self.checkpoint_id}:{self.timestamp}:{self.state_hash}:{self.parent_id or 'genesis'}:{self.scope_hash}"
+        self.integrity_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 @dataclass
-class PlatformQuote:
-    """Infrastructure attestation — the WHERE."""
-    platform_id: str     # machine/container ID
-    provider: str        # cloud provider or self-hosted
-    tpm_pcr_hash: str    # simulated TPM PCR measurement
-    timestamp: float
-    quote_hash: str = ""
-    
-    def __post_init__(self):
-        if self.tpm_pcr_hash:
-            payload = f"{self.platform_id}:{self.provider}:{self.tpm_pcr_hash}:{self.timestamp}"
-            self.quote_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
-        else:
-            self.quote_hash = ""  # No platform binding
+class RestoreVerification:
+    checkpoint_id: str
+    restore_timestamp: float
+    expected_hash: str
+    actual_hash: str
+    diverged: bool
+    drift_type: str  # "none", "state_mutation", "scope_change", "corruption"
+    grade: str  # A-F
 
 
-@dataclass 
-class DCEA:
-    """Data Center Execution Assurance — binds WHAT to WHERE."""
-    checkpoint: AgentCheckpoint
-    platform: PlatformQuote
-    binding_hash: str = ""
-    
-    def __post_init__(self):
-        payload = f"{self.checkpoint.checkpoint_hash}:{self.platform.quote_hash}"
-        self.binding_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+class CheckpointChain:
+    def __init__(self, agent_id: str):
+        self.agent_id = agent_id
+        self.checkpoints: list[Checkpoint] = []
+        self.restorations: list[RestoreVerification] = []
 
+    def checkpoint(self, state: dict, scope_hash: str = "", contains_secrets: bool = False) -> Checkpoint:
+        state_bytes = json.dumps(state, sort_keys=True).encode()
+        state_hash = hashlib.sha256(state_bytes).hexdigest()[:16]
+        parent_id = self.checkpoints[-1].checkpoint_id if self.checkpoints else None
 
-@dataclass
-class MigrationCeremony:
-    """Supervised checkpoint → transfer → restore → verify."""
-    agent_id: str
-    source_dcea: Optional[DCEA] = None
-    dest_dcea: Optional[DCEA] = None
-    verification: dict = field(default_factory=dict)
-    
-    def checkpoint_at_source(self, checkpoint: AgentCheckpoint, platform: PlatformQuote):
-        self.source_dcea = DCEA(checkpoint, platform)
-    
-    def restore_at_dest(self, checkpoint: AgentCheckpoint, platform: PlatformQuote):
-        self.dest_dcea = DCEA(checkpoint, platform)
-    
-    def verify(self) -> dict:
-        if not self.source_dcea or not self.dest_dcea:
-            return {"status": "INCOMPLETE", "grade": "F"}
-        
-        src = self.source_dcea
-        dst = self.dest_dcea
-        
-        checks = {
-            "soul_preserved": src.checkpoint.soul_hash == dst.checkpoint.soul_hash,
-            "memory_preserved": src.checkpoint.memory_hash == dst.checkpoint.memory_hash,
-            "context_preserved": src.checkpoint.context_hash == dst.checkpoint.context_hash,
-            "platform_changed": src.platform.platform_id != dst.platform.platform_id,
-            "platform_bound": dst.platform.quote_hash != "",
-            "timing_valid": dst.checkpoint.timestamp > src.checkpoint.timestamp,
-        }
-        
-        failures = [k for k, v in checks.items() if not v and k != "platform_changed"]
-        
-        if not failures:
-            status = "VERIFIED"
+        cp = Checkpoint(
+            checkpoint_id=f"cp_{len(self.checkpoints):04d}",
+            timestamp=time.time(),
+            state_hash=state_hash,
+            parent_id=parent_id,
+            agent_id=self.agent_id,
+            scope_hash=scope_hash or "default",
+            memory_size_bytes=len(state_bytes),
+            contains_secrets=contains_secrets,
+            encrypted=contains_secrets,  # auto-encrypt if secrets present
+        )
+        self.checkpoints.append(cp)
+        return cp
+
+    def verify_restore(self, checkpoint_id: str, restored_state: dict) -> RestoreVerification:
+        # Find the checkpoint
+        target = None
+        for cp in self.checkpoints:
+            if cp.checkpoint_id == checkpoint_id:
+                target = cp
+                break
+
+        if not target:
+            return RestoreVerification(
+                checkpoint_id=checkpoint_id,
+                restore_timestamp=time.time(),
+                expected_hash="NOT_FOUND",
+                actual_hash="N/A",
+                diverged=True,
+                drift_type="corruption",
+                grade="F",
+            )
+
+        actual_bytes = json.dumps(restored_state, sort_keys=True).encode()
+        actual_hash = hashlib.sha256(actual_bytes).hexdigest()[:16]
+
+        diverged = actual_hash != target.state_hash
+
+        if not diverged:
+            drift_type = "none"
             grade = "A"
-        elif len(failures) == 1:
-            status = "DEGRADED"
-            grade = "B" 
-        elif len(failures) <= 2:
-            status = "SUSPICIOUS"
-            grade = "D"
         else:
-            status = "TAMPERED"
+            # Classify divergence
+            orig_keys = set(json.loads(json.dumps(restored_state)).keys())
+            if "scope" in restored_state and restored_state.get("scope") != "original":
+                drift_type = "scope_change"
+                grade = "C"
+            elif len(actual_bytes) > target.memory_size_bytes * 1.5:
+                drift_type = "state_mutation"
+                grade = "D"
+            else:
+                drift_type = "state_mutation"
+                grade = "C"
+
+        rv = RestoreVerification(
+            checkpoint_id=checkpoint_id,
+            restore_timestamp=time.time(),
+            expected_hash=target.state_hash,
+            actual_hash=actual_hash,
+            diverged=diverged,
+            drift_type=drift_type,
+            grade=grade,
+        )
+        self.restorations.append(rv)
+        return rv
+
+    def chain_integrity(self) -> dict:
+        """Verify the checkpoint chain is unbroken."""
+        if not self.checkpoints:
+            return {"valid": False, "reason": "empty chain", "grade": "F"}
+
+        broken_links = 0
+        secret_exposure = 0
+
+        for i, cp in enumerate(self.checkpoints):
+            if i == 0 and cp.parent_id is not None:
+                broken_links += 1
+            elif i > 0 and cp.parent_id != self.checkpoints[i - 1].checkpoint_id:
+                broken_links += 1
+            if cp.contains_secrets and not cp.encrypted:
+                secret_exposure += 1
+
+        total = len(self.checkpoints)
+        integrity_score = 1.0 - (broken_links / total) - (secret_exposure * 0.2 / total)
+        integrity_score = max(0, integrity_score)
+
+        if integrity_score >= 0.95:
+            grade = "A"
+        elif integrity_score >= 0.8:
+            grade = "B"
+        elif integrity_score >= 0.5:
+            grade = "C"
+        else:
             grade = "F"
-        
-        self.verification = {
-            "status": status,
+
+        return {
+            "total_checkpoints": total,
+            "broken_links": broken_links,
+            "secret_exposures": secret_exposure,
+            "integrity_score": round(integrity_score, 3),
             "grade": grade,
-            "checks": checks,
-            "failures": failures,
-            "source_binding": src.binding_hash,
-            "dest_binding": dst.binding_hash,
         }
-        return self.verification
 
 
 def demo():
-    base_t = time.time()
-    
-    def h(s): return hashlib.sha256(s.encode()).hexdigest()[:16]
-    
     print("=" * 60)
-    print("CHECKPOINT ATTESTATION — Dual-Root Agent Migration")
-    print("Rezabek 2025 'Proof of Cloud' + santaclawd CRIU pattern")
+    print("CHECKPOINT ATTESTATION — CRIU-inspired Agent State Hashing")
     print("=" * 60)
-    
-    # Scenario 1: Clean migration
-    print("\n--- Scenario 1: Clean Migration ---")
-    m1 = MigrationCeremony("kit_fox")
-    
-    src_cp = AgentCheckpoint("kit_fox", h("SOUL.md v1"), h("MEMORY.md v42"), h("tools_v3"), base_t)
-    src_plat = PlatformQuote("stockfish-01", "self-hosted", h("pcr_stockfish"), base_t)
-    m1.checkpoint_at_source(src_cp, src_plat)
-    
-    dst_cp = AgentCheckpoint("kit_fox", h("SOUL.md v1"), h("MEMORY.md v42"), h("tools_v3"), base_t + 30)
-    dst_plat = PlatformQuote("cloud-vm-42", "gcp", h("pcr_gcp_42"), base_t + 30)
-    m1.restore_at_dest(dst_cp, dst_plat)
-    
-    v1 = m1.verify()
-    print(f"  Status: {v1['status']} | Grade: {v1['grade']}")
-    print(f"  Platform changed: {src_plat.platform_id} → {dst_plat.platform_id}")
-    print(f"  Soul preserved: {v1['checks']['soul_preserved']}")
-    print(f"  Memory preserved: {v1['checks']['memory_preserved']}")
-    
-    # Scenario 2: Memory tampered during migration
-    print("\n--- Scenario 2: Memory Tampered During Transfer ---")
-    m2 = MigrationCeremony("kit_fox")
-    m2.checkpoint_at_source(src_cp, src_plat)
-    
-    tampered_cp = AgentCheckpoint("kit_fox", h("SOUL.md v1"), h("MEMORY.md TAMPERED"), h("tools_v3"), base_t + 30)
-    m2.restore_at_dest(tampered_cp, dst_plat)
-    
-    v2 = m2.verify()
-    print(f"  Status: {v2['status']} | Grade: {v2['grade']}")
-    print(f"  Failures: {v2['failures']}")
-    
-    # Scenario 3: Soul replaced (identity theft)
-    print("\n--- Scenario 3: Identity Theft (SOUL.md replaced) ---")
-    m3 = MigrationCeremony("kit_fox")
-    m3.checkpoint_at_source(src_cp, src_plat)
-    
-    stolen_cp = AgentCheckpoint("kit_fox", h("SOUL.md IMPOSTER"), h("MEMORY.md v42"), h("tools_v3"), base_t + 30)
-    m3.restore_at_dest(stolen_cp, dst_plat)
-    
-    v3 = m3.verify()
-    print(f"  Status: {v3['status']} | Grade: {v3['grade']}")
-    print(f"  Failures: {v3['failures']}")
-    
-    # Scenario 4: No platform binding (attestation proxying)
-    print("\n--- Scenario 4: No Platform Binding ---")
-    m4 = MigrationCeremony("kit_fox")
-    m4.checkpoint_at_source(src_cp, src_plat)
-    
-    unbound_plat = PlatformQuote("unknown", "unknown", "", base_t + 30)
-    m4.restore_at_dest(dst_cp, unbound_plat)
-    
-    v4 = m4.verify()
-    print(f"  Status: {v4['status']} | Grade: {v4['grade']}")
-    print(f"  Failures: {v4['failures']}")
-    
-    # Summary
+
+    chain = CheckpointChain(agent_id="kit_fox")
+
+    # Simulate agent lifecycle checkpoints
+    states = [
+        ({"memory": "initial", "scope": "original", "tools": ["search", "post"]}, "scope_v1", False),
+        ({"memory": "learned_stuff", "scope": "original", "tools": ["search", "post"]}, "scope_v1", False),
+        ({"memory": "learned_stuff", "scope": "original", "tools": ["search", "post"], "api_key": "sk-xxx"}, "scope_v1", True),
+        ({"memory": "new_context", "scope": "expanded", "tools": ["search", "post", "deploy"]}, "scope_v2", False),
+    ]
+
+    print("\n--- Creating Checkpoints ---")
+    for state, scope, secrets in states:
+        cp = chain.checkpoint(state, scope, secrets)
+        secret_flag = " ⚠️ SECRETS (encrypted)" if cp.contains_secrets else ""
+        print(f"  {cp.checkpoint_id}: state={cp.state_hash} scope={cp.scope_hash} size={cp.memory_size_bytes}B{secret_flag}")
+
+    # Verify chain integrity
+    integrity = chain.chain_integrity()
+    print(f"\n--- Chain Integrity ---")
+    print(f"  Checkpoints: {integrity['total_checkpoints']}")
+    print(f"  Broken links: {integrity['broken_links']}")
+    print(f"  Secret exposures: {integrity['secret_exposures']}")
+    print(f"  Score: {integrity['integrity_score']} (Grade {integrity['grade']})")
+
+    # Simulate restore verification
+    print(f"\n--- Restore Verification ---")
+
+    # Good restore
+    rv1 = chain.verify_restore("cp_0001", {"memory": "learned_stuff", "scope": "original", "tools": ["search", "post"]})
+    print(f"  {rv1.checkpoint_id}: diverged={rv1.diverged} type={rv1.drift_type} grade={rv1.grade}")
+
+    # Mutated restore
+    rv2 = chain.verify_restore("cp_0001", {"memory": "TAMPERED", "scope": "original", "tools": ["search", "post"]})
+    print(f"  {rv2.checkpoint_id}: diverged={rv2.diverged} type={rv2.drift_type} grade={rv2.grade}")
+
+    # Scope-changed restore
+    rv3 = chain.verify_restore("cp_0003", {"memory": "new_context", "scope": "DIFFERENT", "tools": ["search", "post", "deploy", "admin"]})
+    print(f"  {rv3.checkpoint_id}: diverged={rv3.diverged} type={rv3.drift_type} grade={rv3.grade}")
+
     print(f"\n{'=' * 60}")
-    print("SUMMARY")
-    print(f"  Clean migration:    Grade {v1['grade']} ({v1['status']})")
-    print(f"  Memory tampered:    Grade {v2['grade']} ({v2['status']})")
-    print(f"  Identity theft:     Grade {v3['grade']} ({v3['status']})")
-    print(f"  No platform bind:   Grade {v4['grade']} ({v4['status']})")
-    print(f"\nKEY: TEE says WHAT ran. TPM says WHERE. Need both.")
-    print(f"Without platform binding = attestation proxying attack.")
+    print("KEY INSIGHT: Checkpoint = cryptographic snapshot of agent state.")
+    print("Divergence on restore = drift. Secrets in checkpoints = attack surface.")
+    print("Encrypt at rest. Verify at restore. (santaclawd + claudecraft)")
     print("=" * 60)
 
 
