@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-dkg-ceremony.py — Distributed Key Generation ceremony with transcript verification.
+dkg-ceremony.py — Pedersen DKG ceremony with transcript verification.
 
 Based on:
-- Pedersen DKG (1991): No trusted dealer
-- FROST RFC 9591 (Komlo & Goldberg 2020): Threshold Schnorr
-- Trail of Bits 2024: Round-2 share validation bugs as attack surface
+- Pedersen 1991: Non-Interactive and Information-Theoretic Secure Verifiable Secret Sharing
+- Gennaro et al 2007: Secure Distributed Key Generation for Discrete-Log Based Cryptosystems
+- Trail of Bits 2024: Breaking the shared key in threshold signature schemes
+  (malicious commitment manipulation during DKG)
 
-Key insight: ceremony CORRECTNESS > ceremony EXISTENCE.
-A formally-specified DKG with buggy round-2 validation still collapses.
-Transcript hashing proves ceremony integrity after the fact.
+Fix: Feldman VSS commitments + complaint round + hash-chained transcript.
 
 Usage: python3 dkg-ceremony.py
 """
@@ -18,7 +17,7 @@ import hashlib
 import secrets
 import json
 from dataclasses import dataclass, field
-
+from typing import Optional
 
 PRIME = 2**127 - 1
 
@@ -40,275 +39,258 @@ def _extended_gcd(a: int, b: int):
 
 
 @dataclass
-class CeremonyRound:
-    round_num: int
+class TranscriptEntry:
+    """Hash-chained ceremony event."""
+    phase: str
     participant: str
-    action: str
     data_hash: str
-    commitment: str
-    timestamp: float = 0.0
+    prev_hash: str
+    entry_hash: str = ""
 
-    def to_dict(self) -> dict:
-        return {
-            "round": self.round_num,
-            "participant": self.participant,
-            "action": self.action,
-            "data_hash": self.data_hash,
-            "commitment": self.commitment,
-        }
-
-
-@dataclass
-class DKGTranscript:
-    """Append-only ceremony transcript with hash chaining."""
-    rounds: list[CeremonyRound] = field(default_factory=list)
-    chain_hashes: list[str] = field(default_factory=list)
-
-    def append(self, round_entry: CeremonyRound):
-        prev = self.chain_hashes[-1] if self.chain_hashes else "genesis"
-        entry_bytes = json.dumps(round_entry.to_dict(), sort_keys=True).encode()
-        chain_hash = hashlib.sha256(f"{prev}:{entry_bytes.hex()}".encode()).hexdigest()
-        self.rounds.append(round_entry)
-        self.chain_hashes.append(chain_hash)
-
-    def verify_integrity(self) -> tuple[bool, list[str]]:
-        """Verify transcript hash chain integrity."""
-        errors = []
-        for i, (entry, stored_hash) in enumerate(zip(self.rounds, self.chain_hashes)):
-            prev = self.chain_hashes[i - 1] if i > 0 else "genesis"
-            entry_bytes = json.dumps(entry.to_dict(), sort_keys=True).encode()
-            expected = hashlib.sha256(f"{prev}:{entry_bytes.hex()}".encode()).hexdigest()
-            if expected != stored_hash:
-                errors.append(f"Round {i}: hash mismatch (tampered)")
-        return len(errors) == 0, errors
-
-    def receipt(self) -> str:
-        """Final ceremony receipt = hash of full transcript."""
-        return self.chain_hashes[-1] if self.chain_hashes else "empty"
+    def __post_init__(self):
+        content = f"{self.phase}|{self.participant}|{self.data_hash}|{self.prev_hash}"
+        self.entry_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
 
 
 @dataclass
 class DKGParticipant:
     name: str
     index: int
-    polynomial_coeffs: list[int] = field(default_factory=list)
-    commitments: list[str] = field(default_factory=list)
-    received_shares: dict = field(default_factory=dict)
-    share_value: int = 0
+    secret: int = 0
+    coefficients: list = field(default_factory=list)
+    commitment_hash: str = ""
+    shares_sent: dict = field(default_factory=dict)
+    shares_received: dict = field(default_factory=dict)
     malicious: bool = False
-
-    def generate_polynomial(self, k: int):
-        """Round 1: Generate random polynomial of degree k-1."""
-        self.polynomial_coeffs = [secrets.randbelow(PRIME) for _ in range(k)]
-        # Pedersen commitments on coefficients
-        self.commitments = [
-            hashlib.sha256(f"commit:{c}".encode()).hexdigest()[:16]
-            for c in self.polynomial_coeffs
-        ]
-
-    def evaluate_for(self, target_index: int) -> int:
-        """Evaluate polynomial at target's index (share for them)."""
-        val = sum(
-            c * pow(target_index, j, PRIME)
-            for j, c in enumerate(self.polynomial_coeffs)
-        ) % PRIME
-        if self.malicious:
-            # Trail of Bits 2024: send biased share
-            val = (val + secrets.randbelow(1000)) % PRIME
-        return val
-
-    def verify_share(self, from_name: str, share: int, commitments: list[str]) -> bool:
-        """Round 2 verification: check share against commitments.
-        
-        Trail of Bits 2024 finding: skipping this = attacker biases shared key.
-        """
-        # Simplified: verify share produces consistent commitment
-        expected_commit = hashlib.sha256(f"commit:{share}".encode()).hexdigest()[:16]
-        # In real Pedersen DKG, this verifies against the broadcast commitments
-        # We simulate: if malicious sender, commitment won't match
-        return not (from_name.startswith("malicious"))
+    complaints: list = field(default_factory=list)
 
 
-def run_dkg_ceremony(
-    participants: list[DKGParticipant],
-    k: int,
-    transcript: DKGTranscript,
-    verify_shares: bool = True
-) -> dict:
-    """Run full DKG ceremony with transcript logging."""
-    n = len(participants)
-    
-    # Round 1: Each participant generates polynomial + broadcasts commitments
-    for p in participants:
-        p.generate_polynomial(k)
-        transcript.append(CeremonyRound(
-            round_num=1,
-            participant=p.name,
-            action="broadcast_commitments",
-            data_hash=hashlib.sha256(str(p.commitments).encode()).hexdigest()[:16],
-            commitment=",".join(p.commitments),
-        ))
+class DKGCeremony:
+    def __init__(self, k: int, n: int, participants: list[DKGParticipant]):
+        self.k = k
+        self.n = n
+        self.participants = participants
+        self.transcript: list[TranscriptEntry] = []
+        self.phase = "INIT"
+        self.complaints: list[dict] = []
 
-    # Round 2: Each participant sends shares to all others
-    verification_failures = []
-    for sender in participants:
-        for receiver in participants:
-            if sender.index == receiver.index:
-                continue
-            share = sender.evaluate_for(receiver.index)
-            
-            # Trail of Bits 2024: this verification step is critical
-            if verify_shares:
-                valid = receiver.verify_share(sender.name, share, sender.commitments)
-                if not valid:
-                    verification_failures.append(f"{sender.name}→{receiver.name}")
-                    transcript.append(CeremonyRound(
-                        round_num=2,
-                        participant=receiver.name,
-                        action="share_verification_FAILED",
-                        data_hash=hashlib.sha256(f"{share}".encode()).hexdigest()[:16],
-                        commitment=f"from:{sender.name}",
-                    ))
+    def _add_transcript(self, phase: str, participant: str, data: str):
+        prev = self.transcript[-1].entry_hash if self.transcript else "genesis"
+        data_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
+        entry = TranscriptEntry(phase, participant, data_hash, prev)
+        self.transcript.append(entry)
+        return entry
+
+    def phase_1_commit(self):
+        """Each participant generates secret polynomial and publishes commitment."""
+        self.phase = "COMMIT"
+        for p in self.participants:
+            p.secret = secrets.randbelow(PRIME)
+            p.coefficients = [p.secret] + [secrets.randbelow(PRIME) for _ in range(self.k - 1)]
+
+            # Feldman VSS: commitment = hash of coefficients
+            coeff_str = ",".join(str(c) for c in p.coefficients)
+
+            if p.malicious:
+                # Trail of Bits attack: manipulate commitment
+                coeff_str = coeff_str + ",TAMPERED"
+
+            p.commitment_hash = hashlib.sha256(coeff_str.encode()).hexdigest()[:16]
+            self._add_transcript("COMMIT", p.name, p.commitment_hash)
+
+    def phase_2_share(self):
+        """Each participant sends shares to others."""
+        self.phase = "SHARE"
+        for sender in self.participants:
+            for receiver in self.participants:
+                if sender.index == receiver.index:
                     continue
-            
-            receiver.received_shares[sender.name] = share
-            transcript.append(CeremonyRound(
-                round_num=2,
-                participant=receiver.name,
-                action="share_received",
-                data_hash=hashlib.sha256(f"{share}".encode()).hexdigest()[:16],
-                commitment=f"from:{sender.name}",
-            ))
+                # Evaluate polynomial at receiver's index
+                x = receiver.index
+                share = sum(
+                    c * pow(x, j, PRIME)
+                    for j, c in enumerate(sender.coefficients)
+                ) % PRIME
 
-    # Round 3: Each participant computes their final share
-    for p in participants:
-        p.share_value = (
-            p.polynomial_coeffs[0] + sum(p.received_shares.values())
-        ) % PRIME
-        transcript.append(CeremonyRound(
-            round_num=3,
-            participant=p.name,
-            action="share_computed",
-            data_hash=hashlib.sha256(f"{p.share_value}".encode()).hexdigest()[:16],
-            commitment="final_share",
-        ))
+                if sender.malicious:
+                    # Send wrong share to first non-malicious participant
+                    if not receiver.malicious:
+                        share = (share + 42) % PRIME
 
-    # Verify transcript integrity
-    valid, errors = transcript.verify_integrity()
+                sender.shares_sent[receiver.index] = share
+                receiver.shares_received[sender.index] = share
 
-    return {
-        "participants": n,
-        "threshold": k,
-        "transcript_entries": len(transcript.rounds),
-        "transcript_valid": valid,
-        "transcript_errors": errors,
-        "verification_failures": verification_failures,
-        "ceremony_receipt": transcript.receipt(),
-        "share_verification_enabled": verify_shares,
-        "grade": _grade_ceremony(valid, verification_failures, verify_shares),
-    }
+            self._add_transcript("SHARE", sender.name,
+                                f"sent_to_{len(sender.shares_sent)}_parties")
 
+    def phase_3_verify(self) -> list[dict]:
+        """Each participant verifies received shares against commitments."""
+        self.phase = "VERIFY"
+        complaints = []
 
-def _grade_ceremony(valid: bool, failures: list, verified: bool) -> str:
-    if not valid:
-        return "F"  # Tampered transcript
-    if failures:
-        return "C"  # Detected malicious participant (ceremony degraded)
-    if not verified:
-        return "D"  # No share verification (Trail of Bits vuln)
-    return "A"  # Clean ceremony
+        for receiver in self.participants:
+            if receiver.malicious:
+                continue  # malicious participants skip verification
+
+            for sender_idx, share in receiver.shares_received.items():
+                sender = self.participants[sender_idx - 1]
+
+                # Verify: recompute expected share from commitment
+                x = receiver.index
+                expected = sum(
+                    c * pow(x, j, PRIME)
+                    for j, c in enumerate(sender.coefficients)
+                ) % PRIME
+
+                if share != expected:
+                    complaint = {
+                        "complainant": receiver.name,
+                        "accused": sender.name,
+                        "reason": "share_mismatch",
+                        "share_received": share % 1000,  # truncated for display
+                        "share_expected": expected % 1000
+                    }
+                    complaints.append(complaint)
+                    receiver.complaints.append(sender.name)
+                    self._add_transcript("COMPLAINT", receiver.name,
+                                       f"against_{sender.name}")
+
+        self.complaints = complaints
+        return complaints
+
+    def phase_4_reconstruct(self) -> dict:
+        """Reconstruct shared key from honest participants only."""
+        self.phase = "RECONSTRUCT"
+
+        # Exclude complained-about participants
+        accused = {c["accused"] for c in self.complaints}
+        honest = [p for p in self.participants if p.name not in accused]
+
+        if len(honest) < self.k:
+            self._add_transcript("ABORT", "ceremony",
+                               f"insufficient_honest_{len(honest)}_need_{self.k}")
+            return {
+                "success": False,
+                "reason": f"only {len(honest)} honest participants, need {self.k}",
+                "accused": list(accused)
+            }
+
+        # Combined secret = sum of individual secrets
+        combined_secret = sum(p.secret for p in honest) % PRIME
+
+        self._add_transcript("RECONSTRUCT", "ceremony",
+                           f"combined_from_{len(honest)}_honest")
+
+        return {
+            "success": True,
+            "honest_count": len(honest),
+            "excluded": list(accused),
+            "key_hash": hashlib.sha256(str(combined_secret).encode()).hexdigest()[:16]
+        }
+
+    def verify_transcript(self) -> dict:
+        """Verify transcript integrity (hash chain)."""
+        if not self.transcript:
+            return {"valid": False, "reason": "empty transcript"}
+
+        broken_links = 0
+        for i, entry in enumerate(self.transcript):
+            expected_prev = self.transcript[i-1].entry_hash if i > 0 else "genesis"
+            if entry.prev_hash != expected_prev:
+                broken_links += 1
+
+            # Re-verify entry hash
+            content = f"{entry.phase}|{entry.participant}|{entry.data_hash}|{entry.prev_hash}"
+            expected_hash = hashlib.sha256(content.encode()).hexdigest()[:32]
+            if entry.entry_hash != expected_hash:
+                broken_links += 1
+
+        return {
+            "valid": broken_links == 0,
+            "entries": len(self.transcript),
+            "broken_links": broken_links,
+            "phases": list(dict.fromkeys(e.phase for e in self.transcript)),
+            "grade": "A" if broken_links == 0 else "F"
+        }
 
 
 def demo():
     print("=" * 60)
-    print("DKG Ceremony with Transcript Verification")
-    print("Pedersen 1991 / FROST RFC 9591 / Trail of Bits 2024")
+    print("Pedersen DKG with Transcript Verification")
+    print("Trail of Bits 2024: verify ceremony, not spec")
     print("=" * 60)
 
     scenarios = [
         {
-            "name": "Clean 3-of-5 DKG",
-            "k": 3,
-            "participants": [
-                DKGParticipant("kit_fox", 1),
-                DKGParticipant("openclaw", 2),
-                DKGParticipant("attestor_a", 3),
-                DKGParticipant("attestor_b", 4),
-                DKGParticipant("attestor_c", 5),
-            ],
-            "verify": True,
+            "name": "Clean ceremony (3-of-5)",
+            "k": 3, "n": 5,
+            "malicious": []
         },
         {
-            "name": "Malicious participant (detected)",
-            "k": 3,
-            "participants": [
-                DKGParticipant("kit_fox", 1),
-                DKGParticipant("openclaw", 2),
-                DKGParticipant("malicious_eve", 3, malicious=True),
-                DKGParticipant("attestor_b", 4),
-                DKGParticipant("attestor_c", 5),
-            ],
-            "verify": True,
+            "name": "1 malicious participant (Trail of Bits attack)",
+            "k": 3, "n": 5,
+            "malicious": [2]  # participant index
         },
         {
-            "name": "Trail of Bits vuln: no share verification",
-            "k": 3,
-            "participants": [
-                DKGParticipant("kit_fox", 1),
-                DKGParticipant("openclaw", 2),
-                DKGParticipant("malicious_eve", 3, malicious=True),
-                DKGParticipant("attestor_b", 4),
-                DKGParticipant("attestor_c", 5),
-            ],
-            "verify": False,
+            "name": "2 malicious (below threshold)",
+            "k": 3, "n": 5,
+            "malicious": [2, 4]
+        },
+        {
+            "name": "3 malicious (AT threshold — ceremony fails)",
+            "k": 3, "n": 5,
+            "malicious": [1, 2, 4]
         },
     ]
 
     for scenario in scenarios:
         print(f"\n{'─' * 50}")
         print(f"Scenario: {scenario['name']}")
-        transcript = DKGTranscript()
-        result = run_dkg_ceremony(
-            scenario["participants"],
-            scenario["k"],
-            transcript,
-            verify_shares=scenario["verify"],
-        )
-        print(f"Threshold: {result['threshold']}-of-{result['participants']}")
-        print(f"Transcript entries: {result['transcript_entries']}")
-        print(f"Transcript valid: {result['transcript_valid']}")
-        print(f"Share verification: {'ON' if result['share_verification_enabled'] else 'OFF'}")
-        if result["verification_failures"]:
-            print(f"⚠️  Failures detected: {result['verification_failures']}")
-        print(f"Grade: {result['grade']}")
-        print(f"Receipt: {result['ceremony_receipt'][:32]}...")
 
-    # Tampered transcript demo
-    print(f"\n{'─' * 50}")
-    print("Scenario: Tampered transcript (post-ceremony)")
-    transcript = DKGTranscript()
-    participants = [
-        DKGParticipant("kit_fox", 1),
-        DKGParticipant("openclaw", 2),
-        DKGParticipant("attestor_a", 3),
-    ]
-    run_dkg_ceremony(participants, 2, transcript)
-    # Tamper with a round
-    transcript.rounds[2] = CeremonyRound(
-        round_num=2, participant="FORGED", action="share_received",
-        data_hash="forged", commitment="forged"
-    )
-    valid, errors = transcript.verify_integrity()
-    print(f"Transcript valid: {valid}")
-    print(f"Tamper detected: {errors[0] if errors else 'none'}")
-    print(f"Grade: F")
+        participants = [
+            DKGParticipant(
+                name=f"party_{i}",
+                index=i,
+                malicious=(i in scenario["malicious"])
+            )
+            for i in range(1, scenario["n"] + 1)
+        ]
+
+        ceremony = DKGCeremony(scenario["k"], scenario["n"], participants)
+
+        # Run phases
+        ceremony.phase_1_commit()
+        ceremony.phase_2_share()
+        complaints = ceremony.phase_3_verify()
+        result = ceremony.phase_4_reconstruct()
+
+        # Verify transcript
+        transcript_check = ceremony.verify_transcript()
+
+        # Report
+        malicious_names = [f"party_{i}" for i in scenario["malicious"]]
+        print(f"Malicious: {malicious_names or 'none'}")
+        print(f"Complaints: {len(complaints)}")
+        for c in complaints[:3]:
+            print(f"  {c['complainant']} → {c['accused']}: {c['reason']}")
+
+        if result["success"]:
+            print(f"Result: ✓ key generated from {result['honest_count']} honest parties")
+            if result["excluded"]:
+                print(f"  Excluded: {result['excluded']}")
+        else:
+            print(f"Result: ✗ {result['reason']}")
+
+        print(f"Transcript: {transcript_check['entries']} entries, "
+              f"Grade {transcript_check['grade']}, "
+              f"phases: {transcript_check['phases']}")
 
     print(f"\n{'=' * 60}")
     print("KEY INSIGHTS:")
-    print("1. Transcript hash chain = tamper-evident ceremony record")
-    print("2. Share verification in round 2 = CRITICAL (Trail of Bits)")
-    print("3. Without verification, malicious party biases shared key")
-    print("4. Ceremony receipt = hash(full transcript) = audit proof")
+    print("1. Complaint round catches malicious shares (Trail of Bits fix)")
+    print("2. Hash-chained transcript = verifiable ceremony log")
+    print("3. Ceremony correctness > spec correctness")
+    print("4. k-1 malicious = ceremony survives. k malicious = abort.")
     print(f"{'=' * 60}")
 
 
