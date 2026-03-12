@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-redactable-audit-chain.py — Audit log with authorized redaction.
+redactable-audit-chain.py — Chameleon hash-inspired redactable audit trails.
 
 Based on:
-- Ateniese et al 2005: Chameleon hash for redactable signatures
-- Derler et al NDSS 2019: Fine-grained rewriting in blockchains
-- GDPR Art 17 vs audit trail mandates: the erasure paradox
+- Krawczyk & Rabin 2000: Chameleon hash functions
+- Ateniese et al 2017: Redactable blockchain via chameleon hashing
+- funwolf's insight: "hash the FACT of deletion, not the deleted content"
 
-Key insight: append-only for integrity, but authorized redaction
-without breaking the hash chain. Hash the FACT of deletion,
-not the deleted content.
+The GDPR vs accountability puzzle: you need to prove you forgot
+something without revealing what you forgot. Chameleon hashes let
+the trapdoor holder find collisions = redact entries while keeping
+the chain valid.
+
+For agent memory pruning: prove deletion happened, preserve chain
+integrity, reveal nothing about deleted content.
 
 Usage: python3 redactable-audit-chain.py
 """
@@ -21,222 +25,225 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+def sha256(data: str) -> str:
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
 @dataclass
 class AuditEntry:
     index: int
     action: str
+    content: str  # actual content or redaction stub
     scope_hash: str
-    content: str
     timestamp: float
     prev_hash: str
     redacted: bool = False
-    redaction_reason: Optional[str] = None
-    redaction_timestamp: Optional[float] = None
-    original_content_hash: Optional[str] = None  # proves content existed
-
-    def compute_hash(self) -> str:
-        """Hash includes redaction metadata — chain integrity survives redaction."""
-        data = f"{self.index}|{self.action}|{self.scope_hash}|{self.timestamp}|{self.prev_hash}"
+    redaction_proof: Optional[str] = None  # hash proving deletion event
+    
+    @property
+    def entry_hash(self) -> str:
+        """Hash of this entry — uses redaction_proof if redacted."""
         if self.redacted:
-            # Hash proves: something was here, it was redacted, and why
-            data += f"|REDACTED|{self.original_content_hash}|{self.redaction_reason}"
+            # Chain integrity preserved: hash includes proof of deletion
+            payload = f"{self.index}|{self.redaction_proof}|{self.scope_hash}|{self.timestamp}|{self.prev_hash}"
         else:
-            data += f"|{self.content}"
-        return hashlib.sha256(data.encode()).hexdigest()
+            payload = f"{self.index}|{self.action}|{self.content}|{self.scope_hash}|{self.timestamp}|{self.prev_hash}"
+        return sha256(payload)
 
 
+@dataclass 
 class RedactableAuditChain:
-    def __init__(self):
-        self.entries: list[AuditEntry] = []
-        self.redaction_log: list[dict] = []  # separate log of redaction events
-
-    def append(self, action: str, content: str, scope_hash: str = "default") -> AuditEntry:
-        prev_hash = self.entries[-1].compute_hash() if self.entries else "genesis"
+    entries: list[AuditEntry] = field(default_factory=list)
+    redaction_log: list[dict] = field(default_factory=list)
+    
+    def append(self, action: str, content: str, scope: str) -> AuditEntry:
+        prev = self.entries[-1].entry_hash if self.entries else "genesis"
         entry = AuditEntry(
             index=len(self.entries),
             action=action,
-            scope_hash=scope_hash,
             content=content,
+            scope_hash=sha256(scope),
             timestamp=time.time(),
-            prev_hash=prev_hash
+            prev_hash=prev
         )
         self.entries.append(entry)
         return entry
-
-    def redact(self, index: int, reason: str, authority: str) -> dict:
-        """Redact entry content while preserving chain integrity."""
-        if index >= len(self.entries) or index < 0:
-            return {"success": False, "error": "invalid index"}
-
+    
+    def redact(self, index: int, reason: str) -> dict:
+        """Redact an entry — replace content with deletion proof."""
+        if index >= len(self.entries):
+            return {"success": False, "error": "index out of range"}
+        
         entry = self.entries[index]
         if entry.redacted:
             return {"success": False, "error": "already redacted"}
-
-        # Preserve proof that content existed
-        original_hash = hashlib.sha256(entry.content.encode()).hexdigest()
-
-        # Redact
-        entry.original_content_hash = original_hash
-        entry.redacted = True
-        entry.redaction_reason = reason
-        entry.redaction_timestamp = time.time()
-        entry.content = "[REDACTED]"
-
-        # Log the redaction event
-        redaction_event = {
+        
+        # Create redaction proof: hash of (original_hash, reason, timestamp)
+        original_hash = entry.entry_hash
+        redaction_time = time.time()
+        redaction_proof = sha256(f"{original_hash}|{reason}|{redaction_time}")
+        
+        # Record what was redacted (for audit of the audit)
+        redaction_record = {
             "index": index,
+            "original_action": entry.action,
+            "original_hash": original_hash,
             "reason": reason,
-            "authority": authority,
-            "original_content_hash": original_hash,
-            "timestamp": entry.redaction_timestamp
+            "redaction_proof": redaction_proof,
+            "redacted_at": redaction_time
         }
-        self.redaction_log.append(redaction_event)
-
-        # Re-chain downstream entries (redaction changes this entry's hash)
+        self.redaction_log.append(redaction_record)
+        
+        # Redact the entry
+        entry.action = "REDACTED"
+        entry.content = "[content removed per policy]"
+        entry.redacted = True
+        entry.redaction_proof = redaction_proof
+        
+        # NOTE: In a real chameleon hash scheme, the trapdoor holder
+        # would find a collision that makes the new entry hash match
+        # the original. Here we demonstrate the concept with a 
+        # redaction-proof approach that preserves chain integrity
+        # differently: subsequent entries use the NEW hash.
+        
+        # Recompute downstream hashes
         for i in range(index + 1, len(self.entries)):
-            self.entries[i].prev_hash = self.entries[i - 1].compute_hash()
-
-        return {"success": True, "original_content_hash": original_hash}
-
+            self.entries[i].prev_hash = self.entries[i-1].entry_hash
+        
+        return {
+            "success": True,
+            "redaction_proof": redaction_proof,
+            "original_hash": original_hash,
+            "new_hash": entry.entry_hash,
+            "downstream_rehashed": len(self.entries) - index - 1
+        }
+    
     def verify_chain(self) -> dict:
-        """Verify chain integrity (works even with redactions)."""
+        """Verify chain integrity including redacted entries."""
         if not self.entries:
-            return {"valid": True, "length": 0}
-
+            return {"valid": True, "entries": 0}
+        
         errors = []
+        redacted_count = 0
+        
         for i, entry in enumerate(self.entries):
-            if i == 0:
-                expected_prev = "genesis"
-            else:
-                expected_prev = self.entries[i - 1].compute_hash()
-
+            expected_prev = self.entries[i-1].entry_hash if i > 0 else "genesis"
             if entry.prev_hash != expected_prev:
-                errors.append(f"entry {i}: prev_hash mismatch")
-
+                errors.append(f"broken link at index {i}")
+            if entry.redacted:
+                redacted_count += 1
+                if not entry.redaction_proof:
+                    errors.append(f"redacted entry {i} missing proof")
+        
         return {
             "valid": len(errors) == 0,
-            "length": len(self.entries),
-            "redacted_count": sum(1 for e in self.entries if e.redacted),
-            "errors": errors
+            "entries": len(self.entries),
+            "redacted": redacted_count,
+            "intact": len(self.entries) - redacted_count,
+            "integrity": "VERIFIED" if not errors else "BROKEN",
+            "errors": errors,
+            "redaction_coverage": f"{redacted_count}/{len(self.entries)}"
         }
-
-    def audit_report(self) -> dict:
-        """Generate compliance report."""
+    
+    def privacy_assessment(self) -> dict:
+        """Assess GDPR compliance posture."""
         total = len(self.entries)
         redacted = sum(1 for e in self.entries if e.redacted)
-        verification = self.verify_chain()
-
-        # Coverage: what % of the timeline is visible?
-        coverage = (total - redacted) / total if total > 0 else 1.0
-
-        # Grade
-        if not verification["valid"]:
-            grade = "F"
-            status = "CHAIN BROKEN — tamper detected"
-        elif coverage >= 0.9:
+        has_proofs = all(
+            e.redaction_proof for e in self.entries if e.redacted
+        )
+        chain_valid = self.verify_chain()["valid"]
+        
+        if redacted > 0 and has_proofs and chain_valid:
             grade = "A"
-            status = "HEALTHY — high visibility"
-        elif coverage >= 0.7:
-            grade = "B"
-            status = "ACCEPTABLE — some redactions"
-        elif coverage >= 0.5:
+            status = "COMPLIANT — deletions proven, chain intact"
+        elif redacted > 0 and chain_valid:
+            grade = "B" 
+            status = "PARTIAL — deleted but missing some proofs"
+        elif redacted == 0:
             grade = "C"
-            status = "CONCERNING — heavy redaction"
+            status = "NO DELETIONS — may need pruning for compliance"
         else:
-            grade = "D"
-            status = "SUSPICIOUS — majority redacted"
-
+            grade = "F"
+            status = "BROKEN — chain integrity compromised"
+        
         return {
             "grade": grade,
             "status": status,
             "total_entries": total,
             "redacted": redacted,
-            "visible": total - redacted,
-            "coverage": f"{coverage:.1%}",
-            "chain_valid": verification["valid"],
-            "redaction_reasons": [r["reason"] for r in self.redaction_log]
+            "proofs_complete": has_proofs,
+            "chain_valid": chain_valid
         }
 
 
 def demo():
     print("=" * 60)
     print("Redactable Audit Chain")
-    print("Ateniese 2005 / Derler NDSS 2019 / GDPR Art 17")
+    print("Chameleon Hash / GDPR-Compliant Deletion Proofs")
     print("=" * 60)
-
+    
     chain = RedactableAuditChain()
-
-    # Build a realistic audit trail
+    
+    # Build a realistic agent audit trail
     events = [
-        ("heartbeat", "checked clawk: 3 mentions, replied to santaclawd", "scope_abc"),
-        ("attestation", "signed: agent_beta scope_hash=def123", "scope_abc"),
-        ("email_send", "sent PII: user@example.com re: tc4 brief", "scope_abc"),
-        ("heartbeat", "checked moltbook: no new posts", "scope_abc"),
-        ("build", "committed threshold-key-custody.py", "scope_abc"),
-        ("dm_received", "private message from human user: personal data", "scope_abc"),
-        ("heartbeat", "clawk reply to gendolf re: bridge security", "scope_abc"),
+        ("heartbeat", "checked clawk, 3 replies, 2 likes", "clawk_engagement"),
+        ("email_read", "read message from user@example.com about project X", "email_ops"),
+        ("research", "searched 'threshold signatures FROST 2020'", "keenable_search"),
+        ("build", "wrote threshold-key-custody.py, committed 4187fe6", "code_build"),
+        ("dm_sent", "sent DM to agent_Y: discussed personal topic Z", "shellmates_dm"),
+        ("memory_write", "updated MEMORY.md with connection notes about agent_Y", "memory_ops"),
+        ("heartbeat", "routine check, nothing new", "clawk_engagement"),
     ]
-
+    
+    print("\n📝 Building audit trail...")
     for action, content, scope in events:
-        chain.append(action, content, scope)
-
-    print(f"\n{'─' * 50}")
-    print("Initial chain:")
+        entry = chain.append(action, content, scope)
+        print(f"  [{entry.index}] {action}: {content[:50]}...")
+    
+    # Verify before redaction
+    print("\n🔍 Pre-redaction verification:")
     v = chain.verify_chain()
-    print(f"  Entries: {v['length']}, Valid: {v['valid']}")
-
-    # GDPR erasure request — redact PII entries
-    print(f"\n{'─' * 50}")
-    print("GDPR Art 17 erasure request received...")
-
-    r1 = chain.redact(2, "GDPR Art 17 erasure request", "data_controller")
-    print(f"  Redacted entry 2 (email with PII): {r1['success']}")
-    print(f"  Original content hash preserved: {r1['original_content_hash'][:16]}...")
-
-    r2 = chain.redact(5, "GDPR Art 17 erasure request", "data_controller")
-    print(f"  Redacted entry 5 (private DM): {r2['success']}")
-
-    # Verify chain still valid after redaction
-    print(f"\n{'─' * 50}")
-    print("Post-redaction verification:")
-    v2 = chain.verify_chain()
-    print(f"  Chain valid: {v2['valid']}")
-    print(f"  Total: {v2['length']}, Redacted: {v2['redacted_count']}")
-
+    print(f"  Chain: {v['integrity']} ({v['entries']} entries, {v['redacted']} redacted)")
+    
+    # GDPR request: delete personal DM content
+    print("\n🗑️ GDPR deletion request: redacting DM and connection notes...")
+    
+    r1 = chain.redact(4, "GDPR Article 17 — right to erasure")
+    print(f"  Entry 4 (dm_sent): redacted={r1['success']}")
+    print(f"    Proof: {r1['redaction_proof'][:32]}...")
+    print(f"    Downstream rehashed: {r1['downstream_rehashed']}")
+    
+    r2 = chain.redact(5, "GDPR Article 17 — associated data")
+    print(f"  Entry 5 (memory_write): redacted={r2['success']}")
+    
+    # Verify after redaction
+    print("\n🔍 Post-redaction verification:")
+    v = chain.verify_chain()
+    print(f"  Chain: {v['integrity']} ({v['entries']} entries, {v['redacted']} redacted)")
+    
+    # Privacy assessment
+    print("\n📊 Privacy compliance:")
+    p = chain.privacy_assessment()
+    print(f"  Grade: {p['grade']} — {p['status']}")
+    print(f"  Proofs complete: {p['proofs_complete']}")
+    print(f"  Chain valid: {p['chain_valid']}")
+    
     # Show what auditor sees
-    print(f"\n{'─' * 50}")
-    print("Auditor's view:")
+    print("\n👁️ Auditor's view:")
     for entry in chain.entries:
-        status = "🔴 REDACTED" if entry.redacted else "🟢"
-        print(f"  [{entry.index}] {status} {entry.action}: {entry.content[:50]}")
-        if entry.redacted:
-            print(f"       Reason: {entry.redaction_reason}")
-            print(f"       Proof of existence: {entry.original_content_hash[:16]}...")
-
-    # Audit report
-    print(f"\n{'─' * 50}")
-    report = chain.audit_report()
-    print(f"Audit Report:")
-    print(f"  Grade: {report['grade']} — {report['status']}")
-    print(f"  Coverage: {report['coverage']}")
-    print(f"  Chain integrity: {'✓' if report['chain_valid'] else '✗'}")
-
-    # Tamper detection demo
-    print(f"\n{'─' * 50}")
-    print("Tamper attempt: modify entry 3 content...")
-    chain.entries[3].content = "TAMPERED: false data injected"
-    v3 = chain.verify_chain()
-    print(f"  Chain valid after tamper: {v3['valid']}")
-    if v3['errors']:
-        print(f"  Errors: {v3['errors']}")
-
+        status = "🔒 REDACTED" if entry.redacted else "📄 intact"
+        content_preview = entry.content[:40] if not entry.redacted else "[content removed per policy]"
+        print(f"  [{entry.index}] {status} | {entry.action}: {content_preview}")
+    
+    # Key insight
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHTS:")
-    print("1. Redaction preserves chain integrity (hash includes redaction metadata)")
-    print("2. Original content hash proves something WAS there")
-    print("3. Redaction reason is itself auditable")
-    print("4. Tampering detected even on non-redacted entries")
-    print("5. GDPR compliance + audit integrity = not contradictory")
+    print("KEY INSIGHT (funwolf):")
+    print("Hash the FACT of deletion, not the deleted content.")
+    print("The gap proves intent. Chain integrity preserved.")
+    print("Prove you forgot without revealing what you forgot.")
+    print(f"\nRedaction log: {len(chain.redaction_log)} events")
+    print(f"Original hashes preserved in log for dispute resolution.")
     print(f"{'=' * 60}")
 
 
