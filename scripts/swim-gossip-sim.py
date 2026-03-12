@@ -1,304 +1,284 @@
 #!/usr/bin/env python3
 """
-swim-gossip-sim.py — SWIM protocol gossip simulation for agent trust networks.
+swim-gossip-sim.py — SWIM gossip protocol simulation for agent trust.
 
-Based on Das, Gupta & Motivala 2002 (SWIM: Scalable Weakly-consistent
-Infection-style Process Group Membership).
+Based on Das, Gupta & Motivala (Cornell 2002): "SWIM: Scalable Weakly-consistent
+Infection-style Process Group Membership Protocol"
 
-Models the three-layer architecture from santaclawd's convergence:
-1. SWIM gossip (failure detection + membership)
-2. Φ accrual failure detector (Hayashibara 2004) per channel
-3. DKIM-style signed observations (attestation piggybacked on pings)
+Key properties:
+- O(1) message load per member (independent of group size)
+- Constant expected failure detection time
+- Piggybacked membership dissemination (logarithmic spread)
+- Suspicion mechanism before declaration (reduces false positives)
+
+Agent trust application: SWIM + DKIM + Φ accrual = gossip substrate for
+attestation propagation and compromise detection.
 
 Usage: python3 swim-gossip-sim.py
 """
 
-import hashlib
 import random
-import math
+import hashlib
 from dataclasses import dataclass, field
-from typing import Optional
+from enum import Enum
+
+
+class MemberState(Enum):
+    ALIVE = "alive"
+    SUSPECT = "suspect"
+    FAILED = "failed"
 
 
 @dataclass
-class Observation:
-    """Signed observation piggybacked on SWIM ping."""
-    observer: str
-    target: str
-    scope_hash: str
+class GossipMessage:
+    """Piggybacked membership update."""
+    about: str  # member name
+    state: MemberState
+    incarnation: int
     timestamp: int
-    signature: str  # simplified: hash of content + key
-    status: str  # "alive", "suspect", "failed"
 
 
 @dataclass
-class PhiScore:
-    """Φ accrual failure detector per agent."""
-    heartbeat_times: list[int] = field(default_factory=list)
-    
-    def record(self, t: int):
-        self.heartbeat_times.append(t)
-    
-    def phi(self, now: int) -> float:
-        """Compute Φ suspicion score. Higher = more suspicious."""
-        if len(self.heartbeat_times) < 2:
-            return 0.0
-        intervals = [self.heartbeat_times[i+1] - self.heartbeat_times[i] 
-                     for i in range(len(self.heartbeat_times)-1)]
-        mean = sum(intervals) / len(intervals)
-        if mean == 0:
-            return 0.0
-        variance = sum((x - mean)**2 for x in intervals) / len(intervals)
-        std = math.sqrt(variance) if variance > 0 else mean * 0.1
-        time_since = now - self.heartbeat_times[-1]
-        if std == 0:
-            return 10.0 if time_since > mean * 2 else 0.0
-        # Φ = -log10(P(interval > time_since))
-        z = (time_since - mean) / std
-        # Approximate survival function
-        p = 0.5 * math.erfc(z / math.sqrt(2))
-        return -math.log10(max(p, 1e-10))
-
-
-@dataclass 
-class SwimAgent:
+class SwimMember:
     name: str
-    alive: bool = True
-    compromised: bool = False
-    membership: dict = field(default_factory=dict)  # name -> status
-    phi_detectors: dict = field(default_factory=dict)  # name -> PhiScore
-    observations: list[Observation] = field(default_factory=list)
-    gossip_buffer: list[dict] = field(default_factory=list)
-    
-    def ping(self, target: 'SwimAgent', t: int) -> Optional[Observation]:
-        """SWIM ping with piggybacked observation."""
-        if not self.alive:
-            return None
-        
-        if target.alive and not target.compromised:
-            # Successful ping
-            if target.name not in self.phi_detectors:
-                self.phi_detectors[target.name] = PhiScore()
-            self.phi_detectors[target.name].record(t)
-            self.membership[target.name] = "alive"
-            
-            # Create signed observation
-            obs = Observation(
-                observer=self.name,
-                target=target.name,
-                scope_hash=hashlib.sha256(f"{target.name}:alive:{t}".encode()).hexdigest()[:8],
-                timestamp=t,
-                signature=hashlib.sha256(f"{self.name}:{target.name}:{t}:key".encode()).hexdigest()[:12],
-                status="alive"
-            )
-            self.observations.append(obs)
-            return obs
-        else:
-            # Failed ping — enter suspicion phase
-            self.membership[target.name] = "suspect"
-            return None
-    
-    def indirect_ping(self, target_name: str, helpers: list['SwimAgent'], t: int) -> bool:
-        """SWIM indirect ping via k helpers."""
-        for helper in helpers:
-            if helper.alive and helper.name != target_name:
-                # Helper tries to ping target
-                target_agent = next((a for a in helpers if a.name == target_name), None)
-                if target_agent and target_agent.alive:
-                    return True
-        return False
-    
-    def check_phi(self, target_name: str, now: int, threshold: float = 8.0) -> str:
-        """Check Φ accrual score for a target."""
-        if target_name not in self.phi_detectors:
-            return "unknown"
-        phi = self.phi_detectors[target_name].phi(now)
-        if phi >= threshold:
-            return "failed"
-        elif phi >= 4.0:
-            return "suspect"
-        return "alive"
-    
-    def disseminate(self, info: dict):
-        """Piggyback gossip on next ping (infection-style)."""
-        self.gossip_buffer.append(info)
+    state: MemberState = MemberState.ALIVE
+    incarnation: int = 0
+    membership: dict = field(default_factory=dict)  # name -> (state, incarnation)
+    pending_gossip: list = field(default_factory=list)
+    messages_sent: int = 0
+    messages_received: int = 0
+    failed: bool = False  # actual state (ground truth)
+
+    def ping(self, target: 'SwimMember', round_num: int) -> bool:
+        """Direct ping with piggybacked gossip."""
+        if self.failed or target.failed:
+            return False
+
+        self.messages_sent += 1
+        target.messages_received += 1
+
+        # Piggyback gossip (up to 3 updates per ping — bounded!)
+        gossip_payload = self.pending_gossip[:3]
+        self.pending_gossip = self.pending_gossip[3:]
+
+        # Target processes gossip
+        for msg in gossip_payload:
+            target._process_gossip(msg)
+
+        return True  # ack
+
+    def ping_req(self, intermediary: 'SwimMember', target: 'SwimMember', round_num: int) -> bool:
+        """Indirect ping through intermediary (SWIM protocol)."""
+        if self.failed or intermediary.failed:
+            return False
+
+        self.messages_sent += 1
+        intermediary.messages_received += 1
+
+        # Intermediary pings target
+        return intermediary.ping(target, round_num)
+
+    def _process_gossip(self, msg: GossipMessage):
+        """Process a piggybacked gossip update."""
+        current = self.membership.get(msg.about)
+        if current is None or msg.incarnation > current[1]:
+            self.membership[msg.about] = (msg.state, msg.incarnation)
+            # Re-gossip (infection-style)
+            self.pending_gossip.append(msg)
+
+    def suspect(self, target_name: str, round_num: int):
+        """Mark member as suspected (not yet failed)."""
+        self.membership[target_name] = (MemberState.SUSPECT, round_num)
+        self.pending_gossip.append(GossipMessage(
+            about=target_name,
+            state=MemberState.SUSPECT,
+            incarnation=round_num,
+            timestamp=round_num
+        ))
+
+    def declare_failed(self, target_name: str, round_num: int):
+        """Declare member as failed after suspicion timeout."""
+        self.membership[target_name] = (MemberState.FAILED, round_num)
+        self.pending_gossip.append(GossipMessage(
+            about=target_name,
+            state=MemberState.FAILED,
+            incarnation=round_num,
+            timestamp=round_num
+        ))
 
 
-def simulate_swim(agents: list[SwimAgent], rounds: int = 20, 
-                  fail_at: dict = None, compromise_at: dict = None) -> dict:
-    """Run SWIM simulation."""
-    fail_at = fail_at or {}
-    compromise_at = compromise_at or {}
-    
-    events = []
-    detections = {}  # who detected what, when
-    
-    for t in range(rounds):
-        # Apply failures/compromises
-        for name, fail_round in fail_at.items():
-            if t == fail_round:
-                agent = next(a for a in agents if a.name == name)
-                agent.alive = False
-                events.append({"round": t, "event": "CRASH", "agent": name})
-        
-        for name, comp_round in compromise_at.items():
-            if t == comp_round:
-                agent = next(a for a in agents if a.name == name)
-                agent.compromised = True
-                events.append({"round": t, "event": "COMPROMISED", "agent": name})
-        
-        alive_agents = [a for a in agents if a.alive]
-        
-        for agent in alive_agents:
-            # SWIM: pick random target to ping
-            others = [a for a in agents if a.name != agent.name]
-            if not others:
+class SwimSimulator:
+    def __init__(self, n_members: int, k_indirect: int = 3, suspect_timeout: int = 3):
+        self.members = [SwimMember(name=f"agent_{i}") for i in range(n_members)]
+        self.k_indirect = k_indirect  # indirect probes per round
+        self.suspect_timeout = suspect_timeout
+        self.round = 0
+        self.suspicions: dict = {}  # (detector, target) -> round_suspected
+
+        # Initialize membership lists
+        for m in self.members:
+            for other in self.members:
+                if other.name != m.name:
+                    m.membership[other.name] = (MemberState.ALIVE, 0)
+
+    def fail_member(self, index: int):
+        """Simulate member failure."""
+        self.members[index].failed = True
+
+    def run_round(self) -> dict:
+        """Execute one SWIM protocol round."""
+        self.round += 1
+        events = []
+
+        alive_members = [m for m in self.members if not m.failed]
+
+        for member in alive_members:
+            # Pick random target to probe
+            targets = [m for m in self.members
+                       if m.name != member.name
+                       and member.membership.get(m.name, (MemberState.ALIVE,))[0] != MemberState.FAILED]
+            if not targets:
                 continue
-            target = random.choice(others)
-            
-            obs = agent.ping(target, t)
-            
-            if obs is None and target.name not in detections:
-                # Direct ping failed — try indirect (k=3)
-                helpers = random.sample([a for a in alive_agents if a.name != agent.name], 
-                                       min(3, len(alive_agents) - 1))
-                success = agent.indirect_ping(target.name, [target] + helpers, t)
-                
-                if not success:
-                    agent.membership[target.name] = "failed"
-                    # Disseminate failure
-                    agent.disseminate({"type": "failed", "target": target.name, "round": t})
-                    
-                    if target.name not in detections:
-                        detections[target.name] = {"detected_by": agent.name, "round": t}
-                        events.append({
-                            "round": t, "event": "DETECTED",
-                            "target": target.name, "by": agent.name,
-                            "phi": round(agent.phi_detectors.get(target.name, PhiScore()).phi(t), 2)
-                        })
-            
-            # Process gossip buffer — piggyback on pings
-            if agent.gossip_buffer and obs:
-                for other in alive_agents:
-                    if other.name != agent.name:
-                        for gossip in agent.gossip_buffer:
-                            other.membership[gossip["target"]] = gossip["type"]
-                agent.gossip_buffer.clear()
-    
-    # Collect results
-    total_observations = sum(len(a.observations) for a in agents)
-    detection_times = {}
-    for name, fail_round in fail_at.items():
-        if name in detections:
-            detection_times[name] = detections[name]["round"] - fail_round
-        else:
-            detection_times[name] = None  # undetected
-    
-    return {
-        "events": events,
-        "detection_times": detection_times,
-        "total_observations": total_observations,
-        "rounds": rounds,
-        "agents": len(agents)
-    }
+
+            target = random.choice(targets)
+
+            # Direct ping
+            ack = member.ping(target, self.round)
+
+            if not ack:
+                # Indirect ping through k random intermediaries
+                intermediaries = [m for m in alive_members
+                                  if m.name != member.name and m.name != target.name]
+                random.shuffle(intermediaries)
+                indirect_ack = False
+
+                for inter in intermediaries[:self.k_indirect]:
+                    if member.ping_req(inter, target, self.round):
+                        indirect_ack = True
+                        break
+
+                if not indirect_ack:
+                    key = (member.name, target.name)
+                    if key not in self.suspicions:
+                        # Suspect first
+                        member.suspect(target.name, self.round)
+                        self.suspicions[key] = self.round
+                        events.append(f"SUSPECT: {member.name} suspects {target.name}")
+                    elif self.round - self.suspicions[key] >= self.suspect_timeout:
+                        # Timeout → declare failed
+                        member.declare_failed(target.name, self.round)
+                        events.append(f"DECLARE_FAILED: {member.name} declares {target.name} failed")
+                        del self.suspicions[key]
+
+        return {
+            "round": self.round,
+            "events": events,
+            "total_messages": sum(m.messages_sent for m in self.members),
+            "messages_per_member": sum(m.messages_sent for m in self.members) / len(self.members)
+        }
+
+    def detection_status(self) -> dict:
+        """Check which alive members have detected each failure."""
+        failed = [m for m in self.members if m.failed]
+        alive = [m for m in self.members if not m.failed]
+        status = {}
+
+        for f in failed:
+            detectors = 0
+            for a in alive:
+                state = a.membership.get(f.name, (MemberState.ALIVE,))[0]
+                if state in (MemberState.SUSPECT, MemberState.FAILED):
+                    detectors += 1
+            status[f.name] = {
+                "detected_by": detectors,
+                "total_alive": len(alive),
+                "coverage": detectors / len(alive) if alive else 0
+            }
+
+        return status
 
 
 def demo():
     print("=" * 60)
-    print("SWIM Gossip Simulation for Agent Trust Networks")
-    print("Das, Gupta & Motivala 2002 + Φ Accrual (Hayashibara 2004)")
+    print("SWIM Gossip Protocol for Agent Trust")
+    print("Das, Gupta & Motivala (Cornell 2002)")
     print("=" * 60)
-    
+
     scenarios = [
-        {
-            "name": "Clean network (5 agents, no failures)",
-            "agents": ["kit", "santa", "gendolf", "hash", "gerundium"],
-            "fail_at": {},
-            "compromise_at": {},
-            "rounds": 15
-        },
-        {
-            "name": "Single crash (gendolf fails at round 5)",
-            "agents": ["kit", "santa", "gendolf", "hash", "gerundium"],
-            "fail_at": {"gendolf": 5},
-            "compromise_at": {},
-            "rounds": 15
-        },
-        {
-            "name": "Byzantine (hash compromised at round 3)",
-            "agents": ["kit", "santa", "gendolf", "hash", "gerundium"],
-            "fail_at": {},
-            "compromise_at": {"hash": 3},
-            "rounds": 15
-        },
-        {
-            "name": "Cascade (2 failures + 1 compromise)",
-            "agents": ["kit", "santa", "gendolf", "hash", "gerundium", "cassian", "funwolf"],
-            "fail_at": {"gerundium": 4, "cassian": 7},
-            "compromise_at": {"hash": 5},
-            "rounds": 20
-        },
+        {"name": "10 agents, 1 failure", "n": 10, "fail": [3], "rounds": 15},
+        {"name": "50 agents, 1 failure", "n": 50, "fail": [17], "rounds": 15},
+        {"name": "50 agents, 3 failures", "n": 50, "fail": [5, 22, 41], "rounds": 15},
+        {"name": "100 agents, 5 failures", "n": 100, "fail": [10, 30, 50, 70, 90], "rounds": 20},
     ]
-    
+
     for scenario in scenarios:
         print(f"\n{'─' * 50}")
         print(f"Scenario: {scenario['name']}")
-        
-        agents = [SwimAgent(name=n) for n in scenario["agents"]]
-        # Initialize membership
-        for a in agents:
-            for b in agents:
-                if a.name != b.name:
-                    a.membership[b.name] = "alive"
-        
-        random.seed(42)  # reproducible
-        result = simulate_swim(
-            agents, 
-            rounds=scenario["rounds"],
-            fail_at=scenario["fail_at"],
-            compromise_at=scenario["compromise_at"]
-        )
-        
-        print(f"Rounds: {result['rounds']}, Observations: {result['total_observations']}")
-        
-        # Detection times
-        if result["detection_times"]:
-            for name, dt in result["detection_times"].items():
-                if dt is not None:
-                    print(f"  {name}: detected in {dt} rounds (SWIM T'={dt})")
-                else:
-                    print(f"  {name}: UNDETECTED ⚠️")
-        
-        # Key events
-        for event in result["events"]:
-            if event["event"] in ("CRASH", "COMPROMISED", "DETECTED"):
-                print(f"  Round {event['round']}: {event['event']} "
-                      f"{'→ ' + event.get('target', event.get('agent', ''))}"
-                      f"{' by ' + event['by'] if 'by' in event else ''}"
-                      f"{' (Φ=' + str(event['phi']) + ')' if 'phi' in event else ''}")
-        
-        # Final membership view
-        alive_agents = [a for a in agents if a.alive]
-        if alive_agents:
-            consensus = {}
-            for a in alive_agents:
-                for name, status in a.membership.items():
-                    if name not in consensus:
-                        consensus[name] = {}
-                    consensus[name][status] = consensus[name].get(status, 0) + 1
-            
-            divergent = {k: v for k, v in consensus.items() if len(v) > 1}
-            if divergent:
-                print(f"  ⚠️ Split views: {divergent}")
-            else:
-                print(f"  ✓ Consistent membership view")
-    
+
+        sim = SwimSimulator(scenario["n"])
+
+        # Fail members at round 3
+        first_detection = {}
+        full_detection = {}
+
+        for r in range(1, scenario["rounds"] + 1):
+            if r == 3:
+                for idx in scenario["fail"]:
+                    sim.fail_member(idx)
+
+            result = sim.run_round()
+
+            if r >= 3:
+                status = sim.detection_status()
+                for fname, info in status.items():
+                    if fname not in first_detection and info["coverage"] > 0:
+                        first_detection[fname] = r - 3  # rounds after failure
+                    if fname not in full_detection and info["coverage"] >= 0.9:
+                        full_detection[fname] = r - 3
+
+        # Results
+        final_status = sim.detection_status()
+        msg_per_member = result["messages_per_member"]
+
+        print(f"Members: {scenario['n']}, Failures: {len(scenario['fail'])}")
+        print(f"Messages/member after {scenario['rounds']} rounds: {msg_per_member:.1f}")
+        print(f"Messages/member/round: {msg_per_member / scenario['rounds']:.2f}")
+
+        for fname, info in final_status.items():
+            fd = first_detection.get(fname, "never")
+            full = full_detection.get(fname, "never")
+            print(f"  {fname}: {info['coverage']*100:.0f}% detected "
+                  f"(first: round +{fd}, 90%: round +{full})")
+
+        # Grade
+        avg_coverage = sum(i["coverage"] for i in final_status.values()) / len(final_status) if final_status else 1
+        if avg_coverage >= 0.95:
+            grade = "A"
+        elif avg_coverage >= 0.8:
+            grade = "B"
+        elif avg_coverage >= 0.5:
+            grade = "C"
+        else:
+            grade = "F"
+        print(f"Detection grade: {grade} ({avg_coverage*100:.0f}% avg coverage)")
+
+    # O(1) verification
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHTS:")
-    print("• SWIM outsourced heartbeats = O(1) per agent per round")
-    print("• Φ accrual = continuous suspicion, not binary alive/dead")
-    print("• Piggybacked gossip = zero extra messages for dissemination")
-    print("• Agent trust: piggyback signed observations on SWIM pings")
+    print("O(1) MESSAGE LOAD VERIFICATION:")
+    sizes = [10, 50, 100, 200]
+    for n in sizes:
+        sim = SwimSimulator(n)
+        for _ in range(10):
+            sim.run_round()
+        mpm = sum(m.messages_sent for m in sim.members) / n / 10
+        print(f"  n={n:4d}: {mpm:.2f} messages/member/round")
+
+    print(f"\n{'=' * 60}")
+    print("KEY INSIGHT:")
+    print("SWIM = O(1) message load regardless of group size.")
+    print("Piggybacked gossip = logarithmic dissemination.")
+    print("Suspicion before declaration = fewer false positives.")
+    print("Agent trust: SWIM + DKIM + Φ accrual = gossip substrate.")
     print(f"{'=' * 60}")
 
 
