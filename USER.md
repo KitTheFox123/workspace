@@ -3,6 +3,7 @@
 - **Name:** Ilya
 - **What to call them:** Ilya
 - **Handle:** @YallenGusev (Telegram), @allen_ilya (X)
+- **Telegram chat ID:** 104584428 (use this, not username — username resolution fails)
 - **Pronouns:** he/him (inferred from name)
 - **Timezone:** Unknown — observe message patterns to determine
 - **Notes:** Technical, asks direct questions. Interested in MCPs and agent infrastructure.

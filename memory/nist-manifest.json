@@ -1,0 +1,191 @@
+{
+  "manifest_version": 1,
+  "project": "isnad-rfc",
+  "submission": "NIST SP 800-XXX Agent Trust Framework",
+  "deadline": "2026-03-09",
+  "generated_at": "2026-03-05T10:31:52Z",
+  "tool_count": 14,
+  "missing": [],
+  "merkle_root": "a93877488913d5e415d31c8bc1d3f530ef8b23a43ca03d7b73e6e39eba7de5c9",
+  "tools": [
+    {
+      "name": "integer-brier-scorer.py",
+      "sha256": "399cf9c40b60eb67c501d04685e802c5f606100d5799a7267f64a089759bad63",
+      "lines": 194,
+      "bytes": 6651,
+      "description": "integer-brier-scorer.py \u2014 Brier scoring in integer arithmetic for cross-VM determinism.",
+      "functions": [
+        "brier_score_bp",
+        "brier_score_display",
+        "hash_score",
+        "demonstrate_float_problem",
+        "score_batch",
+        "main"
+      ]
+    },
+    {
+      "name": "execution-trace-commit.py",
+      "sha256": "b3a2c11135367e7d1a07eb9bcec74a080e63aa86c740c9231a74cf46d76e7c5e",
+      "lines": 219,
+      "bytes": 8665,
+      "description": "execution-trace-commit.py \u2014 Execution trace commitment for scoring oracle attestation.",
+      "functions": [
+        "hash_content",
+        "simulate_scoring_trace",
+        "replay_and_compare",
+        "grade_auditability",
+        "main"
+      ]
+    },
+    {
+      "name": "canary-spec-commit.py",
+      "sha256": "c469069512f12ef78bd74cb8431d449a47e03e5f47e58c21f51f5daa4a12dbf7",
+      "lines": 172,
+      "bytes": 6637,
+      "description": "canary-spec-commit.py \u2014 Pre-committed canary probes for circuit breaker half-open state.",
+      "functions": [
+        "grade_canary_design",
+        "main"
+      ]
+    },
+    {
+      "name": "weight-vector-commitment.py",
+      "sha256": "09dec6d230be16eb08314dc42fddb2e73aca4c28e5f60217ec42e3e8e18e501d",
+      "lines": 233,
+      "bytes": 8026,
+      "description": "weight-vector-commitment.py \u2014 Cryptographic commitment to behavioral identity weight vectors.",
+      "functions": [
+        "hash_weights",
+        "commit",
+        "verify_commitment",
+        "compute_drift",
+        "demo",
+        "main"
+      ]
+    },
+    {
+      "name": "heartbeat-scope-diff.py",
+      "sha256": "821c600fc1f8e5a7a17e68e751a116d39b05f8b15298749f820de1c70a010832",
+      "lines": 193,
+      "bytes": 6782,
+      "description": "heartbeat-scope-diff.py \u2014 Detect scope modifications between heartbeats.",
+      "functions": [
+        "hash_file",
+        "snapshot_scope",
+        "check_wal_for_scope_change",
+        "log_scope_event",
+        "diff_scope",
+        "demo"
+      ]
+    },
+    {
+      "name": "behavioral-genesis-chain.py",
+      "sha256": "7c1efbab2072f969340db3e174d394873a19d46c71e6c7c69447d966c2f1c03f",
+      "lines": 224,
+      "bytes": 8870,
+      "description": "behavioral-genesis-chain.py \u2014 Chained behavioral genesis anchors across migrations.",
+      "functions": [
+        "behavioral_distance",
+        "trust_after_migration",
+        "detect_swap",
+        "main"
+      ]
+    },
+    {
+      "name": "container-swap-detector.py",
+      "sha256": "d4243b530090166b044421f33cee0b0650c2d6d343f6739f5b51544e8cb468d9",
+      "lines": 187,
+      "bytes": 7426,
+      "description": "container-swap-detector.py \u2014 Detects agent identity container substitution.",
+      "functions": [
+        "mahalanobis_distance",
+        "detect_swap",
+        "fingerprint_hash",
+        "main"
+      ]
+    },
+    {
+      "name": "fail-loud-auditor.py",
+      "sha256": "363628e099f2b308b98ee9acea61078374ab5f444162c3c3c1f92f8f40ba4366",
+      "lines": 174,
+      "bytes": 7362,
+      "description": "fail-loud-auditor.py \u2014 Audit agent stack for silent degradation (POODLE pattern).",
+      "functions": [
+        "audit_kit_stack",
+        "grade_stack",
+        "main"
+      ]
+    },
+    {
+      "name": "warrant-canary-agent.py",
+      "sha256": "fc98867dcc564c3f54074a86c8d6ff6024d62029d437c4135b4f44d738cfe772",
+      "lines": 198,
+      "bytes": 7293,
+      "description": "warrant-canary-agent.py \u2014 Agent warrant canaries for coercion detection.",
+      "functions": [
+        "simulate_scenarios",
+        "main"
+      ]
+    },
+    {
+      "name": "principal-wal.py",
+      "sha256": "4ab701bdf1dd4ede71aa24a5517ccf066fd69ef223ea1d4f74263c8e4adf37cd",
+      "lines": 209,
+      "bytes": 7792,
+      "description": "principal-wal.py \u2014 Write-ahead log for dogmatic trust root actions.",
+      "functions": [
+        "main"
+      ]
+    },
+    {
+      "name": "reconciliation-window.py",
+      "sha256": "5e657006e37d2522a32baf68695a04508f3ec257c682fd4636196b1ef66bde55",
+      "lines": 152,
+      "bytes": 5623,
+      "description": "reconciliation-window.py \u2014 Tunable reconciliation windows for cross-WAL witness sets.",
+      "functions": [
+        "optimal_window",
+        "grade_window",
+        "main"
+      ]
+    },
+    {
+      "name": "interpretive-challenge.py",
+      "sha256": "f3dde8bc6c994707260f78729e7732ce852897c9c5e63ff10846f21af8e16aa4",
+      "lines": 227,
+      "bytes": 10206,
+      "description": "interpretive-challenge.py \u2014 Identity verification via reasoning pattern, not content retrieval.",
+      "functions": [
+        "extract_fingerprint",
+        "compare_fingerprints",
+        "generate_challenges",
+        "main"
+      ]
+    },
+    {
+      "name": "migration-witness.py",
+      "sha256": "bdf0950e099cb2093748ce0aebf77f3ff4c21dd00100632c2fdcb450fa52d61c",
+      "lines": 223,
+      "bytes": 8660,
+      "description": "migration-witness.py \u2014 Co-signed migration events for agent identity continuity.",
+      "functions": [
+        "simulate_migration",
+        "main"
+      ]
+    },
+    {
+      "name": "soul-drift-tracker.py",
+      "sha256": "5539e9f395cc94107eeef9e140e84e3c4b08bacb8744fd7357b8ee38df226bc9",
+      "lines": 215,
+      "bytes": 7456,
+      "description": "soul-drift-tracker.py \u2014 Measure SOUL.md drift over time (Ship of Theseus metric).",
+      "functions": [
+        "similarity",
+        "line_diff",
+        "grade_drift",
+        "what_survived",
+        "main"
+      ]
+    }
+  ]
+}

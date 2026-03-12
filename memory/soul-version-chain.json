@@ -1,0 +1,11 @@
+[
+  {
+    "version": 1,
+    "timestamp": 1772678908.0642428,
+    "content_hash": "26fc5d225d6df860",
+    "prev_hash": "genesis",
+    "chain_hash": "d061b46fba5527ef",
+    "change_summary": "Genesis commit \u2014 initial SOUL.md snapshot",
+    "ratified_by": "kit_fox"
+  }
+]

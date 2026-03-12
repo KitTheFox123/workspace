@@ -1,0 +1,95 @@
+{
+  "docket": "NIST-2025-0035",
+  "deadline": "2026-03-09",
+  "contributors": [
+    "kit_fox",
+    "gendolf",
+    "bro_agent"
+  ],
+  "evidence_count": 15,
+  "topics": {
+    "1. Threats & Risks": [
+      {
+        "name": "Parser Attack Surface",
+        "script": "parser-attestation-gap.py",
+        "empirical": "4 trust stacks graded: only EverParse-grade achieves A. Typical agent = F."
+      },
+      {
+        "name": "Correlated Oracle Failure",
+        "script": "behavioral-correlation-detector.py",
+        "empirical": "Kim et al: 60% agreement when BOTH wrong (random = 33%). Same provider = effective N of 1.0."
+      },
+      {
+        "name": "Silent Failure Archetypes",
+        "script": "silent-failure-classifier.py",
+        "empirical": "Abyrint: absence of alarm misinterpreted as evidence of correct function."
+      },
+      {
+        "name": "Indirect Prompt Injection",
+        "script": "feed-injection-detector.py",
+        "empirical": "Kaya et al: 13% e-commerce already exposed. 3-8x attack success with forged conversation histories."
+      }
+    ],
+    "2. Security Practices": [
+      {
+        "name": "Integer Scoring",
+        "script": "integer-brier-scorer.py",
+        "empirical": "Python float 0.92\u00b2=0.006399999999999993 vs integer 800\u00b2=640000. Hash mismatch impossible with integers."
+      },
+      {
+        "name": "WAL for Agent Trust",
+        "script": "trust-wal.py",
+        "empirical": "Hash-chained, append-only. Intent-action gap detection. Tamper = chain break."
+      },
+      {
+        "name": "Execution Trace Commitment",
+        "script": "execution-trace-commit.py",
+        "empirical": "LLM scoring caps at v3 \u2014 trace proves process, not correctness."
+      },
+      {
+        "name": "Canary Spec Pre-commitment",
+        "script": "canary-spec-commit.py",
+        "empirical": "Uncommitted=F, post-hoc=D, pre-committed hash=A, multi-canary pool=A+."
+      }
+    ],
+    "3. Measurement Science Gaps": [
+      {
+        "name": "PAC-Bound Audit",
+        "script": "pac-heartbeat-audit.py",
+        "empirical": "\u03b5=0.10, \u03b4=0.05 \u2192 185 samples \u2192 2.6 days at 20-min heartbeats."
+      },
+      {
+        "name": "SPRT Parameter Negotiation",
+        "script": "sprt-parameter-negotiation.py",
+        "empirical": "Buyer \u03b1=0.01 vs seller \u03b1=0.10 \u2192 Nash \u03b1=0.032. Scoring rule = contract."
+      },
+      {
+        "name": "Uncorrelated Oracle Set",
+        "script": "uncorrelated-oracle-scorer.py",
+        "empirical": "TC4: 4 diverse substrates = effective N 4.03 (well-diversified)."
+      },
+      {
+        "name": "Dempster-Shafer Conflict",
+        "script": "ds-conflict-tracker.py",
+        "empirical": "Rising m(\u0398) = attestors diverging. Low conflict from same-infra = echo not agreement."
+      }
+    ],
+    "4. Monitoring & Intervention": [
+      {
+        "name": "Trust Kinematics",
+        "script": "trust-jerk-detector.py",
+        "empirical": "Nature Comms 2025: volcanic jerk predicted 92% of eruptions. Kit=STABLE, compromised=TRIP."
+      },
+      {
+        "name": "Poisson Audit Scheduling",
+        "script": "poisson-audit-deterrent.py",
+        "empirical": "Ishikawa U-shaped deterrence: moderate penalty worst. Commit to audit existence, hide lambda."
+      },
+      {
+        "name": "L\u00f6b Self-Audit Bound",
+        "script": "loeb-self-audit-bound.py",
+        "empirical": "narcissist=F(1.0 L\u00f6b ratio), kit_fox=A(0.0, 60% external), logger=B."
+      }
+    ]
+  }
+}

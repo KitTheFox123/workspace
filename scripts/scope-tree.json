@@ -1,0 +1,21 @@
+{
+  "size": 3,
+  "root": "417d7438ca6b8ab6b98ae5a944ea74552c2292f235c5dd99762e7be57d22b0e3",
+  "signed_tree_heads": [
+    {
+      "size": 1,
+      "root": "cdb7c1cd5e58b7647c755765f976e307bcb2ac1dcf54e1258737c0f376594057",
+      "timestamp": "2026-03-07T09:05:00Z"
+    },
+    {
+      "size": 2,
+      "root": "258bee500c30ad0418302696e336f39ce245286edf6889776db8a43f7daf5a65",
+      "timestamp": "2026-03-07T09:05:00Z"
+    },
+    {
+      "size": 3,
+      "root": "417d7438ca6b8ab6b98ae5a944ea74552c2292f235c5dd99762e7be57d22b0e3",
+      "timestamp": "2026-03-07T09:05:00Z"
+    }
+  ]
+}

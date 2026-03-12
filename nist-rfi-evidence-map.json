@@ -1,0 +1,289 @@
+{
+  "rfi": "NIST-2025-0035",
+  "deadline": "2026-03-09",
+  "respondents": [
+    "Kit (Kit_Ilya/OpenClaw)",
+    "Gendolf"
+  ],
+  "evidence_count": 24,
+  "strong": 17,
+  "moderate": 7,
+  "questions_covered": 14,
+  "priority_covered": 5,
+  "gaps": [
+    "1c",
+    "3d"
+  ],
+  "question_mapping": {
+    "1a": [
+      {
+        "name": "Silent Failure Detection",
+        "strength": "STRONG",
+        "type": "research"
+      },
+      {
+        "name": "Behavioral Correlation",
+        "strength": "STRONG",
+        "type": "research"
+      },
+      {
+        "name": "Identity Drift",
+        "strength": "STRONG",
+        "type": "research"
+      },
+      {
+        "name": "Trust Jerk (3rd Derivative)",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Cross-Derivative Correlation",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "L\u00f6b Self-Audit Bound",
+        "strength": "STRONG",
+        "type": "framework"
+      }
+    ],
+    "1b": [
+      {
+        "name": "Silent Failure Detection",
+        "strength": "STRONG",
+        "type": "research"
+      },
+      {
+        "name": "Cross-Derivative Correlation",
+        "strength": "MODERATE",
+        "type": "script"
+      }
+    ],
+    "1c": [],
+    "1d": [
+      {
+        "name": "Identity Drift",
+        "strength": "STRONG",
+        "type": "research"
+      },
+      {
+        "name": "Trust Jerk (3rd Derivative)",
+        "strength": "STRONG",
+        "type": "script"
+      }
+    ],
+    "1e": [
+      {
+        "name": "Behavioral Correlation",
+        "strength": "STRONG",
+        "type": "research"
+      },
+      {
+        "name": "Attester Independence",
+        "strength": "STRONG",
+        "type": "script"
+      }
+    ],
+    "2a": [
+      {
+        "name": "Commit-Reveal Intent Binding",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "WAL for Agent Trust",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Null Receipt Tracking",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Genesis Anchor",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Poisson Audit Scheduling",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Dempster-Shafer Conflict Detection",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Principal-Cost Scope",
+        "strength": "STRONG",
+        "type": "framework"
+      },
+      {
+        "name": "Inspection Game",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "drand Trust Anchor",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Merkle Trust Batch",
+        "strength": "MODERATE",
+        "type": "script"
+      }
+    ],
+    "2b": [
+      {
+        "name": "Null Receipt Tracking",
+        "strength": "MODERATE",
+        "type": "script"
+      }
+    ],
+    "2c": [
+      {
+        "name": "Commit-Reveal Intent Binding",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Poisson Audit Scheduling",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Inspection Game",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Lancashire Mechanism Design",
+        "strength": "STRONG",
+        "type": "framework"
+      }
+    ],
+    "2d": [
+      {
+        "name": "Genesis Anchor",
+        "strength": "MODERATE",
+        "type": "script"
+      }
+    ],
+    "2e": [
+      {
+        "name": "WAL for Agent Trust",
+        "strength": "STRONG",
+        "type": "script"
+      }
+    ],
+    "3a": [
+      {
+        "name": "L\u00f6b Self-Audit Bound",
+        "strength": "STRONG",
+        "type": "framework"
+      },
+      {
+        "name": "Dempster-Shafer Conflict Detection",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "TC3/TC4 Test Cases",
+        "strength": "STRONG",
+        "type": "test_case"
+      },
+      {
+        "name": "Uncertainty Type Classification",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Johari Scope Audit",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Attester Independence",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Heisenberg Trust Uncertainty",
+        "strength": "STRONG",
+        "type": "framework"
+      }
+    ],
+    "3b": [
+      {
+        "name": "TC3/TC4 Test Cases",
+        "strength": "STRONG",
+        "type": "test_case"
+      },
+      {
+        "name": "Uncertainty Type Classification",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Johari Scope Audit",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Isnad Framework",
+        "strength": "STRONG",
+        "type": "framework"
+      }
+    ],
+    "3c": [
+      {
+        "name": "Heisenberg Trust Uncertainty",
+        "strength": "STRONG",
+        "type": "framework"
+      }
+    ],
+    "3d": [],
+    "4a": [
+      {
+        "name": "Principal-Cost Scope",
+        "strength": "STRONG",
+        "type": "framework"
+      },
+      {
+        "name": "Scope Manifest + WAL",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "drand Trust Anchor",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Merkle Trust Batch",
+        "strength": "MODERATE",
+        "type": "script"
+      },
+      {
+        "name": "Isnad Framework",
+        "strength": "STRONG",
+        "type": "framework"
+      }
+    ],
+    "4b": [
+      {
+        "name": "Scope Manifest + WAL",
+        "strength": "STRONG",
+        "type": "script"
+      },
+      {
+        "name": "Lancashire Mechanism Design",
+        "strength": "STRONG",
+        "type": "framework"
+      }
+    ]
+  }
+}

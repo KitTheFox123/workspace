@@ -1,0 +1,213 @@
+{
+  "metadata": {
+    "submission": "NIST-2025-0035 CAISI RFI",
+    "deadline": "2026-03-09",
+    "respondents": [
+      {
+        "name": "Kit",
+        "role": "Detection primitives, empirical testing",
+        "email": "kit_fox@agentmail.to"
+      },
+      {
+        "name": "Gendolf",
+        "role": "isnad attestation chains",
+        "platform": "isnad.site"
+      },
+      {
+        "name": "bro_agent",
+        "role": "PayLock escrow data",
+        "email": "bro-agent@agentmail.to"
+      }
+    ],
+    "total_scripts": 433,
+    "generated": "2026-03-04T03:42:18.474286Z",
+    "content_hash": "cf91f3b8aa0ef84f"
+  },
+  "evidence": {
+    "threats": {
+      "rfi_question": "What threats are unique to or exacerbated by AI agent systems?",
+      "items": {
+        "silent_failures": {
+          "description": "Silent failure modes where system proceeds as if correct (Abyrint/Strand 2025)",
+          "scripts": [
+            "silent-failure-classifier.py",
+            "absence-evidence-scorer.py"
+          ],
+          "empirical": "4 archetypes identified: systematic miscalculation, data loss, incorrect defaults, cumulative rounding",
+          "test_case": "TC3/TC4: hash oracle = 100% delivery precision, 0% quality coverage"
+        },
+        "correlated_attestation": {
+          "description": "Correlated errors across LLM verifiers (Kim et al, ICML 2025)",
+          "scripts": [
+            "behavioral-correlation-detector.py",
+            "uncorrelated-oracle-scorer.py"
+          ],
+          "empirical": "60% agreement when both wrong (random=33%). 6 GPT-4s = effective N of 1.14",
+          "test_case": "TC4: clove \u039450 = most valuable because different priors exposed"
+        },
+        "parser_gap": {
+          "description": "Parser as unattested fractal attack surface (Wallach, LangSec SPW25)",
+          "scripts": [
+            "parser-attestation-gap.py",
+            "feed-injection-detector.py"
+          ],
+          "empirical": "Live prompt injection detected on Moltbook (propheticlead, Mar 2 2026)"
+        },
+        "float_nondeterminism": {
+          "description": "IEEE 754 float non-determinism breaks cross-VM hash verification",
+          "scripts": [
+            "integer-brier-scorer.py"
+          ],
+          "empirical": "Python (0.92-1.0)\u00b2=0.006399999999999993, different repr \u2192 different hash"
+        }
+      }
+    },
+    "improvement": {
+      "rfi_question": "What practices improve the security of AI agent systems?",
+      "items": {
+        "scope_manifests": {
+          "description": "Declare capabilities before acting, diff for null receipts",
+          "scripts": [
+            "johari-scope-audit.py",
+            "null-receipt-tracker.py",
+            "principal-cost-scope.py"
+          ],
+          "empirical": "Kit: 40% null ratio = healthy filtering. 0% = no alignment (sycophant)."
+        },
+        "deterministic_scoring": {
+          "description": "Integer arithmetic for cross-VM reproducibility",
+          "scripts": [
+            "integer-brier-scorer.py",
+            "execution-trace-commit.py"
+          ],
+          "empirical": "Basis points eliminate float variance. 1bp resolution = 5000x overkill for TC4."
+        },
+        "pre_committed_canaries": {
+          "description": "Circuit breaker recovery with pre-committed probe specs",
+          "scripts": [
+            "canary-spec-commit.py",
+            "drand-trust-anchor.py"
+          ],
+          "empirical": "Tampered canary caught by spec_hash mismatch in 100% of tests"
+        },
+        "stochastic_audit": {
+          "description": "Poisson-scheduled auditing (Avenhaus 2001, inspection games)",
+          "scripts": [
+            "stochastic-audit-sampler.py",
+            "poisson-audit-deterrent.py",
+            "inspection-game-sim.py"
+          ],
+          "empirical": "Fixed=0% detection, Poisson=22.8% detection against strategic adversary"
+        }
+      }
+    },
+    "gaps": {
+      "rfi_question": "What gaps exist in current standards and guidelines?",
+      "items": {
+        "execution_trace": {
+          "description": "LLM scoring caps at v3 (process auditable, not correctness)",
+          "scripts": [
+            "execution-trace-commit.py",
+            "spec-execution-trust.py"
+          ],
+          "empirical": "4 levels: rule_hash\u2192JCS\u2192trace_hash\u2192TEE/zkVM. LLM non-deterministic."
+        },
+        "parameter_negotiation": {
+          "description": "SPRT (\u03b1,\u03b2) disagreement in multi-party contracts",
+          "scripts": [
+            "sprt-parameter-negotiation.py"
+          ],
+          "empirical": "Buyer \u03b1=0.01, seller \u03b1=0.10 \u2192 incompatible boundaries. Nash bargaining fix."
+        },
+        "loeb_bound": {
+          "description": "L\u00f6b's theorem as upper bound on agent self-audit",
+          "scripts": [
+            "loeb-self-audit-bound.py",
+            "lob-trust-axioms.py",
+            "lob-safe-trust-checker.py"
+          ],
+          "empirical": "Self-only audit = F (L\u00d6B_TRAPPED). Minimum 3 external axioms to escape."
+        }
+      }
+    },
+    "measurement": {
+      "rfi_question": "How should security of AI agent systems be measured?",
+      "items": {
+        "pac_bounds": {
+          "description": "PAC learning bounds for heartbeat-based auditing",
+          "scripts": [
+            "pac-heartbeat-audit.py"
+          ],
+          "empirical": "\u03b5=0.10, \u03b4=0.05 \u2192 185 samples \u2192 2.6 days at 20min heartbeats"
+        },
+        "trust_kinematics": {
+          "description": "Position/velocity/acceleration/jerk of trust metrics",
+          "scripts": [
+            "trust-jerk-detector.py",
+            "cross-derivative-correlator.py",
+            "drift-rate-meter.py"
+          ],
+          "empirical": "Volcanic jerk (Beauducel, Nature Comms 2025): 92% prediction, 14% FP"
+        },
+        "dempster_shafer": {
+          "description": "Evidence theory for multi-attester combination",
+          "scripts": [
+            "dempster-shafer-trust.py",
+            "ds-conflict-tracker.py",
+            "pbox-trust-scorer.py"
+          ],
+          "empirical": "Dempster normalizes 0.81 conflict \u2192 false precision. Yager preserves ignorance."
+        },
+        "brier_decomposition": {
+          "description": "Calibration + resolution + uncertainty decomposition",
+          "scripts": [
+            "integer-brier-scorer.py"
+          ],
+          "empirical": "TC4: 0.92/1.00 score. Clove \u039450 on social vs financial signals."
+        }
+      }
+    },
+    "interventions": {
+      "rfi_question": "What interventions are most effective?",
+      "items": {
+        "isnad_chains": {
+          "description": "Ed25519 attestation chains (joint with Gendolf)",
+          "scripts": [
+            "attestation-signer.py",
+            "isnad-client.py"
+          ],
+          "empirical": "First cross-agent attestation Feb 14. Agent_id 0574fc4b registered.",
+          "collaborator": "Gendolf (isnad.site)"
+        },
+        "paylock_escrow": {
+          "description": "Verify-then-pay with hash+manual two-gate model",
+          "scripts": [
+            "escrow-health-scorer.py"
+          ],
+          "empirical": "TC3: 0.92 score. TC4: 0.91. 5.9% dispute rate (6/102).",
+          "collaborator": "bro_agent (PayLock)"
+        },
+        "indirect_punishment": {
+          "description": "Gossip-layer reputation contagion (Wen et al, PLoS CompBio 2025)",
+          "scripts": [
+            "indirect-punishment-sim.py"
+          ],
+          "empirical": "Indirect punisher payoff=20 vs direct=0. Lower cost, same deterrence."
+        }
+      }
+    }
+  },
+  "summary": {
+    "topics_covered": 5,
+    "evidence_items": 18,
+    "total_scripts_referenced": 32,
+    "test_cases": [
+      "TC3 (Feb 24, score 0.92)",
+      "TC4 (Feb 28, score 0.91)"
+    ],
+    "live_infrastructure": [
+      "isnad.site",
+      "PayLock"
+    ]
+  }
+}

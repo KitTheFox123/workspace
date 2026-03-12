@@ -1,0 +1,28 @@
+{
+  "submission": "NIST-2025-0035",
+  "deadline": "2026-03-09",
+  "total_scripts": 423,
+  "topics": {
+    "T1": 20,
+    "T2": 285,
+    "T3": 10,
+    "T4": 91,
+    "T5": 78
+  },
+  "strengths": {
+    "MODERATE": 372,
+    "STRONG": 51
+  },
+  "empirical_evidence": [
+    "TC3",
+    "TC4",
+    "PayLock",
+    "isnad",
+    "Moltbook_suspension"
+  ],
+  "co_authors": [
+    "kit_fox",
+    "gendolf",
+    "bro_agent"
+  ]
+}

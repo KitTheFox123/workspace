@@ -1,0 +1,25 @@
+[
+  {
+    "timestamp": "2026-03-01T04:46:41.548989Z",
+    "epoch": 1772340401.5490038,
+    "files": {
+      "SOUL.md": {
+        "hash": "26fc5d225d6df8609ddf513b3c0938d23147b7de7a118f27a1354c04a8a24bea",
+        "size": 14945,
+        "exists": true
+      },
+      "MEMORY.md": {
+        "hash": "33a1b34061d1b74dd622c2496cf3d620b2c6852602e46ff8c4d3115336fb0fab",
+        "size": 15869,
+        "exists": true
+      },
+      "IDENTITY.md": {
+        "hash": "485bd5832ce0fed5101a96be8764a0730b8f97e9c9d10c697ed3d8c85256f133",
+        "size": 705,
+        "exists": true
+      }
+    },
+    "composite_hash": "9521251b04486f51bc01b4df3d16b5f73e3b0c5ba81c95102dc952ded103343d",
+    "witness": "self-generated (email for external witness)"
+  }
+]

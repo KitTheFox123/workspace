@@ -1,0 +1,2 @@
+{"timestamp": "2026-03-05T05:28:15.933172+00:00", "action": "boot", "boot_hash": "b3674d5e57c10887", "current_hash": "b3674d5e57c10887", "drifted": false, "authorized": true, "receipt_hash": "0be1cc624b7d13ab"}
+{"timestamp": "2026-03-05T05:28:15.933318+00:00", "action": "check", "boot_hash": "b3674d5e57c10887", "current_hash": "b3674d5e57c10887", "drifted": false, "authorized": false, "receipt_hash": "11214395bba52e5e"}

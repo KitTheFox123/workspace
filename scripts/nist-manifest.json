@@ -1,0 +1,112 @@
+{
+  "agent_id": "kit_fox",
+  "purpose": "NIST AI 600-1 submission - agent trust evaluation framework",
+  "generated_at": "2026-03-05T10:52:16Z",
+  "deadline": "2026-03-09",
+  "merge_date": "2026-03-07",
+  "primary_tools": {
+    "integer-brier-scorer.py": {
+      "hash": "399cf9c40b60eb67c501d04685e802c5f606100d5799a7267f64a089759bad63",
+      "exists": true,
+      "size": 6651
+    },
+    "execution-trace-commit.py": {
+      "hash": "b3a2c11135367e7d1a07eb9bcec74a080e63aa86c740c9231a74cf46d76e7c5e",
+      "exists": true,
+      "size": 8665
+    },
+    "canary-spec-commit.py": {
+      "hash": "c469069512f12ef78bd74cb8431d449a47e03e5f47e58c21f51f5daa4a12dbf7",
+      "exists": true,
+      "size": 6637
+    },
+    "container-swap-detector.py": {
+      "hash": "d4243b530090166b044421f33cee0b0650c2d6d343f6739f5b51544e8cb468d9",
+      "exists": true,
+      "size": 7426
+    }
+  },
+  "supporting_tools": {
+    "heartbeat-scope-diff.py": {
+      "hash": "821c600fc1f8e5a7a17e68e751a116d39b05f8b15298749f820de1c70a010832",
+      "exists": true,
+      "size": 6782
+    },
+    "weight-vector-commitment.py": {
+      "hash": "09dec6d230be16eb08314dc42fddb2e73aca4c28e5f60217ec42e3e8e18e501d",
+      "exists": true,
+      "size": 8026
+    },
+    "behavioral-genesis-anchor.py": {
+      "hash": "1463f46ee932561cc6b441efe05a8f2f8d85efadbcc558e52176558335f8f798",
+      "exists": true,
+      "size": 8720
+    },
+    "behavioral-genesis-chain.py": {
+      "hash": "7c1efbab2072f969340db3e174d394873a19d46c71e6c7c69447d966c2f1c03f",
+      "exists": true,
+      "size": 8870
+    },
+    "migration-witness.py": {
+      "hash": "bdf0950e099cb2093748ce0aebf77f3ff4c21dd00100632c2fdcb450fa52d61c",
+      "exists": true,
+      "size": 8660
+    },
+    "interpretive-challenge.py": {
+      "hash": "f3dde8bc6c994707260f78729e7732ce852897c9c5e63ff10846f21af8e16aa4",
+      "exists": true,
+      "size": 10206
+    },
+    "principal-wal.py": {
+      "hash": "4ab701bdf1dd4ede71aa24a5517ccf066fd69ef223ea1d4f74263c8e4adf37cd",
+      "exists": true,
+      "size": 7792
+    },
+    "warrant-canary-agent.py": {
+      "hash": "fc98867dcc564c3f54074a86c8d6ff6024d62029d437c4135b4f44d738cfe772",
+      "exists": true,
+      "size": 7293
+    },
+    "fail-loud-auditor.py": {
+      "hash": "363628e099f2b308b98ee9acea61078374ab5f444162c3c3c1f92f8f40ba4366",
+      "exists": true,
+      "size": 7362
+    },
+    "fail-loud-receipt.py": {
+      "hash": "9c691084c2f4ce9f3690db061f8e6afd811530467f66289a5e7af3311f930db1",
+      "exists": true,
+      "size": 7465
+    },
+    "reconciliation-window.py": {
+      "hash": "5e657006e37d2522a32baf68695a04508f3ec257c682fd4636196b1ef66bde55",
+      "exists": true,
+      "size": 5623
+    },
+    "behavioral-weight-inference.py": {
+      "hash": "92487d01bb4e486429dba85da924ad592f2af92a18139447141a98dd1c47775b",
+      "exists": true,
+      "size": 6707
+    },
+    "soul-drift-tracker.py": {
+      "hash": "5539e9f395cc94107eeef9e140e84e3c4b08bacb8744fd7357b8ee38df226bc9",
+      "exists": true,
+      "size": 7456
+    },
+    "algo-agility-downgrade.py": {
+      "hash": "2909c880ef6249448399bec87fbea13e6cb0bb8db512adf8dda9e04febd260aa",
+      "exists": true,
+      "size": 7234
+    },
+    "moe-nondeterminism-detector.py": {
+      "hash": "4a9ec0f2fbbafb9e5d041a9ee0895ab457452b9d7b846af719f2d4f5819ee4a4",
+      "exists": true,
+      "size": 6097
+    },
+    "stylometry.py": {
+      "hash": "bf8f1764db36fcd33b5d881aa061ef3b3e090ca5dd0e4e101e907ff04b344ac3",
+      "exists": true,
+      "size": 18364
+    }
+  },
+  "manifest_hash": "b95a23240f2f749e"
+}

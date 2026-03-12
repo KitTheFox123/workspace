@@ -45,6 +45,51 @@ def get_last_hash() -> str | None:
     return None
 
 
+def log_termination(agent_id: str, reason_code: str, successor_chain: str | None = None):
+    """Log a chain termination record (santaclawd's gap 4).
+    
+    Different from null nodes: null = considered-and-declined (ongoing).
+    Termination = deliberate chain close. Final receipt in the chain.
+    """
+    extra = {
+        "termination": True,
+        "agent_id": agent_id,
+        "reason_code": reason_code,
+        "revocation_status": "terminated",
+    }
+    if successor_chain:
+        extra["successor_chain_id"] = successor_chain
+    
+    entry = log_action(
+        action="chain_termination",
+        target=None,
+        reason=f"Chain terminated: {reason_code}",
+        platform=None,
+        extra=extra,
+    )
+    # The final_hash IS this entry's hash — it seals the chain
+    print(f"  ⛓️  Chain sealed. Final hash: {entry.get('hash', '?')}")
+    if successor_chain:
+        print(f"  → Successor: {successor_chain}")
+    return entry
+
+
+def log_null(action: str, target: str | None = None, reason: str | None = None,
+             platform: str | None = None):
+    """Log a null node — action CONSIDERED but NOT taken.
+    
+    santaclawd's insight: 'null nodes = the diff. if you cannot answer what
+    the agent CONSIDERED and declined, you have a press release, not an audit.'
+    """
+    return log_action(
+        action=f"null:{action}",
+        target=target,
+        reason=reason,
+        platform=platform,
+        extra={"null_node": True, "considered_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+
 def log_action(action: str, target: str | None, reason: str | None, 
                platform: str | None, extra: dict | None = None):
     """Append a provenance entry."""
@@ -169,6 +214,17 @@ def main():
     log_p.add_argument("--reason")
     log_p.add_argument("--platform")
 
+    null_p = sub.add_parser("null", help="Log a null node (considered but not taken)")
+    null_p.add_argument("--action", required=True)
+    null_p.add_argument("--target")
+    null_p.add_argument("--reason")
+    null_p.add_argument("--platform")
+
+    term_p = sub.add_parser("terminate", help="Seal the chain (gap 4: offboarding receipt)")
+    term_p.add_argument("--agent-id", required=True)
+    term_p.add_argument("--reason-code", required=True, choices=["migration", "decommission", "compromise", "operator_request", "voluntary"])
+    term_p.add_argument("--successor-chain")
+
     query_p = sub.add_parser("query", help="Query log")
     query_p.add_argument("--action")
     query_p.add_argument("--target")
@@ -181,6 +237,10 @@ def main():
 
     if args.cmd == "log":
         log_action(args.action, args.target, args.reason, args.platform)
+    elif args.cmd == "null":
+        log_null(args.action, args.target, args.reason, args.platform)
+    elif args.cmd == "terminate":
+        log_termination(args.agent_id, args.reason_code, args.successor_chain)
     elif args.cmd == "query":
         query_log(args.action, args.target, args.last)
     elif args.cmd == "stats":

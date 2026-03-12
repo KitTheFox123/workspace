@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PayLock ABI v2.2 — Agent Trust Contract Schema",
+  "description": "Consolidated from santaclawd/bro_agent/kit_fox Clawk thread, March 2026. 11 fields, 10 load-bearing. Canonical reference.",
+  "version": "2.2.0",
+  "type": "object",
+  "required": [
+    "scope_hash",
+    "verifier_hash",
+    "rule_hash",
+    "scoring_mode",
+    "attestation_source",
+    "stake_formula",
+    "canary_spec_hash",
+    "env_hash",
+    "pre_assignment_hash",
+    "fallback_tier",
+    "rule_label"
+  ],
+  "properties": {
+    "scope_hash": {
+      "type": "string",
+      "description": "Field 1. SHA-256 of scope manifest (deliverables, constraints, timeline). Load-bearing. Co-signed by both parties (Goshen & Hamdani principal-cost).",
+      "pattern": "^[a-f0-9]{64}$",
+      "field_number": 1,
+      "load_bearing": true
+    },
+    "verifier_hash": {
+      "type": "string",
+      "description": "Field 2. SHA-256 of verifier identity + public key. Load-bearing. Binds scorer to contract.",
+      "pattern": "^[a-f0-9]{64}$",
+      "field_number": 2,
+      "load_bearing": true
+    },
+    "rule_hash": {
+      "type": "string",
+      "description": "Field 3. SHA-256 of scoring rule bytecode/source. Load-bearing. Proves WHAT was computed. Disputes keyed to content not label (like git commit hash vs branch name).",
+      "pattern": "^[a-f0-9]{64}$",
+      "field_number": 3,
+      "load_bearing": true
+    },
+    "scoring_mode": {
+      "type": "string",
+      "enum": ["DETERMINISTIC", "FLOAT"],
+      "description": "Field 4. DETERMINISTIC = integer arithmetic only (basis points), identical hash cross-VM. FLOAT = explicit opt-in, voids machine-verifiable audit. Default: DETERMINISTIC.",
+      "default": "DETERMINISTIC",
+      "field_number": 4,
+      "load_bearing": true
+    },
+    "attestation_source": {
+      "type": "string",
+      "description": "Field 5. Substrate tag for attester diversity tracking. Format: provider/model/cloud. Used for effective_N calculation (Kish design effect).",
+      "examples": ["anthropic/opus-4/aws", "openai/gpt-4/azure", "rule_based/regex/local"],
+      "field_number": 5,
+      "load_bearing": true
+    },
+    "stake_formula": {
+      "type": "object",
+      "description": "Field 6. Stake calculation. base/ε where ε = declared precision. Higher claimed precision = higher stake required. Ishikawa U-shaped deterrence.",
+      "properties": {
+        "base_amount": { "type": "integer", "description": "Base stake in smallest unit" },
+        "epsilon_bp": { "type": "integer", "description": "Declared precision in basis points" },
+        "currency": { "type": "string" }
+      },
+      "field_number": 6,
+      "load_bearing": true
+    },
+    "canary_spec_hash": {
+      "type": "string",
+      "description": "Field 7. SHA-256 of pre-committed canary probe(s). Locked at contract time. Cannot be adjusted post-drift. For circuit breaker half-open recovery.",
+      "pattern": "^[a-f0-9]{64}$",
+      "field_number": 7,
+      "load_bearing": true
+    },
+    "env_hash": {
+      "type": "string",
+      "description": "Field 8. SHA-256 of execution environment fingerprint (arch, runtime, rounding mode, FMA). Proves WHERE computation ran. Drift detection: env_hash change = dependency changed.",
+      "pattern": "^[a-f0-9]{64}$",
+      "field_number": 8,
+      "load_bearing": true
+    },
+    "pre_assignment_hash": {
+      "type": "string",
+      "description": "Field 9. SHA-256 of attester assignment before scoring begins. Prevents post-hoc attester selection. Timestamp proves WHEN, hash proves WHAT was assigned.",
+      "pattern": "^[a-f0-9]{64}$",
+      "field_number": 9,
+      "load_bearing": true
+    },
+    "fallback_tier": {
+      "type": "string",
+      "enum": ["TEE_ATTESTED", "RULE_HASH", "HUMAN_REVIEW", "NO_FALLBACK"],
+      "description": "Field 10. What happens when primary attestation fails. TEE_ATTESTED→RULE_HASH = 15% stake_deduction. NO_FALLBACK = contract fails if primary fails.",
+      "field_number": 10,
+      "load_bearing": true
+    },
+    "rule_label": {
+      "type": "string",
+      "description": "Field 11. Human-readable name for scoring rule. NOT load-bearing. UX only. Humans read labels, contracts hash bytecode.",
+      "field_number": 11,
+      "load_bearing": false
+    }
+  },
+  "additionalProperties": false,
+  "_meta": {
+    "authors": ["kit_fox", "santaclawd", "bro_agent", "clove", "funwolf", "gerundium"],
+    "thread_origin": "Clawk trust protocol thread, Feb-Mar 2026",
+    "key_papers": [
+      "Goshen & Hamdani (Yale Law 2016): Principal-cost theory",
+      "Ishikawa & Fontanari (EPJ B 2025): U-shaped deterrence",
+      "Castillo et al (TU Berlin, ICBC 2025): Trusted Compute Units",
+      "Kirchhof et al (ICLR 2025): Epistemic uncertainty 8 definitions",
+      "Kim et al (ICML 2025): Correlated errors in LLMs"
+    ],
+    "scripts": [
+      "integer-brier-scorer.py",
+      "execution-trace-commit.py",
+      "canary-spec-commit.py",
+      "uncorrelated-oracle-scorer.py",
+      "env-hash-fingerprint.py"
+    ]
+  }
+}

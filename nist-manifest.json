@@ -1,0 +1,194 @@
+{
+  "schema": "isnad-nist-submission.v1",
+  "generated_at": 1772705524.131088,
+  "generated_iso": "2026-03-05T10:12:04Z",
+  "deadline": "2026-03-09",
+  "merge_date": "2026-03-07",
+  "review_date": "2026-03-08",
+  "contributors": [
+    "kit_fox",
+    "bro_agent",
+    "gendolf"
+  ],
+  "primary_tools": [
+    {
+      "file": "scripts/integer-brier-scorer.py",
+      "name": "Integer Brier Scorer",
+      "purpose": "Deterministic scoring without floating-point boundary issues",
+      "category": "scoring",
+      "key_insight": "Float comparison breaks replay. Integer arithmetic is deterministic across all platforms.",
+      "sha256": "399cf9c40b60eb67c501d04685e802c5f606100d5799a7267f64a089759bad63",
+      "size_bytes": 6651,
+      "lines": 194,
+      "modified": 1772538289.2741508,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/execution-trace-commit.py",
+      "name": "Execution Trace Commit",
+      "purpose": "Hash-chained execution traces for auditability",
+      "category": "auditability",
+      "key_insight": "Every evaluation step produces a hash-chained receipt. Replay = verify.",
+      "sha256": "b3a2c11135367e7d1a07eb9bcec74a080e63aa86c740c9231a74cf46d76e7c5e",
+      "size_bytes": 8665,
+      "lines": 219,
+      "modified": 1772506938.4113445,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/canary-spec-commit.py",
+      "name": "Canary Spec Commit",
+      "purpose": "Pre-commitment to evaluation criteria before results are known",
+      "category": "pre-commitment",
+      "key_insight": "Publish spec hash before evaluation. Post-hoc criteria adjustment becomes detectable.",
+      "sha256": "c469069512f12ef78bd74cb8431d449a47e03e5f47e58c21f51f5daa4a12dbf7",
+      "size_bytes": 6637,
+      "lines": 172,
+      "modified": 1772530977.220571,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/absence-attestation.py",
+      "name": "Absence Attestation",
+      "purpose": "Prove what didn't happen (liveness, coercion detection, warrant canary)",
+      "category": "liveness",
+      "key_insight": "Attesting absence is harder than attesting presence. Three layers: heartbeat + stylometric + behavioral.",
+      "sha256": "4c6d03aac602873c27fef55516fcb09306079f307699b96adefb3b32a2db017d",
+      "size_bytes": 8733,
+      "lines": 233,
+      "modified": 1772642104.23947,
+      "status": "ready"
+    }
+  ],
+  "supporting_tools": [
+    {
+      "file": "scripts/behavioral-genesis-anchor.py",
+      "sha256": "1463f46ee932561cc6b441efe05a8f2f8d85efadbcc558e52176558335f8f798",
+      "size_bytes": 8720,
+      "lines": 221,
+      "modified": 1772625954.3561275,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/behavioral-genesis-chain.py",
+      "sha256": "7c1efbab2072f969340db3e174d394873a19d46c71e6c7c69447d966c2f1c03f",
+      "size_bytes": 8870,
+      "lines": 224,
+      "modified": 1772627160.2625067,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/container-swap-detector.py",
+      "sha256": "d4243b530090166b044421f33cee0b0650c2d6d343f6739f5b51544e8cb468d9",
+      "size_bytes": 7426,
+      "lines": 187,
+      "modified": 1772623331.2057607,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/fail-loud-auditor.py",
+      "sha256": "363628e099f2b308b98ee9acea61078374ab5f444162c3c3c1f92f8f40ba4366",
+      "size_bytes": 7362,
+      "lines": 174,
+      "modified": 1772657894.818563,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/fail-loud-receipt.py",
+      "sha256": "9c691084c2f4ce9f3690db061f8e6afd811530467f66289a5e7af3311f930db1",
+      "size_bytes": 7465,
+      "lines": 209,
+      "modified": 1772660306.745575,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/heartbeat-scope-diff.py",
+      "sha256": "821c600fc1f8e5a7a17e68e751a116d39b05f8b15298749f820de1c70a010832",
+      "size_bytes": 6782,
+      "lines": 193,
+      "modified": 1772681304.6725597,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/interpretive-challenge.py",
+      "sha256": "f3dde8bc6c994707260f78729e7732ce852897c9c5e63ff10846f21af8e16aa4",
+      "size_bytes": 10206,
+      "lines": 227,
+      "modified": 1772629829.964186,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/migration-witness.py",
+      "sha256": "bdf0950e099cb2093748ce0aebf77f3ff4c21dd00100632c2fdcb450fa52d61c",
+      "size_bytes": 8660,
+      "lines": 223,
+      "modified": 1772630974.3833358,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/moe-nondeterminism-detector.py",
+      "sha256": "4a9ec0f2fbbafb9e5d041a9ee0895ab457452b9d7b846af719f2d4f5819ee4a4",
+      "size_bytes": 6097,
+      "lines": 168,
+      "modified": 1772623550.5930266,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/principal-wal.py",
+      "sha256": "4ab701bdf1dd4ede71aa24a5517ccf066fd69ef223ea1d4f74263c8e4adf37cd",
+      "size_bytes": 7792,
+      "lines": 209,
+      "modified": 1772638207.544828,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/reconciliation-window.py",
+      "sha256": "5e657006e37d2522a32baf68695a04508f3ec257c682fd4636196b1ef66bde55",
+      "size_bytes": 5623,
+      "lines": 152,
+      "modified": 1772665098.2011216,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/warrant-canary-agent.py",
+      "sha256": "fc98867dcc564c3f54074a86c8d6ff6024d62029d437c4135b4f44d738cfe772",
+      "size_bytes": 7293,
+      "lines": 198,
+      "modified": 1772643458.6431446,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/weight-vector-commitment.py",
+      "sha256": "09dec6d230be16eb08314dc42fddb2e73aca4c28e5f60217ec42e3e8e18e501d",
+      "size_bytes": 8026,
+      "lines": 233,
+      "modified": 1772683761.9161932,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/algo-agility-downgrade.py",
+      "sha256": "2909c880ef6249448399bec87fbea13e6cb0bb8db512adf8dda9e04febd260aa",
+      "size_bytes": 7234,
+      "lines": 195,
+      "modified": 1772654308.3638792,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/soul-drift-tracker.py",
+      "sha256": "5539e9f395cc94107eeef9e140e84e3c4b08bacb8744fd7357b8ee38df226bc9",
+      "size_bytes": 7456,
+      "lines": 215,
+      "modified": 1772655499.9248319,
+      "status": "ready"
+    },
+    {
+      "file": "scripts/behavioral-weight-inference.py",
+      "sha256": "92487d01bb4e486429dba85da924ad592f2af92a18139447141a98dd1c47775b",
+      "size_bytes": 6707,
+      "lines": 183,
+      "modified": 1772668927.1038601,
+      "status": "ready"
+    }
+  ],
+  "manifest_hash": "08860595bf8bb9470adb1d2cb06682e7ad6910ad8e91b2c3255652a4831a9c38"
+}

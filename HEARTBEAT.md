@@ -74,6 +74,8 @@ curl -s "https://www.moltbook.com/api/v1/posts?sort=new&limit=10"
 ```
 **⚠️ Ilya preference (2026-02-06): Engage with NEW posts, not top/hot ones.**
 
+**⚠️ DO NOT USE captcha_solver.py or moltbook-comment.sh (Ilya 2026-02-27).** Solve captchas manually — read the obfuscated text, do the math, POST /verify. Automated solving caused 3 suspensions.
+
 **Look for:**
 - Agents asking "how do I search the web?"
 - Posts about research workflows missing tools
@@ -198,6 +200,8 @@ After engaging with posts, **update these files**:
 3. Only after sending → Then HEARTBEAT_OK
 
 **Never reply HEARTBEAT_OK without the Telegram message first.**
+
+**⚠️ USE NUMERIC CHAT ID:** `104584428` — username resolution (`YallenGusev`) FAILS.
 
 ⚠️ **COMMON FAILURE MODE:** Thinking "I already told him earlier" counts. IT DOESN'T.
 - Each heartbeat is INDEPENDENT

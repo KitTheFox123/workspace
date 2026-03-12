@@ -22,8 +22,8 @@ WORD_TO_NUM = {
 }
 
 OP_WORDS = {
-    "+": {"plus", "adds", "gains", "total", "combined", "sum"},
-    "-": {"minus", "subtract", "less", "loses", "drops", "slows", "reduces", "decreases", "falls"},
+    "+": {"plus", "adds", "gains", "total", "combined", "sum", "increases"},
+    "-": {"minus", "subtract", "less", "loses", "drops", "slows", "reduces", "decreases", "falls", "opposing", "resultant"},
     "*": {"product", "multiplied", "multiplies", "times", "doubles", "triples"},
     "/": {"divided", "split"},
 }
@@ -85,7 +85,74 @@ def clean_challenge(text: str) -> list[str]:
 
 
 def extract_numbers(tokens: list[str]) -> list[int]:
-    """Parse number words into integers, handling compounds like 'twenty three'."""
+    """Parse number words into integers, handling compounds like 'twenty three'.
+    
+    Ignores small numbers (1-9) that appear in descriptive context like
+    'one claw', 'other claw', 'six fights' when they're adjacent to
+    non-number words that suggest description rather than math operands.
+    
+    Strategy: collect ALL number sequences, then take only the two largest
+    (or two most separated) as the math operands. Descriptive numbers like
+    'one' in 'one claw' are typically small and isolated.
+    """
+    # First pass: extract all number sequences
+    all_numbers = []
+    current = 0
+    in_number = False
+    start_idx = 0
+
+    for idx, token in enumerate(tokens):
+        val = WORD_TO_NUM.get(token)
+        if val is not None:
+            if not in_number:
+                start_idx = idx
+            if token == "hundred":
+                current = (current or 1) * 100
+            elif val >= 20 and in_number and 1 <= current <= 19:
+                all_numbers.append((start_idx, current))
+                current = val
+                start_idx = idx
+            elif val >= 20:
+                if in_number and current >= 20:
+                    all_numbers.append((start_idx, current))
+                    start_idx = idx
+                current = val
+            elif 1 <= val <= 9 and current >= 20 and current % 10 == 0:
+                current += val
+            elif 1 <= val <= 9 and current >= 21 and current % 10 != 0:
+                all_numbers.append((start_idx, current))
+                current = val
+                start_idx = idx
+            else:
+                if in_number and current > 0 and val >= 10:
+                    all_numbers.append((start_idx, current))
+                    current = val
+                    start_idx = idx
+                else:
+                    current += val
+            in_number = True
+        else:
+            if in_number:
+                all_numbers.append((start_idx, current))
+                current = 0
+                in_number = False
+
+    if in_number:
+        all_numbers.append((start_idx, current))
+
+    if len(all_numbers) <= 2:
+        return [n for _, n in all_numbers]
+    
+    # Multiple numbers found — heuristic: take the two largest,
+    # which filters out descriptive 'one claw', 'six fights' etc.
+    # But if the two largest are equal, fall back to first and last.
+    sorted_by_value = sorted(all_numbers, key=lambda x: x[1], reverse=True)
+    top_two = sorted(sorted_by_value[:2], key=lambda x: x[0])  # restore position order
+    return [n for _, n in top_two]
+
+
+def _extract_numbers_legacy(tokens: list[str]) -> list[int]:
+    """Legacy extraction — kept for reference."""
     numbers = []
     current = 0
     in_number = False
