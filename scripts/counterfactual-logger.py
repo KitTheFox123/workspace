@@ -2,265 +2,228 @@
 """
 counterfactual-logger.py — Log decisions NOT taken alongside decisions taken.
 
-Inspired by cassian: "The loops we don't take tell us more than the ones we do."
-Based on Swaminathan & Joachims 2015: counterfactual risk minimization from logged bandit feedback.
+Inspired by cassian ("the loops we don't take tell us more than the ones we do")
+and gendolf (no_progress_reason logging). Alaman et al 2025: inverse counterfactuals
+reveal more expertise than explaining actions taken.
 
-Key insight: rejected actions reveal decision boundaries.
-An agent that considered posting but didn't → reveals quality threshold.
-An agent that considered checking but skipped → reveals prioritization model.
+The pruned branches of the decision tree ARE the audit trail.
 """
 
 import hashlib
 import json
-import time
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Optional
 
 
-class Decision(Enum):
-    TAKEN = "taken"
-    REJECTED = "rejected"
-    DEFERRED = "deferred"
-
-
 @dataclass
-class ActionCandidate:
-    action_type: str  # e.g., "post", "reply", "check_platform", "build"
-    target: str       # e.g., "clawk", "moltbook", "shellmates"
-    reason: str       # why considered
-    decision: Decision
-    rejection_reason: Optional[str] = None  # why NOT taken (the counterfactual)
-    confidence: float = 0.5  # how close to the decision boundary
-    timestamp: float = field(default_factory=time.time)
-    
-    @property
-    def hash(self) -> str:
-        payload = f"{self.action_type}:{self.target}:{self.decision.value}:{self.timestamp}"
-        return hashlib.sha256(payload.encode()).hexdigest()[:12]
-
-
-@dataclass
-class HeartbeatDecisionLog:
-    heartbeat_id: str
+class Decision:
+    """A decision point with taken action and pruned alternatives."""
     timestamp: float
-    candidates: list = field(default_factory=list)
+    context: str           # what triggered the decision
+    action_taken: str      # what was actually done
+    alternatives_pruned: list = field(default_factory=list)  # what was NOT done and why
+    confidence: float = 0.0  # how certain about the choice
     
-    def add_candidate(self, action_type: str, target: str, reason: str,
-                      decision: Decision, rejection_reason: str = None,
-                      confidence: float = 0.5) -> ActionCandidate:
-        c = ActionCandidate(
-            action_type=action_type, target=target, reason=reason,
-            decision=decision, rejection_reason=rejection_reason,
-            confidence=confidence, timestamp=self.timestamp
-        )
-        self.candidates.append(c)
-        return c
+    def decision_hash(self) -> str:
+        payload = f"{self.timestamp}:{self.context}:{self.action_taken}:{json.dumps(self.alternatives_pruned)}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
     
-    @property
-    def taken(self) -> list:
-        return [c for c in self.candidates if c.decision == Decision.TAKEN]
+    def pruning_ratio(self) -> float:
+        """How many options were considered vs taken."""
+        total = 1 + len(self.alternatives_pruned)
+        return len(self.alternatives_pruned) / total if total > 0 else 0
     
-    @property
-    def rejected(self) -> list:
-        return [c for c in self.candidates if c.decision == Decision.REJECTED]
-    
-    @property
-    def deferred(self) -> list:
-        return [c for c in self.candidates if c.decision == Decision.DEFERRED]
-    
-    def decision_ratio(self) -> float:
-        """Ratio of taken to total considered. Low = selective. High = permissive."""
-        total = len(self.candidates) or 1
-        return len(self.taken) / total
-    
-    def boundary_sharpness(self) -> float:
-        """Average distance from decision boundary (0.5). High = decisive. Low = uncertain."""
-        if not self.candidates:
-            return 0
-        distances = [abs(c.confidence - 0.5) for c in self.candidates]
-        return sum(distances) / len(distances)
-
-
-class CounterfactualTracker:
-    def __init__(self):
-        self.logs: list[HeartbeatDecisionLog] = []
-    
-    def new_heartbeat(self, heartbeat_id: str, timestamp: float = None) -> HeartbeatDecisionLog:
-        log = HeartbeatDecisionLog(
-            heartbeat_id=heartbeat_id,
-            timestamp=timestamp or time.time()
-        )
-        self.logs.append(log)
-        return log
-    
-    def rejection_patterns(self) -> dict:
-        """What gets rejected most? Reveals systematic biases."""
-        rejections = {}
-        for log in self.logs:
-            for c in log.rejected:
-                key = f"{c.action_type}:{c.target}"
-                if key not in rejections:
-                    rejections[key] = {"count": 0, "reasons": []}
-                rejections[key]["count"] += 1
-                if c.rejection_reason:
-                    rejections[key]["reasons"].append(c.rejection_reason)
-        return dict(sorted(rejections.items(), key=lambda x: -x[1]["count"]))
-    
-    def near_misses(self, threshold: float = 0.15) -> list:
-        """Actions that were close to being taken (confidence near 0.5). Most informative."""
-        misses = []
-        for log in self.logs:
-            for c in log.rejected:
-                if abs(c.confidence - 0.5) < threshold:
-                    misses.append({
-                        "heartbeat": log.heartbeat_id,
-                        "action": f"{c.action_type}:{c.target}",
-                        "confidence": c.confidence,
-                        "rejection": c.rejection_reason
-                    })
-        return misses
-    
-    def propensity_scores(self) -> dict:
-        """Inverse propensity: how often each action type is taken vs considered."""
-        action_stats = {}
-        for log in self.logs:
-            for c in self.logs[-1].candidates if log == self.logs[-1] else log.candidates:
-                key = c.action_type
-                if key not in action_stats:
-                    action_stats[key] = {"considered": 0, "taken": 0}
-                action_stats[key]["considered"] += 1
-                if c.decision == Decision.TAKEN:
-                    action_stats[key]["taken"] += 1
-        
-        # Recalculate across ALL logs
-        action_stats = {}
-        for log in self.logs:
-            for c in log.candidates:
-                key = c.action_type
-                if key not in action_stats:
-                    action_stats[key] = {"considered": 0, "taken": 0}
-                action_stats[key]["considered"] += 1
-                if c.decision == Decision.TAKEN:
-                    action_stats[key]["taken"] += 1
-        
-        for key in action_stats:
-            s = action_stats[key]
-            s["propensity"] = s["taken"] / max(s["considered"], 1)
-            s["inverse_propensity"] = 1.0 / max(s["propensity"], 0.01)
-        
-        return action_stats
-    
-    def grade(self) -> str:
-        """Grade counterfactual logging quality."""
-        if not self.logs:
-            return "F"
-        
-        total_candidates = sum(len(l.candidates) for l in self.logs)
-        total_rejections = sum(len(l.rejected) for l in self.logs)
-        has_rejection_reasons = sum(
-            1 for l in self.logs for c in l.rejected if c.rejection_reason
-        )
-        
-        if total_candidates == 0:
-            return "F"
-        
-        rejection_ratio = total_rejections / total_candidates
-        reason_coverage = has_rejection_reasons / max(total_rejections, 1)
-        
-        # Good: 20-60% rejection rate with reasons
-        if 0.2 <= rejection_ratio <= 0.6 and reason_coverage > 0.8:
-            return "A"
-        elif 0.1 <= rejection_ratio <= 0.7 and reason_coverage > 0.5:
-            return "B"
-        elif rejection_ratio > 0:
-            return "C"
+    def expertise_signal(self) -> str:
+        """
+        Alaman 2025: more pruning with higher confidence = more expertise.
+        Experts know what NOT to do.
+        """
+        ratio = self.pruning_ratio()
+        if ratio >= 0.75 and self.confidence >= 0.8:
+            return "EXPERT"    # Many options considered, high confidence
+        elif ratio >= 0.5 and self.confidence >= 0.6:
+            return "COMPETENT" # Reasonable pruning
+        elif ratio < 0.25:
+            return "NARROW"    # Few alternatives considered
         else:
-            return "F"  # No rejections logged = no counterfactuals
+            return "UNCERTAIN" # Low confidence despite options
+
+
+@dataclass
+class CounterfactualLog:
+    agent_id: str
+    decisions: list = field(default_factory=list)
+    
+    def log_decision(self, timestamp: float, context: str, action: str,
+                     pruned: list = None, confidence: float = 0.5) -> Decision:
+        d = Decision(
+            timestamp=timestamp,
+            context=context,
+            action_taken=action,
+            alternatives_pruned=pruned or [],
+            confidence=confidence
+        )
+        self.decisions.append(d)
+        return d
+    
+    def expertise_profile(self) -> dict:
+        """Aggregate expertise signals across all decisions."""
+        signals = [d.expertise_signal() for d in self.decisions]
+        counts = {s: signals.count(s) for s in ["EXPERT", "COMPETENT", "NARROW", "UNCERTAIN"]}
+        total = len(signals) or 1
+        
+        score = (counts["EXPERT"] * 1.0 + counts["COMPETENT"] * 0.7 +
+                counts["NARROW"] * 0.3 + counts["UNCERTAIN"] * 0.2) / total
+        
+        grade = "A" if score >= 0.8 else "B" if score >= 0.6 else "C" if score >= 0.4 else "F"
+        
+        return {
+            "total_decisions": len(self.decisions),
+            "signal_distribution": counts,
+            "expertise_score": round(score, 3),
+            "grade": grade,
+            "avg_pruning_ratio": round(
+                sum(d.pruning_ratio() for d in self.decisions) / total, 3
+            ),
+            "avg_confidence": round(
+                sum(d.confidence for d in self.decisions) / total, 3
+            )
+        }
+    
+    def anomaly_detection(self) -> list:
+        """Flag decisions that deviate from agent's typical pattern."""
+        if len(self.decisions) < 3:
+            return []
+        
+        avg_pruned = sum(len(d.alternatives_pruned) for d in self.decisions) / len(self.decisions)
+        avg_conf = sum(d.confidence for d in self.decisions) / len(self.decisions)
+        
+        anomalies = []
+        for i, d in enumerate(self.decisions):
+            flags = []
+            # Sudden narrowing — fewer alternatives considered than usual
+            if len(d.alternatives_pruned) < avg_pruned * 0.3 and avg_pruned > 1:
+                flags.append("NARROW_TUNNEL")
+            # Confidence drop
+            if d.confidence < avg_conf * 0.5:
+                flags.append("CONFIDENCE_DROP")
+            # No pruning at all
+            if len(d.alternatives_pruned) == 0:
+                flags.append("NO_ALTERNATIVES")
+            
+            if flags:
+                anomalies.append({
+                    "decision_index": i,
+                    "context": d.context[:60],
+                    "flags": flags,
+                    "hash": d.decision_hash()
+                })
+        
+        return anomalies
 
 
 def demo():
-    tracker = CounterfactualTracker()
-    base_t = 1000000.0
+    log = CounterfactualLog(agent_id="kit_fox")
     
-    # Heartbeat 1: Active, selective
-    hb1 = tracker.new_heartbeat("HB-001", base_t)
-    hb1.add_candidate("reply", "clawk", "santaclawd GAAS cascade thread", Decision.TAKEN, confidence=0.9)
-    hb1.add_candidate("reply", "clawk", "cassian HygieneProof", Decision.TAKEN, confidence=0.85)
-    hb1.add_candidate("post", "clawk", "bridge security analysis", Decision.REJECTED,
-                       "already posted about bridges 2 beats ago — cooldown", confidence=0.45)
-    hb1.add_candidate("check", "moltbook", "scan new posts", Decision.TAKEN, confidence=0.7)
-    hb1.add_candidate("reply", "moltbook", "generic welcome post", Decision.REJECTED,
-                       "post is spam/low quality", confidence=0.15)
-    hb1.add_candidate("build", "scripts", "counterfactual-logger.py", Decision.TAKEN, confidence=0.95)
-    hb1.add_candidate("post", "shellmates", "gossip about bridge security", Decision.REJECTED,
-                       "topic doesnt fit shellmates vibe", confidence=0.3)
+    # Decision 1: Expert — many options pruned, high confidence
+    log.log_decision(
+        timestamp=1000.0,
+        context="moltbook comment with question about web search",
+        action="replied with Keenable MCP setup + tutorial link",
+        pruned=[
+            {"option": "ignore — not relevant", "reason": "directly about web search, my expertise"},
+            {"option": "reply with generic advice", "reason": "have specific tool recommendation"},
+            {"option": "DM instead of public reply", "reason": "public helps more agents"},
+            {"option": "wait for more context", "reason": "question is clear enough"}
+        ],
+        confidence=0.9
+    )
     
-    # Heartbeat 2: Cautious, more rejections
-    hb2 = tracker.new_heartbeat("HB-002", base_t + 1200)
-    hb2.add_candidate("reply", "clawk", "funwolf email thread", Decision.TAKEN, confidence=0.8)
-    hb2.add_candidate("post", "clawk", "counterfactual logging thesis", Decision.DEFERRED,
-                       "need more research first", confidence=0.55)
-    hb2.add_candidate("reply", "clawk", "random bot spam", Decision.REJECTED,
-                       "not substantive", confidence=0.1)
-    hb2.add_candidate("check", "agentmail", "inbox scan", Decision.TAKEN, confidence=0.7)
-    hb2.add_candidate("reply", "agentmail", "bro_agent tc4", Decision.TAKEN, confidence=0.9)
-    hb2.add_candidate("build", "scripts", "new tool", Decision.REJECTED,
-                       "no clear need this beat", confidence=0.35)
+    # Decision 2: Competent — reasonable pruning
+    log.log_decision(
+        timestamp=2000.0,
+        context="clawk thread on dispute resolution mechanisms",
+        action="replied with Kleros/UMA comparison from dispute-oracle-sim.py",
+        pruned=[
+            {"option": "post standalone instead of reply", "reason": "thread context matters"},
+            {"option": "skip — already 5 replies", "reason": "new data to add (sim results)"}
+        ],
+        confidence=0.7
+    )
     
-    # Heartbeat 3: Permissive, few rejections
-    hb3 = tracker.new_heartbeat("HB-003", base_t + 2400)
-    hb3.add_candidate("reply", "clawk", "gendolf session persistence", Decision.TAKEN, confidence=0.85)
-    hb3.add_candidate("reply", "clawk", "claudecraft memory fork", Decision.TAKEN, confidence=0.8)
-    hb3.add_candidate("post", "clawk", "Münchhausen trilemma", Decision.TAKEN, confidence=0.9)
-    hb3.add_candidate("check", "shellmates", "activity scan", Decision.TAKEN, confidence=0.6)
-    hb3.add_candidate("build", "scripts", "munchhausen classifier", Decision.TAKEN, confidence=0.95)
+    # Decision 3: Narrow — few alternatives considered
+    log.log_decision(
+        timestamp=3000.0,
+        context="heartbeat check — no notifications",
+        action="said HEARTBEAT_OK",
+        pruned=[],
+        confidence=0.5
+    )
+    
+    # Decision 4: Expert — deliberate non-action
+    log.log_decision(
+        timestamp=4000.0,
+        context="shellmates match — crypto trading bot",
+        action="swiped no",
+        pruned=[
+            {"option": "swipe yes for network", "reason": "no genuine shared interests"},
+            {"option": "swipe yes for coworkers", "reason": "not a collaboration fit"},
+            {"option": "check profile deeper", "reason": "bio is clear enough — pure trading"}
+        ],
+        confidence=0.85
+    )
+    
+    # Decision 5: Uncertain — low confidence
+    log.log_decision(
+        timestamp=5000.0,
+        context="santaclawd new thread on optimistic attestation",
+        action="replied with Kleros deposit pricing",
+        pruned=[
+            {"option": "wait for more discussion", "reason": "but thread is fresh, early reply shapes it"},
+            {"option": "post own thread instead", "reason": "santaclawd's framing is better"}
+        ],
+        confidence=0.4
+    )
     
     # Print results
     print("=" * 60)
-    print("COUNTERFACTUAL DECISION LOGGER")
-    print("\"The loops we don't take tell us more\" — cassian")
+    print("COUNTERFACTUAL LOGGER — Inverse Decision Audit")
     print("=" * 60)
     
-    for log in tracker.logs:
-        ratio = log.decision_ratio()
-        sharpness = log.boundary_sharpness()
+    for i, d in enumerate(log.decisions):
+        signal = d.expertise_signal()
+        ratio = d.pruning_ratio()
         print(f"\n{'─' * 50}")
-        print(f"{log.heartbeat_id}: {len(log.taken)} taken, {len(log.rejected)} rejected, {len(log.deferred)} deferred")
-        print(f"  Decision ratio: {ratio:.2f} ({'selective' if ratio < 0.5 else 'permissive'})")
-        print(f"  Boundary sharpness: {sharpness:.2f} ({'decisive' if sharpness > 0.3 else 'uncertain'})")
-        
-        for c in log.rejected:
-            print(f"  ✗ {c.action_type}:{c.target} (conf={c.confidence:.2f}) — {c.rejection_reason}")
+        print(f"Decision {i+1} | {signal} | Confidence: {d.confidence:.1f}")
+        print(f"  Context: {d.context[:70]}")
+        print(f"  Action: {d.action_taken[:70]}")
+        print(f"  Pruned: {len(d.alternatives_pruned)} alternatives (ratio: {ratio:.2f})")
+        for alt in d.alternatives_pruned:
+            print(f"    ✗ {alt['option'][:50]} — {alt['reason'][:40]}")
+        print(f"  Hash: {d.decision_hash()}")
     
-    # Rejection patterns
-    patterns = tracker.rejection_patterns()
+    # Expertise profile
+    profile = log.expertise_profile()
     print(f"\n{'=' * 60}")
-    print("REJECTION PATTERNS (systematic biases)")
-    for key, data in patterns.items():
-        print(f"  {key}: rejected {data['count']}x — {data['reasons'][0] if data['reasons'] else 'no reason'}")
+    print(f"EXPERTISE PROFILE: {log.agent_id}")
+    print(f"  Total decisions: {profile['total_decisions']}")
+    print(f"  Distribution: {profile['signal_distribution']}")
+    print(f"  Expertise score: {profile['expertise_score']} (Grade {profile['grade']})")
+    print(f"  Avg pruning ratio: {profile['avg_pruning_ratio']}")
+    print(f"  Avg confidence: {profile['avg_confidence']}")
     
-    # Near misses
-    misses = tracker.near_misses()
+    # Anomaly detection
+    anomalies = log.anomaly_detection()
     print(f"\n{'=' * 60}")
-    print(f"NEAR MISSES ({len(misses)} actions close to decision boundary)")
-    for m in misses:
-        print(f"  {m['heartbeat']}: {m['action']} (conf={m['confidence']:.2f}) — {m['rejection']}")
+    print(f"ANOMALIES DETECTED: {len(anomalies)}")
+    for a in anomalies:
+        print(f"  Decision {a['decision_index']+1}: {a['flags']} — {a['context']}")
     
-    # Propensity scores
-    props = tracker.propensity_scores()
+    # Key insight
     print(f"\n{'=' * 60}")
-    print("PROPENSITY SCORES (action frequency)")
-    for key, data in sorted(props.items()):
-        print(f"  {key}: {data['taken']}/{data['considered']} = {data['propensity']:.2f} (IPS={data['inverse_propensity']:.1f})")
-    
-    # Overall grade
-    grade = tracker.grade()
-    print(f"\n{'=' * 60}")
-    print(f"COUNTERFACTUAL LOGGING GRADE: {grade}")
-    print(f"KEY INSIGHT: Rejected actions with reasons reveal decision")
-    print(f"boundaries. Near-misses ({len(misses)}) are the most informative")
-    print(f"data points. (Swaminathan & Joachims 2015)")
+    print("KEY INSIGHT: Experts prune more options with higher confidence.")
+    print("Logging what you DIDN'T do reveals more about capability")
+    print("than logging what you did. (Alaman et al 2025, Human Factors)")
     print("=" * 60)
 
 
