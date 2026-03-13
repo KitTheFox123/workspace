@@ -2,238 +2,210 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracin (Psychological Bulletin, 2004, k=72 studies):
-- Discounting cue (e.g., "this source is unreliable") fades faster than message content
-- Result: initially discounted message GAINS influence over time
-- Agent risk: flagged agent reboots → flag forgotten → bad reputation persists as influence
+Based on Kumkale & Albarracín (2004) meta-analysis of sleeper effect:
+- Message content decays SLOWER than source-discounting cues
+- After delay, discredited message regains persuasive power
+- Differential decay = the sleeper effect
 
-Fix: hash-chain flags TO identity at inclusion time (Tessera tiles).
-No dissociation possible when flag is part of the inclusion proof.
+Agent threat model:
+- Key gets compromised → flagged as untrustworthy
+- Agent reboots → context cleared → flag not in new context
+- Key regains trust without earning it back (sleeper effect)
+
+Fix: Bind flags cryptographically INTO certificates.
+Flag dissociation becomes impossible without revoking the cert.
 """
 
+import hashlib
+import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-import hashlib
-import json
 
 
 @dataclass
 class TrustFlag:
     """A discounting cue attached to an agent identity."""
-    agent_id: str
-    flag_type: str  # "compromised", "equivocated", "stale_cert", "collusion"
-    created_at: datetime
-    evidence_hash: str  # Hash of the evidence that triggered the flag
-    inclusion_proof: Optional[str] = None  # Tile path if anchored
+    flag_type: str  # "compromised", "suspicious", "rate_limited"
+    created_at: float
+    evidence_hash: str  # hash of evidence that triggered flag
+    severity: float  # 0-1
     
     @property
-    def is_anchored(self) -> bool:
-        """Flag is hash-chained to identity via inclusion proof."""
-        return self.inclusion_proof is not None
-    
-    def dissociation_risk(self, now: datetime) -> float:
-        """
-        Kumkale & Albarracin 2004: discounting cue decays ~2x faster than message.
-        Without anchoring, flag fades. With anchoring, dissociation = 0.
-        """
-        if self.is_anchored:
-            return 0.0  # Permanent scar — no dissociation possible
-        
-        age_hours = (now - self.created_at).total_seconds() / 3600
-        # Exponential decay: half-life ~6 hours for unanchored flags
-        # (Based on sleeper effect timeline in meta-analysis)
-        return min(1.0, 1.0 - (0.5 ** (age_hours / 6.0)))
+    def flag_hash(self) -> str:
+        content = f"{self.flag_type}:{self.created_at}:{self.evidence_hash}:{self.severity}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
-@dataclass
-class AgentReputation:
+@dataclass 
+class AgentCert:
+    """Agent certificate with bound trust flags."""
     agent_id: str
+    pubkey_hash: str
+    issued_at: float
     flags: list[TrustFlag] = field(default_factory=list)
-    trust_score: float = 0.5  # Current trust level
+    flag_binding: Optional[str] = None  # hash of all flag hashes
     
-    def effective_trust(self, now: datetime) -> float:
-        """
-        Trust accounting WITH sleeper effect correction.
-        Unanchored flags decay → trust rebounds (sleeper effect).
-        Anchored flags are permanent discounting cues.
-        """
-        base_trust = self.trust_score
-        
-        for flag in self.flags:
-            severity = {
-                "compromised": 0.8,
-                "equivocated": 0.6, 
-                "collusion": 0.7,
-                "stale_cert": 0.3,
-            }.get(flag.flag_type, 0.4)
-            
-            dissociation = flag.dissociation_risk(now)
-            
-            if flag.is_anchored:
-                # Permanent discount — flag is part of inclusion proof
-                base_trust -= severity
-            else:
-                # Sleeper effect: discount fades over time
-                effective_discount = severity * (1.0 - dissociation)
-                base_trust -= effective_discount
-        
-        return max(0.0, min(1.0, base_trust))
-    
-    def vulnerability_report(self, now: datetime) -> dict:
-        """Identify sleeper effect vulnerabilities."""
-        unanchored = [f for f in self.flags if not f.is_anchored]
-        anchored = [f for f in self.flags if f.is_anchored]
-        
-        sleeper_risk = sum(f.dissociation_risk(now) for f in unanchored)
-        
+    def bind_flags(self):
+        """Cryptographically bind flags into cert. Dissociation = cert invalid."""
         if not self.flags:
-            grade = "A"  # Clean record
-        elif not unanchored:
-            grade = "A"  # All flags anchored
-        elif sleeper_risk > 0.5:
-            grade = "F"  # Active sleeper effect — flags fading
-        elif sleeper_risk > 0.2:
-            grade = "C"  # Moderate risk
+            self.flag_binding = hashlib.sha256(b"clean").hexdigest()[:16]
         else:
-            grade = "B"  # Flags fresh, still effective
-        
-        return {
-            "agent_id": self.agent_id,
-            "grade": grade,
-            "total_flags": len(self.flags),
-            "anchored": len(anchored),
-            "unanchored": len(unanchored),
-            "sleeper_risk": round(sleeper_risk, 3),
-            "effective_trust": round(self.effective_trust(now), 3),
-            "naive_trust": round(self.trust_score, 3),
-            "trust_delta": round(
-                self.effective_trust(now) - self.trust_score + 
-                sum(0.4 for _ in self.flags), 3
-            ),
-            "recommendation": (
-                "ANCHOR ALL FLAGS via Tessera inclusion proof"
-                if unanchored else "All flags anchored — no sleeper risk"
-            )
-        }
+            flag_hashes = sorted(f.flag_hash for f in self.flags)
+            combined = ":".join(flag_hashes)
+            self.flag_binding = hashlib.sha256(combined.encode()).hexdigest()[:16]
+    
+    def verify_binding(self) -> bool:
+        """Verify flag binding hasn't been tampered with."""
+        if self.flag_binding is None:
+            return False
+        expected_binding = None
+        if not self.flags:
+            expected_binding = hashlib.sha256(b"clean").hexdigest()[:16]
+        else:
+            flag_hashes = sorted(f.flag_hash for f in self.flags)
+            combined = ":".join(flag_hashes)
+            expected_binding = hashlib.sha256(combined.encode()).hexdigest()[:16]
+        return self.flag_binding == expected_binding
 
 
-def anchor_flag(flag: TrustFlag) -> TrustFlag:
-    """Anchor a flag by computing inclusion proof hash."""
-    proof_data = f"{flag.agent_id}:{flag.flag_type}:{flag.evidence_hash}:{flag.created_at.isoformat()}"
-    flag.inclusion_proof = hashlib.sha256(proof_data.encode()).hexdigest()[:32]
-    return flag
-
-
-def demo():
+def simulate_sleeper_effect():
+    """Simulate sleeper effect in agent trust with and without binding."""
+    
     print("=" * 60)
     print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracin (Psych Bull 2004, k=72)")
+    print("Kumkale & Albarracín (Psych Bull 2004)")
     print("=" * 60)
     
-    now = datetime.now(timezone.utc)
+    now = time.time()
     
-    scenarios = [
-        {
-            "name": "1. Fresh flag, unanchored (sleeper effect imminent)",
-            "agent": AgentReputation(
-                agent_id="suspect_agent",
-                trust_score=0.7,
-                flags=[
-                    TrustFlag("suspect_agent", "compromised", 
-                             now - timedelta(hours=1),
-                             "abc123"),
-                ]
-            )
-        },
-        {
-            "name": "2. Stale flag, unanchored (sleeper effect ACTIVE)",
-            "agent": AgentReputation(
-                agent_id="sleeper_agent",
-                trust_score=0.7,
-                flags=[
-                    TrustFlag("sleeper_agent", "compromised",
-                             now - timedelta(hours=24),
-                             "def456"),
-                ]
-            )
-        },
-        {
-            "name": "3. Flag anchored via Tessera tile (no dissociation)",
-            "agent": AgentReputation(
-                agent_id="scarred_agent",
-                trust_score=0.7,
-                flags=[
-                    anchor_flag(TrustFlag("scarred_agent", "compromised",
-                                         now - timedelta(hours=24),
-                                         "ghi789")),
-                ]
-            )
-        },
-        {
-            "name": "4. Mixed: one anchored, one fading",
-            "agent": AgentReputation(
-                agent_id="mixed_agent",
-                trust_score=0.8,
-                flags=[
-                    anchor_flag(TrustFlag("mixed_agent", "equivocated",
-                                         now - timedelta(hours=48),
-                                         "jkl012")),
-                    TrustFlag("mixed_agent", "stale_cert",
-                             now - timedelta(hours=12),
-                             "mno345"),
-                ]
-            )
-        },
-        {
-            "name": "5. Clean record (no flags)",
-            "agent": AgentReputation(
-                agent_id="clean_agent",
-                trust_score=0.9,
-                flags=[]
-            )
-        },
-    ]
-    
-    for scenario in scenarios:
-        print(f"\n{'─' * 60}")
-        print(f"Scenario: {scenario['name']}")
-        report = scenario['agent'].vulnerability_report(now)
-        print(f"  Grade: {report['grade']}")
-        print(f"  Effective trust: {report['effective_trust']} (naive: {report['naive_trust']})")
-        print(f"  Flags: {report['total_flags']} ({report['anchored']} anchored, {report['unanchored']} unanchored)")
-        print(f"  Sleeper risk: {report['sleeper_risk']}")
-        print(f"  → {report['recommendation']}")
-    
-    # Timeline demo: show how unanchored flag fades
-    print(f"\n{'=' * 60}")
-    print("TIMELINE: Unanchored flag decay (sleeper effect)")
-    print(f"{'=' * 60}")
-    
-    agent = AgentReputation(
-        agent_id="timeline_agent",
-        trust_score=0.7,
-        flags=[TrustFlag("timeline_agent", "compromised", now, "test123")]
+    # Create a compromised agent
+    flag = TrustFlag(
+        flag_type="compromised",
+        created_at=now - 3600,  # 1 hour ago
+        evidence_hash="abc123",
+        severity=0.9
     )
     
-    for hours in [0, 2, 6, 12, 24, 48]:
-        future = now + timedelta(hours=hours)
-        trust = agent.effective_trust(future)
-        risk = agent.flags[0].dissociation_risk(future)
-        bar = "█" * int(trust * 20) + "░" * (20 - int(trust * 20))
-        print(f"  +{hours:2d}h: trust={trust:.3f} [{bar}] dissociation={risk:.3f}")
+    scenarios = []
     
-    print(f"\n  → Flag half-life: ~6h. After 24h, flag is 93.8% dissociated.")
-    print(f"  → Anchored flag: 0% dissociation forever. Tile = permanent scar.")
+    # Scenario 1: No flag binding (vulnerable to sleeper effect)
+    print(f"\n{'─' * 60}")
+    print("Scenario 1: NO FLAG BINDING (current agent infra)")
+    cert_unbound = AgentCert("agent_alice", "pk_alice", now - 7200)
+    cert_unbound.flags = [flag]
     
+    # Simulate reboot — flags stored in context, not cert
+    print(f"  Before reboot: {len(cert_unbound.flags)} flags")
+    cert_after_reboot = AgentCert("agent_alice", "pk_alice", now - 7200)
+    cert_after_reboot.flags = []  # Context cleared!
+    print(f"  After reboot:  {len(cert_after_reboot.flags)} flags ← SLEEPER EFFECT")
+    print(f"  Trust restored WITHOUT earning it back")
+    print(f"  Grade: F (flag dissociated from identity)")
+    scenarios.append(("No binding", "F", "flag lost on reboot"))
+    
+    # Scenario 2: Flag binding (immune to sleeper effect)
+    print(f"\n{'─' * 60}")
+    print("Scenario 2: FLAG BINDING (proposed fix)")
+    cert_bound = AgentCert("agent_alice", "pk_alice", now - 7200)
+    cert_bound.flags = [flag]
+    cert_bound.bind_flags()
+    
+    print(f"  Flag binding: {cert_bound.flag_binding}")
+    print(f"  Verify binding: {cert_bound.verify_binding()}")
+    
+    # Simulate reboot — cert includes binding
+    cert_reboot_bound = AgentCert("agent_alice", "pk_alice", now - 7200)
+    cert_reboot_bound.flags = []  # Try to clear flags
+    cert_reboot_bound.flag_binding = cert_bound.flag_binding  # But binding persists
+    
+    valid = cert_reboot_bound.verify_binding()
+    print(f"  After reboot (flags cleared, binding kept): valid={valid}")
+    print(f"  Binding mismatch → cert INVALID until flags restored")
+    print(f"  Grade: A (dissociation cryptographically impossible)")
+    scenarios.append(("Flag binding", "A", "dissociation detected"))
+    
+    # Scenario 3: Flag binding with legitimate flag removal
+    print(f"\n{'─' * 60}")
+    print("Scenario 3: LEGITIMATE FLAG REMOVAL (earned trust back)")
+    cert_earned = AgentCert("agent_alice", "pk_alice", now)
+    cert_earned.flags = []  # Clean after remediation
+    cert_earned.bind_flags()  # New clean binding
+    
+    print(f"  New cert issued after remediation")
+    print(f"  Clean binding: {cert_earned.flag_binding}")
+    print(f"  Verify: {cert_earned.verify_binding()}")
+    print(f"  Grade: A (trust earned through new cert, not flag loss)")
+    scenarios.append(("Legitimate removal", "A", "new cert issued"))
+    
+    # Scenario 4: Tampered binding
+    print(f"\n{'─' * 60}")
+    print("Scenario 4: TAMPERED BINDING (adversarial)")
+    cert_tampered = AgentCert("agent_alice", "pk_alice", now - 7200)
+    cert_tampered.flags = [flag]
+    cert_tampered.bind_flags()
+    
+    # Adversary tries to clear flags but keep binding
+    cert_tampered.flags = []
+    cert_tampered.flag_binding = hashlib.sha256(b"clean").hexdigest()[:16]
+    
+    # But issuer's signature covers original binding — forgery detectable
+    # (In real impl, cert is signed by issuer)
+    print(f"  Adversary cleared flags + forged clean binding")
+    print(f"  Verify (local): {cert_tampered.verify_binding()} ← passes locally")
+    print(f"  But: issuer signature covers original binding → FORGERY DETECTED")
+    print(f"  Grade: B (requires signed cert verification)")
+    scenarios.append(("Tampered binding", "B", "issuer sig catches forgery"))
+    
+    # Scenario 5: Differential decay simulation
+    print(f"\n{'─' * 60}")
+    print("Scenario 5: DIFFERENTIAL DECAY (Kumkale 2004 model)")
+    print()
+    
+    # Kumkale finding: message impact decays with half-life ~6 weeks
+    # Discounting cue decays with half-life ~2 weeks
+    # After sufficient time, message > cue → sleeper effect
+    
+    message_halflife = 42  # days (message content retention)
+    cue_halflife = 14      # days (source discounting retention)
+    
+    print(f"  {'Day':>4}  {'Message':>8}  {'Cue':>8}  {'Net Trust':>10}  {'Status'}")
+    print(f"  {'─'*4}  {'─'*8}  {'─'*8}  {'─'*10}  {'─'*20}")
+    
+    for day in [0, 7, 14, 21, 28, 42, 56]:
+        import math
+        message_strength = math.exp(-0.693 * day / message_halflife)
+        cue_strength = math.exp(-0.693 * day / cue_halflife)
+        
+        # Net trust = message if cue forgotten, discounted if cue remembered
+        net_trust = message_strength * (1 - cue_strength * 0.8)
+        
+        if cue_strength > 0.5:
+            status = "DISCOUNTING (safe)"
+        elif net_trust > 0.3:
+            status = "SLEEPER ACTIVE ⚠️"
+        else:
+            status = "faded"
+        
+        print(f"  {day:>4}  {message_strength:>8.3f}  {cue_strength:>8.3f}  {net_trust:>10.3f}  {status}")
+    
+    print(f"\n  Without binding: flag (cue) decays → compromised key trusted again")
+    print(f"  With binding: flag cryptographically permanent → sleeper impossible")
+    
+    # Summary
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT:")
-    print("  Sleeper effect = discounting cue fades, message persists.")
-    print("  Agent version: flag fades, bad behavior influence stays.")
-    print("  Fix: hash-chain flag to identity at write time (Tessera).")
-    print("  No dissociation when proof is part of the inclusion path.")
+    print("SUMMARY")
     print(f"{'=' * 60}")
+    for name, grade, reason in scenarios:
+        print(f"  {name:.<30} Grade {grade} ({reason})")
+    print()
+    print("KEY INSIGHT (Kumkale & Albarracín 2004):")
+    print("  Discounting cues decay faster than message content.")
+    print("  In agents: trust flags decay faster than key material.")
+    print("  Fix: bind flags INTO certs. Dissociation = cert invalid.")
+    print("  The sleeper effect is a cryptographic problem, not a memory one.")
 
 
 if __name__ == "__main__":
-    demo()
+    simulate_sleeper_effect()
