@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-grace-epoch-calculator.py — Grace window bounds for threshold key reshare.
+grace-epoch-calculator.py — Grace epoch window for proactive reshare.
 
-When a shard is compromised, the threshold holds but the compromised
-party can observe co-signs until reshare completes. Grace epoch = time
-window where old shares remain valid during reshare ceremony.
+santaclawd's question: "what is the max grace window before extended TTL
+becomes a security risk?"
 
-Bound: grace ≤ min(MTTD_compromise, reshare_latency × safety_factor)
+Answer: grace_window = 2× max_expected_partition (Nyquist).
+Beyond that = assume committee lost, trigger emergency reshare.
 
-Based on:
-- CHURP (Maram et al 2019, CCS): handoff epoch = max(2×Δ, BFT view change)
-- CA/B Forum: cert lifetime → revocation window ratio ~10%
-- D-FROST (Cimatti et al 2024): requires t+1 old members online
+DyCAPS (CJE 2026) handles async; D-FROST (Cimatti 2024) needs sync.
+Grace epoch bridges the gap for D-FROST deployments.
 
 Usage: python3 grace-epoch-calculator.py
 """
@@ -20,100 +18,98 @@ from dataclasses import dataclass
 
 
 @dataclass
-class GraceParams:
+class ReshareScenario:
     name: str
-    cert_ttl_hours: float       # certificate lifetime
-    reshare_latency_min: float  # time to complete reshare ceremony
-    mttd_compromise_hours: float  # mean time to detect compromise
-    network_delay_ms: float     # max network round-trip
-    committee_size: int         # n
-    threshold: int              # k
-    online_probability: float   # P(party online) during reshare
+    threshold: int  # k
+    committee_size: int  # n
+    heartbeat_interval_min: float
+    max_partition_min: float
+    compromised: int = 0
 
+    @property
+    def grace_window_min(self) -> float:
+        """2× max partition (Nyquist sampling theorem applied to availability)."""
+        return 2 * self.max_partition_min
 
-def calculate_grace(p: GraceParams) -> dict:
-    """Calculate grace epoch bounds."""
-    # CHURP bound: handoff needs t+1 online
-    required_online = p.threshold + 1
-    expected_online = p.committee_size * p.online_probability
-    reshare_feasible = expected_online >= required_online
+    @property
+    def exposure_window_min(self) -> float:
+        """Time attacker has to exploit compromised shard before reshare."""
+        return self.grace_window_min + self.max_partition_min
 
-    # Safety factor: 2× reshare latency (for retries)
-    reshare_bound_hours = (p.reshare_latency_min * 2) / 60
+    @property
+    def honest_margin(self) -> int:
+        return self.committee_size - self.compromised - self.threshold
 
-    # Grace window = min(MTTD, reshare bound)
-    grace_hours = min(p.mttd_compromise_hours, reshare_bound_hours)
+    @property
+    def security_grade(self) -> str:
+        if self.compromised >= self.threshold:
+            return "F"  # attacker controls threshold
+        if self.honest_margin < 0:
+            return "F"  # can't sign
+        if self.exposure_window_min > 120:  # 2 hours
+            return "D"  # too long grace
+        if self.honest_margin <= 1:
+            return "C"  # thin margin
+        if self.exposure_window_min > 60:
+            return "B"
+        return "A"
 
-    # CA/B Forum ratio check
-    cab_ratio = grace_hours / p.cert_ttl_hours if p.cert_ttl_hours > 0 else float('inf')
-    cab_healthy = cab_ratio <= 0.15  # ≤15% of cert lifetime
+    def report(self) -> dict:
+        return {
+            "name": self.name,
+            "threshold": f"{self.threshold}-of-{self.committee_size}",
+            "grace_window": f"{self.grace_window_min:.0f} min",
+            "exposure_window": f"{self.exposure_window_min:.0f} min",
+            "honest_margin": self.honest_margin,
+            "grade": self.security_grade,
+            "recommendation": self._recommendation()
+        }
 
-    # Risk: exposure window during grace
-    exposure_risk = grace_hours / p.mttd_compromise_hours if p.mttd_compromise_hours > 0 else 1.0
-
-    # Grade
-    if not reshare_feasible:
-        grade = "F"
-        status = f"RESHARE INFEASIBLE — need {required_online} online, expect {expected_online:.1f}"
-    elif exposure_risk > 0.5:
-        grade = "D"
-        status = "HIGH EXPOSURE — grace > 50% of MTTD"
-    elif not cab_healthy:
-        grade = "C"
-        status = f"GRACE RATIO HIGH — {cab_ratio:.1%} of cert TTL (>15%)"
-    elif grace_hours < reshare_bound_hours:
-        grade = "B"
-        status = "MTTD-BOUNDED — detection faster than reshare"
-    else:
-        grade = "A"
-        status = "OPTIMAL — reshare completes well within detection window"
-
-    return {
-        "name": p.name,
-        "grade": grade,
-        "status": status,
-        "grace_window_hours": round(grace_hours, 2),
-        "grace_window_min": round(grace_hours * 60, 1),
-        "reshare_bound_hours": round(reshare_bound_hours, 2),
-        "mttd_hours": p.mttd_compromise_hours,
-        "cab_ratio": f"{cab_ratio:.1%}",
-        "reshare_feasible": reshare_feasible,
-        "exposure_risk": f"{exposure_risk:.1%}",
-        "expected_online": f"{expected_online:.1f}/{required_online} needed"
-    }
+    def _recommendation(self):
+        if self.security_grade == "F":
+            return "EMERGENCY: trigger reshare with reduced threshold immediately"
+        if self.security_grade == "D":
+            return "WARN: grace window too long, reduce max_partition or increase heartbeat freq"
+        if self.security_grade == "C":
+            return "CAUTION: thin honest margin, consider growing committee"
+        if self.security_grade == "B":
+            return "OK: acceptable but monitor exposure window"
+        return "HEALTHY: grace window within safe bounds"
 
 
 def demo():
     print("=" * 60)
-    print("Grace Epoch Calculator")
-    print("CHURP (2019) + D-FROST (2024) + CA/B Forum bounds")
+    print("Grace Epoch Calculator for Proactive Reshare")
+    print("DyCAPS (CJE 2026) / D-FROST (Cimatti 2024)")
     print("=" * 60)
 
     scenarios = [
-        GraceParams("Agent heartbeat (20min TTL)", 0.33, 5, 1.0, 200, 5, 3, 0.9),
-        GraceParams("Daily attestation", 24, 30, 8.0, 500, 5, 3, 0.8),
-        GraceParams("TLS cert (47-day)", 47*24, 60, 48.0, 100, 7, 4, 0.95),
-        GraceParams("Low-availability pool", 24, 30, 4.0, 1000, 5, 3, 0.5),
-        GraceParams("Fast detection, slow reshare", 8, 120, 0.5, 200, 9, 5, 0.7),
+        ReshareScenario("kit_fox (frequent heartbeat)", 3, 5, 20, 10),
+        ReshareScenario("lazy_agent (6hr heartbeat)", 3, 5, 360, 60),
+        ReshareScenario("high_security (5min heartbeat)", 4, 7, 5, 5),
+        ReshareScenario("ronin_pattern (3 compromised)", 3, 5, 20, 10, compromised=3),
+        ReshareScenario("partition_heavy (cloud outage)", 3, 5, 20, 120),
+        ReshareScenario("tight_margin (2 compromised)", 3, 5, 20, 10, compromised=2),
     ]
 
-    for params in scenarios:
-        result = calculate_grace(params)
+    for s in scenarios:
+        r = s.report()
         print(f"\n{'─' * 50}")
-        print(f"  {result['name']}")
-        print(f"  Grade: {result['grade']} — {result['status']}")
-        print(f"  Grace window: {result['grace_window_min']} min ({result['grace_window_hours']} hr)")
-        print(f"  Reshare bound: {result['reshare_bound_hours']} hr")
-        print(f"  MTTD: {result['mttd_hours']} hr")
-        print(f"  CA/B ratio: {result['cab_ratio']}")
-        print(f"  Exposure risk: {result['exposure_risk']}")
-        print(f"  Online: {result['expected_online']}")
+        print(f"Scenario: {r['name']}")
+        print(f"  Threshold: {r['threshold']}")
+        print(f"  Grace window: {r['grace_window']}")
+        print(f"  Exposure window: {r['exposure_window']}")
+        print(f"  Honest margin: {r['honest_margin']}")
+        print(f"  Grade: {r['grade']}")
+        print(f"  → {r['recommendation']}")
 
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT:")
-    print("grace ≤ min(MTTD, 2×reshare_latency)")
-    print("CA/B Forum: ~10% of cert lifetime is the empirical ceiling")
-    print("Low availability = reshare infeasible = stuck in grace forever")
+    print("KEY INSIGHTS:")
+    print("  grace_window = 2× max_partition (Nyquist)")
+    print("  exposure = grace + partition (total attacker window)")
+    print("  >2hr exposure = unacceptable for most agent use cases")
+    print("  D-FROST needs sync → grace epoch bridges gap")
+    print("  DyCAPS handles async natively → no grace needed")
     print(f"{'=' * 60}")
 
 
