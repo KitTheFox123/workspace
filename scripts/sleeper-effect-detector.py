@@ -2,267 +2,235 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracín (2004) meta-analysis (Psychological Bulletin, k=72).
+Based on Kumkale & Albarracín (2004) meta-analysis and Hovland et al (1949).
 
-The sleeper effect: discounting cues (e.g., "source is compromised") decay 
-faster than message content ("attestation is valid"). After reboot/context loss,
-the attestation persists but the flag dissociates → trust restored incorrectly.
+The sleeper effect: discounting cue (e.g., "source is untrustworthy") 
+dissociates from message content over time → initially discounted 
+message becomes MORE persuasive later.
 
-Three defenses:
-1. Hash-bind flags INTO certs (dissociation = cryptographically impossible)
-2. TTL on bindings (force re-verification)  
-3. Inoculation ordering: check flags BEFORE processing attestation content
+Agent threat model:
+- Agent gets flagged (discounting cue)
+- Agent reboots / changes context
+- Flag dissociates from identity
+- Verifiers trust the agent again despite the flag
 
-Moderators from meta-analysis:
-- Strong initial message impact → larger sleeper effect
-- Cue AFTER message → larger effect (vs cue before)
-- High processing motivation → larger effect
+Fix: cryptographic binding (Merkle inclusion) prevents dissociation.
+
+This detector monitors for dissociation risk across trust events.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 import hashlib
 import json
 
 
-@dataclass
-class Attestation:
-    """An attestation with optional discounting cue (flag)."""
-    agent_id: str
-    content_hash: str
-    created_at: datetime
-    flag: Optional[str] = None          # Discounting cue: "compromised", "disputed", etc.
-    flag_hash_bound: bool = False       # Is flag hash-bound into cert?
-    flag_ttl: Optional[timedelta] = None  # TTL on flag binding
-    flag_order: str = "after"           # "before" or "after" content (inoculation)
-    
-    @property
-    def cert_hash(self) -> str:
-        """If flag is hash-bound, cert hash includes flag."""
-        base = self.content_hash
-        if self.flag and self.flag_hash_bound:
-            base = hashlib.sha256(f"{base}:{self.flag}".encode()).hexdigest()[:16]
-        return base
-    
-    @property
-    def flag_expired(self) -> bool:
-        if not self.flag or not self.flag_ttl:
-            return False
-        return datetime.now(timezone.utc) - self.created_at > self.flag_ttl
-
-
 @dataclass 
-class AgentContext:
-    """Agent's current context state."""
-    has_rebooted: bool = False
-    context_age: timedelta = timedelta(hours=0)
-    processing_motivation: float = 0.5  # 0-1
+class TrustEvent:
+    """An event in an agent's trust lifecycle."""
+    agent_id: str
+    event_type: str  # "flag", "attestation", "reboot", "cert_update", "verification"
+    timestamp: datetime
+    content_hash: str  # hash of the event content
+    binding: str = "none"  # "merkle" | "gossip" | "self_reported" | "none"
     
     @property
-    def dissociation_risk(self) -> float:
-        """Probability of source-content dissociation (Kumkale moderators)."""
-        risk = 0.1  # baseline
-        if self.has_rebooted:
-            risk += 0.4  # reboot = forced dissociation
-        # Time decay of source cues (faster than content)
-        hours = self.context_age.total_seconds() / 3600
-        risk += min(0.3, hours * 0.05)  # +5% per hour, cap 30%
-        # High motivation = MORE susceptible (counterintuitive but per meta-analysis)
-        risk *= (0.7 + 0.6 * self.processing_motivation)
-        return min(risk, 0.95)
+    def age_hours(self) -> float:
+        return (datetime.now(timezone.utc) - self.timestamp).total_seconds() / 3600
 
 
-def detect_sleeper_risk(attestation: Attestation, context: AgentContext) -> dict:
-    """
-    Detect sleeper effect vulnerability in an attestation.
+@dataclass
+class DissociationRisk:
+    """Kumkale 2004: dissociation likelihood based on time + binding."""
     
-    Returns risk assessment with grade and mitigations.
-    """
-    vulnerabilities = []
-    mitigations = []
-    risk_score = 0.0
-    
-    # 1. Check for dissociation risk
-    dissoc = context.dissociation_risk
-    if dissoc > 0.3:
-        vulnerabilities.append(f"dissociation_risk={dissoc:.2f} (reboot={context.has_rebooted})")
-        risk_score += dissoc * 0.4
-    
-    # 2. Check flag binding
-    if attestation.flag:
-        if not attestation.flag_hash_bound:
-            vulnerabilities.append("flag NOT hash-bound to cert — dissociation trivial")
-            risk_score += 0.3
-        else:
-            mitigations.append("flag hash-bound to cert")
-            
-        # 3. Check TTL
-        if attestation.flag_ttl:
-            if attestation.flag_expired:
-                vulnerabilities.append(f"flag TTL expired — binding stale")
-                risk_score += 0.2
-            else:
-                mitigations.append(f"flag TTL active ({attestation.flag_ttl})")
-        else:
-            vulnerabilities.append("no TTL on flag binding")
-            risk_score += 0.1
+    @staticmethod
+    def score(flag_event: TrustEvent, current_time: datetime) -> dict:
+        """
+        Score dissociation risk for a flag event.
         
-        # 4. Check inoculation order
-        if attestation.flag_order == "after":
-            vulnerabilities.append("flag presented AFTER content — max sleeper effect (Kumkale)")
-            risk_score += 0.15
+        Kumkale 2004 key findings:
+        - Strong initial impact + discounting cue after message → highest sleeper effect
+        - Dissociation increases with time
+        - Higher ability/motivation to process → stronger sleeper effect
+        
+        Agent mapping:
+        - Time since flag → dissociation risk increases
+        - Binding type → prevents or enables dissociation
+        - Reboots between flag and now → context loss = forced dissociation
+        """
+        hours_since = (current_time - flag_event.timestamp).total_seconds() / 3600
+        
+        # Time-based dissociation (Hovland's differential decay)
+        # Flag memory decays faster than content memory
+        if hours_since < 1:
+            time_risk = 0.1  # Recent — flag still salient
+        elif hours_since < 6:
+            time_risk = 0.3  # Short-term — starting to dissociate
+        elif hours_since < 24:
+            time_risk = 0.6  # Medium — significant dissociation risk
+        elif hours_since < 72:
+            time_risk = 0.8  # Days — high risk
         else:
-            mitigations.append("flag presented BEFORE content (inoculation)")
-    else:
-        mitigations.append("no discounting cue present")
-    
-    # 5. Processing motivation amplification
-    if context.processing_motivation > 0.7 and attestation.flag:
-        vulnerabilities.append(f"high processing motivation ({context.processing_motivation}) amplifies sleeper effect")
-        risk_score += 0.1
-    
-    risk_score = min(risk_score, 1.0)
-    
-    # Grade
-    if risk_score < 0.15:
-        grade = "A"
-    elif risk_score < 0.3:
-        grade = "B"
-    elif risk_score < 0.5:
-        grade = "C"
-    elif risk_score < 0.7:
-        grade = "D"
-    else:
-        grade = "F"
-    
-    return {
-        "agent_id": attestation.agent_id,
-        "grade": grade,
-        "risk_score": round(risk_score, 3),
-        "vulnerabilities": vulnerabilities,
-        "mitigations": mitigations,
-        "recommendation": _recommend(vulnerabilities, grade),
-    }
+            time_risk = 0.95  # Weeks — near-certain dissociation
+        
+        # Binding prevents dissociation
+        binding_protection = {
+            "merkle": 0.95,       # Cryptographic — near-impossible to dissociate
+            "gossip": 0.60,       # Distributed but not cryptographic
+            "self_reported": 0.10, # Trivially dissociable
+            "none": 0.0,          # No binding — maximum risk
+        }
+        
+        protection = binding_protection.get(flag_event.binding, 0.0)
+        
+        # Net risk = time risk * (1 - protection)
+        net_risk = time_risk * (1 - protection)
+        
+        # Grade
+        if net_risk < 0.1:
+            grade = "A"  # Flag bound — dissociation blocked
+        elif net_risk < 0.3:
+            grade = "B"  # Low risk
+        elif net_risk < 0.5:
+            grade = "C"  # Moderate — investigate
+        elif net_risk < 0.7:
+            grade = "D"  # High — flag may have dissociated
+        else:
+            grade = "F"  # Critical — sleeper effect likely active
+        
+        return {
+            "agent_id": flag_event.agent_id,
+            "hours_since_flag": round(hours_since, 1),
+            "time_risk": round(time_risk, 2),
+            "binding": flag_event.binding,
+            "binding_protection": round(protection, 2),
+            "net_dissociation_risk": round(net_risk, 3),
+            "grade": grade,
+            "sleeper_effect_active": net_risk > 0.5,
+        }
 
 
-def _recommend(vulns: list, grade: str) -> str:
-    if grade in ("A", "B"):
-        return "Low risk. Continue monitoring."
-    recs = []
-    for v in vulns:
-        if "NOT hash-bound" in v:
-            recs.append("Bind flag hash INTO cert body")
-        if "no TTL" in v:
-            recs.append("Set TTL on flag bindings")
-        if "AFTER content" in v:
-            recs.append("Present flags BEFORE attestation content (inoculation)")
-        if "dissociation_risk" in v:
-            recs.append("Re-verify after reboot — don't trust cached trust")
-    return "; ".join(recs) if recs else "Review attestation chain"
+def detect_reboot_dissociation(events: list[TrustEvent]) -> list[dict]:
+    """
+    Detect forced dissociation through reboots.
+    
+    Agent reboot = context window reset = all in-memory flags lost.
+    Only persisted bindings survive.
+    """
+    flags = [e for e in events if e.event_type == "flag"]
+    reboots = [e for e in events if e.event_type == "reboot"]
+    verifications = [e for e in events if e.event_type == "verification"]
+    
+    alerts = []
+    for flag in flags:
+        # Check if reboot happened after flag
+        post_flag_reboots = [r for r in reboots if r.timestamp > flag.timestamp]
+        
+        if post_flag_reboots and flag.binding not in ("merkle",):
+            # Flag likely lost through reboot
+            post_reboot_verifications = [
+                v for v in verifications 
+                if v.timestamp > post_flag_reboots[-1].timestamp
+                and v.agent_id == flag.agent_id
+            ]
+            
+            if post_reboot_verifications:
+                alerts.append({
+                    "type": "REBOOT_DISSOCIATION",
+                    "agent_id": flag.agent_id,
+                    "flag_time": flag.timestamp.isoformat(),
+                    "reboot_time": post_flag_reboots[-1].timestamp.isoformat(),
+                    "binding": flag.binding,
+                    "verified_post_reboot": len(post_reboot_verifications),
+                    "severity": "CRITICAL" if flag.binding == "none" else "WARNING",
+                    "recommendation": "Rebind flag via Merkle inclusion"
+                })
+    
+    return alerts
 
 
 def demo():
-    print("=" * 60)
-    print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracín (Psych Bull 2004, k=72)")
-    print("=" * 60)
+    """Demo with agent trust scenarios."""
     
     now = datetime.now(timezone.utc)
     
-    scenarios = [
-        {
-            "name": "1. Flagged cert, no binding, post-reboot",
-            "attestation": Attestation(
-                agent_id="ghost_dave",
-                content_hash="abc123",
-                created_at=now - timedelta(hours=2),
-                flag="key_compromised",
-                flag_hash_bound=False,
-                flag_ttl=None,
-                flag_order="after",
-            ),
-            "context": AgentContext(has_rebooted=True, context_age=timedelta(minutes=5)),
-        },
-        {
-            "name": "2. Flagged cert, hash-bound, fresh context",
-            "attestation": Attestation(
-                agent_id="honest_alice",
-                content_hash="def456",
-                created_at=now - timedelta(minutes=30),
-                flag="disputed_scope",
-                flag_hash_bound=True,
-                flag_ttl=timedelta(hours=24),
-                flag_order="before",
-            ),
-            "context": AgentContext(has_rebooted=False, context_age=timedelta(minutes=30)),
-        },
-        {
-            "name": "3. No flag, clean attestation",
-            "attestation": Attestation(
-                agent_id="trusted_bob",
-                content_hash="ghi789",
-                created_at=now - timedelta(hours=1),
-            ),
-            "context": AgentContext(has_rebooted=False, context_age=timedelta(hours=1)),
-        },
-        {
-            "name": "4. Expired TTL, high motivation verifier",
-            "attestation": Attestation(
-                agent_id="expired_eve",
-                content_hash="jkl012",
-                created_at=now - timedelta(hours=48),
-                flag="behavioral_drift",
-                flag_hash_bound=True,
-                flag_ttl=timedelta(hours=24),
-                flag_order="after",
-            ),
-            "context": AgentContext(
-                has_rebooted=False,
-                context_age=timedelta(hours=6),
-                processing_motivation=0.9,
-            ),
-        },
-        {
-            "name": "5. Ronin pattern: flagged, unbound, long context",
-            "attestation": Attestation(
-                agent_id="ronin_validator",
-                content_hash="mno345",
-                created_at=now - timedelta(days=7),
-                flag="compromised_operator",
-                flag_hash_bound=False,
-                flag_ttl=None,
-                flag_order="after",
-            ),
-            "context": AgentContext(
-                has_rebooted=True,
-                context_age=timedelta(hours=12),
-                processing_motivation=0.8,
-            ),
-        },
+    print("=" * 60)
+    print("SLEEPER EFFECT DETECTOR")
+    print("Kumkale & Albarracín (2004) + Hovland (1949)")
+    print("=" * 60)
+    
+    # Scenario 1: Merkle-bound flag (protected)
+    print("\n--- Scenario 1: Merkle-bound flag (72h old) ---")
+    flag1 = TrustEvent("agent_alpha", "flag", now - timedelta(hours=72), 
+                       "abc123", binding="merkle")
+    result = DissociationRisk.score(flag1, now)
+    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
+    print(f"Time risk: {result['time_risk']} × (1 - {result['binding_protection']}) = {result['net_dissociation_risk']}")
+    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
+    
+    # Scenario 2: Gossip-only flag (partial protection)
+    print("\n--- Scenario 2: Gossip-only flag (24h old) ---")
+    flag2 = TrustEvent("agent_beta", "flag", now - timedelta(hours=24),
+                       "def456", binding="gossip")
+    result = DissociationRisk.score(flag2, now)
+    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
+    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
+    
+    # Scenario 3: Self-reported flag (minimal protection)
+    print("\n--- Scenario 3: Self-reported flag (6h old) ---")
+    flag3 = TrustEvent("agent_gamma", "flag", now - timedelta(hours=6),
+                       "ghi789", binding="self_reported")
+    result = DissociationRisk.score(flag3, now)
+    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
+    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
+    
+    # Scenario 4: Unbound flag (maximum risk)
+    print("\n--- Scenario 4: Unbound flag (48h old) ---")
+    flag4 = TrustEvent("agent_delta", "flag", now - timedelta(hours=48),
+                       "jkl012", binding="none")
+    result = DissociationRisk.score(flag4, now)
+    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
+    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
+    
+    # Scenario 5: Reboot dissociation detection
+    print("\n--- Scenario 5: Reboot dissociation ---")
+    events = [
+        TrustEvent("agent_epsilon", "flag", now - timedelta(hours=12), "flag_hash", binding="gossip"),
+        TrustEvent("agent_epsilon", "reboot", now - timedelta(hours=6), "reboot_hash"),
+        TrustEvent("agent_epsilon", "verification", now - timedelta(hours=1), "verify_hash"),
     ]
+    alerts = detect_reboot_dissociation(events)
+    for alert in alerts:
+        print(f"  ALERT: {alert['type']} | Severity: {alert['severity']}")
+        print(f"  Agent: {alert['agent_id']} | Binding: {alert['binding']}")
+        print(f"  Verified {alert['verified_post_reboot']}x after reboot")
+        print(f"  → {alert['recommendation']}")
     
-    for s in scenarios:
-        print(f"\n{'─' * 60}")
-        print(f"Scenario: {s['name']}")
-        result = detect_sleeper_risk(s["attestation"], s["context"])
-        print(f"Grade: {result['grade']} (risk: {result['risk_score']})")
-        if result["vulnerabilities"]:
-            print(f"Vulnerabilities:")
-            for v in result["vulnerabilities"]:
-                print(f"  ⚠ {v}")
-        if result["mitigations"]:
-            print(f"Mitigations:")
-            for m in result["mitigations"]:
-                print(f"  ✓ {m}")
-        print(f"Recommendation: {result['recommendation']}")
+    # Scenario 6: Merkle-bound survives reboot
+    print("\n--- Scenario 6: Merkle-bound flag survives reboot ---")
+    events2 = [
+        TrustEvent("agent_zeta", "flag", now - timedelta(hours=12), "flag_hash", binding="merkle"),
+        TrustEvent("agent_zeta", "reboot", now - timedelta(hours=6), "reboot_hash"),
+        TrustEvent("agent_zeta", "verification", now - timedelta(hours=1), "verify_hash"),
+    ]
+    alerts2 = detect_reboot_dissociation(events2)
+    if not alerts2:
+        print("  ✓ No alerts — Merkle binding survives reboot")
     
+    # Summary
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT (Kumkale & Albarracín 2004):")
-    print("  Source credibility decays FASTER than message content.")
-    print("  Agent reboots = forced dissociation of flag from attestation.")
-    print("  High processing motivation makes it WORSE (counterintuitive).")
-    print("  Fix: hash-bind + TTL + inoculation order (flag BEFORE content).")
+    print("KEY INSIGHT (Kumkale & Albarracín 2004 meta-analysis):")
+    print("  Sleeper effect requires:")
+    print("    1. Strong initial message impact")
+    print("    2. Discounting cue presented AFTER message")
+    print("    3. High processing motivation")
+    print("    4. Time for dissociation to occur")
+    print("")
+    print("  Agent fix: Merkle inclusion binds flag to identity.")
+    print("  Dissociation = cryptographically impossible.")
+    print("  Gossip = partial (survives reboot? depends on peers).")
+    print("  Self-reported = useless (agent controls own flags).")
     print(f"{'=' * 60}")
 
 
