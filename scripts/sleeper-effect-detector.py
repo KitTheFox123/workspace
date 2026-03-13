@@ -2,219 +2,228 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracin (2004) meta-analysis (k=72 studies).
+Based on Kumkale & Albarracín 2004 (Psychological Bulletin, k=72 studies):
+- Discounting cue (e.g., "source flagged as compromised") fades faster than message
+- After delay, flagged info regains persuasive power
+- Agent risk: compromised identity gets "clean" after reboot/migration
 
-The sleeper effect: a discounting cue (e.g., "source is unreliable") 
-decays faster than the message content. Over time, people become MORE 
-persuaded by discounted messages, not less.
-
-Agent risk: revocation flags or compromise warnings fade on restart/
-context loss, but the compromised agent's influence persists in the 
-network. Hash-chaining flags to identity prevents this.
-
-Detection: monitor trust scores over time. If a previously-flagged 
-agent's effective trust INCREASES without new positive evidence, 
-that's the sleeper effect.
+Detection: monitor trust scores for flagged sources over time.
+If trust rises without new positive evidence → sleeper effect.
+Fix: append-only flag log binds cue to identity permanently.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 import math
 
 
 @dataclass
-class TrustEvent:
-    """A trust-relevant event for an agent."""
-    timestamp: datetime
-    event_type: str  # "flag", "attestation", "observation", "restart"
-    content: str
-    severity: float = 0.5  # 0-1
-    bound_to_identity: bool = False  # Is this hash-chained to identity?
-
-
-@dataclass 
-class AgentTrustProfile:
-    """Trust profile with sleeper effect detection."""
+class TrustFlag:
+    """A discounting cue attached to an identity."""
     agent_id: str
-    events: list[TrustEvent] = field(default_factory=list)
+    flag_type: str  # "compromised", "equivocation", "split_view"
+    timestamp: datetime
+    evidence_hash: str  # Hash-chained to make unforgeable
+    severity: float  # 0-1
     
-    def trust_score_at(self, t: datetime, memory_half_life_hours: float = 24.0) -> float:
-        """
-        Compute trust score at time t.
-        
-        Kumkale & Albarracin model:
-        - Message content decays with half-life H_msg
-        - Discounting cue decays with half-life H_cue (shorter!)
-        - Net effect: flag impact shrinks faster than positive impressions
-        """
-        H_msg = memory_half_life_hours  # Content half-life
-        H_cue = memory_half_life_hours * 0.4  # Cue decays 2.5x faster
-        
-        base_trust = 0.5
-        positive_influence = 0.0
-        negative_influence = 0.0
-        
-        for event in self.events:
-            if event.timestamp > t:
-                continue
-                
-            hours_elapsed = (t - event.timestamp).total_seconds() / 3600
-            
-            if event.event_type in ("attestation", "observation"):
-                # Positive evidence decays normally
-                decay = math.exp(-0.693 * hours_elapsed / H_msg)
-                positive_influence += event.severity * decay
-                
-            elif event.event_type == "flag":
-                if event.bound_to_identity:
-                    # Hash-chained flag: decays at same rate as content
-                    decay = math.exp(-0.693 * hours_elapsed / H_msg)
-                else:
-                    # Session-scoped flag: decays FASTER (sleeper effect!)
-                    decay = math.exp(-0.693 * hours_elapsed / H_cue)
-                negative_influence += event.severity * decay
-                
-            elif event.event_type == "restart":
-                if not event.bound_to_identity:
-                    # Restart clears session-scoped flags entirely
-                    # (simulates context loss)
-                    negative_influence *= 0.1  # 90% flag loss
-        
-        trust = base_trust + positive_influence - negative_influence
-        return max(0.0, min(1.0, trust))
+    @property
+    def age_hours(self) -> float:
+        now = datetime.now(timezone.utc)
+        return (now - self.timestamp).total_seconds() / 3600
+
+
+@dataclass  
+class TrustRecord:
+    agent_id: str
+    flags: list[TrustFlag] = field(default_factory=list)
+    trust_score: float = 0.5
+    trust_history: list[tuple[datetime, float]] = field(default_factory=list)
+    positive_evidence_since_flag: int = 0
     
-    def detect_sleeper_effect(self, 
-                               window_hours: float = 48.0,
-                               sample_interval_hours: float = 4.0) -> dict:
+    def add_flag(self, flag: TrustFlag):
+        self.flags.append(flag)
+        # Immediate discount
+        self.trust_score *= (1.0 - flag.severity * 0.5)
+        self.trust_history.append((flag.timestamp, self.trust_score))
+    
+    def naive_decay(self, hours_elapsed: float) -> float:
         """
-        Detect sleeper effect: trust increasing after a flag WITHOUT 
-        new positive evidence.
+        Naive trust systems: flag influence decays exponentially.
+        This IS the sleeper effect — the discounting cue fades.
+        Kumkale 2004: cue fades at ~2 weeks for humans.
+        For agents with short context: much faster.
         """
-        if not self.events:
-            return {"detected": False, "reason": "no events"}
+        if not self.flags:
+            return self.trust_score
         
-        # Find flags
-        flags = [e for e in self.events if e.event_type == "flag"]
-        if not flags:
-            return {"detected": False, "reason": "no flags"}
+        # Each flag's influence decays
+        total_discount = 0.0
+        for flag in self.flags:
+            age = flag.age_hours + hours_elapsed
+            # Half-life: 168 hours (1 week) for humans, 
+            # but agent context windows = much shorter
+            half_life = 24.0  # 24 hours for agents (context resets)
+            decay = math.exp(-0.693 * age / half_life)
+            total_discount += flag.severity * decay
         
-        latest_flag = max(flags, key=lambda e: e.timestamp)
+        # Trust recovers as flags fade
+        recovery = min(total_discount, 1.0)
+        return min(0.5 + 0.5 * (1.0 - recovery), 1.0)
+    
+    def append_only_score(self) -> float:
+        """
+        Sleeper-proof: flags never decay. Only positive evidence can
+        rehabilitate trust, and even then, flags remain visible.
+        """
+        if not self.flags:
+            return self.trust_score
         
-        # Sample trust over time after flag
-        samples = []
-        t = latest_flag.timestamp
-        end = t + timedelta(hours=window_hours)
+        # Flags are permanent discounts
+        permanent_discount = sum(f.severity * 0.3 for f in self.flags)
+        permanent_discount = min(permanent_discount, 0.8)
         
-        while t <= end:
-            score = self.trust_score_at(t)
-            samples.append((t, score))
-            t += timedelta(hours=sample_interval_hours)
+        # Positive evidence can partially recover
+        recovery = min(self.positive_evidence_since_flag * 0.05, 0.3)
         
-        # Detect increasing trust after flag
-        if len(samples) < 3:
-            return {"detected": False, "reason": "insufficient samples"}
-        
-        # Check if trust at flag time vs later
-        trust_at_flag = samples[0][1]
-        trust_later = samples[-1][1]
-        
-        # Find new positive evidence after flag
-        new_positives = [e for e in self.events 
-                        if e.timestamp > latest_flag.timestamp 
-                        and e.event_type in ("attestation", "observation")]
-        
-        sleeper_detected = (
-            trust_later > trust_at_flag + 0.05  # Trust increased
-            and len(new_positives) == 0  # No new positive evidence
-            and not latest_flag.bound_to_identity  # Flag not hash-chained
-        )
-        
+        return max(0.5 * (1.0 - permanent_discount) + recovery, 0.05)
+
+
+def detect_sleeper_effect(record: TrustRecord, current_trust: float) -> dict:
+    """
+    Detect if a flagged identity's trust is rising without new evidence.
+    This is the sleeper effect in action.
+    """
+    if not record.flags:
+        return {"detected": False, "reason": "no flags"}
+    
+    # Trust at time of most recent flag
+    flag_trust = record.trust_score
+    
+    # Expected trust with append-only (no decay)
+    expected = record.append_only_score()
+    
+    # If current trust significantly exceeds expected → sleeper effect
+    delta = current_trust - expected
+    
+    if delta > 0.15 and record.positive_evidence_since_flag < 3:
         return {
-            "detected": sleeper_detected,
-            "trust_at_flag": round(trust_at_flag, 3),
-            "trust_after_window": round(trust_later, 3),
-            "trust_delta": round(trust_later - trust_at_flag, 3),
-            "new_positive_evidence": len(new_positives),
-            "flag_bound_to_identity": latest_flag.bound_to_identity,
-            "flag_type": "hash-chained" if latest_flag.bound_to_identity else "session-scoped",
-            "recommendation": (
-                "ALERT: sleeper effect detected. Flag decayed without new evidence. "
-                "Bind flag to identity hash chain."
-                if sleeper_detected else
-                "OK: trust trajectory consistent with evidence."
-            )
+            "detected": True,
+            "severity": "HIGH",
+            "delta": round(delta, 3),
+            "current": round(current_trust, 3),
+            "expected": round(expected, 3),
+            "reason": f"Trust rose {delta:.1%} without sufficient positive evidence "
+                      f"({record.positive_evidence_since_flag} events). "
+                      f"Discounting cue has faded. Sleeper effect active.",
+            "fix": "Bind flag to identity via append-only log. "
+                   "Flag IS the identity now."
+        }
+    elif delta > 0.05:
+        return {
+            "detected": True, 
+            "severity": "LOW",
+            "delta": round(delta, 3),
+            "current": round(current_trust, 3),
+            "expected": round(expected, 3),
+            "reason": "Minor trust drift detected. Monitor."
+        }
+    else:
+        return {
+            "detected": False,
+            "delta": round(delta, 3),
+            "current": round(current_trust, 3),
+            "expected": round(expected, 3),
+            "reason": "Trust aligned with flag history."
         }
 
 
 def demo():
-    """Demo scenarios."""
-    now = datetime.now(timezone.utc)
-    
     print("=" * 60)
     print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracin 2004 (k=72, Psych Bull)")
+    print("Kumkale & Albarracín 2004 (Psych Bull, k=72)")
     print("=" * 60)
+    
+    now = datetime.now(timezone.utc)
     
     scenarios = [
         {
-            "name": "1. Session-scoped flag (VULNERABLE to sleeper effect)",
-            "events": [
-                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
-                TrustEvent(now - timedelta(hours=48), "observation", "completed task", 0.4),
-                TrustEvent(now - timedelta(hours=24), "flag", "compromised key detected", 0.8, bound_to_identity=False),
-                # No new positive evidence, but flag will decay...
-            ]
+            "name": "1. Fresh flag — trust correctly suppressed",
+            "record": TrustRecord(agent_id="agent_alice", trust_score=0.8),
+            "flag": TrustFlag("agent_alice", "compromised", now - timedelta(hours=1),
+                            "abc123", 0.7),
+            "hours_elapsed": 1,
+            "positive_evidence": 0,
         },
         {
-            "name": "2. Hash-chained flag (RESISTANT to sleeper effect)", 
-            "events": [
-                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
-                TrustEvent(now - timedelta(hours=48), "observation", "completed task", 0.4),
-                TrustEvent(now - timedelta(hours=24), "flag", "compromised key detected", 0.8, bound_to_identity=True),
-            ]
+            "name": "2. Old flag — naive system lets trust recover (SLEEPER!)",
+            "record": TrustRecord(agent_id="agent_bob", trust_score=0.8),
+            "flag": TrustFlag("agent_bob", "equivocation", now - timedelta(hours=48),
+                            "def456", 0.6),
+            "hours_elapsed": 48,
+            "positive_evidence": 0,
         },
         {
-            "name": "3. Flag + restart (worst case)",
-            "events": [
-                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
-                TrustEvent(now - timedelta(hours=48), "observation", "completed task", 0.4),
-                TrustEvent(now - timedelta(hours=24), "flag", "compromised key detected", 0.8, bound_to_identity=False),
-                TrustEvent(now - timedelta(hours=20), "restart", "agent rebooted", 0.0, bound_to_identity=False),
-            ]
+            "name": "3. Old flag — append-only keeps flag active",
+            "record": TrustRecord(agent_id="agent_carol", trust_score=0.8),
+            "flag": TrustFlag("agent_carol", "split_view", now - timedelta(hours=72),
+                            "ghi789", 0.8),
+            "hours_elapsed": 72,
+            "positive_evidence": 1,
         },
         {
-            "name": "4. Flag + new evidence (legitimate recovery)",
-            "events": [
-                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
-                TrustEvent(now - timedelta(hours=24), "flag", "suspicious behavior", 0.6, bound_to_identity=False),
-                TrustEvent(now - timedelta(hours=12), "attestation", "key rotated + re-verified", 0.7),
-                TrustEvent(now - timedelta(hours=6), "observation", "clean behavior observed", 0.5),
-            ]
+            "name": "4. Rehabilitated — genuine positive evidence",
+            "record": TrustRecord(agent_id="agent_dave", trust_score=0.8),
+            "flag": TrustFlag("agent_dave", "compromised", now - timedelta(hours=168),
+                            "jkl012", 0.5),
+            "hours_elapsed": 168,
+            "positive_evidence": 10,
+        },
+        {
+            "name": "5. Reboot amnesia — context reset clears flags",
+            "record": TrustRecord(agent_id="agent_eve", trust_score=0.8),
+            "flag": TrustFlag("agent_eve", "compromised", now - timedelta(hours=4),
+                            "mno345", 0.9),
+            "hours_elapsed": 4,
+            "positive_evidence": 0,
         },
     ]
     
-    for scenario in scenarios:
+    for s in scenarios:
         print(f"\n{'─' * 60}")
-        print(f"Scenario: {scenario['name']}")
+        print(f"Scenario: {s['name']}")
         
-        profile = AgentTrustProfile(agent_id="test_agent", events=scenario['events'])
-        result = profile.detect_sleeper_effect(window_hours=48.0)
+        record = s["record"]
+        record.add_flag(s["flag"])
+        record.positive_evidence_since_flag = s["positive_evidence"]
         
-        print(f"  Trust at flag: {result['trust_at_flag']}")
-        print(f"  Trust after 48h: {result['trust_after_window']}")
-        print(f"  Delta: {result['trust_delta']:+.3f}")
-        print(f"  New positive evidence: {result['new_positive_evidence']}")
-        print(f"  Flag type: {result['flag_type']}")
-        print(f"  Sleeper effect: {'⚠️ DETECTED' if result['detected'] else '✅ Not detected'}")
-        print(f"  → {result['recommendation']}")
+        # What naive system would show (sleeper effect)
+        naive_trust = record.naive_decay(s["hours_elapsed"])
+        # What append-only system shows
+        safe_trust = record.append_only_score()
+        
+        print(f"  Flag: {s['flag'].flag_type} (severity {s['flag'].severity})")
+        print(f"  Age: {s['hours_elapsed']}h, Positive evidence: {s['positive_evidence']}")
+        print(f"  Naive trust (decaying):  {naive_trust:.3f}")
+        print(f"  Append-only trust:       {safe_trust:.3f}")
+        print(f"  Delta (sleeper risk):    {naive_trust - safe_trust:+.3f}")
+        
+        # Detect
+        result = detect_sleeper_effect(record, naive_trust)
+        if result["detected"]:
+            print(f"  ⚠️  SLEEPER EFFECT: {result['severity']}")
+            print(f"      {result['reason']}")
+            if "fix" in result:
+                print(f"      Fix: {result['fix']}")
+        else:
+            print(f"  ✓ {result['reason']}")
     
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT (Kumkale & Albarracin 2004):")
-    print("  Discounting cues decay 2.5x faster than message content.")
-    print("  After ~24h, flagged agent's positive reputation resurfaces.")
-    print("  Fix: hash-chain flags to identity (CT revocation model).")
-    print("  Revocation must be append-only, not session-scoped.")
+    print("KEY INSIGHT (Kumkale & Albarracín 2004):")
+    print("  Discounting cues fade faster than messages.")
+    print("  \"This source was flagged\" dissociates from identity over time.")
+    print("  Agent version: reboot/migration = instant cue fade.")
+    print("  Fix: append-only flag log. The flag IS the identity.")
+    print("  CT SCTs solve this — receipt is permanent, unforgeable.")
     print(f"{'=' * 60}")
 
 
