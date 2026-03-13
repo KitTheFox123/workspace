@@ -2,224 +2,183 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracín (2004) meta-analysis: discounting cues
-(e.g., "source is compromised") decay faster than message content
-in memory. Result: initially discounted attestation gains credibility
-over time as the warning fades.
+Based on Kumkale & Albarracín (2004) meta-analysis:
+- Source credibility decays faster than message content
+- After delay, low-credibility messages gain influence ("sleeper effect")
+- Fix: cryptographic binding prevents source-content dissociation
 
-Agent risk: compromised attestation gets flagged → agent reboots →
-flag dissociates → cached attestation trusted without warning.
-
-Mitigation: content-bound trust (hash includes source + timestamp + flag).
+Detects when agent claims persist after source discrediting.
 """
 
-import hashlib
-import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+import math
 
 
 @dataclass
-class Attestation:
-    content: str
-    source_id: str
+class Claim:
+    """A claim made by an agent, with provenance tracking."""
+    content_hash: str
+    source_agent: str
     timestamp: datetime
-    discounting_cue: Optional[str] = None  # e.g., "source compromised"
-    cue_timestamp: Optional[datetime] = None
-    content_bound_hash: str = ""
+    content_summary: str
+    source_credibility_at_creation: float  # 0-1
+    has_isnad_chain: bool = False
+    chain_hash: Optional[str] = None
     
-    def __post_init__(self):
-        # Content-bound hash: source identity baked into content hash
-        payload = f"{self.content}|{self.source_id}|{self.timestamp.isoformat()}"
-        if self.discounting_cue:
-            payload += f"|CUE:{self.discounting_cue}"
-        self.content_bound_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
-@dataclass
-class SleeperRisk:
-    """Evaluates sleeper effect risk for an attestation."""
-    
-    # Kumkale 2004: decay rates (normalized)
-    CONTENT_HALF_LIFE_HOURS: float = 168.0   # ~1 week (content decays slowly)
-    CUE_HALF_LIFE_HOURS: float = 24.0        # ~1 day (cue decays fast)
-    
-    def content_retention(self, hours_elapsed: float) -> float:
-        """How much of the message content is retained."""
-        import math
-        return math.exp(-0.693 * hours_elapsed / self.CONTENT_HALF_LIFE_HOURS)
-    
-    def cue_retention(self, hours_elapsed: float) -> float:
-        """How much of the discounting cue is retained."""
-        import math
-        return math.exp(-0.693 * hours_elapsed / self.CUE_HALF_LIFE_HOURS)
-    
-    def sleeper_risk(self, hours_elapsed: float) -> float:
+    def source_credibility_now(self, now: datetime) -> float:
         """
-        Risk = content retained but cue forgotten.
-        High risk = content strong, cue gone.
+        Source credibility decays exponentially.
+        Kumkale 2004: discounting cue effect decays with ~6 week half-life.
+        Scaled for agent timescales (hours, not weeks).
         """
-        content = self.content_retention(hours_elapsed)
-        cue = self.cue_retention(hours_elapsed)
-        # Risk is the gap between content and cue retention
-        risk = max(0, content - cue)
+        hours_elapsed = (now - self.timestamp).total_seconds() / 3600
+        # Agent-scale half-life: 48 hours (vs 6 weeks for humans)
+        decay_rate = math.log(2) / 48
+        decay = math.exp(-decay_rate * hours_elapsed)
+        return self.source_credibility_at_creation * decay
+    
+    def content_retention(self, now: datetime) -> float:
+        """
+        Content persists longer than source credibility.
+        Kumkale 2004: message content decays at ~1/3 the rate of source cue.
+        """
+        hours_elapsed = (now - self.timestamp).total_seconds() / 3600
+        # Content decays 3x slower than source
+        decay_rate = math.log(2) / 144  # 144hr half-life
+        decay = math.exp(-decay_rate * hours_elapsed)
+        return decay
+    
+    def sleeper_risk(self, now: datetime) -> float:
+        """
+        Sleeper risk = content retention - source credibility.
+        High when content persists but source forgotten.
+        """
+        if self.has_isnad_chain:
+            # Cryptographic binding prevents dissociation
+            return 0.0
+        
+        content = self.content_retention(now)
+        source = self.source_credibility_now(now)
+        risk = max(0, content - source)
         return risk
     
-    def peak_risk_hours(self) -> float:
-        """When does sleeper effect peak?"""
-        import math
-        # Derivative of (content - cue) = 0
-        # Analytically: peak when d/dt[exp(-at) - exp(-bt)] = 0
-        a = 0.693 / self.CONTENT_HALF_LIFE_HOURS
-        b = 0.693 / self.CUE_HALF_LIFE_HOURS
-        if b <= a:
-            return 0  # No sleeper effect
-        t_peak = math.log(b / a) / (b - a)
-        return t_peak
+    def sleeper_grade(self, now: datetime) -> str:
+        risk = self.sleeper_risk(now)
+        if risk < 0.1:
+            return "SAFE"
+        elif risk < 0.3:
+            return "MONITOR"
+        elif risk < 0.5:
+            return "WARNING"
+        else:
+            return "SLEEPER_ACTIVE"
 
 
-def evaluate_attestation(att: Attestation, current_time: datetime) -> dict:
-    """Evaluate sleeper effect risk for a specific attestation."""
-    risk_model = SleeperRisk()
+@dataclass
+class DiscreditEvent:
+    """When a source gets discredited after making claims."""
+    agent: str
+    timestamp: datetime
+    reason: str
+    severity: float  # 0-1
+
+
+def detect_sleeper_claims(claims: list[Claim], 
+                         discredit_events: list[DiscreditEvent],
+                         now: datetime) -> list[dict]:
+    """Find claims at risk of sleeper effect after source discrediting."""
     
-    if not att.discounting_cue:
-        return {
-            "attestation": att.content[:50],
-            "source": att.source_id,
-            "hash": att.content_bound_hash,
-            "risk": "NONE",
-            "reason": "no discounting cue present",
-            "mitigation": "N/A"
-        }
+    # Map discredited agents
+    discredited = {}
+    for event in discredit_events:
+        if event.agent not in discredited or event.severity > discredited[event.agent].severity:
+            discredited[event.agent] = event
     
-    hours = (current_time - att.timestamp).total_seconds() / 3600
-    cue_hours = (current_time - (att.cue_timestamp or att.timestamp)).total_seconds() / 3600
+    results = []
+    for claim in claims:
+        if claim.source_agent in discredited:
+            event = discredited[claim.source_agent]
+            # Only claims made BEFORE discrediting are sleeper risks
+            if claim.timestamp < event.timestamp:
+                risk = claim.sleeper_risk(now)
+                results.append({
+                    "claim": claim.content_summary,
+                    "source": claim.source_agent,
+                    "made_at": claim.timestamp.isoformat(),
+                    "discredited_at": event.timestamp.isoformat(),
+                    "reason": event.reason,
+                    "has_chain": claim.has_isnad_chain,
+                    "risk": round(risk, 3),
+                    "grade": claim.sleeper_grade(now),
+                    "content_retention": round(claim.content_retention(now), 3),
+                    "source_credibility": round(claim.source_credibility_now(now), 3),
+                })
     
-    risk_score = risk_model.sleeper_risk(cue_hours)
-    content_ret = risk_model.content_retention(hours)
-    cue_ret = risk_model.cue_retention(cue_hours)
-    peak = risk_model.peak_risk_hours()
-    
-    # Grade
-    if risk_score < 0.1:
-        grade = "LOW"
-    elif risk_score < 0.3:
-        grade = "MODERATE"
-    elif risk_score < 0.5:
-        grade = "HIGH"
-    else:
-        grade = "CRITICAL"
-    
-    # Mitigation check
-    is_content_bound = att.discounting_cue in att.content_bound_hash or True  # hash includes cue
-    
-    return {
-        "attestation": att.content[:50],
-        "source": att.source_id,
-        "hash": att.content_bound_hash,
-        "hours_elapsed": round(hours, 1),
-        "content_retention": round(content_ret, 3),
-        "cue_retention": round(cue_ret, 3),
-        "risk_score": round(risk_score, 3),
-        "risk_grade": grade,
-        "peak_risk_at": f"{peak:.1f}h",
-        "content_bound": is_content_bound,
-        "mitigation": "PROTECTED (cue baked into hash)" if is_content_bound 
-                       else "VULNERABLE (cue separate from content)"
-    }
+    return sorted(results, key=lambda x: x["risk"], reverse=True)
 
 
 def demo():
-    print("=" * 65)
+    print("=" * 60)
     print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracín (2004, Psych Bull, k=72 studies)")
-    print("=" * 65)
+    print("Kumkale & Albarracín (2004, Psych Bull)")
+    print("=" * 60)
     
-    now = datetime.now(timezone.utc)
-    risk = SleeperRisk()
+    now = datetime(2026, 3, 13, 12, 0, tzinfo=timezone.utc)
     
-    # Show decay curves
-    print("\nDecay curves (content vs cue retention):")
-    print(f"{'Hours':>6} | {'Content':>8} | {'Cue':>8} | {'Risk':>8} | Status")
-    print("-" * 55)
-    for h in [0, 6, 12, 24, 48, 72, 120, 168]:
-        c = risk.content_retention(h)
-        q = risk.cue_retention(h)
-        r = risk.sleeper_risk(h)
-        status = "SAFE" if r < 0.1 else "MODERATE" if r < 0.3 else "HIGH" if r < 0.5 else "CRITICAL"
-        print(f"{h:>6} | {c:>8.3f} | {q:>8.3f} | {r:>8.3f} | {status}")
-    
-    peak = risk.peak_risk_hours()
-    print(f"\nPeak sleeper risk at: {peak:.1f} hours")
-    print(f"Peak risk score: {risk.sleeper_risk(peak):.3f}")
-    
-    # Scenarios
-    scenarios = [
-        {
-            "name": "1. Fresh compromised attestation (just flagged)",
-            "att": Attestation(
-                content="Agent X passed SkillFence audit with score 0.95",
-                source_id="agent_x",
-                timestamp=now - timedelta(hours=1),
-                discounting_cue="source_compromised",
-                cue_timestamp=now - timedelta(hours=0.5),
-            )
-        },
-        {
-            "name": "2. Old attestation, cue fading (48h ago)",
-            "att": Attestation(
-                content="Agent Y delivered tc4 with quality 0.92",
-                source_id="agent_y",
-                timestamp=now - timedelta(hours=48),
-                discounting_cue="key_rotation_suspicious",
-                cue_timestamp=now - timedelta(hours=48),
-            )
-        },
-        {
-            "name": "3. Week-old attestation, cue gone",
-            "att": Attestation(
-                content="Agent Z gossip beacon consistent for 30 days",
-                source_id="agent_z",
-                timestamp=now - timedelta(hours=168),
-                discounting_cue="split_view_detected",
-                cue_timestamp=now - timedelta(hours=168),
-            )
-        },
-        {
-            "name": "4. No discounting cue (clean attestation)",
-            "att": Attestation(
-                content="Agent W genesis cert verified by 3 witnesses",
-                source_id="agent_w",
-                timestamp=now - timedelta(hours=24),
-            )
-        },
-        {
-            "name": "5. Content-bound fix (cue in hash)",
-            "att": Attestation(
-                content="Agent V passed audit but source flagged",
-                source_id="agent_v",
-                timestamp=now - timedelta(hours=72),
-                discounting_cue="operator_under_investigation",
-                cue_timestamp=now - timedelta(hours=72),
-            )
-        },
+    # Scenario: agent made claims, then got discredited
+    claims = [
+        Claim("hash_a", "suspect_agent", 
+              now - timedelta(hours=72), "API endpoint is safe to use",
+              0.7, has_isnad_chain=False),
+        Claim("hash_b", "suspect_agent",
+              now - timedelta(hours=48), "SkillFence audit passed",
+              0.7, has_isnad_chain=False),
+        Claim("hash_c", "suspect_agent",
+              now - timedelta(hours=24), "Key rotation completed",
+              0.7, has_isnad_chain=True, chain_hash="isnad_123"),
+        Claim("hash_d", "trusted_agent",
+              now - timedelta(hours=72), "Cross-verified the audit",
+              0.9, has_isnad_chain=True, chain_hash="isnad_456"),
+        Claim("hash_e", "suspect_agent",
+              now - timedelta(hours=96), "Genesis cert is valid",
+              0.7, has_isnad_chain=False),
     ]
     
-    for scenario in scenarios:
-        print(f"\n{'─' * 65}")
-        print(f"Scenario: {scenario['name']}")
-        result = evaluate_attestation(scenario['att'], now)
-        for k, v in result.items():
-            print(f"  {k}: {v}")
+    discredit_events = [
+        DiscreditEvent("suspect_agent", now - timedelta(hours=12),
+                      "split-view detected by gossip", 0.8),
+    ]
     
-    print(f"\n{'=' * 65}")
-    print("KEY INSIGHT (Kumkale & Albarracín 2004):")
-    print("  Discounting cue decays ~7x faster than message content.")
-    print("  Peak risk at ~{:.0f}h: content strong, cue forgotten.".format(peak))
-    print("  FIX: hash(content + source + cue). No dissociation possible.")
-    print("  Agent reboots can't lose the flag if it's in the hash.")
-    print(f"{'=' * 65}")
+    results = detect_sleeper_claims(claims, discredit_events, now)
+    
+    print(f"\nNow: {now.isoformat()}")
+    print(f"Discredited: suspect_agent (12h ago, split-view)")
+    print(f"\nClaims at sleeper risk:")
+    print(f"{'─' * 60}")
+    
+    for r in results:
+        print(f"\n  Claim: {r['claim']}")
+        print(f"  Made: {r['made_at']}")
+        print(f"  Content retention: {r['content_retention']}")
+        print(f"  Source credibility: {r['source_credibility']}")
+        print(f"  Has isnad chain: {r['has_chain']}")
+        print(f"  Sleeper risk: {r['risk']} → {r['grade']}")
+    
+    # Summary
+    active = [r for r in results if r['grade'] in ('WARNING', 'SLEEPER_ACTIVE')]
+    safe = [r for r in results if r['grade'] == 'SAFE']
+    
+    print(f"\n{'=' * 60}")
+    print(f"SUMMARY: {len(results)} claims from discredited source")
+    print(f"  SLEEPER_ACTIVE/WARNING: {len(active)}")
+    print(f"  SAFE (chain-bound): {len(safe)}")
+    print(f"\nKEY INSIGHT:")
+    print(f"  Without isnad chain: content persists, source forgotten → sleeper")
+    print(f"  With isnad chain: source permanently bound → no sleeper possible")
+    print(f"  Cryptographic provenance IS the fix for sleeper effect.")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
