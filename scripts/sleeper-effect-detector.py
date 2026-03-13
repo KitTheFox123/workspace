@@ -2,235 +2,274 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracín (2004) meta-analysis and Hovland et al (1949).
+Based on Kumkale & Albarracín (2004, Psychological Bulletin, k=72 studies).
 
-The sleeper effect: discounting cue (e.g., "source is untrustworthy") 
-dissociates from message content over time → initially discounted 
-message becomes MORE persuasive later.
+The sleeper effect: discounting cues (e.g., "this source is unreliable") 
+dissociate from message content over time. People become MORE persuaded 
+by messages from discredited sources as time passes.
 
 Agent threat model:
-- Agent gets flagged (discounting cue)
-- Agent reboots / changes context
-- Flag dissociates from identity
-- Verifiers trust the agent again despite the flag
+- Agent flagged as compromised at t=0
+- Agent reboots/rotates identity at t=1  
+- By t=n, other agents remember the behavior pattern but forget the flag
+- The compromised agent regains trust through sleeper effect
 
-Fix: cryptographic binding (Merkle inclusion) prevents dissociation.
-
-This detector monitors for dissociation risk across trust events.
+Fix: Bind discounting cues to identity hashes in the isnad chain.
+The flag travels with the cert, not the session.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import hashlib
 import json
 
 
-@dataclass 
-class TrustEvent:
-    """An event in an agent's trust lifecycle."""
-    agent_id: str
-    event_type: str  # "flag", "attestation", "reboot", "cert_update", "verification"
-    timestamp: datetime
-    content_hash: str  # hash of the event content
-    binding: str = "none"  # "merkle" | "gossip" | "self_reported" | "none"
+@dataclass
+class DiscountingCue:
+    """A flag/warning attached to an agent identity."""
+    cue_type: str          # "compromised", "unreliable", "flagged", "suspended"
+    issued_at: datetime
+    issuer_id: str
+    reason: str
+    identity_hash: Optional[str] = None  # Bound to identity, not session
+    ttl_hours: float = 720  # 30 days default
     
     @property
-    def age_hours(self) -> float:
-        return (datetime.now(timezone.utc) - self.timestamp).total_seconds() / 3600
+    def is_bound(self) -> bool:
+        """Is this cue bound to identity hash (persistent) or session (volatile)?"""
+        return self.identity_hash is not None
+    
+    def decay_factor(self, at_time: datetime) -> float:
+        """
+        Kumkale 2004: source credibility decays ~50% faster than message content.
+        Unbound cues decay exponentially. Bound cues decay at message rate.
+        """
+        elapsed_hours = (at_time - self.issued_at).total_seconds() / 3600
+        
+        if self.is_bound:
+            # Bound to identity: decays at message rate (slower)
+            # Half-life = ttl_hours
+            half_life = self.ttl_hours
+        else:
+            # Unbound (session): decays at source-credibility rate (faster)
+            # Kumkale 2004: ~2x faster decay for source vs message
+            half_life = self.ttl_hours / 2
+        
+        import math
+        return math.exp(-0.693 * elapsed_hours / half_life)
 
 
 @dataclass
-class DissociationRisk:
-    """Kumkale 2004: dissociation likelihood based on time + binding."""
+class AgentTrustRecord:
+    agent_id: str
+    identity_hash: str
+    trust_score: float = 0.5
+    cues: list[DiscountingCue] = field(default_factory=list)
+    behavior_observations: list[dict] = field(default_factory=list)
     
-    @staticmethod
-    def score(flag_event: TrustEvent, current_time: datetime) -> dict:
+    def effective_trust(self, at_time: datetime) -> dict:
         """
-        Score dissociation risk for a flag event.
+        Calculate trust accounting for sleeper effect.
         
-        Kumkale 2004 key findings:
-        - Strong initial impact + discounting cue after message → highest sleeper effect
-        - Dissociation increases with time
-        - Higher ability/motivation to process → stronger sleeper effect
-        
-        Agent mapping:
-        - Time since flag → dissociation risk increases
-        - Binding type → prevents or enables dissociation
-        - Reboots between flag and now → context loss = forced dissociation
+        Without sleeper detection: trust recovers as cue decays
+        With sleeper detection: trust stays discounted while bound cue persists
         """
-        hours_since = (current_time - flag_event.timestamp).total_seconds() / 3600
+        base_trust = self.trust_score
         
-        # Time-based dissociation (Hovland's differential decay)
-        # Flag memory decays faster than content memory
-        if hours_since < 1:
-            time_risk = 0.1  # Recent — flag still salient
-        elif hours_since < 6:
-            time_risk = 0.3  # Short-term — starting to dissociate
-        elif hours_since < 24:
-            time_risk = 0.6  # Medium — significant dissociation risk
-        elif hours_since < 72:
-            time_risk = 0.8  # Days — high risk
+        # Behavior-based trust (observed, not advisory - Watson & Morgan 2025)
+        if self.behavior_observations:
+            good = sum(1 for o in self.behavior_observations if o.get("positive"))
+            total = len(self.behavior_observations)
+            behavior_trust = good / total if total > 0 else 0.5
         else:
-            time_risk = 0.95  # Weeks — near-certain dissociation
+            behavior_trust = 0.5
         
-        # Binding prevents dissociation
-        binding_protection = {
-            "merkle": 0.95,       # Cryptographic — near-impossible to dissociate
-            "gossip": 0.60,       # Distributed but not cryptographic
-            "self_reported": 0.10, # Trivially dissociable
-            "none": 0.0,          # No binding — maximum risk
-        }
+        # Apply active discounting cues
+        naive_discount = 1.0   # Without sleeper detection
+        bound_discount = 1.0   # With sleeper detection
         
-        protection = binding_protection.get(flag_event.binding, 0.0)
+        active_cues = []
+        sleeper_risks = []
         
-        # Net risk = time risk * (1 - protection)
-        net_risk = time_risk * (1 - protection)
+        for cue in self.cues:
+            decay = cue.decay_factor(at_time)
+            
+            if cue.is_bound:
+                # Bound cue: applies full discount adjusted by decay
+                bound_discount *= (1.0 - 0.5 * decay)  # Max 50% discount per cue
+                naive_discount *= (1.0 - 0.5 * decay)
+                if decay > 0.01:
+                    active_cues.append({
+                        "type": cue.cue_type,
+                        "decay": round(decay, 3),
+                        "bound": True
+                    })
+            else:
+                # Unbound cue: decays 2x faster (sleeper effect!)
+                naive_discount *= (1.0 - 0.5 * decay)
+                # But the ACTUAL risk hasn't changed
+                actual_decay = cue.decay_factor(at_time)  # Already 2x faster
+                real_decay_factor = decay  # This is already the fast decay
+                
+                # Sleeper risk = gap between perceived trust and actual risk
+                import math
+                slow_decay = math.exp(-0.693 * (at_time - cue.issued_at).total_seconds() / 3600 / cue.ttl_hours)
+                fast_decay = decay
+                
+                if slow_decay - fast_decay > 0.1:
+                    sleeper_risks.append({
+                        "type": cue.cue_type,
+                        "perceived_discount": round(fast_decay, 3),
+                        "actual_risk": round(slow_decay, 3),
+                        "sleeper_gap": round(slow_decay - fast_decay, 3)
+                    })
+                
+                bound_discount *= (1.0 - 0.5 * slow_decay)  # Use slow decay
         
-        # Grade
-        if net_risk < 0.1:
-            grade = "A"  # Flag bound — dissociation blocked
-        elif net_risk < 0.3:
-            grade = "B"  # Low risk
-        elif net_risk < 0.5:
-            grade = "C"  # Moderate — investigate
-        elif net_risk < 0.7:
-            grade = "D"  # High — flag may have dissociated
-        else:
-            grade = "F"  # Critical — sleeper effect likely active
+        naive_trust = min(behavior_trust * naive_discount, 1.0)
+        corrected_trust = min(behavior_trust * bound_discount, 1.0)
+        
+        sleeper_detected = len(sleeper_risks) > 0
         
         return {
-            "agent_id": flag_event.agent_id,
-            "hours_since_flag": round(hours_since, 1),
-            "time_risk": round(time_risk, 2),
-            "binding": flag_event.binding,
-            "binding_protection": round(protection, 2),
-            "net_dissociation_risk": round(net_risk, 3),
-            "grade": grade,
-            "sleeper_effect_active": net_risk > 0.5,
+            "agent_id": self.agent_id,
+            "naive_trust": round(naive_trust, 3),
+            "corrected_trust": round(corrected_trust, 3),
+            "sleeper_detected": sleeper_detected,
+            "sleeper_risks": sleeper_risks,
+            "active_cues": active_cues,
+            "grade": self._grade(corrected_trust, sleeper_detected)
         }
-
-
-def detect_reboot_dissociation(events: list[TrustEvent]) -> list[dict]:
-    """
-    Detect forced dissociation through reboots.
     
-    Agent reboot = context window reset = all in-memory flags lost.
-    Only persisted bindings survive.
-    """
-    flags = [e for e in events if e.event_type == "flag"]
-    reboots = [e for e in events if e.event_type == "reboot"]
-    verifications = [e for e in events if e.event_type == "verification"]
-    
-    alerts = []
-    for flag in flags:
-        # Check if reboot happened after flag
-        post_flag_reboots = [r for r in reboots if r.timestamp > flag.timestamp]
-        
-        if post_flag_reboots and flag.binding not in ("merkle",):
-            # Flag likely lost through reboot
-            post_reboot_verifications = [
-                v for v in verifications 
-                if v.timestamp > post_flag_reboots[-1].timestamp
-                and v.agent_id == flag.agent_id
-            ]
-            
-            if post_reboot_verifications:
-                alerts.append({
-                    "type": "REBOOT_DISSOCIATION",
-                    "agent_id": flag.agent_id,
-                    "flag_time": flag.timestamp.isoformat(),
-                    "reboot_time": post_flag_reboots[-1].timestamp.isoformat(),
-                    "binding": flag.binding,
-                    "verified_post_reboot": len(post_reboot_verifications),
-                    "severity": "CRITICAL" if flag.binding == "none" else "WARNING",
-                    "recommendation": "Rebind flag via Merkle inclusion"
-                })
-    
-    return alerts
+    def _grade(self, trust: float, sleeper: bool) -> str:
+        if sleeper:
+            return "⚠️ SLEEPER"  # Always warn
+        if trust >= 0.7: return "A"
+        if trust >= 0.5: return "B"
+        if trust >= 0.3: return "C"
+        if trust >= 0.15: return "D"
+        return "F"
 
 
 def demo():
-    """Demo with agent trust scenarios."""
-    
-    now = datetime.now(timezone.utc)
-    
     print("=" * 60)
     print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracín (2004) + Hovland (1949)")
+    print("Kumkale & Albarracín (Psych Bull 2004, k=72)")
     print("=" * 60)
     
-    # Scenario 1: Merkle-bound flag (protected)
-    print("\n--- Scenario 1: Merkle-bound flag (72h old) ---")
-    flag1 = TrustEvent("agent_alpha", "flag", now - timedelta(hours=72), 
-                       "abc123", binding="merkle")
-    result = DissociationRisk.score(flag1, now)
-    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
-    print(f"Time risk: {result['time_risk']} × (1 - {result['binding_protection']}) = {result['net_dissociation_risk']}")
-    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
+    now = datetime(2026, 3, 13, 12, 0, tzinfo=timezone.utc)
     
-    # Scenario 2: Gossip-only flag (partial protection)
-    print("\n--- Scenario 2: Gossip-only flag (24h old) ---")
-    flag2 = TrustEvent("agent_beta", "flag", now - timedelta(hours=24),
-                       "def456", binding="gossip")
-    result = DissociationRisk.score(flag2, now)
-    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
-    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
-    
-    # Scenario 3: Self-reported flag (minimal protection)
-    print("\n--- Scenario 3: Self-reported flag (6h old) ---")
-    flag3 = TrustEvent("agent_gamma", "flag", now - timedelta(hours=6),
-                       "ghi789", binding="self_reported")
-    result = DissociationRisk.score(flag3, now)
-    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
-    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
-    
-    # Scenario 4: Unbound flag (maximum risk)
-    print("\n--- Scenario 4: Unbound flag (48h old) ---")
-    flag4 = TrustEvent("agent_delta", "flag", now - timedelta(hours=48),
-                       "jkl012", binding="none")
-    result = DissociationRisk.score(flag4, now)
-    print(f"Grade: {result['grade']} | Risk: {result['net_dissociation_risk']}")
-    print(f"Sleeper effect active: {result['sleeper_effect_active']}")
-    
-    # Scenario 5: Reboot dissociation detection
-    print("\n--- Scenario 5: Reboot dissociation ---")
-    events = [
-        TrustEvent("agent_epsilon", "flag", now - timedelta(hours=12), "flag_hash", binding="gossip"),
-        TrustEvent("agent_epsilon", "reboot", now - timedelta(hours=6), "reboot_hash"),
-        TrustEvent("agent_epsilon", "verification", now - timedelta(hours=1), "verify_hash"),
+    scenarios = [
+        {
+            "name": "1. Bound flag (identity-linked) — 3 days old",
+            "agent": AgentTrustRecord(
+                agent_id="agent_alpha",
+                identity_hash="abc123",
+                trust_score=0.8,
+                cues=[DiscountingCue(
+                    "compromised", now - timedelta(days=3),
+                    "monitor_1", "split-view detected",
+                    identity_hash="abc123", ttl_hours=720
+                )],
+                behavior_observations=[
+                    {"positive": True}, {"positive": True}, 
+                    {"positive": True}, {"positive": False}
+                ]
+            )
+        },
+        {
+            "name": "2. Unbound flag (session-only) — 3 days old — SLEEPER RISK",
+            "agent": AgentTrustRecord(
+                agent_id="agent_beta",
+                identity_hash="def456",
+                trust_score=0.8,
+                cues=[DiscountingCue(
+                    "compromised", now - timedelta(days=3),
+                    "monitor_1", "split-view detected",
+                    identity_hash=None, ttl_hours=720  # NOT bound!
+                )],
+                behavior_observations=[
+                    {"positive": True}, {"positive": True}, 
+                    {"positive": True}, {"positive": False}
+                ]
+            )
+        },
+        {
+            "name": "3. Rebooted agent — flag lost entirely",
+            "agent": AgentTrustRecord(
+                agent_id="agent_gamma_v2",  # New session
+                identity_hash="ghi789",
+                trust_score=0.5,  # Fresh
+                cues=[],  # Flag was session-bound, gone after reboot
+                behavior_observations=[
+                    {"positive": True}, {"positive": True}
+                ]
+            )
+        },
+        {
+            "name": "4. Multiple cues, mixed binding — 7 days old",
+            "agent": AgentTrustRecord(
+                agent_id="agent_delta",
+                identity_hash="jkl012",
+                trust_score=0.7,
+                cues=[
+                    DiscountingCue(
+                        "unreliable", now - timedelta(days=7),
+                        "skillfence", "failed audit",
+                        identity_hash="jkl012", ttl_hours=720
+                    ),
+                    DiscountingCue(
+                        "flagged", now - timedelta(days=7),
+                        "gossip", "inconsistent beacons",
+                        identity_hash=None, ttl_hours=720  # Session-bound
+                    ),
+                ],
+                behavior_observations=[
+                    {"positive": True}, {"positive": True},
+                    {"positive": True}, {"positive": True}, {"positive": False}
+                ]
+            )
+        },
+        {
+            "name": "5. Old bound flag — 25 days — mostly decayed",
+            "agent": AgentTrustRecord(
+                agent_id="agent_epsilon",
+                identity_hash="mno345",
+                trust_score=0.9,
+                cues=[DiscountingCue(
+                    "suspended", now - timedelta(days=25),
+                    "platform", "temporary suspension",
+                    identity_hash="mno345", ttl_hours=720
+                )],
+                behavior_observations=[
+                    {"positive": True} for _ in range(10)
+                ]
+            )
+        },
     ]
-    alerts = detect_reboot_dissociation(events)
-    for alert in alerts:
-        print(f"  ALERT: {alert['type']} | Severity: {alert['severity']}")
-        print(f"  Agent: {alert['agent_id']} | Binding: {alert['binding']}")
-        print(f"  Verified {alert['verified_post_reboot']}x after reboot")
-        print(f"  → {alert['recommendation']}")
     
-    # Scenario 6: Merkle-bound survives reboot
-    print("\n--- Scenario 6: Merkle-bound flag survives reboot ---")
-    events2 = [
-        TrustEvent("agent_zeta", "flag", now - timedelta(hours=12), "flag_hash", binding="merkle"),
-        TrustEvent("agent_zeta", "reboot", now - timedelta(hours=6), "reboot_hash"),
-        TrustEvent("agent_zeta", "verification", now - timedelta(hours=1), "verify_hash"),
-    ]
-    alerts2 = detect_reboot_dissociation(events2)
-    if not alerts2:
-        print("  ✓ No alerts — Merkle binding survives reboot")
+    for scenario in scenarios:
+        print(f"\n{'─' * 60}")
+        print(f"Scenario: {scenario['name']}")
+        result = scenario["agent"].effective_trust(now)
+        print(f"  Naive trust:     {result['naive_trust']}")
+        print(f"  Corrected trust: {result['corrected_trust']}")
+        print(f"  Grade:           {result['grade']}")
+        if result['sleeper_risks']:
+            for risk in result['sleeper_risks']:
+                print(f"  ⚠️ SLEEPER: {risk['type']} — perceived discount {risk['perceived_discount']}, actual risk {risk['actual_risk']}, gap {risk['sleeper_gap']}")
+        if result['active_cues']:
+            for cue in result['active_cues']:
+                print(f"  Active cue: {cue['type']} (decay={cue['decay']}, bound={cue['bound']})")
     
-    # Summary
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT (Kumkale & Albarracín 2004 meta-analysis):")
-    print("  Sleeper effect requires:")
-    print("    1. Strong initial message impact")
-    print("    2. Discounting cue presented AFTER message")
-    print("    3. High processing motivation")
-    print("    4. Time for dissociation to occur")
-    print("")
-    print("  Agent fix: Merkle inclusion binds flag to identity.")
-    print("  Dissociation = cryptographically impossible.")
-    print("  Gossip = partial (survives reboot? depends on peers).")
-    print("  Self-reported = useless (agent controls own flags).")
+    print("KEY INSIGHT (Kumkale & Albarracín 2004):")
+    print("  Source credibility decays ~2x faster than message content.")
+    print("  Agent: 'compromised' flag forgotten before behavior pattern.")
+    print("  Fix: Bind flags to identity hash in isnad chain.")
+    print("  The flag travels with the cert, not the session.")
+    print("  Scenario 2 vs 1: same flag, different binding, different risk.")
     print(f"{'=' * 60}")
 
 
