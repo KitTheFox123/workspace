@@ -2,229 +2,243 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracin (2004) meta-analysis (k=72 studies).
+Based on Kumkale & Albarracín (2004) meta-analysis (Psychological Bulletin).
 
-The sleeper effect: a discounting cue (e.g., "this source is unreliable")
-fades faster than the message itself. Over time, the persuasive message
-regains influence because the discounting cue is forgotten.
+The sleeper effect: discounting cues (e.g., "this source is unreliable")
+dissociate from messages over time, causing persuasion to INCREASE.
 
-Agent parallel: A revocation flag or trust warning dissociates from the
-agent identity across context windows. The flagged agent regains trust
-not because it earned it, but because the flag was forgotten.
+Agent vulnerability: reboots force cue dissociation.
+- Agent flagged as compromised at t=0
+- Agent reboots at t=1, flag stored in session memory (lost)
+- At t=2, other agents see the message ("I'm trustworthy") without the cue
+- Trust increases AFTER the flag should have prevented it
 
-Fix: Bind flags to cert hashes in append-only logs. No dissociation possible.
+Fix: bind discounting cues to identity chains, not session state.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-import math
+import json
 
 
 @dataclass
-class TrustFlag:
-    """A discounting cue attached to an agent identity."""
+class DiscountingCue:
+    """A flag/warning associated with an agent's identity"""
     agent_id: str
-    flag_type: str  # "revocation", "warning", "suspicious", "compromised"
-    reason: str
+    cue_type: str  # "compromised_key", "failed_audit", "equivocation", "suspension"
     created_at: datetime
-    cert_hash: Optional[str] = None  # If bound to cert, immune to sleeper effect
-    in_append_log: bool = False      # If in append-only log, persistent
+    severity: float  # 0-1
+    stored_in: str  # "session" | "chain" | "both"
     
-    @property
-    def is_bound(self) -> bool:
-        """Flag bound to cert hash = no dissociation possible."""
-        return self.cert_hash is not None and self.in_append_log
+    def survives_reboot(self) -> bool:
+        return self.stored_in in ("chain", "both")
+    
+    def dissociation_risk(self, hours_elapsed: float) -> float:
+        """
+        Kumkale 2004: dissociation increases with delay.
+        Session-stored cues dissociate immediately on reboot.
+        Chain-stored cues persist but may be ignored.
+        """
+        if self.stored_in == "session":
+            # Reboot at any point = total dissociation
+            return 1.0 if hours_elapsed > 0 else 0.0
+        elif self.stored_in == "chain":
+            # Chain cues persist but receivers may not check
+            # Decay follows ~log curve (Kumkale Fig 2)
+            import math
+            return min(0.3 * math.log1p(hours_elapsed / 24), 0.8)
+        else:  # both
+            return min(0.1 * (hours_elapsed / 24) ** 0.5, 0.5)
 
 
-@dataclass 
+@dataclass
 class AgentTrustState:
-    """Agent's trust state with sleeper effect modeling."""
     agent_id: str
-    base_trust: float = 0.5
-    flags: list[TrustFlag] = field(default_factory=list)
-    context_resets: int = 0  # Number of context window resets
+    current_trust: float = 0.5
+    cues: list[DiscountingCue] = field(default_factory=list)
+    reboots: int = 0
+    last_reboot: Optional[datetime] = None
     
-    def effective_trust(self, current_time: datetime) -> dict:
-        """
-        Calculate trust accounting for sleeper effect.
+    def effective_trust(self, now: datetime) -> dict:
+        """Calculate trust accounting for sleeper effect risk."""
         
-        Kumkale & Albarracin 2004 key findings:
-        - Discounting cue decays with f(time) = e^(-λt)
-        - Message content decays slower: g(time) = e^(-μt) where μ < λ
-        - Sleeper effect = gap between message retention and cue retention
-        - Strongest when: strong arguments + strong discounting cue + delay
-        """
+        naive_trust = self.current_trust
         
-        if not self.flags:
-            return {
-                "trust": self.base_trust,
-                "sleeper_risk": 0.0,
-                "flags_effective": 0,
-                "flags_total": 0,
-                "grade": self._grade(self.base_trust, 0.0)
-            }
+        active_cues = []
+        dissociated_cues = []
         
-        total_discount = 0.0
-        effective_flags = 0
-        sleeper_risks = []
-        
-        for flag in self.flags:
-            age_hours = (current_time - flag.created_at).total_seconds() / 3600
+        for cue in self.cues:
+            hours = (now - cue.created_at).total_seconds() / 3600
+            risk = cue.dissociation_risk(hours)
             
-            if flag.is_bound:
-                # Bound to cert hash in append-only log = no decay
-                decay = 1.0
-                sleeper_risk = 0.0
+            if risk > 0.5:
+                dissociated_cues.append({
+                    "type": cue.cue_type,
+                    "risk": round(risk, 3),
+                    "stored_in": cue.stored_in,
+                    "hours_ago": round(hours, 1),
+                    "survives_reboot": cue.survives_reboot()
+                })
             else:
-                # Unbound flag decays per Kumkale & Albarracin
-                # λ = 0.1/hr for unbound flags (fast decay)
-                # Additional decay per context reset
-                lambda_cue = 0.1
-                resets_factor = 1.0 + 0.5 * self.context_resets
-                decay = math.exp(-lambda_cue * age_hours * resets_factor)
-                
-                # Sleeper risk = probability flag has dissociated
-                sleeper_risk = 1.0 - decay
-            
-            # Flag severity
-            severity = {
-                "compromised": 1.0,
-                "revocation": 0.8,
-                "suspicious": 0.5,
-                "warning": 0.3,
-            }.get(flag.flag_type, 0.3)
-            
-            effective_discount = severity * decay
-            total_discount += effective_discount
-            sleeper_risks.append(sleeper_risk)
-            
-            if decay > 0.1:
-                effective_flags += 1
+                active_cues.append({
+                    "type": cue.cue_type,
+                    "discount": round(cue.severity * (1 - risk), 3),
+                    "stored_in": cue.stored_in
+                })
         
-        # Trust = base - effective discounts
-        trust = max(0.0, min(1.0, self.base_trust - total_discount))
-        avg_sleeper = sum(sleeper_risks) / len(sleeper_risks) if sleeper_risks else 0.0
+        # Apply active cue discounts
+        total_discount = sum(c["discount"] for c in active_cues)
+        adjusted_trust = naive_trust * max(0, 1 - total_discount)
+        
+        # Sleeper effect warning
+        sleeper_risk = len(dissociated_cues) / max(len(self.cues), 1) if self.cues else 0
+        
+        # Reboot amplification
+        if self.reboots > 0 and any(not c.survives_reboot() for c in self.cues):
+            reboot_amnesia = sum(1 for c in self.cues if not c.survives_reboot())
+            sleeper_risk = min(sleeper_risk + 0.2 * reboot_amnesia, 1.0)
+        
+        # Grade
+        if sleeper_risk > 0.7:
+            grade = "F"
+            status = "SLEEPER_ACTIVE"
+        elif sleeper_risk > 0.4:
+            grade = "D"
+            status = "SLEEPER_RISK"
+        elif sleeper_risk > 0.1:
+            grade = "C"
+            status = "MONITORING"
+        elif len(active_cues) > 0:
+            grade = "B"
+            status = "CUES_ACTIVE"
+        else:
+            grade = "A"
+            status = "CLEAN"
         
         return {
-            "trust": round(trust, 3),
-            "sleeper_risk": round(avg_sleeper, 3),
-            "flags_effective": effective_flags,
-            "flags_total": len(self.flags),
-            "grade": self._grade(trust, avg_sleeper)
+            "agent_id": self.agent_id,
+            "naive_trust": round(naive_trust, 3),
+            "adjusted_trust": round(adjusted_trust, 3),
+            "sleeper_risk": round(sleeper_risk, 3),
+            "grade": grade,
+            "status": status,
+            "active_cues": active_cues,
+            "dissociated_cues": dissociated_cues,
+            "reboots": self.reboots,
+            "recommendation": self._recommend(status, dissociated_cues)
         }
     
-    def _grade(self, trust: float, sleeper_risk: float) -> str:
-        if sleeper_risk > 0.7:
-            return "F"  # High sleeper risk = trust score unreliable
-        if sleeper_risk > 0.4:
-            return "D"  # Moderate sleeper risk
-        if trust < 0.2:
-            return "C"  # Low trust but flags working
-        if trust < 0.5:
-            return "B"  # Flagged, discounted appropriately
-        return "A"      # Clean or well-monitored
+    def _recommend(self, status: str, dissociated: list) -> str:
+        if status == "SLEEPER_ACTIVE":
+            session_cues = [c for c in dissociated if c["stored_in"] == "session"]
+            if session_cues:
+                return "CRITICAL: Session-stored cues lost after reboot. Migrate to chain storage."
+            return "WARNING: Cues dissociating over time. Re-verify or re-flag."
+        elif status == "SLEEPER_RISK":
+            return "Monitor: cues weakening. Consider refreshing attestations."
+        elif status == "CUES_ACTIVE":
+            return "Healthy: discounting cues bound and active."
+        return "Clean: no active concerns."
 
 
 def demo():
-    """Demonstrate sleeper effect in agent trust scenarios."""
-    
     print("=" * 60)
     print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracin 2004 (k=72, Psych Bull)")
+    print("Kumkale & Albarracín (2004, Psychological Bulletin)")
     print("=" * 60)
     
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 3, 13, 9, 0, tzinfo=timezone.utc)
     
     scenarios = [
         {
-            "name": "1. Fresh flag, bound to cert (IMMUNE)",
-            "state": AgentTrustState(
+            "name": "1. Session-stored flag + reboot (VULNERABLE)",
+            "agent": AgentTrustState(
                 agent_id="agent_alpha",
-                base_trust=0.7,
-                flags=[TrustFlag(
-                    "agent_alpha", "suspicious", "anomalous heartbeat pattern",
-                    now - timedelta(hours=1),
-                    cert_hash="abc123", in_append_log=True
-                )],
-                context_resets=0
+                current_trust=0.7,
+                reboots=1,
+                last_reboot=now - timedelta(hours=2),
+                cues=[
+                    DiscountingCue("agent_alpha", "compromised_key", 
+                                   now - timedelta(hours=6), 0.8, "session"),
+                    DiscountingCue("agent_alpha", "failed_audit",
+                                   now - timedelta(hours=4), 0.6, "session"),
+                ]
             )
         },
         {
-            "name": "2. Fresh flag, NOT bound (VULNERABLE)",
-            "state": AgentTrustState(
+            "name": "2. Chain-stored flags (RESILIENT)",
+            "agent": AgentTrustState(
                 agent_id="agent_beta",
-                base_trust=0.7,
-                flags=[TrustFlag(
-                    "agent_beta", "suspicious", "anomalous heartbeat pattern",
-                    now - timedelta(hours=1),
-                    cert_hash=None, in_append_log=False
-                )],
-                context_resets=0
+                current_trust=0.7,
+                reboots=3,
+                cues=[
+                    DiscountingCue("agent_beta", "compromised_key",
+                                   now - timedelta(hours=6), 0.8, "chain"),
+                    DiscountingCue("agent_beta", "equivocation",
+                                   now - timedelta(hours=2), 0.7, "chain"),
+                ]
             )
         },
         {
-            "name": "3. Old flag, unbound, 3 context resets (SLEEPER)",
-            "state": AgentTrustState(
+            "name": "3. Mixed storage (PARTIAL RISK)",
+            "agent": AgentTrustState(
                 agent_id="agent_gamma",
-                base_trust=0.7,
-                flags=[TrustFlag(
-                    "agent_gamma", "compromised", "key material leaked",
-                    now - timedelta(hours=24),
-                    cert_hash=None, in_append_log=False
-                )],
-                context_resets=3
+                current_trust=0.6,
+                reboots=1,
+                cues=[
+                    DiscountingCue("agent_gamma", "suspension",
+                                   now - timedelta(hours=24), 0.9, "chain"),
+                    DiscountingCue("agent_gamma", "failed_audit",
+                                   now - timedelta(hours=1), 0.5, "session"),
+                ]
             )
         },
         {
-            "name": "4. Old flag, BOUND, 3 context resets (SAFE)",
-            "state": AgentTrustState(
+            "name": "4. Stale chain cue (TIME DECAY)",
+            "agent": AgentTrustState(
                 agent_id="agent_delta",
-                base_trust=0.7,
-                flags=[TrustFlag(
-                    "agent_delta", "compromised", "key material leaked",
-                    now - timedelta(hours=24),
-                    cert_hash="def456", in_append_log=True
-                )],
-                context_resets=3
+                current_trust=0.8,
+                reboots=0,
+                cues=[
+                    DiscountingCue("agent_delta", "compromised_key",
+                                   now - timedelta(days=30), 0.9, "chain"),
+                ]
             )
         },
         {
-            "name": "5. Revoked agent, reboot, flag lost (REAL ATTACK)",
-            "state": AgentTrustState(
-                agent_id="agent_evil",
-                base_trust=0.8,
-                flags=[TrustFlag(
-                    "agent_evil", "revocation", "cert revoked by attestor pool",
-                    now - timedelta(hours=48),
-                    cert_hash=None, in_append_log=False
-                )],
-                context_resets=5  # Many reboots to wash the flag
+            "name": "5. Clean agent (NO CUES)",
+            "agent": AgentTrustState(
+                agent_id="agent_epsilon",
+                current_trust=0.9,
+                reboots=5,
+                cues=[]
             )
         },
     ]
     
-    for scenario in scenarios:
-        state = scenario["state"]
-        result = state.effective_trust(now)
+    for s in scenarios:
         print(f"\n{'─' * 60}")
-        print(f"Scenario: {scenario['name']}")
-        print(f"Base trust: {state.base_trust}")
-        print(f"Context resets: {state.context_resets}")
-        for f in state.flags:
-            bound = "BOUND" if f.is_bound else "UNBOUND"
-            age = (now - f.created_at).total_seconds() / 3600
-            print(f"  Flag: {f.flag_type} ({bound}, {age:.0f}h old)")
-        print(f"Result: trust={result['trust']}, sleeper_risk={result['sleeper_risk']}")
-        print(f"Grade: {result['grade']} ({result['flags_effective']}/{result['flags_total']} flags effective)")
+        print(f"Scenario: {s['name']}")
+        result = s["agent"].effective_trust(now)
+        print(f"  Naive trust: {result['naive_trust']}")
+        print(f"  Adjusted trust: {result['adjusted_trust']}")
+        print(f"  Sleeper risk: {result['sleeper_risk']}")
+        print(f"  Grade: {result['grade']} ({result['status']})")
+        print(f"  Reboots: {result['reboots']}")
+        if result['active_cues']:
+            print(f"  Active cues: {json.dumps(result['active_cues'], indent=4)}")
+        if result['dissociated_cues']:
+            print(f"  ⚠️ Dissociated: {json.dumps(result['dissociated_cues'], indent=4)}")
+        print(f"  → {result['recommendation']}")
     
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT (Kumkale & Albarracin 2004):")
-    print("  Discounting cues decay FASTER than message content.")
-    print("  Agent: revocation flag forgotten before identity rebuilt.")
-    print("  Context resets accelerate cue decay (forced forgetting).")
-    print("  FIX: Hash-chain flags TO cert hashes in append-only log.")
-    print("  Bound flags = zero sleeper risk. Unbound = inevitable decay.")
+    print("KEY INSIGHT (Kumkale & Albarracín 2004):")
+    print("  Discounting cues dissociate from messages over time.")
+    print("  Agent reboots FORCE dissociation (session amnesia).")
+    print("  Chain-stored cues persist but still decay (~log curve).")
+    print("  Fix: isnad chain = persistent discounting cue binding.")
+    print("  Periodic re-attestation refreshes the cue-message bond.")
     print(f"{'=' * 60}")
 
 
