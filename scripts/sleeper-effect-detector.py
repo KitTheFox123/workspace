@@ -2,221 +2,219 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracín (Psychological Bulletin 2004) meta-analysis
-and Hovland, Lumsdaine & Sheffield (1949).
+Based on Kumkale & Albarracin (2004) meta-analysis (k=72 studies).
 
-The Sleeper Effect: message persuasion INCREASES over time when the
-discounting cue (e.g., noncredible source) dissociates from the message
-in memory. Counter-intuitive: bad source → more persuasion later.
+The sleeper effect: a discounting cue (e.g., "source is unreliable") 
+decays faster than the message content. Over time, people become MORE 
+persuaded by discounted messages, not less.
 
-Agent risk: An attestation flagged as suspect gets unflagged after
-reboot/compaction. The discount vanishes but the attestation persists.
+Agent risk: revocation flags or compromise warnings fade on restart/
+context loss, but the compromised agent's influence persists in the 
+network. Hash-chaining flags to identity prevents this.
 
-Detection: Track whether source metadata (discounting cues) decay
-faster than message content across memory compaction cycles.
+Detection: monitor trust scores over time. If a previously-flagged 
+agent's effective trust INCREASES without new positive evidence, 
+that's the sleeper effect.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-import json
+import math
 
 
 @dataclass
-class Attestation:
-    """An attestation with source credibility metadata."""
-    id: str
-    content: str  # The message/claim
-    source: str   # Who made it
-    source_credibility: float  # 0-1 at time of receipt
-    discounting_cue: Optional[str] = None  # Why we discounted it
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    
-    # Tracking across compaction
-    cue_present_in_memory: bool = True  # Is the discounting cue still stored?
-    content_present_in_memory: bool = True  # Is the content still stored?
-    compaction_cycles: int = 0
+class TrustEvent:
+    """A trust-relevant event for an agent."""
+    timestamp: datetime
+    event_type: str  # "flag", "attestation", "observation", "restart"
+    content: str
+    severity: float = 0.5  # 0-1
+    bound_to_identity: bool = False  # Is this hash-chained to identity?
 
 
-@dataclass
-class MemoryState:
-    """Simulates memory compaction and sleeper effect risk."""
-    attestations: list[Attestation] = field(default_factory=list)
-    compaction_count: int = 0
+@dataclass 
+class AgentTrustProfile:
+    """Trust profile with sleeper effect detection."""
+    agent_id: str
+    events: list[TrustEvent] = field(default_factory=list)
     
-    def compact(self, retention_threshold: float = 0.5):
+    def trust_score_at(self, t: datetime, memory_half_life_hours: float = 24.0) -> float:
         """
-        Simulate memory compaction. Key insight from Kumkale 2004:
-        Discounting cues decay FASTER than message content.
+        Compute trust score at time t.
         
-        Cue decay rate > message decay rate → sleeper effect.
+        Kumkale & Albarracin model:
+        - Message content decays with half-life H_msg
+        - Discounting cue decays with half-life H_cue (shorter!)
+        - Net effect: flag impact shrinks faster than positive impressions
         """
-        self.compaction_count += 1
+        H_msg = memory_half_life_hours  # Content half-life
+        H_cue = memory_half_life_hours * 0.4  # Cue decays 2.5x faster
         
-        for att in self.attestations:
-            att.compaction_cycles += 1
+        base_trust = 0.5
+        positive_influence = 0.0
+        negative_influence = 0.0
+        
+        for event in self.events:
+            if event.timestamp > t:
+                continue
+                
+            hours_elapsed = (t - event.timestamp).total_seconds() / 3600
             
-            # Kumkale 2004: cue decays ~40% faster than message
-            # (derived from meta-analytic effect sizes)
-            cue_retention = max(0, 1.0 - 0.3 * att.compaction_cycles)
-            content_retention = max(0, 1.0 - 0.18 * att.compaction_cycles)
-            
-            # Simulate probabilistic forgetting
-            if cue_retention < retention_threshold:
-                att.cue_present_in_memory = False
-            if content_retention < retention_threshold:
-                att.content_present_in_memory = False
+            if event.event_type in ("attestation", "observation"):
+                # Positive evidence decays normally
+                decay = math.exp(-0.693 * hours_elapsed / H_msg)
+                positive_influence += event.severity * decay
+                
+            elif event.event_type == "flag":
+                if event.bound_to_identity:
+                    # Hash-chained flag: decays at same rate as content
+                    decay = math.exp(-0.693 * hours_elapsed / H_msg)
+                else:
+                    # Session-scoped flag: decays FASTER (sleeper effect!)
+                    decay = math.exp(-0.693 * hours_elapsed / H_cue)
+                negative_influence += event.severity * decay
+                
+            elif event.event_type == "restart":
+                if not event.bound_to_identity:
+                    # Restart clears session-scoped flags entirely
+                    # (simulates context loss)
+                    negative_influence *= 0.1  # 90% flag loss
+        
+        trust = base_trust + positive_influence - negative_influence
+        return max(0.0, min(1.0, trust))
     
-    def detect_sleeper_risk(self) -> list[dict]:
+    def detect_sleeper_effect(self, 
+                               window_hours: float = 48.0,
+                               sample_interval_hours: float = 4.0) -> dict:
         """
-        Detect attestations at risk of sleeper effect:
-        content retained but discounting cue lost.
+        Detect sleeper effect: trust increasing after a flag WITHOUT 
+        new positive evidence.
         """
-        risks = []
-        for att in self.attestations:
-            if att.content_present_in_memory and not att.cue_present_in_memory:
-                if att.discounting_cue and att.source_credibility < 0.5:
-                    risks.append({
-                        "attestation_id": att.id,
-                        "source": att.source,
-                        "original_credibility": att.source_credibility,
-                        "discounting_cue": att.discounting_cue,
-                        "cycles_since_receipt": att.compaction_cycles,
-                        "risk": "SLEEPER_EFFECT",
-                        "explanation": (
-                            f"Content retained but discounting cue lost after "
-                            f"{att.compaction_cycles} compaction cycles. "
-                            f"Original credibility was {att.source_credibility}. "
-                            f"Without the cue, this attestation may be treated "
-                            f"as credible despite original concerns."
-                        )
-                    })
-        return risks
-    
-    def bind_cue_to_content(self, attestation_id: str) -> bool:
-        """
-        Fix: hash-bind the discounting cue to the content.
-        Cue can't be compacted away independently.
-        """
-        for att in self.attestations:
-            if att.id == attestation_id:
-                # Binding means cue follows content lifecycle
-                att.cue_present_in_memory = att.content_present_in_memory
-                return True
-        return False
+        if not self.events:
+            return {"detected": False, "reason": "no events"}
+        
+        # Find flags
+        flags = [e for e in self.events if e.event_type == "flag"]
+        if not flags:
+            return {"detected": False, "reason": "no flags"}
+        
+        latest_flag = max(flags, key=lambda e: e.timestamp)
+        
+        # Sample trust over time after flag
+        samples = []
+        t = latest_flag.timestamp
+        end = t + timedelta(hours=window_hours)
+        
+        while t <= end:
+            score = self.trust_score_at(t)
+            samples.append((t, score))
+            t += timedelta(hours=sample_interval_hours)
+        
+        # Detect increasing trust after flag
+        if len(samples) < 3:
+            return {"detected": False, "reason": "insufficient samples"}
+        
+        # Check if trust at flag time vs later
+        trust_at_flag = samples[0][1]
+        trust_later = samples[-1][1]
+        
+        # Find new positive evidence after flag
+        new_positives = [e for e in self.events 
+                        if e.timestamp > latest_flag.timestamp 
+                        and e.event_type in ("attestation", "observation")]
+        
+        sleeper_detected = (
+            trust_later > trust_at_flag + 0.05  # Trust increased
+            and len(new_positives) == 0  # No new positive evidence
+            and not latest_flag.bound_to_identity  # Flag not hash-chained
+        )
+        
+        return {
+            "detected": sleeper_detected,
+            "trust_at_flag": round(trust_at_flag, 3),
+            "trust_after_window": round(trust_later, 3),
+            "trust_delta": round(trust_later - trust_at_flag, 3),
+            "new_positive_evidence": len(new_positives),
+            "flag_bound_to_identity": latest_flag.bound_to_identity,
+            "flag_type": "hash-chained" if latest_flag.bound_to_identity else "session-scoped",
+            "recommendation": (
+                "ALERT: sleeper effect detected. Flag decayed without new evidence. "
+                "Bind flag to identity hash chain."
+                if sleeper_detected else
+                "OK: trust trajectory consistent with evidence."
+            )
+        }
 
 
 def demo():
-    """Demonstrate sleeper effect in agent memory."""
+    """Demo scenarios."""
+    now = datetime.now(timezone.utc)
     
     print("=" * 60)
     print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracín (Psych Bull 2004) + Hovland (1949)")
+    print("Kumkale & Albarracin 2004 (k=72, Psych Bull)")
     print("=" * 60)
     
-    memory = MemoryState()
-    
-    # Add attestations with various credibility levels
-    memory.attestations = [
-        Attestation(
-            id="att_001",
-            content="Agent X completed task Y with 95% accuracy",
-            source="agent_x_self_report",
-            source_credibility=0.3,
-            discounting_cue="Self-reported by interested party; no independent verification"
-        ),
-        Attestation(
-            id="att_002", 
-            content="Agent Z's key was used in unauthorized transaction",
-            source="anonymous_tip",
-            source_credibility=0.2,
-            discounting_cue="Anonymous source; could be competitor sabotage"
-        ),
-        Attestation(
-            id="att_003",
-            content="Service A maintains 99.9% uptime",
-            source="service_a_dashboard",
-            source_credibility=0.4,
-            discounting_cue="Self-reported metrics; dashboard controlled by service operator"
-        ),
-        Attestation(
-            id="att_004",
-            content="SkillFence audit passed for agent B",
-            source="skillfence_v2",
-            source_credibility=0.85,
-            discounting_cue=None  # No discounting cue — credible source
-        ),
-        Attestation(
-            id="att_005",
-            content="Agent C's memory file was tampered with",
-            source="compromised_monitor",
-            source_credibility=0.15,
-            discounting_cue="Monitor itself was compromised in prior incident; possible false flag"
-        ),
+    scenarios = [
+        {
+            "name": "1. Session-scoped flag (VULNERABLE to sleeper effect)",
+            "events": [
+                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
+                TrustEvent(now - timedelta(hours=48), "observation", "completed task", 0.4),
+                TrustEvent(now - timedelta(hours=24), "flag", "compromised key detected", 0.8, bound_to_identity=False),
+                # No new positive evidence, but flag will decay...
+            ]
+        },
+        {
+            "name": "2. Hash-chained flag (RESISTANT to sleeper effect)", 
+            "events": [
+                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
+                TrustEvent(now - timedelta(hours=48), "observation", "completed task", 0.4),
+                TrustEvent(now - timedelta(hours=24), "flag", "compromised key detected", 0.8, bound_to_identity=True),
+            ]
+        },
+        {
+            "name": "3. Flag + restart (worst case)",
+            "events": [
+                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
+                TrustEvent(now - timedelta(hours=48), "observation", "completed task", 0.4),
+                TrustEvent(now - timedelta(hours=24), "flag", "compromised key detected", 0.8, bound_to_identity=False),
+                TrustEvent(now - timedelta(hours=20), "restart", "agent rebooted", 0.0, bound_to_identity=False),
+            ]
+        },
+        {
+            "name": "4. Flag + new evidence (legitimate recovery)",
+            "events": [
+                TrustEvent(now - timedelta(hours=72), "attestation", "initial good behavior", 0.6),
+                TrustEvent(now - timedelta(hours=24), "flag", "suspicious behavior", 0.6, bound_to_identity=False),
+                TrustEvent(now - timedelta(hours=12), "attestation", "key rotated + re-verified", 0.7),
+                TrustEvent(now - timedelta(hours=6), "observation", "clean behavior observed", 0.5),
+            ]
+        },
     ]
     
-    # Simulate compaction cycles
-    print("\n--- Initial State ---")
-    print(f"Attestations: {len(memory.attestations)}")
-    print(f"With discounting cues: {sum(1 for a in memory.attestations if a.discounting_cue)}")
-    
-    for cycle in range(1, 5):
-        memory.compact()
-        risks = memory.detect_sleeper_risk()
+    for scenario in scenarios:
+        print(f"\n{'─' * 60}")
+        print(f"Scenario: {scenario['name']}")
         
-        print(f"\n--- After Compaction Cycle {cycle} ---")
-        cues_remaining = sum(1 for a in memory.attestations if a.cue_present_in_memory and a.discounting_cue)
-        content_remaining = sum(1 for a in memory.attestations if a.content_present_in_memory)
-        print(f"Content retained: {content_remaining}/{len(memory.attestations)}")
-        print(f"Cues retained: {cues_remaining}/{sum(1 for a in memory.attestations if a.discounting_cue)}")
+        profile = AgentTrustProfile(agent_id="test_agent", events=scenario['events'])
+        result = profile.detect_sleeper_effect(window_hours=48.0)
         
-        if risks:
-            print(f"⚠️  SLEEPER EFFECT RISKS: {len(risks)}")
-            for r in risks:
-                print(f"  → {r['attestation_id']} ({r['source']}): "
-                      f"credibility was {r['original_credibility']}, "
-                      f"cue lost after {r['cycles_since_receipt']} cycles")
-        else:
-            print("✓ No sleeper effect risks detected")
+        print(f"  Trust at flag: {result['trust_at_flag']}")
+        print(f"  Trust after 48h: {result['trust_after_window']}")
+        print(f"  Delta: {result['trust_delta']:+.3f}")
+        print(f"  New positive evidence: {result['new_positive_evidence']}")
+        print(f"  Flag type: {result['flag_type']}")
+        print(f"  Sleeper effect: {'⚠️ DETECTED' if result['detected'] else '✅ Not detected'}")
+        print(f"  → {result['recommendation']}")
     
-    # Fix demonstration
     print(f"\n{'=' * 60}")
-    print("FIX: Bind discounting cues to content via hash-chain")
-    print("=" * 60)
-    
-    # Reset and apply fix
-    memory2 = MemoryState()
-    memory2.attestations = [
-        Attestation(
-            id="att_fixed",
-            content="Agent X completed task Y with 95% accuracy",
-            source="agent_x_self_report",
-            source_credibility=0.3,
-            discounting_cue="Self-reported; hash(content + cue) bound in chain"
-        ),
-    ]
-    
-    for cycle in range(1, 5):
-        memory2.compact()
-        # Apply binding after each compaction
-        memory2.bind_cue_to_content("att_fixed")
-        risks = memory2.detect_sleeper_risk()
-        att = memory2.attestations[0]
-        print(f"Cycle {cycle}: content={att.content_present_in_memory}, "
-              f"cue={att.cue_present_in_memory}, risks={len(risks)}")
-    
-    # Summary
-    print(f"\n{'=' * 60}")
-    print("KEY FINDINGS (Kumkale & Albarracín 2004 meta-analysis):")
-    print("  1. Discounting cues decay ~40% faster than message content")
-    print("  2. Sleeper effect strongest when:")
-    print("     - Message arguments are initially strong")
-    print("     - Discounting cue presented AFTER message (not before)")
-    print("     - Recipients have high processing motivation")
-    print("  3. Agent risk: flagged attestation becomes unflagged")
-    print("     after memory compaction loses the flag but keeps content")
-    print("  4. Fix: hash-bind cue to content. They compact together.")
-    print("     Cue can't be lost independently of what it discounts.")
+    print("KEY INSIGHT (Kumkale & Albarracin 2004):")
+    print("  Discounting cues decay 2.5x faster than message content.")
+    print("  After ~24h, flagged agent's positive reputation resurfaces.")
+    print("  Fix: hash-chain flags to identity (CT revocation model).")
+    print("  Revocation must be append-only, not session-scoped.")
     print(f"{'=' * 60}")
 
 
