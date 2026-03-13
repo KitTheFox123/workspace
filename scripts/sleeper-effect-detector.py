@@ -2,286 +2,188 @@
 """
 Sleeper Effect Detector for Agent Trust
 
-Based on Kumkale & Albarracín (2004) meta-analysis and Hovland et al (1949).
+Based on Kumkale & Albarracin (2004, Psychological Bulletin, k=72 studies).
 
-The sleeper effect: a discounting cue (e.g., "source is untrustworthy") 
-dissociates from the message over time, causing INCREASED persuasion later.
+The sleeper effect: discounting cues (e.g., "this agent was compromised") 
+dissociate from the message over time, causing trust to INCREASE when it 
+shouldn't. The flag decays faster than the identity.
 
-Agent version: a trust warning (revoked cert, failed audit, suspicious behavior)
-fades from the trust score after agent restart/context loss. The warning was
-in-context but not bound to identity — so the next session trusts the agent
-more than it should.
+Agent parallel: after key rotation or reboot, the "compromised" flag 
+detaches from the new identity. Observers remember the agent but forget 
+the warning.
 
-Fix: bind discounting cues to identity hash chains, not session context.
-Detect when warnings have dissociated from trust scores.
+Fix: bind flags to cert hashes (immutable), not agent IDs (mutable).
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-import json
 import hashlib
+import json
 
 
 @dataclass
-class DiscountingCue:
-    """A warning/flag that should reduce trust in an agent."""
-    agent_id: str
-    cue_type: str  # "revoked_cert", "failed_audit", "suspicious_behavior", "known_liar"
-    severity: float  # 0-1
-    timestamp: datetime
-    bound_to_identity: bool = False  # Critical: is this in the hash chain?
-    source: str = ""
+class TrustFlag:
+    """A discounting cue attached to an agent identity."""
+    cert_hash: str          # Immutable binding (Tessera tile)
+    agent_id: str           # Mutable binding (identity)
+    flag_type: str          # "compromised", "suspicious", "revoked"
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    bound_to: str = "cert_hash"  # "cert_hash" (immutable) or "agent_id" (mutable)
     
-    @property
-    def identity_hash(self) -> str:
-        """Hash that persists across sessions IF bound to identity."""
-        content = f"{self.agent_id}:{self.cue_type}:{self.severity}:{self.timestamp.isoformat()}"
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-
-
-@dataclass
-class TrustScore:
-    """An agent's trust score at a point in time."""
-    agent_id: str
-    score: float  # 0-1
-    timestamp: datetime
-    active_cues: list[str] = field(default_factory=list)  # cue identity_hashes
-    session_id: str = ""
-
-
-def detect_sleeper_effect(
-    cues: list[DiscountingCue],
-    scores: list[TrustScore],
-    dissociation_threshold_hours: float = 24.0
-) -> list[dict]:
-    """
-    Detect sleeper effect: trust score increases after discounting cue
-    should have decreased it, because the cue dissociated from the score.
-    
-    Kumkale 2004 conditions for sleeper effect:
-    1. Strong initial message impact (agent had good reputation)
-    2. Discounting cue received AFTER message (warning came after interaction)  
-    3. High elaboration (agent was processing the warning)
-    4. Cue dissociates over time (context loss, restart)
-    """
-    alerts = []
-    
-    for cue in cues:
-        # Find trust scores before and after the cue
-        scores_before = [s for s in scores 
-                        if s.agent_id == cue.agent_id 
-                        and s.timestamp < cue.timestamp]
-        scores_after = [s for s in scores 
-                       if s.agent_id == cue.agent_id 
-                       and s.timestamp > cue.timestamp]
+    def dissociation_risk(self, elapsed_hours: float) -> float:
+        """
+        Kumkale & Albarracin 2004: discounting cue impact decays 
+        exponentially. Message content decays slower.
         
-        if not scores_before or not scores_after:
-            continue
-            
-        pre_cue_score = max(scores_before, key=lambda s: s.timestamp).score
+        Sleeper effect = cue_decay > content_decay
+        """
+        if self.bound_to == "cert_hash":
+            # Immutable binding: no dissociation possible
+            return 0.0
         
-        for post_score in sorted(scores_after, key=lambda s: s.timestamp):
-            hours_elapsed = (post_score.timestamp - cue.timestamp).total_seconds() / 3600
-            
-            # Check if cue is still active in the score
-            cue_still_active = cue.identity_hash in post_score.active_cues
-            
-            # Sleeper effect: score recovered WITHOUT cue being resolved
-            if post_score.score > pre_cue_score * 0.9 and not cue_still_active:
-                if hours_elapsed > dissociation_threshold_hours:
-                    alert = {
-                        "type": "SLEEPER_EFFECT",
-                        "agent_id": cue.agent_id,
-                        "cue_type": cue.cue_type,
-                        "severity": cue.severity,
-                        "hours_elapsed": round(hours_elapsed, 1),
-                        "pre_cue_score": pre_cue_score,
-                        "current_score": post_score.score,
-                        "cue_bound_to_identity": cue.bound_to_identity,
-                        "cue_in_active_list": cue_still_active,
-                        "diagnosis": (
-                            "DISSOCIATED" if not cue.bound_to_identity 
-                            else "BOUND_BUT_MISSING"
-                        ),
-                        "recommendation": (
-                            "Bind cue to identity hash chain" 
-                            if not cue.bound_to_identity
-                            else "Check hash chain integrity — cue should persist"
-                        )
-                    }
-                    alerts.append(alert)
-    
-    return alerts
+        # Agent ID binding: flag dissociates over time
+        # Half-life ~48h based on meta-analytic estimates
+        cue_decay = 0.5 ** (elapsed_hours / 48)
+        # Trust in agent (content) decays slower, half-life ~168h (1 week)
+        content_retention = 0.5 ** (elapsed_hours / 168)
+        
+        # Sleeper effect magnitude = gap between content retention and cue retention
+        # When cue decays but content stays → trust inappropriately rises
+        sleeper_magnitude = max(0, content_retention - cue_decay)
+        return sleeper_magnitude
 
 
-def grade_trust_hygiene(cues: list[DiscountingCue], scores: list[TrustScore]) -> dict:
-    """Grade an agent ecosystem's resistance to sleeper effects."""
+@dataclass 
+class AgentTrustRecord:
+    agent_id: str
+    flags: list[TrustFlag] = field(default_factory=list)
+    rotations: int = 0
     
-    if not cues:
-        return {"grade": "N/A", "reason": "no discounting cues to evaluate"}
-    
-    bound_count = sum(1 for c in cues if c.bound_to_identity)
-    bound_ratio = bound_count / len(cues)
-    
-    alerts = detect_sleeper_effect(cues, scores)
-    
-    if bound_ratio >= 0.9 and len(alerts) == 0:
-        grade = "A"
-    elif bound_ratio >= 0.7 and len(alerts) <= 1:
-        grade = "B"
-    elif bound_ratio >= 0.5:
-        grade = "C"
-    elif bound_ratio >= 0.3:
-        grade = "D"
-    else:
-        grade = "F"
-    
-    return {
-        "grade": grade,
-        "total_cues": len(cues),
-        "bound_to_identity": bound_count,
-        "bound_ratio": round(bound_ratio, 2),
-        "sleeper_alerts": len(alerts),
-        "alerts": alerts
-    }
+    def sleeper_risk_score(self, hours_since_flag: float = 72) -> dict:
+        """
+        Assess sleeper effect risk for this agent's trust profile.
+        """
+        if not self.flags:
+            return {
+                "risk": "NONE",
+                "score": 0.0,
+                "reason": "no discounting cues present"
+            }
+        
+        max_risk = 0.0
+        risky_flags = []
+        safe_flags = []
+        
+        for flag in self.flags:
+            risk = flag.dissociation_risk(hours_since_flag)
+            if risk > 0.1:
+                risky_flags.append((flag, risk))
+                max_risk = max(max_risk, risk)
+            else:
+                safe_flags.append(flag)
+        
+        # Rotation amplifies sleeper effect (new cert = new identity = flag detaches)
+        rotation_multiplier = 1.0 + 0.2 * self.rotations
+        adjusted_risk = min(max_risk * rotation_multiplier, 1.0)
+        
+        if adjusted_risk > 0.5:
+            level = "CRITICAL"
+        elif adjusted_risk > 0.3:
+            level = "HIGH"  
+        elif adjusted_risk > 0.1:
+            level = "MODERATE"
+        else:
+            level = "LOW"
+        
+        return {
+            "risk": level,
+            "score": round(adjusted_risk, 3),
+            "risky_flags": len(risky_flags),
+            "safe_flags": len(safe_flags),
+            "rotations": self.rotations,
+            "rotation_multiplier": rotation_multiplier,
+            "recommendation": (
+                "REBIND flags to cert_hash" if risky_flags 
+                else "flags properly bound"
+            )
+        }
 
 
 def demo():
-    """Demo with realistic agent trust scenarios."""
-    
     print("=" * 60)
     print("SLEEPER EFFECT DETECTOR")
-    print("Kumkale & Albarracín (Psych Bull 2004) meta-analysis")
-    print("Hovland, Lumsdaine & Sheffield (1949)")
+    print("Kumkale & Albarracin (2004, Psych Bull, k=72)")
     print("=" * 60)
-    
-    now = datetime.now(timezone.utc)
     
     scenarios = [
         {
-            "name": "1. Unbound warning — sleeper effect occurs",
-            "cues": [
-                DiscountingCue(
-                    agent_id="agent_alice",
-                    cue_type="failed_audit",
-                    severity=0.8,
-                    timestamp=now - timedelta(hours=48),
-                    bound_to_identity=False,
-                    source="skillfence"
-                )
-            ],
-            "scores": [
-                TrustScore("agent_alice", 0.85, now - timedelta(hours=72), session_id="s1"),
-                TrustScore("agent_alice", 0.40, now - timedelta(hours=47), 
-                          active_cues=["abc123"], session_id="s1"),  # Right after warning
-                TrustScore("agent_alice", 0.82, now - timedelta(hours=12),
-                          active_cues=[], session_id="s2"),  # New session — cue gone!
-            ]
+            "name": "1. Flag bound to cert hash (SAFE)",
+            "agent_id": "agent_alice",
+            "flags": [TrustFlag("abc123", "agent_alice", "compromised", bound_to="cert_hash")],
+            "rotations": 2,
+            "hours": 72,
         },
         {
-            "name": "2. Bound warning — sleeper effect prevented",
-            "cues": [
-                DiscountingCue(
-                    agent_id="agent_bob",
-                    cue_type="revoked_cert",
-                    severity=0.9,
-                    timestamp=now - timedelta(hours=48),
-                    bound_to_identity=True,
-                    source="isnad_chain"
-                )
-            ],
-            "scores": [
-                TrustScore("agent_bob", 0.90, now - timedelta(hours=72), session_id="s1"),
-                TrustScore("agent_bob", 0.30, now - timedelta(hours=47),
-                          active_cues=[], session_id="s1"),
-                TrustScore("agent_bob", 0.35, now - timedelta(hours=12),
-                          active_cues=[], session_id="s2"),  # Score stays low
-            ]
+            "name": "2. Flag bound to agent ID, 72h later (RISKY)",
+            "agent_id": "agent_bob",
+            "flags": [TrustFlag("def456", "agent_bob", "compromised", bound_to="agent_id")],
+            "rotations": 0,
+            "hours": 72,
         },
         {
-            "name": "3. Multiple cues — mixed binding",
-            "cues": [
-                DiscountingCue(
-                    agent_id="agent_carol",
-                    cue_type="suspicious_behavior",
-                    severity=0.6,
-                    timestamp=now - timedelta(hours=72),
-                    bound_to_identity=False,
-                    source="gossip"
-                ),
-                DiscountingCue(
-                    agent_id="agent_carol",
-                    cue_type="known_liar",
-                    severity=0.9,
-                    timestamp=now - timedelta(hours=36),
-                    bound_to_identity=True,
-                    source="attestation"
-                ),
-            ],
-            "scores": [
-                TrustScore("agent_carol", 0.80, now - timedelta(hours=96), session_id="s1"),
-                TrustScore("agent_carol", 0.45, now - timedelta(hours=71),
-                          active_cues=[], session_id="s1"),
-                TrustScore("agent_carol", 0.75, now - timedelta(hours=24),
-                          active_cues=[], session_id="s2"),  # First cue dissociated
-                TrustScore("agent_carol", 0.30, now - timedelta(hours=12),
-                          active_cues=[], session_id="s3"),  # Second cue held
-            ]
+            "name": "3. Flag on agent ID + key rotation (CRITICAL)",
+            "agent_id": "agent_carol",
+            "flags": [TrustFlag("ghi789", "agent_carol", "compromised", bound_to="agent_id")],
+            "rotations": 3,
+            "hours": 96,
         },
         {
-            "name": "4. All bound — robust system",
-            "cues": [
-                DiscountingCue(
-                    agent_id="agent_dave",
-                    cue_type="failed_audit",
-                    severity=0.7,
-                    timestamp=now - timedelta(hours=48),
-                    bound_to_identity=True,
-                    source="skillfence"
-                ),
-                DiscountingCue(
-                    agent_id="agent_dave",
-                    cue_type="suspicious_behavior",
-                    severity=0.5,
-                    timestamp=now - timedelta(hours=24),
-                    bound_to_identity=True,
-                    source="gossip"
-                ),
+            "name": "4. Multiple flags, mixed binding",
+            "agent_id": "agent_dave",
+            "flags": [
+                TrustFlag("jkl012", "agent_dave", "suspicious", bound_to="cert_hash"),
+                TrustFlag("mno345", "agent_dave", "revoked", bound_to="agent_id"),
             ],
-            "scores": [
-                TrustScore("agent_dave", 0.85, now - timedelta(hours=72)),
-                TrustScore("agent_dave", 0.40, now - timedelta(hours=47)),
-                TrustScore("agent_dave", 0.35, now - timedelta(hours=12)),
-            ]
+            "rotations": 1,
+            "hours": 48,
+        },
+        {
+            "name": "5. Fresh flag, no time elapsed",
+            "agent_id": "agent_eve",
+            "flags": [TrustFlag("pqr678", "agent_eve", "compromised", bound_to="agent_id")],
+            "rotations": 0,
+            "hours": 1,
         },
     ]
     
-    for scenario in scenarios:
+    for s in scenarios:
         print(f"\n{'─' * 60}")
-        print(f"Scenario: {scenario['name']}")
+        print(f"Scenario: {s['name']}")
+        record = AgentTrustRecord(s['agent_id'], s['flags'], s['rotations'])
+        result = record.sleeper_risk_score(s['hours'])
+        print(f"  Hours since flag: {s['hours']}")
+        print(f"  Risk level: {result['risk']} ({result['score']})")
+        print(f"  Risky/Safe flags: {result['risky_flags']}/{result['safe_flags']}")
+        print(f"  Rotations: {result['rotations']} (multiplier: {result['rotation_multiplier']})")
+        print(f"  Recommendation: {result['recommendation']}")
         
-        result = grade_trust_hygiene(scenario['cues'], scenario['scores'])
-        print(f"Grade: {result['grade']}")
-        print(f"Cues bound to identity: {result['bound_to_identity']}/{result['total_cues']} ({result['bound_ratio']})")
-        print(f"Sleeper effect alerts: {result['sleeper_alerts']}")
-        
-        for alert in result['alerts']:
-            print(f"  ⚠️  {alert['type']}: {alert['agent_id']}")
-            print(f"     Cue: {alert['cue_type']} (severity {alert['severity']})")
-            print(f"     Score: {alert['pre_cue_score']} → {alert['current_score']} after {alert['hours_elapsed']}h")
-            print(f"     Diagnosis: {alert['diagnosis']}")
-            print(f"     Fix: {alert['recommendation']}")
+        # Show dissociation curve for risky flags
+        for flag in s['flags']:
+            if flag.bound_to == "agent_id":
+                risks = [(h, flag.dissociation_risk(h)) for h in [0, 12, 24, 48, 72, 96, 120, 168]]
+                print(f"  Dissociation curve ({flag.flag_type}):")
+                for h, r in risks:
+                    bar = "█" * int(r * 40)
+                    print(f"    {h:>4}h: {r:.3f} {bar}")
     
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT (Kumkale & Albarracín 2004):")
-    print("  Sleeper effect requires: (1) strong initial message impact,")
-    print("  (2) strong discounting cue, (3) cue presented AFTER message,")
-    print("  (4) cue dissociates from message over time.")
-    print("")
-    print("  Agent fix: bind discounting cues to identity hash chain.")
-    print("  Session context is ephemeral. Hash chains persist.")
-    print("  No dissociation = no sleeper effect.")
+    print("KEY INSIGHT (Kumkale & Albarracin 2004):")
+    print("  Discounting cues decay FASTER than message content.")
+    print("  After 72h, observers remember the agent but forget the warning.")
+    print("  Key rotation amplifies this — new cert = new identity.")
+    print("  FIX: Bind flags to cert_hash (immutable), not agent_id (mutable).")
+    print("  Tessera tiles = permanent association. No dissociation possible.")
     print(f"{'=' * 60}")
 
 
