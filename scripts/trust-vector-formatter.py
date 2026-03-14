@@ -131,6 +131,47 @@ class EpistemicWeight:
         return sum(d.score * weights.get(d.code, 1.0) for d in tv.dimensions) / total_w
 
 
+@dataclass
+class DecaySchedule:
+    """Per-dimension trust decay. score(t) = base × e^(-λt)."""
+    # Half-lives in hours per dimension
+    HALF_LIVES = {"T": 24.0, "G": 2.0, "A": 168.0, "S": 12.0}
+
+    @classmethod
+    def lambda_for(cls, code: str) -> float:
+        """Decay constant λ = ln(2) / half_life."""
+        import math
+        hl = cls.HALF_LIVES.get(code, 24.0)
+        return math.log(2) / hl
+
+    @classmethod
+    def decayed_score(cls, code: str, base_score: float, hours_elapsed: float) -> float:
+        """Score after time decay."""
+        import math
+        lam = cls.lambda_for(code)
+        return base_score * math.exp(-lam * hours_elapsed)
+
+    @classmethod
+    def decayed_vector(cls, tv: 'TrustVector', hours_elapsed: float) -> 'TrustVector':
+        """Apply time decay to all dimensions."""
+        new_dims = []
+        for d in tv.dimensions:
+            new_score = cls.decayed_score(d.code, d.score, hours_elapsed)
+            new_dims.append(TrustDimension(d.name, d.code, new_score, evidence=d.evidence))
+        return TrustVector(dimensions=new_dims, agent_id=tv.agent_id)
+
+    @classmethod
+    def wire_format(cls, tv: 'TrustVector') -> str:
+        """L3.5 wire format: T4:24h.G3:2h.A4:7d.S2:12h"""
+        parts = []
+        for d in tv.dimensions:
+            hl = cls.HALF_LIVES.get(d.code, 24.0)
+            unit = "d" if hl >= 24 else "h"
+            val = int(hl / 24) if hl >= 24 else int(hl)
+            parts.append(f"{d.code}{d.level}:{val}{unit}")
+        return ".".join(parts)
+
+
 def demo():
     print("=== Trust Vector Formatter (RFC 8485 pattern) ===\n")
 
@@ -156,7 +197,15 @@ def demo():
         print(f"  Relaxed threshold (T≥C,A≥D):         {'PASS' if relaxed else 'FAIL'}")
         ew = EpistemicWeight.weighted_score(tv)
         print(f"  Epistemic weighted (obs 2x):          {ew:.3f}")
+        print(f"  L3.5 wire:  {DecaySchedule.wire_format(tv)}")
         print()
+
+    # Decay demo
+    print("\n=== Trust Decay Over Time ===\n")
+    healthy = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, "healthy")
+    for hours in [0, 1, 4, 12, 24, 48]:
+        decayed = DecaySchedule.decayed_vector(healthy, hours)
+        print(f"  t={hours:2d}h: {decayed.machine_format}  {decayed.human_format}  overall={decayed.overall_grade}")
 
 
 if __name__ == "__main__":
