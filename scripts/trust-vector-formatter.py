@@ -195,6 +195,16 @@ class TemporalDecay:
         return math.exp(-hours_since / s)
 
     @staticmethod
+    def to_wire(code: str, score: float, t0_iso: str) -> dict:
+        """Encode score + stability + timestamp for wire format."""
+        s = TemporalDecay.STABILITY.get(code, 24.0)
+        return {
+            "score": round(score, 3),
+            "S": "inf" if s == float('inf') else s,
+            "t0": t0_iso,
+        }
+
+    @staticmethod
     def apply_decay(tv: 'TrustVector', ages_hours: dict[str, float]) -> 'TrustVector':
         """Return new TrustVector with decay applied."""
         new_dims = []
