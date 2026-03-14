@@ -85,10 +85,12 @@ class TrustReceipt:
         ds = self.decayed_scores
         return level_to_grade(min(score_to_level(v) for v in ds.values()))
 
+    commitment: dict = None  # Optional: {type: "sol_lock", amount: 0.01, tx: "...", expiry: "..."}
+
     def to_json(self) -> str:
         return json.dumps({
             "l35_trust_receipt": {
-                "version": "0.1.0",
+                "version": "0.2.0",
                 "agent_id": self.agent_id,
                 "timestamp": self.timestamp_utc,
                 "wire_format": self.wire_format,
@@ -108,6 +110,7 @@ class TrustReceipt:
                     "grade": self.overall_grade,
                     "epistemic_score": round(self.epistemic_score, 3),
                 },
+                "commitment": self.commitment if self.commitment else {"type": "none"},
                 "spec_refs": [
                     "RFC 8485 (Vectors of Trust, 2018)",
                     "Ebbinghaus 1885 (forgetting curve)",
