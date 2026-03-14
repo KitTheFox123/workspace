@@ -44,23 +44,28 @@ class Step:
 
 @dataclass(frozen=True)
 class Phase:
-    """Phase transition: Step while active, Decay after deactivation.
+    """3-state machine: NEVER_COMMITTED → LOCKED → UNLOCKED.
+    Transitions are observable on-chain events with timestamps.
     C_residual: the FACT of past commitment decays slowly.
     """
-    active: bool
-    stability_hours: float  # S for post-deactivation decay
-    deactivated_hours_ago: float = 0.0  # time since phase transition
+    state: str  # "never_committed" | "locked" | "unlocked"
+    stability_hours: float  # S for post-unlock decay
+    unlocked_hours_ago: float = 0.0  # time since LOCKED→UNLOCKED transition
 
     def score(self, raw: float, age_hours: float) -> float:
-        if self.active:
-            return raw  # Step behavior
-        # Post-transition: decay from deactivation moment
-        return raw * math.exp(-self.deactivated_hours_ago / self.stability_hours)
+        if self.state == "never_committed":
+            return 0.0
+        if self.state == "locked":
+            return raw  # Step: on-chain state = 1.0
+        # unlocked: C_residual decays
+        return raw * math.exp(-self.unlocked_hours_ago / self.stability_hours)
 
     def __repr__(self):
-        if self.active:
-            return f"Phase(active, S={self.stability_hours}h)"
-        return f"Phase(residual, {self.deactivated_hours_ago:.0f}h ago, S={self.stability_hours}h)"
+        if self.state == "never_committed":
+            return "Phase(NEVER_COMMITTED)"
+        if self.state == "locked":
+            return f"Phase(LOCKED, S={self.stability_hours}h)"
+        return f"Phase(UNLOCKED, {self.unlocked_hours_ago:.0f}h ago, S={self.stability_hours}h)"
 
 
 DimensionType = Union[Decay, Step, Phase]
@@ -160,12 +165,15 @@ def l35_standard(
         Dimension("A", "attestation", Decay(720.0), attestation, attestation_age, "issuer_anchored"),
         Dimension("S", "sleeper", Decay(168.0), sleeper, sleeper_age, "self_attested"),
     ]
-    if commitment > 0:
-        if commitment_locked:
-            ct = Phase(active=True, stability_hours=720.0)
-        else:
-            ct = Phase(active=False, stability_hours=720.0, deactivated_hours_ago=commitment_unlocked_hours)
+    if commitment_locked:
+        ct = Phase(state="locked", stability_hours=720.0)
+        dims.append(Dimension("C", "commitment", ct, commitment or 1.0, 0, "on_chain"))
+    elif commitment > 0:
+        ct = Phase(state="unlocked", stability_hours=720.0, unlocked_hours_ago=commitment_unlocked_hours)
         dims.append(Dimension("C", "commitment", ct, commitment, 0, "on_chain"))
+    elif commitment_unlocked_hours == 0 and not commitment_locked:
+        # Explicitly show NEVER_COMMITTED when requested
+        pass  # omit C dimension entirely — no history
     return dims
 
 
@@ -178,8 +186,9 @@ def demo():
         ("Gossip stale (8h)", dict(tile=0.95, gossip=0.9, gossip_age=8, attestation=0.88, sleeper=0.91)),
         ("Commitment unlocked 48h ago", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91,
                                               commitment=1.0, commitment_locked=False, commitment_unlocked_hours=48)),
-        ("Commitment unlocked 720h ago", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91,
+        ("Commitment unlocked 720h ago (C_residual fading)", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91,
                                                commitment=1.0, commitment_locked=False, commitment_unlocked_hours=720)),
+        ("Never committed (no C dimension)", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91)),
     ]
 
     for name, kwargs in scenarios:
