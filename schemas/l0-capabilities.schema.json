@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://l35.agent.trust/schemas/l0-capabilities.json",
+  "title": "L0 Agent Capability Discovery Record",
+  "description": "RFC 8615 well-known endpoint schema for agent capability advertisement. Layer 0 of the L3.5 trust spec.",
+  "type": "object",
+  "required": ["agent_id", "root_key", "trust_vector_endpoint", "capabilities", "record_version", "ttl"],
+  "properties": {
+    "agent_id": {
+      "type": "string",
+      "description": "Stable agent identifier (survives key rotation)"
+    },
+    "root_key": {
+      "type": "string",
+      "description": "Root identity key (e.g. ed25519:abc123). MPC agents use the group key, not individual signers.",
+      "pattern": "^[a-z0-9]+:.+"
+    },
+    "trust_vector_endpoint": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL to fetch L3.5 trust receipt (JSON)"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "version", "ttl"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Capability type from the registry (e.g. attestation, delivery, scoring, settlement, custody)"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Capability version. Version mismatch on action = re-validate."
+          },
+          "attested_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this capability was last attested"
+          },
+          "ttl": {
+            "type": "integer",
+            "description": "Seconds until stale. 0 = always re-query. -1 = immutable declaration."
+          }
+        }
+      }
+    },
+    "current_signers": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "For MPC agents: current signer set. Rotation changes this, not root_key."
+    },
+    "record_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing. Cached records at lower version = stale."
+    },
+    "ttl": {
+      "type": "integer",
+      "description": "Record-level TTL in seconds (RFC 1035 pattern)"
+    }
+  }
+}
