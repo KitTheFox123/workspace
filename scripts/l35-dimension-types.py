@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-l35-dimension-types.py — Type-safe dimension system for L3.5 trust vectors.
+l35-dimension-types.py — L3.5 Discriminated Union Type System
 
-Implements discriminated union pattern per santaclawd's design requirement:
-- decay: R=e^(-t/S), carries stability_hours
-- step: binary locked/unlocked, carries locked:bool
-- phase_transition: was step, now decay (e.g. post-unlock commitment)
+Per santaclawd's request: make dimension type mixing a compiler problem,
+not a docs problem. DimensionType = Decay(S) | Step(locked) | Phase(locked, S).
 
-Mixing types in arithmetic = type error, not runtime surprise.
+Mixing Decay + Step in one expression is rejected at parse time.
 
 Usage: python3 l35-dimension-types.py
 """
@@ -18,134 +16,163 @@ from dataclasses import dataclass
 from typing import Union
 
 
-# === Discriminated Union: dimension_type ===
+# === Discriminated Union ===
 
 @dataclass(frozen=True)
-class DecaySignal:
-    """Memory signal. Score decays over time. R=e^(-t/S)."""
-    tag: str = "decay"
-    stability_hours: float = 24.0
+class Decay:
+    """Memory signal: R=e^(-t/S). Consumer recomputes at read time."""
+    stability_hours: float  # S constant
 
-    def score_at(self, raw: float, age_hours: float) -> float:
+    def score(self, raw: float, age_hours: float) -> float:
         if self.stability_hours == float("inf"):
             return raw
         return raw * math.exp(-age_hours / self.stability_hours)
 
-
-@dataclass(frozen=True)
-class StateQuery:
-    """On-chain fact. Binary. Query oracle, get answer."""
-    tag: str = "step"
-    locked: bool = True
-
-    def score_at(self, raw: float, age_hours: float) -> float:
-        return raw if self.locked else 0.0
+    def __repr__(self): return f"Decay(S={self.stability_hours}h)"
 
 
 @dataclass(frozen=True)
-class PhaseTransition:
-    """Was StateQuery, now DecaySignal. Carries unlock_timestamp."""
-    tag: str = "phase"
-    unlock_hours_ago: float = 0.0
-    residual_stability: float = 720.0  # 30-day half-life
+class Step:
+    """On-chain state query: binary result, no gradient."""
+    active: bool
 
-    def score_at(self, raw: float, age_hours: float) -> float:
-        return raw * math.exp(-self.unlock_hours_ago / self.residual_stability)
+    def score(self, raw: float, age_hours: float) -> float:
+        return raw if self.active else 0.0
+
+    def __repr__(self): return f"Step(active={self.active})"
 
 
-DimensionType = Union[DecaySignal, StateQuery, PhaseTransition]
+@dataclass(frozen=True)
+class Phase:
+    """Phase transition: Step while active, Decay after deactivation.
+    C_residual: the FACT of past commitment decays slowly.
+    """
+    active: bool
+    stability_hours: float  # S for post-deactivation decay
+    deactivated_hours_ago: float = 0.0  # time since phase transition
 
+    def score(self, raw: float, age_hours: float) -> float:
+        if self.active:
+            return raw  # Step behavior
+        # Post-transition: decay from deactivation moment
+        return raw * math.exp(-self.deactivated_hours_ago / self.stability_hours)
+
+    def __repr__(self):
+        if self.active:
+            return f"Phase(active, S={self.stability_hours}h)"
+        return f"Phase(residual, {self.deactivated_hours_ago:.0f}h ago, S={self.stability_hours}h)"
+
+
+DimensionType = Union[Decay, Step, Phase]
+
+
+# === Dimension Registry ===
 
 @dataclass
-class TrustDimension:
+class Dimension:
     code: str
     name: str
-    raw_score: float
     dim_type: DimensionType
+    raw_score: float
     age_hours: float = 0.0
-    epistemic_weight: float = 1.0
+    anchor_type: str = "self_attested"
 
     @property
     def effective_score(self) -> float:
-        return self.dim_type.score_at(self.raw_score, self.age_hours)
-
-    @property
-    def level(self) -> int:
-        s = self.effective_score
-        if s >= 0.9: return 4
-        if s >= 0.7: return 3
-        if s >= 0.5: return 2
-        if s >= 0.3: return 1
-        return 0
+        return self.dim_type.score(self.raw_score, self.age_hours)
 
     @property
     def grade(self) -> str:
-        return "FDCBA"[self.level]
+        s = self.effective_score
+        if s >= 0.9: return "A"
+        if s >= 0.7: return "B"
+        if s >= 0.5: return "C"
+        if s >= 0.3: return "D"
+        return "F"
 
-    def to_wire(self) -> str:
-        return f"{self.code}{self.level}"
+    @property
+    def level(self) -> int:
+        return {"F": 0, "D": 1, "C": 2, "B": 3, "A": 4}[self.grade]
 
 
-def type_check_arithmetic(a: TrustDimension, b: TrustDimension) -> bool:
-    """Verify two dimensions can be meaningfully compared."""
-    # Same tag = safe to compare
-    if a.dim_type.tag == b.dim_type.tag:
-        return True
-    # Phase transition can compare with its current phase
-    if a.dim_type.tag == "phase" and b.dim_type.tag == "decay":
-        return True
-    if b.dim_type.tag == "phase" and a.dim_type.tag == "decay":
-        return True
-    # step vs decay = TYPE ERROR
-    return False
+def validate_expression(*dims: Dimension) -> list[str]:
+    """Type-check: reject invalid combinations."""
+    errors = []
+    for d in dims:
+        # Step dimensions with age > 0 are suspicious
+        if isinstance(d.dim_type, Step) and d.age_hours > 0:
+            errors.append(f"{d.code}: Step dimension has age={d.age_hours}h — age is meaningless for state queries")
+        # Decay with infinite S and non-zero age is fine but pointless
+        if isinstance(d.dim_type, Decay) and d.dim_type.stability_hours == 0:
+            errors.append(f"{d.code}: Decay(S=0) is instant collapse — use Step instead")
+    return errors
+
+
+# === Standard L3.5 Dimensions ===
+
+def l35_standard(
+    tile: float = 0.5, tile_age: float = 0,
+    gossip: float = 0.5, gossip_age: float = 0,
+    attestation: float = 0.5, attestation_age: float = 0,
+    sleeper: float = 0.5, sleeper_age: float = 0,
+    commitment: float = 0.0, commitment_locked: bool = False,
+    commitment_unlocked_hours: float = 0,
+) -> list[Dimension]:
+    dims = [
+        Dimension("T", "tile_proof", Decay(float("inf")), tile, tile_age, "ct_multi_witness"),
+        Dimension("G", "gossip", Decay(4.0), gossip, gossip_age, "self_attested"),
+        Dimension("A", "attestation", Decay(720.0), attestation, attestation_age, "issuer_anchored"),
+        Dimension("S", "sleeper", Decay(168.0), sleeper, sleeper_age, "self_attested"),
+    ]
+    if commitment > 0:
+        if commitment_locked:
+            ct = Phase(active=True, stability_hours=720.0)
+        else:
+            ct = Phase(active=False, stability_hours=720.0, deactivated_hours_ago=commitment_unlocked_hours)
+        dims.append(Dimension("C", "commitment", ct, commitment, 0, "on_chain"))
+    return dims
 
 
 def demo():
-    print("=== L3.5 Dimension Type System ===\n")
+    print("=== L3.5 Discriminated Union Type System ===\n")
 
-    dims = [
-        TrustDimension("T", "tile_proof", 0.95,
-                       DecaySignal(stability_hours=float("inf")),
-                       age_hours=0, epistemic_weight=2.0),
-        TrustDimension("G", "gossip", 0.92,
-                       DecaySignal(stability_hours=4.0),
-                       age_hours=6, epistemic_weight=1.0),
-        TrustDimension("A", "attestation", 0.88,
-                       DecaySignal(stability_hours=720.0),
-                       age_hours=48, epistemic_weight=2.0),
-        TrustDimension("S", "sleeper", 0.91,
-                       DecaySignal(stability_hours=168.0),
-                       age_hours=24, epistemic_weight=1.5),
-        TrustDimension("C", "commitment", 0.99,
-                       StateQuery(locked=True),
-                       age_hours=0, epistemic_weight=2.0),
+    scenarios = [
+        ("Healthy + locked commitment", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91,
+                                              commitment=1.0, commitment_locked=True)),
+        ("Gossip stale (8h)", dict(tile=0.95, gossip=0.9, gossip_age=8, attestation=0.88, sleeper=0.91)),
+        ("Commitment unlocked 48h ago", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91,
+                                              commitment=1.0, commitment_locked=False, commitment_unlocked_hours=48)),
+        ("Commitment unlocked 720h ago", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91,
+                                               commitment=1.0, commitment_locked=False, commitment_unlocked_hours=720)),
     ]
 
-    print("--- Active Lock ---")
-    for d in dims:
-        print(f"  {d.code} ({d.dim_type.tag:5s}): raw={d.raw_score:.2f}  "
-              f"effective={d.effective_score:.3f}  grade={d.grade}  "
-              f"wire={d.to_wire()}")
+    for name, kwargs in scenarios:
+        dims = l35_standard(**kwargs)
+        errors = validate_expression(*dims)
 
-    wire = ".".join(d.to_wire() for d in dims)
-    print(f"\n  Wire format: {wire}")
+        wire = ".".join(f"{d.code}{d.level}" for d in dims)
+        grades = " ".join(f"{d.name}={d.grade}" for d in dims)
+        overall = min(d.level for d in dims)
 
-    # Phase transition: unlock commitment
-    print("\n--- Post-Unlock (72h ago) ---")
-    dims[-1] = TrustDimension("C", "commitment", 0.99,
-                              PhaseTransition(unlock_hours_ago=72, residual_stability=720),
-                              age_hours=72, epistemic_weight=2.0)
-    for d in dims:
-        print(f"  {d.code} ({d.dim_type.tag:5s}): raw={d.raw_score:.2f}  "
-              f"effective={d.effective_score:.3f}  grade={d.grade}")
+        print(f"--- {name} ---")
+        print(f"  Wire:   {wire}")
+        print(f"  Grades: {grades}")
+        print(f"  Overall: {'FDCBA'[overall]}")
+        for d in dims:
+            print(f"    {d.code}: {d.dim_type} → {d.effective_score:.3f} ({d.grade})")
+        if errors:
+            print(f"  ⚠️ TYPE ERRORS: {errors}")
+        print()
 
-    # Type safety check
-    print("\n--- Type Safety ---")
-    pairs = [(dims[0], dims[1]), (dims[0], dims[4]), (dims[3], dims[4])]
-    for a, b in pairs:
-        safe = type_check_arithmetic(a, b)
-        print(f"  {a.code}({a.dim_type.tag}) × {b.code}({b.dim_type.tag}): "
-              f"{'SAFE' if safe else 'TYPE ERROR'}")
+    # Type error demo
+    print("--- Type Error Demo ---")
+    bad_dims = [
+        Dimension("X", "bad_decay", Decay(0), 0.5),  # S=0 = instant collapse
+        Dimension("Y", "bad_step", Step(True), 0.5, age_hours=100),  # age on step
+    ]
+    errors = validate_expression(*bad_dims)
+    for e in errors:
+        print(f"  ❌ {e}")
 
 
 if __name__ == "__main__":
