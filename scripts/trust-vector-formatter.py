@@ -242,6 +242,46 @@ class TemporalDecay:
         return TrustVector(dimensions=new_dims, agent_id=tv.agent_id)
 
 
+@dataclass
+class CommitmentPhase:
+    """C_active → C_residual phase transition model.
+    
+    PRE-UNLOCK (C_active): STEP type. Query chain. locked=1.0, unlocked=0.0.
+    POST-UNLOCK (C_residual): DECAY type. R=e^(-t/S) where S=lock_duration.
+    An agent who staked 90 days has more residual trust than one who staked 1 day.
+    """
+    lock_duration_hours: float  # How long they were locked
+    unlock_time_hours_ago: float = 0.0  # Time since unlock (0 = still locked)
+    is_locked: bool = True
+
+    @property
+    def phase(self) -> str:
+        return "C_active" if self.is_locked else "C_residual"
+
+    @property
+    def dimension_type(self) -> DimensionType:
+        return DimensionType.STEP if self.is_locked else DimensionType.DECAY
+
+    @property
+    def score(self) -> float:
+        import math
+        if self.is_locked:
+            return 1.0 if self.lock_duration_hours > 0 else 0.0  # Never staked = 0
+        if self.lock_duration_hours <= 0:
+            return 0.0  # Never staked, can't have residual
+        # DECAY: S = lock_duration (longer stake = slower decay)
+        return math.exp(-self.unlock_time_hours_ago / self.lock_duration_hours)
+
+    @property
+    def grade(self) -> str:
+        s = self.score
+        if s >= 0.9: return "A"
+        if s >= 0.7: return "B"
+        if s >= 0.5: return "C"
+        if s >= 0.3: return "D"
+        return "F"
+
+
 def demo():
     print("=== Trust Vector Formatter (RFC 8485 pattern) ===\n")
 
@@ -272,7 +312,7 @@ def demo():
 
     # Decay demo
     print("\n=== Trust Decay Over Time ===\n")
-    healthy = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, "healthy")
+    healthy = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, agent_id="healthy")
     for hours in [0, 1, 4, 12, 24, 48]:
         decayed = DecaySchedule.decayed_vector(healthy, hours)
         print(f"  t={hours:2d}h: {decayed.machine_format}  {decayed.human_format}  overall={decayed.overall_grade}")
@@ -302,8 +342,8 @@ def compare_vectors(before: TrustVector, after: TrustVector) -> dict:
 if __name__ == "__main__":
     demo()
     print("\n=== Vector Comparison (Drift Detection) ===\n")
-    t1 = create_agent_trust_vector(0.95, 0.85, 0.90, 0.15, "agent_x_day1")
-    t2 = create_agent_trust_vector(0.95, 0.85, 0.90, 0.75, "agent_x_day7")
+    t1 = create_agent_trust_vector(0.95, 0.85, 0.90, 0.15, agent_id="agent_x_day1")
+    t2 = create_agent_trust_vector(0.95, 0.85, 0.90, 0.75, agent_id="agent_x_day7")
     result = compare_vectors(t1, t2)
     print(f"Before: {t1.machine_format} ({t1.overall_grade})")
     print(f"After:  {t2.machine_format} ({t2.overall_grade})")
@@ -350,7 +390,7 @@ if __name__ == "__main__":
 
 def decay_demo():
     print("\n=== Temporal Decay (Ebbinghaus 1885) ===\n")
-    tv = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, "healthy_agent")
+    tv = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, agent_id="healthy_agent")
     ages = [
         ("Fresh (0h)", {"T": 0, "G": 0, "A": 0, "S": 0}),
         ("4h stale gossip", {"T": 0, "G": 4, "A": 0, "S": 0}),
@@ -415,7 +455,7 @@ def receipt_demo():
     import time
     print("\n=== Trust Receipt (OCSP-stapling pattern) ===\n")
     now = time.time()
-    tv = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, "agent_xyz")
+    tv = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, agent_id="agent_xyz")
     stability = {"T": float('inf'), "G": 4.0, "A": 720.0, "S": 168.0}
 
     for anchor in ["self", "issuer", "ct-style"]:
