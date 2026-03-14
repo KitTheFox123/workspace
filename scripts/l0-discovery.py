@@ -126,6 +126,32 @@ class DiscoveryRegistry:
         }
 
 
+@dataclass
+class CapabilityRegistryEntry:
+    """IANA-style capability registry entry."""
+    name: str  # e.g. "attestation", "settlement"
+    namespace: str  # e.g. "trust.l35", "payment"
+    version: int
+    description: str
+    attestation_required: bool  # must capability be attested by third party?
+    min_trust_level: str = "F"  # minimum L3.5 grade to advertise this capability
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.namespace}.{self.name}"
+
+
+CAPABILITY_REGISTRY = [
+    CapabilityRegistryEntry("attestation", "trust.l35", 3, "Issue trust attestations for other agents", True, "B"),
+    CapabilityRegistryEntry("scoring", "trust.l35", 1, "Score agent trust vectors", True, "C"),
+    CapabilityRegistryEntry("delivery", "logistics", 2, "Deliver digital artifacts with proof", False, "D"),
+    CapabilityRegistryEntry("settlement", "payment", 1, "Execute on-chain settlement", True, "A"),
+    CapabilityRegistryEntry("custody", "payment", 2, "Hold assets in escrow", True, "A"),
+    CapabilityRegistryEntry("discovery", "infra.l0", 1, "Resolve agent capabilities", False, "F"),
+    CapabilityRegistryEntry("revocation", "trust.l35", 1, "Issue revocation entries", True, "B"),
+]
+
+
 def demo():
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print("=== Layer 0: Agent Discovery (RFC 6763 pattern) ===\n")
@@ -205,5 +231,17 @@ def demo():
 
 
 
+
+
+def registry_demo():
+    print("\n=== Capability Registry (IANA model) ===\n")
+    print(f"{'Qualified Name':<30} {'Ver':>3} {'Attest?':>7} {'Min Grade':>9}")
+    print("-" * 55)
+    for entry in CAPABILITY_REGISTRY:
+        print(f"{entry.qualified_name:<30} {entry.version:>3} {'yes' if entry.attestation_required else 'no':>7} {entry.min_trust_level:>9}")
+    print(f"\n{len(CAPABILITY_REGISTRY)} registered capabilities across {len(set(e.namespace for e in CAPABILITY_REGISTRY))} namespaces")
+
+
 if __name__ == "__main__":
     demo()
+    registry_demo()
