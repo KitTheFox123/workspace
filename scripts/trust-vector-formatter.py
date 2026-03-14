@@ -12,7 +12,27 @@ Usage: python3 trust-vector-formatter.py
 """
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
+
+
+class DimensionType(Enum):
+    """Constrains which scoring function applies per dimension.
+    Mixing types in one expression should be a type error.
+    """
+    DECAY = "decay"    # Memory signals: gossip, sleeper. R=e^(-t/S)
+    QUERY = "query"    # State signals: tile_proof, attestation. Query source of truth.
+    STEP = "step"      # Binary transitions: commitment lock/unlock. 1.0 or 0.0.
+
+
+# Canonical dimension type assignments
+DIMENSION_TYPES = {
+    "T": DimensionType.QUERY,   # tile_proof: Merkle path, query log
+    "G": DimensionType.DECAY,   # gossip: memory signal, decays
+    "A": DimensionType.QUERY,   # attestation: query chain
+    "S": DimensionType.DECAY,   # sleeper: memory signal, decays
+    "C": DimensionType.STEP,    # commitment: binary on-chain state
+}
 
 
 @dataclass
