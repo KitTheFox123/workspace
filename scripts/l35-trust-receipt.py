@@ -23,7 +23,8 @@ from dataclasses import dataclass, asdict
 
 
 # Stability constants (hours) — Ebbinghaus decay per dimension
-STABILITY = {"T": float("inf"), "G": 4.0, "A": 720.0, "S": 168.0, "C": 2160.0}
+# C uses step function (see decay()), not exponential
+STABILITY = {"T": float("inf"), "G": 4.0, "A": 720.0, "S": 168.0, "C": 0.0}
 
 # Epistemic weights — Watson & Morgan 2025
 EPISTEMIC = {"T": 2.0, "G": 1.0, "A": 2.0, "S": 1.5, "C": 2.0}
@@ -47,7 +48,10 @@ def level_to_grade(l: int) -> str:
     return "FDCBA"[l]
 
 
-def decay(code: str, hours: float) -> float:
+def decay(code: str, hours: float, locked: bool = True) -> float:
+    """C (commitment) = step function. Others = Ebbinghaus exponential."""
+    if code == "C":
+        return 1.0 if locked else 0.0  # Binary: on-chain state, no gradient
     s = STABILITY.get(code, 24.0)
     return 1.0 if s == float("inf") else math.exp(-hours / s)
 
