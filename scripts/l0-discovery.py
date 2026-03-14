@@ -99,6 +99,32 @@ class DiscoveryRegistry:
         return [r for r in self.records.values()
                 if any(c.name == capability for c in r.capabilities)]
 
+    def negotiate(self, agent_id: str, requirements: list[str],
+                  min_version: dict[str, int] = None) -> Optional[dict]:
+        """Content negotiation (RFC 7231 §5.3 pattern).
+        Returns intersection of {advertised ∩ currently_available ∩ requirements}.
+        TTL on the RESPONSE, not the record.
+        """
+        record = self.resolve(agent_id)
+        if not record:
+            return None
+        min_version = min_version or {}
+        matched = []
+        for cap in record.capabilities:
+            if cap.name in requirements:
+                if cap.name in min_version and cap.version < min_version[cap.name]:
+                    continue  # version too old
+                if cap.is_expired:
+                    continue  # stale capability
+                matched.append(cap)
+        return {
+            "agent_id": agent_id,
+            "matched": [{"name": c.name, "version": c.version} for c in matched],
+            "unmatched": [r for r in requirements if r not in [c.name for c in matched]],
+            "response_ttl": min(c.ttl_seconds for c in matched) if matched else 0,
+            "negotiated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
 
 def demo():
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -167,6 +193,16 @@ def demo():
     # Full JSON
     print("=== Full Discovery Record (JSON) ===")
     print(kit.to_json())
+
+    # Capability negotiation
+    print("\n--- Capability Negotiation ---")
+    result = registry.negotiate("kit_fox", ["attestation", "scoring", "settlement"])
+    print("  Requested: attestation, scoring, settlement")
+    matched_names = [m['name'] for m in result['matched']]
+    print(f"  Matched: {matched_names}")
+    print(f"  Unmatched: {result['unmatched']}")
+    print(f"  Response TTL: {result['response_ttl']}s")
+
 
 
 if __name__ == "__main__":
