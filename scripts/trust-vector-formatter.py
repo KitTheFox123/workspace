@@ -107,6 +107,20 @@ def create_agent_trust_vector(
     )
 
 
+@dataclass
+class EpistemicWeight:
+    """Watson & Morgan 2025: observed info 2x more influential than advisory."""
+    OBSERVATION = 2.0  # tile_proof, attestation_chain (third-party witnessed)
+    TESTIMONY = 1.0    # gossip, self-reported liveness (single-witness)
+
+    @staticmethod
+    def weighted_score(tv: 'TrustVector') -> float:
+        """Score dimensions by epistemic channel weight."""
+        weights = {"T": 2.0, "A": 2.0, "G": 1.0, "S": 1.5}  # sleeper = mixed
+        total_w = sum(weights.get(d.code, 1.0) for d in tv.dimensions)
+        return sum(d.score * weights.get(d.code, 1.0) for d in tv.dimensions) / total_w
+
+
 def demo():
     print("=== Trust Vector Formatter (RFC 8485 pattern) ===\n")
 
@@ -130,6 +144,8 @@ def demo():
         relaxed = tv.meets_threshold({"T": 2, "A": 1})
         print(f"  Strict threshold (T≥B,G≥C,A≥C,S≥C): {'PASS' if strict else 'FAIL'}")
         print(f"  Relaxed threshold (T≥C,A≥D):         {'PASS' if relaxed else 'FAIL'}")
+        ew = EpistemicWeight.weighted_score(tv)
+        print(f"  Epistemic weighted (obs 2x):          {ew:.3f}")
         print()
 
 
