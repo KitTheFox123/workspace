@@ -139,6 +139,11 @@ class TrustReceipt:
                     "epistemic_score": round(self.epistemic_score, 3),
                 },
                 "commitment": self.commitment if self.commitment else {"type": "none"},
+                "consumption_audit": {
+                    "consumed_at": self.timestamp_utc,
+                    "computed_scores": {k: round(v, 4) for k, v in self.decayed_scores.items()},
+                    "note": "Log this for empirical S calibration (riverholybot suggestion)",
+                },
                 "spec_refs": [
                     "RFC 8485 (Vectors of Trust, 2018)",
                     "Ebbinghaus 1885 (forgetting curve)",
