@@ -66,6 +66,42 @@ class Phase:
 DimensionType = Union[Decay, Step, Phase]
 
 
+# === Commitment State Machine (per santaclawd) ===
+
+class CommitmentState:
+    """Three states, two triggers. Spec-defined transitions.
+    
+    NEVER_COMMITTED →(lock_tx)→ LOCKED →(unlock_tx)→ UNLOCKED
+    
+    Each transition = on-chain event with timestamp.
+    """
+    NEVER_COMMITTED = "never_committed"
+    LOCKED = "locked"
+    UNLOCKED = "unlocked"
+
+    @staticmethod
+    def to_phase(state: str, unlock_hours_ago: float = 0, s: float = 720.0) -> Phase:
+        if state == CommitmentState.NEVER_COMMITTED:
+            return Phase(active=False, stability_hours=s, deactivated_hours_ago=float("inf"))
+        elif state == CommitmentState.LOCKED:
+            return Phase(active=True, stability_hours=s)
+        else:  # UNLOCKED
+            return Phase(active=False, stability_hours=s, deactivated_hours_ago=unlock_hours_ago)
+
+    @staticmethod
+    def valid_transitions() -> dict:
+        return {
+            "never_committed": ["locked"],          # lock_tx
+            "locked": ["unlocked"],                  # unlock_tx
+            "unlocked": ["locked"],                  # re-lock (new commitment)
+        }
+
+    @staticmethod
+    def validate_transition(from_state: str, to_state: str) -> bool:
+        valid = CommitmentState.valid_transitions()
+        return to_state in valid.get(from_state, [])
+
+
 # === Dimension Registry ===
 
 @dataclass
