@@ -167,3 +167,39 @@ if __name__ == "__main__":
     print(f"Diffs:  {result['diffs']}")
     print(f"Sleeper risk: {result['sleeper_risk']}")
     print(f"Overall shift: {result['overall_shift']}")
+
+
+# === Observation vs Testimony Classifier ===
+# Watson & Morgan (Cognition 2025): observed info ~2x as influential as advisory
+
+CHANNEL_TYPES = {
+    "T": "observation",   # tile_proof: witnessed by CDN/multiple parties
+    "G": "testimony",     # gossip: self-reported liveness
+    "A": "observation",   # attestation: third-party signed
+    "S": "observation",   # sleeper: computed from chain history
+}
+
+def observation_ratio(tv: TrustVector) -> float:
+    """Fraction of dimensions that are observation (not testimony)."""
+    obs = sum(1 for d in tv.dimensions if CHANNEL_TYPES.get(d.code) == "observation")
+    return obs / len(tv.dimensions) if tv.dimensions else 0.0
+
+def weighted_trust(tv: TrustVector, obs_weight: float = 2.0) -> float:
+    """Watson & Morgan weighted trust: observation channels get 2x weight."""
+    total_w, total_s = 0.0, 0.0
+    for d in tv.dimensions:
+        w = obs_weight if CHANNEL_TYPES.get(d.code) == "observation" else 1.0
+        total_w += w
+        total_s += d.score * w
+    return total_s / total_w if total_w else 0.0
+
+
+if __name__ == "__main__":
+    # Extended demo with observation weighting
+    print("\n=== Observation vs Testimony Weighting (Watson & Morgan 2025) ===\n")
+    tv = create_agent_trust_vector(0.95, 0.05, 0.88, 0.91)
+    print(f"Scenario: Gossip partition (tile OK)")
+    print(f"  Observation ratio: {observation_ratio(tv):.0%}")
+    print(f"  Equal-weight score: {tv.overall_score:.3f}")
+    print(f"  Watson-Morgan 2x:   {weighted_trust(tv):.3f}")
+    print(f"  Gossip is testimony — partition hurts less with observation weighting")
