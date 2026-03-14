@@ -172,6 +172,39 @@ class DecaySchedule:
         return ".".join(parts)
 
 
+@dataclass
+class TemporalDecay:
+    """Ebbinghaus 1885 forgetting curve applied to trust signals.
+    R = e^(-t/S) where S = stability constant (hours).
+    """
+    # Stability constants per dimension (hours)
+    STABILITY = {
+        "T": float('inf'),  # tile_proof: Merkle path never expires
+        "G": 4.0,           # gossip: stale after ~12h
+        "A": 720.0,         # attestation: 30-day half-life
+        "S": 168.0,         # sleeper: weekly refresh needed
+    }
+
+    @staticmethod
+    def decay(code: str, hours_since: float) -> float:
+        """Return decay multiplier [0, 1] for a dimension."""
+        import math
+        s = TemporalDecay.STABILITY.get(code, 24.0)
+        if s == float('inf'):
+            return 1.0
+        return math.exp(-hours_since / s)
+
+    @staticmethod
+    def apply_decay(tv: 'TrustVector', ages_hours: dict[str, float]) -> 'TrustVector':
+        """Return new TrustVector with decay applied."""
+        new_dims = []
+        for d in tv.dimensions:
+            age = ages_hours.get(d.code, 0.0)
+            decayed_score = d.score * TemporalDecay.decay(d.code, age)
+            new_dims.append(TrustDimension(d.name, d.code, decayed_score, evidence=f"age={age}h"))
+        return TrustVector(dimensions=new_dims, agent_id=tv.agent_id)
+
+
 def demo():
     print("=== Trust Vector Formatter (RFC 8485 pattern) ===\n")
 
@@ -208,8 +241,6 @@ def demo():
         print(f"  t={hours:2d}h: {decayed.machine_format}  {decayed.human_format}  overall={decayed.overall_grade}")
 
 
-if __name__ == "__main__":
-    demo()
 
 
 def compare_vectors(before: TrustVector, after: TrustVector) -> dict:
@@ -278,3 +309,22 @@ if __name__ == "__main__":
     print(f"  Equal-weight score: {tv.overall_score:.3f}")
     print(f"  Watson-Morgan 2x:   {weighted_trust(tv):.3f}")
     print(f"  Gossip is testimony — partition hurts less with observation weighting")
+
+
+def decay_demo():
+    print("\n=== Temporal Decay (Ebbinghaus 1885) ===\n")
+    tv = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, "healthy_agent")
+    ages = [
+        ("Fresh (0h)", {"T": 0, "G": 0, "A": 0, "S": 0}),
+        ("4h stale gossip", {"T": 0, "G": 4, "A": 0, "S": 0}),
+        ("24h no gossip", {"T": 0, "G": 24, "A": 0, "S": 24}),
+        ("7d no refresh", {"T": 0, "G": 168, "A": 168, "S": 168}),
+    ]
+    for name, ages_h in ages:
+        decayed = TemporalDecay.apply_decay(tv, ages_h)
+        print(f"  {name:25s} -> {decayed.machine_format}  {decayed.human_format}  (overall: {decayed.overall_grade})")
+
+
+if __name__ == "__main__":
+    demo()
+    decay_demo()
