@@ -23,10 +23,10 @@ from dataclasses import dataclass, asdict
 
 
 # Stability constants (hours) — Ebbinghaus decay per dimension
-STABILITY = {"T": float("inf"), "G": 4.0, "A": 720.0, "S": 168.0}
+STABILITY = {"T": float("inf"), "G": 4.0, "A": 720.0, "S": 168.0, "C": 2160.0}
 
 # Epistemic weights — Watson & Morgan 2025
-EPISTEMIC = {"T": 2.0, "G": 1.0, "A": 2.0, "S": 1.5}
+EPISTEMIC = {"T": 2.0, "G": 1.0, "A": 2.0, "S": 1.5, "C": 2.0}
 
 ANCHOR_TYPES = {
     "self_attested": 1.0,
@@ -56,7 +56,7 @@ def decay(code: str, hours: float) -> float:
 class TrustReceipt:
     agent_id: str
     timestamp_utc: str
-    scores: dict  # {T: 0.95, G: 0.8, ...}
+    scores: dict  # {T: 0.95, G: 0.8, ..., C: 0.7}
     ages_hours: dict  # {T: 0, G: 2, ...}
     anchor_types: dict  # {T: "ct_multi_witness", G: "self_attested", ...}
 
@@ -67,7 +67,8 @@ class TrustReceipt:
     @property
     def wire_format(self) -> str:
         ds = self.decayed_scores
-        return ".".join(f"{k}{score_to_level(ds[k])}" for k in ["T", "G", "A", "S"])
+        dims = [k for k in ["T", "G", "A", "S", "C"] if k in ds]
+        return ".".join(f"{k}{score_to_level(ds[k])}" for k in dims)
 
     @property
     def grades(self) -> dict:
