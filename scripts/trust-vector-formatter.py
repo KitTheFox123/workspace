@@ -328,3 +328,69 @@ def decay_demo():
 if __name__ == "__main__":
     demo()
     decay_demo()
+
+
+@dataclass
+class TrustReceipt:
+    """OCSP-stapling-style trust receipt. Carries formula, not answer.
+    Issuer signs {score, stability, timestamp}. Verifier recomputes decay locally.
+    """
+    agent_id: str
+    vector: TrustVector
+    issued_at: float  # Unix timestamp
+    stability_constants: dict  # code -> S (hours)
+    anchor_type: str = "self"  # self | issuer | ct-style
+    anchor_weight: float = 1.0
+
+    def __post_init__(self):
+        weights = {"self": 1.0, "issuer": 1.5, "ct-style": 2.0}
+        self.anchor_weight = weights.get(self.anchor_type, 1.0)
+
+    def evaluate_at(self, eval_time: float) -> TrustVector:
+        """Consumer evaluates receipt at arbitrary time."""
+        import math
+        hours_elapsed = (eval_time - self.issued_at) / 3600
+        new_dims = []
+        for d in self.vector.dimensions:
+            s = self.stability_constants.get(d.code, 24.0)
+            if s == float('inf'):
+                decay = 1.0
+            else:
+                decay = math.exp(-hours_elapsed / s)
+            decayed = d.score * decay * min(self.anchor_weight, 1.0 + (self.anchor_weight - 1.0) * 0.5)
+            new_dims.append(TrustDimension(d.name, d.code, min(decayed, 1.0),
+                            evidence=f"anchor={self.anchor_type},age={hours_elapsed:.1f}h"))
+        return TrustVector(dimensions=new_dims, agent_id=self.agent_id)
+
+    def to_wire(self) -> dict:
+        """Wire format for the receipt (what gets signed)."""
+        return {
+            "agent_id": self.agent_id,
+            "vector": self.vector.machine_format,
+            "scores": {d.code: round(d.score, 3) for d in self.vector.dimensions},
+            "stability": self.stability_constants,
+            "anchor": self.anchor_type,
+            "issued_at": self.issued_at,
+        }
+
+
+def receipt_demo():
+    import time
+    print("\n=== Trust Receipt (OCSP-stapling pattern) ===\n")
+    now = time.time()
+    tv = create_agent_trust_vector(0.95, 0.92, 0.88, 0.91, "agent_xyz")
+    stability = {"T": float('inf'), "G": 4.0, "A": 720.0, "S": 168.0}
+
+    for anchor in ["self", "issuer", "ct-style"]:
+        receipt = TrustReceipt(
+            agent_id="agent_xyz", vector=tv, issued_at=now,
+            stability_constants=stability, anchor_type=anchor
+        )
+        # Evaluate 6h later
+        eval_tv = receipt.evaluate_at(now + 6 * 3600)
+        print(f"  Anchor: {anchor:10s} → {eval_tv.machine_format}  {eval_tv.human_format}  (weight: {receipt.anchor_weight}x)")
+
+    print(f"\n  Wire format: {TrustReceipt('agent_xyz', tv, now, stability, 'ct-style').to_wire()}")
+
+
+receipt_demo()
