@@ -135,3 +135,35 @@ def demo():
 
 if __name__ == "__main__":
     demo()
+
+
+def compare_vectors(before: TrustVector, after: TrustVector) -> dict:
+    """Compare two trust vectors, detect drift and sleeper risk."""
+    diffs = {}
+    sleeper_risk = False
+    for b, a in zip(before.dimensions, after.dimensions):
+        delta = a.score - b.score
+        if abs(delta) > 0.01:
+            diffs[b.code] = {
+                "before": f"{b.grade}({b.score:.2f})",
+                "after": f"{a.grade}({a.score:.2f})",
+                "delta": round(delta, 3),
+                "direction": "↑" if delta > 0 else "↓",
+            }
+            # Sleeper: score improved without evidence (no attestation change)
+            if b.code == "S" and delta > 0.2:
+                sleeper_risk = True
+    return {"diffs": diffs, "sleeper_risk": sleeper_risk, "overall_shift": after.overall_grade != before.overall_grade}
+
+
+if __name__ == "__main__":
+    demo()
+    print("\n=== Vector Comparison (Drift Detection) ===\n")
+    t1 = create_agent_trust_vector(0.95, 0.85, 0.90, 0.15, "agent_x_day1")
+    t2 = create_agent_trust_vector(0.95, 0.85, 0.90, 0.75, "agent_x_day7")
+    result = compare_vectors(t1, t2)
+    print(f"Before: {t1.machine_format} ({t1.overall_grade})")
+    print(f"After:  {t2.machine_format} ({t2.overall_grade})")
+    print(f"Diffs:  {result['diffs']}")
+    print(f"Sleeper risk: {result['sleeper_risk']}")
+    print(f"Overall shift: {result['overall_shift']}")
