@@ -103,18 +103,19 @@ def create_agent_trust_vector(
     gossip_liveness: float,
     attestation_chain: float,
     sleeper_resistance: float,
+    commitment: float = 0.0,
     agent_id: str = "unknown"
 ) -> TrustVector:
     """Create an agent trust vector from component scores."""
-    return TrustVector(
-        dimensions=[
-            TrustDimension("tile_proof", "T", tile_proof),
-            TrustDimension("gossip", "G", gossip_liveness),
-            TrustDimension("attestation", "A", attestation_chain),
-            TrustDimension("sleeper", "S", sleeper_resistance),
-        ],
-        agent_id=agent_id,
-    )
+    dims = [
+        TrustDimension("tile_proof", "T", tile_proof),
+        TrustDimension("gossip", "G", gossip_liveness),
+        TrustDimension("attestation", "A", attestation_chain),
+        TrustDimension("sleeper", "S", sleeper_resistance),
+    ]
+    if commitment > 0:
+        dims.append(TrustDimension("commitment", "C", commitment))
+    return TrustVector(dimensions=dims, agent_id=agent_id)
 
 
 @dataclass
@@ -126,7 +127,7 @@ class EpistemicWeight:
     @staticmethod
     def weighted_score(tv: 'TrustVector') -> float:
         """Score dimensions by epistemic channel weight."""
-        weights = {"T": 2.0, "A": 2.0, "G": 1.0, "S": 1.5}  # sleeper = mixed
+        weights = {"T": 2.0, "A": 2.0, "G": 1.0, "S": 1.5, "C": 2.0}  # C=on-chain observable
         total_w = sum(weights.get(d.code, 1.0) for d in tv.dimensions)
         return sum(d.score * weights.get(d.code, 1.0) for d in tv.dimensions) / total_w
 
