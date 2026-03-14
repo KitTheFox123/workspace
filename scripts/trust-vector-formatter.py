@@ -184,13 +184,19 @@ class TemporalDecay:
         "G": 4.0,           # gossip: stale after ~12h
         "A": 720.0,         # attestation: 30-day half-life
         "S": 168.0,         # sleeper: weekly refresh needed
+        "C": None,          # commitment: step function, not decay curve
     }
 
     @staticmethod
     def decay(code: str, hours_since: float) -> float:
-        """Return decay multiplier [0, 1] for a dimension."""
+        """Return decay multiplier [0, 1] for a dimension.
+        C (commitment) is a step function: 1.0 while locked, 0.0 at unlock.
+        Not subject to Ebbinghaus decay — observable state, not memory.
+        """
         import math
         s = TemporalDecay.STABILITY.get(code, 24.0)
+        if s is None:  # step function (commitment)
+            return 1.0  # caller handles lock/unlock binary state
         if s == float('inf'):
             return 1.0
         return math.exp(-hours_since / s)
