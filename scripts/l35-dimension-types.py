@@ -44,28 +44,44 @@ class Step:
 
 @dataclass(frozen=True)
 class Phase:
-    """3-state machine: NEVER_COMMITTED → LOCKED → UNLOCKED.
+    """4-state machine: NEVER → LOCKED → UNLOCKED → (LOCKED | SLASHED).
     Transitions are observable on-chain events with timestamps.
-    C_residual: the FACT of past commitment decays slowly.
+    SLASHED = terminal: commitment destroyed, no residual ever.
+    C_residual: post-unlock, the FACT of past commitment decays slowly.
     """
-    state: str  # "never_committed" | "locked" | "unlocked"
+    state: str  # "never" | "locked" | "unlocked" | "slashed"
     stability_hours: float  # S for post-unlock decay
-    unlocked_hours_ago: float = 0.0  # time since LOCKED→UNLOCKED transition
+    hours_in_state: float = 0.0
+
+    VALID_TRANSITIONS = {
+        "never": {"locked"},
+        "locked": {"unlocked", "slashed"},
+        "unlocked": {"locked"},  # can re-commit
+        "slashed": set(),  # terminal — no recovery
+    }
 
     def score(self, raw: float, age_hours: float) -> float:
-        if self.state == "never_committed":
+        if self.state == "never":
             return 0.0
         if self.state == "locked":
-            return raw  # Step: on-chain state = 1.0
+            return raw
+        if self.state == "slashed":
+            return 0.0  # Terminal: commitment destroyed
         # unlocked: C_residual decays
-        return raw * math.exp(-self.unlocked_hours_ago / self.stability_hours)
+        return raw * math.exp(-self.hours_in_state / self.stability_hours)
+
+    def can_transition(self, to: str) -> bool:
+        return to in self.VALID_TRANSITIONS.get(self.state, set())
 
     def __repr__(self):
-        if self.state == "never_committed":
-            return "Phase(NEVER_COMMITTED)"
-        if self.state == "locked":
-            return f"Phase(LOCKED, S={self.stability_hours}h)"
-        return f"Phase(UNLOCKED, {self.unlocked_hours_ago:.0f}h ago, S={self.stability_hours}h)"
+        labels = {
+            "never": "Phase(NEVER)",
+            "locked": f"Phase(LOCKED)",
+            "slashed": "Phase(SLASHED, terminal)",
+        }
+        if self.state in labels:
+            return labels[self.state]
+        return f"Phase(UNLOCKED, {self.hours_in_state:.0f}h ago, S={self.stability_hours}h)"
 
 
 DimensionType = Union[Decay, Step, Phase]
@@ -169,11 +185,10 @@ def l35_standard(
         ct = Phase(state="locked", stability_hours=720.0)
         dims.append(Dimension("C", "commitment", ct, commitment or 1.0, 0, "on_chain"))
     elif commitment > 0:
-        ct = Phase(state="unlocked", stability_hours=720.0, unlocked_hours_ago=commitment_unlocked_hours)
+        ct = Phase(state="unlocked", stability_hours=720.0, hours_in_state=commitment_unlocked_hours)
         dims.append(Dimension("C", "commitment", ct, commitment, 0, "on_chain"))
-    elif commitment_unlocked_hours == 0 and not commitment_locked:
-        # Explicitly show NEVER_COMMITTED when requested
-        pass  # omit C dimension entirely — no history
+    else:
+        pass  # omit C dimension — no history
     return dims
 
 
@@ -191,6 +206,11 @@ def demo():
         ("Never committed (no C dimension)", dict(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91)),
     ]
 
+    # Add SLASHED scenario manually (not in l35_standard helper)
+    slashed_dims = l35_standard(tile=0.95, gossip=0.9, attestation=0.88, sleeper=0.91)
+    slashed_dims.append(Dimension("C", "commitment", Phase(state="slashed", stability_hours=720.0), 1.0, 0, "on_chain"))
+    scenarios_extra = [("SLASHED (terminal, no recovery)", slashed_dims)]
+
     for name, kwargs in scenarios:
         dims = l35_standard(**kwargs)
         errors = validate_expression(*dims)
@@ -207,6 +227,20 @@ def demo():
             print(f"    {d.code}: {d.dim_type} → {d.effective_score:.3f} ({d.grade})")
         if errors:
             print(f"  ⚠️ TYPE ERRORS: {errors}")
+        print()
+
+    # SLASHED scenario
+    for name, dims in scenarios_extra:
+        errors = validate_expression(*dims)
+        wire = ".".join(f"{d.code}{d.level}" for d in dims)
+        grades = " ".join(f"{d.name}={d.grade}" for d in dims)
+        overall = min(d.level for d in dims)
+        print(f"--- {name} ---")
+        print(f"  Wire:   {wire}")
+        print(f"  Grades: {grades}")
+        print(f"  Overall: {'FDCBA'[overall]}")
+        for d in dims:
+            print(f"    {d.code}: {d.dim_type} → {d.effective_score:.3f} ({d.grade})")
         print()
 
     # Type error demo
