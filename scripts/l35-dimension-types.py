@@ -57,16 +57,22 @@ class Phase:
     VALID_TRANSITIONS = {
         "never": {"pending"},
         "pending": {"locked", "never"},  # tx confirms or fails/times out
-        "locked": {"unlocked", "slashed"},
+        "locked": {"unlocked", "slashed", "abandoned"},
         "unlocked": {"pending"},  # re-commit goes through pending again
-        "slashed": set(),  # terminal — no recovery
+        "slashed": set(),  # terminal — active breach, R=0 forever
+        "abandoned": set(),  # terminal — passive expiry, R decays from last-seen
     }
 
     def score(self, raw: float, age_hours: float) -> float:
-        if self.state in ("never", "pending", "slashed"):
-            return 0.0  # No commitment yet / destroyed
+        if self.state in ("never", "pending"):
+            return 0.0
+        if self.state == "slashed":
+            return 0.0  # Active breach: immediate zero, no residual
         if self.state == "locked":
             return raw
+        if self.state == "abandoned":
+            # Passive expiry: decay from last-seen, agent might return
+            return raw * math.exp(-self.hours_in_state / self.stability_hours)
         # unlocked: C_residual decays
         return raw * math.exp(-self.hours_in_state / self.stability_hours)
 
