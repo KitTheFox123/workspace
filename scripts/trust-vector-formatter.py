@@ -23,6 +23,8 @@ class TrustDimension:
     score: float  # 0.0 - 1.0
     level: int = 0  # 0-4, RFC 8485 style
     evidence: str = ""
+    ttl_hours: float = 0  # 0 = no decay (e.g. Merkle proof = forever)
+    age_hours: float = 0  # how old is the measurement
 
     def __post_init__(self):
         self.level = self._score_to_level(self.score)
@@ -38,6 +40,14 @@ class TrustDimension:
     @property
     def grade(self) -> str:
         return ["F", "D", "C", "B", "A"][self.level]
+
+    @property
+    def decayed_score(self) -> float:
+        """Score after TTL-based decay. No TTL = no decay (Merkle proof is forever)."""
+        if self.ttl_hours <= 0 or self.age_hours <= 0:
+            return self.score
+        decay = max(0.0, 1.0 - (self.age_hours / self.ttl_hours))
+        return self.score * decay
 
 
 @dataclass
