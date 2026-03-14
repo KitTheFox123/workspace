@@ -39,10 +39,21 @@ class CertRequest:
             json.dumps(self.payload, sort_keys=True).encode()
         ).hexdigest()[:16]
 
-    def idempotency_key(self) -> str:
-        """Deterministic key: both sides compute independently."""
-        epoch_floor = int(self.timestamp) // 3600 * 3600
-        raw = f"{self.deposit_ref}:{epoch_floor}"
+    def idempotency_key(self, mode: str = "deposit_ref") -> str:
+        """Deterministic key: both sides compute independently.
+        
+        mode="deposit_ref": hash(deposit_ref + agent_id + cert_type) — zero false dedup
+        mode="timestamp_floor": hash(deposit_ref + epoch_floor) — v1, breaks at scale
+        """
+        if mode == "deposit_ref":
+            # v2: deposit_ref is already unique per payment
+            agent = self.payload.get("agent", "unknown")
+            cert_type = self.payload.get("scope", "default")
+            raw = f"{self.deposit_ref}:{agent}:{cert_type}"
+        else:
+            # v1: timestamp floor — false dedup at >1 cert/hour
+            epoch_floor = int(self.timestamp) // 3600 * 3600
+            raw = f"{self.deposit_ref}:{epoch_floor}"
         return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
