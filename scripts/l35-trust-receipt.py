@@ -48,10 +48,33 @@ def level_to_grade(l: int) -> str:
     return "FDCBA"[l]
 
 
+class DimensionType:
+    """Two axiom classes — mixing is a type error, not a design choice."""
+    DECAY_SIGNAL = "decay"    # Memory signal: R=e^(-t/S), consumer recomputes
+    STATE_QUERY = "state"     # Fact: query oracle, binary result
+    PHASE_TRANSITION = "phase"  # Was StateQuery, now DecaySignal (e.g. post-unlock C)
+
+# Which axiom class each dimension belongs to
+DIMENSION_TYPES = {
+    "T": DimensionType.DECAY_SIGNAL,   # tile_proof freshness decays
+    "G": DimensionType.DECAY_SIGNAL,   # gossip liveness decays
+    "A": DimensionType.DECAY_SIGNAL,   # attestation age decays
+    "S": DimensionType.DECAY_SIGNAL,   # sleeper resistance decays
+    "C": DimensionType.STATE_QUERY,    # commitment: query chain
+}
+
+# Post-unlock residual stability (hours) — C transitions to DecaySignal
+C_RESIDUAL_STABILITY = 720.0  # 30 days
+
+
 def decay(code: str, hours: float, locked: bool = True) -> float:
-    """C (commitment) = step function. Others = Ebbinghaus exponential."""
-    if code == "C":
+    """Resolve score by axiom class. Mixing types in arithmetic = undefined."""
+    dim_type = DIMENSION_TYPES.get(code, DimensionType.DECAY_SIGNAL)
+    if dim_type == DimensionType.STATE_QUERY:
         return 1.0 if locked else 0.0  # Binary: on-chain state, no gradient
+    if code == "C" and not locked:
+        # Phase transition: C_residual decays as behavioral memory
+        return math.exp(-hours / C_RESIDUAL_STABILITY)
     s = STABILITY.get(code, 24.0)
     return 1.0 if s == float("inf") else math.exp(-hours / s)
 
