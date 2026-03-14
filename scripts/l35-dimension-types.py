@@ -55,19 +55,18 @@ class Phase:
     prior_state: str = ""  # recorded on SLASHED transition — severity signal
 
     VALID_TRANSITIONS = {
-        "never": {"locked"},
+        "never": {"pending"},
+        "pending": {"locked", "never"},  # tx confirms or fails/times out
         "locked": {"unlocked", "slashed"},
-        "unlocked": {"locked"},  # can re-commit
+        "unlocked": {"pending"},  # re-commit goes through pending again
         "slashed": set(),  # terminal — no recovery
     }
 
     def score(self, raw: float, age_hours: float) -> float:
-        if self.state == "never":
-            return 0.0
+        if self.state in ("never", "pending", "slashed"):
+            return 0.0  # No commitment yet / destroyed
         if self.state == "locked":
             return raw
-        if self.state == "slashed":
-            return 0.0  # Terminal: commitment destroyed
         # unlocked: C_residual decays
         return raw * math.exp(-self.hours_in_state / self.stability_hours)
 
