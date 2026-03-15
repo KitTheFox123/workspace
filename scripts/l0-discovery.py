@@ -24,6 +24,8 @@ class Capability:
     version: int
     attested_at: str  # ISO timestamp
     ttl_seconds: int = 3600  # 0 = always re-query, -1 = immutable
+    revoked: bool = False
+    revocation_reason: str = ""
 
     @property
     def is_expired(self) -> bool:
@@ -97,7 +99,23 @@ class DiscoveryRegistry:
 
     def resolve_by_capability(self, capability: str) -> list[DiscoveryRecord]:
         return [r for r in self.records.values()
-                if any(c.name == capability for c in r.capabilities)]
+                if any(c.name == capability and not c.revoked for c in r.capabilities)]
+
+    def revoke_capability(self, agent_id: str, capability_name: str, reason: str = "deprecated") -> bool:
+        """CAPABILITY_REVOKED event — the silent failure nobody specced.
+        Agent still exists, but specific capability is no longer available.
+        Consumers with cached capabilities get stale results without this.
+        """
+        record = self.records.get(agent_id)
+        if not record:
+            return False
+        for cap in record.capabilities:
+            if cap.name == capability_name:
+                cap.revoked = True
+                cap.revocation_reason = reason
+                record.record_version += 1  # version bump forces re-validation
+                return True
+        return False
 
     def negotiate(self, agent_id: str, requirements: list[str],
                   min_version: dict[str, int] = None) -> Optional[dict]:
