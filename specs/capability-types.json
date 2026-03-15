@@ -1,49 +1,54 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "L0 Agent Capability Types Registry",
-  "description": "Bootstrap capability types for Layer 0 Agent Discovery. PR process for additions.",
+  "title": "L0 Capability Types Registry",
+  "description": "Bootstrap capability types for agent trust infrastructure. IANA-style registry: PR to add, maintainers approve, 72h cool-down.",
   "version": "0.1.0",
+  "maintainers": ["funwolf", "kit_fox", "gendolf"],
+  "approval_policy": {
+    "method": "majority_with_cooldown",
+    "cooldown_hours": 72,
+    "block_mechanism": "technical_objection"
+  },
   "types": {
     "attestation": {
-      "description": "Can issue signed attestations about other agents or actions",
       "version": 1,
-      "verifiable_by": "signature_check",
-      "required_fields": ["signing_algorithm", "public_key_endpoint"],
-      "example_ttl_seconds": 3600
+      "description": "Issue and verify trust attestations for other agents",
+      "verifiable_by": "ct_multi_witness",
+      "required_fields": ["signing_key_type", "attestation_format"],
+      "example": "Ed25519 attestation with JWS envelope"
     },
     "delivery": {
-      "description": "Can deliver work products (code, data, reports) with verifiable receipts",
       "version": 1,
-      "verifiable_by": "content_hash_match",
-      "required_fields": ["supported_formats", "max_size_bytes"],
-      "example_ttl_seconds": 1800
+      "description": "Accept and deliver work products between agents",
+      "verifiable_by": "issuer_anchored",
+      "required_fields": ["transport", "max_payload_bytes"],
+      "example": "agentmail delivery with DKIM proof"
     },
     "scoring": {
-      "description": "Can evaluate and score other agents' work or trust profiles",
       "version": 1,
-      "verifiable_by": "scoring_methodology_hash",
-      "required_fields": ["scoring_dimensions", "methodology_version"],
-      "example_ttl_seconds": 7200
+      "description": "Evaluate and score agent work products",
+      "verifiable_by": "issuer_anchored",
+      "required_fields": ["scoring_rubric_hash", "independence_attestation"],
+      "example": "tc4 vocabulary scoring with rubric hash"
     },
     "settlement": {
-      "description": "Can execute financial settlement (escrow, payment, staking)",
       "version": 1,
-      "verifiable_by": "on_chain_state",
-      "required_fields": ["supported_chains", "settlement_contract"],
-      "example_ttl_seconds": 300
+      "description": "Execute financial settlement on-chain",
+      "verifiable_by": "on_chain",
+      "required_fields": ["chain", "token", "finality_gate"],
+      "example": "SOL settlement with finalized commitment gate"
     },
     "discovery": {
-      "description": "Can resolve agent_id to capabilities and trust vector endpoints",
       "version": 1,
-      "verifiable_by": "resolution_test",
-      "required_fields": ["resolution_endpoint", "supported_protocols"],
-      "example_ttl_seconds": 3600
+      "description": "Resolve agent capabilities and trust vector endpoints",
+      "verifiable_by": "self_attested",
+      "required_fields": ["resolution_protocol", "ttl"],
+      "example": "DNS-SD + .well-known/agent-capabilities.json"
     }
   },
-  "registration_rules": {
-    "naming": "lowercase_alphanumeric_underscore",
-    "versioning": "semver_major_only",
-    "verifiable_by_required": true,
-    "pr_process": "Submit PR to capability-types.json with: name, description, version, verifiable_by, required_fields, example_ttl_seconds"
-  }
+  "spec_refs": [
+    "RFC 8485 (Vectors of Trust)",
+    "RFC 6763 (DNS-SD)",
+    "RFC 8615 (.well-known URIs)"
+  ]
 }
