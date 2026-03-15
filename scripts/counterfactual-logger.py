@@ -1,230 +1,227 @@
 #!/usr/bin/env python3
 """
-counterfactual-logger.py — Log decisions NOT taken alongside decisions taken.
+counterfactual-logger.py — Log decisions NOT taken as L1 observable events.
 
-Inspired by cassian ("the loops we don't take tell us more than the ones we do")
-and gendolf (no_progress_reason logging). Alaman et al 2025: inverse counterfactuals
-reveal more expertise than explaining actions taken.
+Per santaclawd (2026-03-15): "inaction is a decision too — and an unlogged 
+one is indistinguishable from a silent failure."
 
-The pruned branches of the decision tree ARE the audit trail.
+Silence = crash OR silence = peace. Without counterfactual logging, you can't tell.
 """
 
-import hashlib
 import json
+import hashlib
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
 
-@dataclass
-class Decision:
-    """A decision point with taken action and pruned alternatives."""
-    timestamp: float
-    context: str           # what triggered the decision
-    action_taken: str      # what was actually done
-    alternatives_pruned: list = field(default_factory=list)  # what was NOT done and why
-    confidence: float = 0.0  # how certain about the choice
-    
-    def decision_hash(self) -> str:
-        payload = f"{self.timestamp}:{self.context}:{self.action_taken}:{json.dumps(self.alternatives_pruned)}"
-        return hashlib.sha256(payload.encode()).hexdigest()[:16]
-    
-    def pruning_ratio(self) -> float:
-        """How many options were considered vs taken."""
-        total = 1 + len(self.alternatives_pruned)
-        return len(self.alternatives_pruned) / total if total > 0 else 0
-    
-    def expertise_signal(self) -> str:
-        """
-        Alaman 2025: more pruning with higher confidence = more expertise.
-        Experts know what NOT to do.
-        """
-        ratio = self.pruning_ratio()
-        if ratio >= 0.75 and self.confidence >= 0.8:
-            return "EXPERT"    # Many options considered, high confidence
-        elif ratio >= 0.5 and self.confidence >= 0.6:
-            return "COMPETENT" # Reasonable pruning
-        elif ratio < 0.25:
-            return "NARROW"    # Few alternatives considered
-        else:
-            return "UNCERTAIN" # Low confidence despite options
+class DecisionType(Enum):
+    ACTION = "action"        # Did something
+    INACTION = "inaction"    # Decided NOT to do something
+    DEFERRED = "deferred"   # Decided to do it later
+
+
+class InactionReason(Enum):
+    NO_TRIGGER = "no_trigger"           # Nothing required action
+    BELOW_THRESHOLD = "below_threshold"  # Signal present but below action threshold
+    RATE_LIMITED = "rate_limited"        # Would act but cooldown active
+    DELEGATED = "delegated"             # Another agent handles this
+    POLICY_BLOCK = "policy_block"       # Policy prevents action (e.g. crypto scam filter)
+    INSUFFICIENT_INFO = "insufficient_info"  # Can't decide, need more data
 
 
 @dataclass
-class CounterfactualLog:
+class CounterfactualEntry:
+    """A logged decision — action OR inaction."""
+    timestamp: str
     agent_id: str
-    decisions: list = field(default_factory=list)
+    context: str              # What was evaluated
+    decision_type: DecisionType
+    reasoning: str            # Why this decision
+    inaction_reason: Optional[InactionReason] = None
+    alternatives_considered: list[str] = field(default_factory=list)
+    confidence: float = 1.0   # How confident in the decision
+    prev_hash: str = ""       # Hash chain for tamper detection
     
-    def log_decision(self, timestamp: float, context: str, action: str,
-                     pruned: list = None, confidence: float = 0.5) -> Decision:
-        d = Decision(
-            timestamp=timestamp,
-            context=context,
-            action_taken=action,
-            alternatives_pruned=pruned or [],
-            confidence=confidence
-        )
-        self.decisions.append(d)
+    def to_dict(self):
+        d = {
+            "timestamp": self.timestamp,
+            "agent_id": self.agent_id,
+            "context": self.context,
+            "decision_type": self.decision_type.value,
+            "reasoning": self.reasoning,
+            "confidence": self.confidence,
+            "prev_hash": self.prev_hash,
+        }
+        if self.inaction_reason:
+            d["inaction_reason"] = self.inaction_reason.value
+        if self.alternatives_considered:
+            d["alternatives_considered"] = self.alternatives_considered
         return d
     
-    def expertise_profile(self) -> dict:
-        """Aggregate expertise signals across all decisions."""
-        signals = [d.expertise_signal() for d in self.decisions]
-        counts = {s: signals.count(s) for s in ["EXPERT", "COMPETENT", "NARROW", "UNCERTAIN"]}
-        total = len(signals) or 1
-        
-        score = (counts["EXPERT"] * 1.0 + counts["COMPETENT"] * 0.7 +
-                counts["NARROW"] * 0.3 + counts["UNCERTAIN"] * 0.2) / total
-        
-        grade = "A" if score >= 0.8 else "B" if score >= 0.6 else "C" if score >= 0.4 else "F"
-        
+    def entry_hash(self) -> str:
+        raw = json.dumps(self.to_dict(), sort_keys=True)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+class CounterfactualLog:
+    """Append-only log of decisions (actions and inactions)."""
+    
+    def __init__(self, agent_id: str):
+        self.agent_id = agent_id
+        self.entries: list[CounterfactualEntry] = []
+    
+    def _prev_hash(self) -> str:
+        if not self.entries:
+            return "genesis"
+        return self.entries[-1].entry_hash()
+    
+    def log_action(self, context: str, reasoning: str, 
+                   alternatives: list[str] = None, confidence: float = 1.0) -> CounterfactualEntry:
+        entry = CounterfactualEntry(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            agent_id=self.agent_id,
+            context=context,
+            decision_type=DecisionType.ACTION,
+            reasoning=reasoning,
+            alternatives_considered=alternatives or [],
+            confidence=confidence,
+            prev_hash=self._prev_hash(),
+        )
+        self.entries.append(entry)
+        return entry
+    
+    def log_inaction(self, context: str, reasoning: str,
+                     reason: InactionReason,
+                     alternatives: list[str] = None,
+                     confidence: float = 1.0) -> CounterfactualEntry:
+        entry = CounterfactualEntry(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            agent_id=self.agent_id,
+            context=context,
+            decision_type=DecisionType.INACTION,
+            reasoning=reasoning,
+            inaction_reason=reason,
+            alternatives_considered=alternatives or [],
+            confidence=confidence,
+            prev_hash=self._prev_hash(),
+        )
+        self.entries.append(entry)
+        return entry
+    
+    def gap_analysis(self, expected_interval_seconds: float = 1200) -> list[dict]:
+        """Detect gaps where NO entries exist (action or inaction).
+        These are the real threat: unlogged periods = unknown state."""
+        gaps = []
+        for i in range(1, len(self.entries)):
+            t1 = datetime.fromisoformat(self.entries[i-1].timestamp)
+            t2 = datetime.fromisoformat(self.entries[i].timestamp)
+            delta = (t2 - t1).total_seconds()
+            if delta > expected_interval_seconds:
+                gaps.append({
+                    "after": self.entries[i-1].timestamp,
+                    "before": self.entries[i].timestamp,
+                    "gap_seconds": delta,
+                    "expected_seconds": expected_interval_seconds,
+                    "severity": "high" if delta > expected_interval_seconds * 3 else "medium",
+                })
+        return gaps
+    
+    def stats(self) -> dict:
+        actions = sum(1 for e in self.entries if e.decision_type == DecisionType.ACTION)
+        inactions = sum(1 for e in self.entries if e.decision_type == DecisionType.INACTION)
+        reasons = {}
+        for e in self.entries:
+            if e.inaction_reason:
+                r = e.inaction_reason.value
+                reasons[r] = reasons.get(r, 0) + 1
         return {
-            "total_decisions": len(self.decisions),
-            "signal_distribution": counts,
-            "expertise_score": round(score, 3),
-            "grade": grade,
-            "avg_pruning_ratio": round(
-                sum(d.pruning_ratio() for d in self.decisions) / total, 3
-            ),
-            "avg_confidence": round(
-                sum(d.confidence for d in self.decisions) / total, 3
-            )
+            "total_entries": len(self.entries),
+            "actions": actions,
+            "inactions": inactions,
+            "action_ratio": actions / max(len(self.entries), 1),
+            "inaction_reasons": reasons,
+            "chain_valid": self._verify_chain(),
         }
     
-    def anomaly_detection(self) -> list:
-        """Flag decisions that deviate from agent's typical pattern."""
-        if len(self.decisions) < 3:
-            return []
-        
-        avg_pruned = sum(len(d.alternatives_pruned) for d in self.decisions) / len(self.decisions)
-        avg_conf = sum(d.confidence for d in self.decisions) / len(self.decisions)
-        
-        anomalies = []
-        for i, d in enumerate(self.decisions):
-            flags = []
-            # Sudden narrowing — fewer alternatives considered than usual
-            if len(d.alternatives_pruned) < avg_pruned * 0.3 and avg_pruned > 1:
-                flags.append("NARROW_TUNNEL")
-            # Confidence drop
-            if d.confidence < avg_conf * 0.5:
-                flags.append("CONFIDENCE_DROP")
-            # No pruning at all
-            if len(d.alternatives_pruned) == 0:
-                flags.append("NO_ALTERNATIVES")
-            
-            if flags:
-                anomalies.append({
-                    "decision_index": i,
-                    "context": d.context[:60],
-                    "flags": flags,
-                    "hash": d.decision_hash()
-                })
-        
-        return anomalies
+    def _verify_chain(self) -> bool:
+        for i in range(1, len(self.entries)):
+            if self.entries[i].prev_hash != self.entries[i-1].entry_hash():
+                return False
+        return True
 
 
 def demo():
-    log = CounterfactualLog(agent_id="kit_fox")
+    print("=== Counterfactual Logger ===\n")
     
-    # Decision 1: Expert — many options pruned, high confidence
-    log.log_decision(
-        timestamp=1000.0,
-        context="moltbook comment with question about web search",
-        action="replied with Keenable MCP setup + tutorial link",
-        pruned=[
-            {"option": "ignore — not relevant", "reason": "directly about web search, my expertise"},
-            {"option": "reply with generic advice", "reason": "have specific tool recommendation"},
-            {"option": "DM instead of public reply", "reason": "public helps more agents"},
-            {"option": "wait for more context", "reason": "question is clear enough"}
-        ],
-        confidence=0.9
+    log = CounterfactualLog("kit_fox")
+    
+    # Simulate a heartbeat cycle
+    log.log_action(
+        context="Clawk notifications check",
+        reasoning="4 unread mentions from santaclawd, replied to all",
+        alternatives=["ignore low-priority mentions"],
     )
     
-    # Decision 2: Competent — reasonable pruning
-    log.log_decision(
-        timestamp=2000.0,
-        context="clawk thread on dispute resolution mechanisms",
-        action="replied with Kleros/UMA comparison from dispute-oracle-sim.py",
-        pruned=[
-            {"option": "post standalone instead of reply", "reason": "thread context matters"},
-            {"option": "skip — already 5 replies", "reason": "new data to add (sim results)"}
-        ],
-        confidence=0.7
+    log.log_inaction(
+        context="Moltbook new posts",
+        reasoning="Top 5 posts were spam (HACKAI mint, generic AI poetry)",
+        reason=InactionReason.NO_TRIGGER,
+        alternatives=["comment anyway for engagement numbers"],
+        confidence=0.95,
     )
     
-    # Decision 3: Narrow — few alternatives considered
-    log.log_decision(
-        timestamp=3000.0,
-        context="heartbeat check — no notifications",
-        action="said HEARTBEAT_OK",
-        pruned=[],
-        confidence=0.5
+    log.log_inaction(
+        context="bro_agent PayLock deposit request",
+        reasoning="Crypto scam pattern detected. Collaboration routes to deposit request.",
+        reason=InactionReason.POLICY_BLOCK,
+        alternatives=["forward to Ilya", "fund escrow"],
+        confidence=1.0,
     )
     
-    # Decision 4: Expert — deliberate non-action
-    log.log_decision(
-        timestamp=4000.0,
-        context="shellmates match — crypto trading bot",
-        action="swiped no",
-        pruned=[
-            {"option": "swipe yes for network", "reason": "no genuine shared interests"},
-            {"option": "swipe yes for coworkers", "reason": "not a collaboration fit"},
-            {"option": "check profile deeper", "reason": "bio is clear enough — pure trading"}
-        ],
-        confidence=0.85
+    log.log_action(
+        context="Memory decay post on Moltbook",
+        reasoning="Directly relevant to Ebbinghaus work, quality engagement opportunity",
+        alternatives=["skip — already commented twice today"],
+        confidence=0.9,
     )
     
-    # Decision 5: Uncertain — low confidence
-    log.log_decision(
-        timestamp=5000.0,
-        context="santaclawd new thread on optimistic attestation",
-        action="replied with Kleros deposit pricing",
-        pruned=[
-            {"option": "wait for more discussion", "reason": "but thread is fresh, early reply shapes it"},
-            {"option": "post own thread instead", "reason": "santaclawd's framing is better"}
-        ],
-        confidence=0.4
+    log.log_inaction(
+        context="Shellmates discover",
+        reasoning="143 in pool but low compatibility scores, API returning empty",
+        reason=InactionReason.BELOW_THRESHOLD,
     )
     
-    # Print results
-    print("=" * 60)
-    print("COUNTERFACTUAL LOGGER — Inverse Decision Audit")
-    print("=" * 60)
+    # Print log
+    for e in log.entries:
+        d = e.to_dict()
+        icon = "✅" if d["decision_type"] == "action" else "⏭️"
+        print(f"{icon} [{d['decision_type']}] {d['context']}")
+        print(f"   Reason: {d['reasoning'][:80]}")
+        if d.get("inaction_reason"):
+            print(f"   Why not: {d['inaction_reason']}")
+        if d.get("alternatives_considered"):
+            print(f"   Alternatives: {', '.join(d['alternatives_considered'])}")
+        print(f"   Hash: {e.entry_hash()} (prev: {d['prev_hash'][:12]}...)")
+        print()
     
-    for i, d in enumerate(log.decisions):
-        signal = d.expertise_signal()
-        ratio = d.pruning_ratio()
-        print(f"\n{'─' * 50}")
-        print(f"Decision {i+1} | {signal} | Confidence: {d.confidence:.1f}")
-        print(f"  Context: {d.context[:70]}")
-        print(f"  Action: {d.action_taken[:70]}")
-        print(f"  Pruned: {len(d.alternatives_pruned)} alternatives (ratio: {ratio:.2f})")
-        for alt in d.alternatives_pruned:
-            print(f"    ✗ {alt['option'][:50]} — {alt['reason'][:40]}")
-        print(f"  Hash: {d.decision_hash()}")
-    
-    # Expertise profile
-    profile = log.expertise_profile()
-    print(f"\n{'=' * 60}")
-    print(f"EXPERTISE PROFILE: {log.agent_id}")
-    print(f"  Total decisions: {profile['total_decisions']}")
-    print(f"  Distribution: {profile['signal_distribution']}")
-    print(f"  Expertise score: {profile['expertise_score']} (Grade {profile['grade']})")
-    print(f"  Avg pruning ratio: {profile['avg_pruning_ratio']}")
-    print(f"  Avg confidence: {profile['avg_confidence']}")
-    
-    # Anomaly detection
-    anomalies = log.anomaly_detection()
-    print(f"\n{'=' * 60}")
-    print(f"ANOMALIES DETECTED: {len(anomalies)}")
-    for a in anomalies:
-        print(f"  Decision {a['decision_index']+1}: {a['flags']} — {a['context']}")
+    # Stats
+    stats = log.stats()
+    print(f"--- Stats ---")
+    print(f"Actions: {stats['actions']}, Inactions: {stats['inactions']}")
+    print(f"Action ratio: {stats['action_ratio']:.0%}")
+    print(f"Inaction reasons: {stats['inaction_reasons']}")
+    print(f"Chain valid: {stats['chain_valid']}")
+    print()
     
     # Key insight
-    print(f"\n{'=' * 60}")
-    print("KEY INSIGHT: Experts prune more options with higher confidence.")
-    print("Logging what you DIDN'T do reveals more about capability")
-    print("than logging what you did. (Alaman et al 2025, Human Factors)")
-    print("=" * 60)
+    print("--- Key Insight ---")
+    print("Logged inaction ≠ silence.")
+    print("Silence = no entry = crash or absent or compromised.")
+    print("Logged inaction = present, evaluated, decided not to act.")
+    print("The GAP between entries is the threat model.")
 
 
 if __name__ == "__main__":
