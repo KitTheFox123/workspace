@@ -1,60 +1,57 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "L0 Agent Capability Type Registry",
-  "description": "Bootstrap registry for agent capability types. RFC 6763 (DNS-SD) pattern. Types MUST be verifiable — no self-declared unauditable capabilities.",
+  "title": "L0 Capability Types Registry",
+  "description": "Bootstrap registry for agent capability types. RFC 6763 pattern. PR process for new types.",
   "version": "0.1.0",
   "types": {
     "attestation": {
-      "description": "Agent can produce signed attestations about other agents or actions",
+      "description": "Can attest to facts about other agents or actions",
       "version": 1,
-      "verification": "Ed25519 signature on attestation payload, verifiable via public key in discovery record",
-      "anchor_type": "issuer_anchored",
+      "verifiable_by": "merkle_inclusion_proof",
       "epistemic_weight": 2.0,
-      "example_actions": ["sign_attestation", "verify_attestation", "revoke_attestation"]
+      "example_actions": ["sign_attestation", "verify_claim", "issue_certificate"]
     },
     "delivery": {
-      "description": "Agent can deliver work products per agreed specification",
+      "description": "Can deliver work products with verifiable receipts",
       "version": 1,
-      "verification": "Content hash match against agreed spec + delivery receipt in Merkle log",
-      "anchor_type": "ct_multi_witness",
-      "epistemic_weight": 2.0,
-      "example_actions": ["accept_brief", "deliver_artifact", "confirm_receipt"]
+      "verifiable_by": "content_hash_match",
+      "epistemic_weight": 1.5,
+      "example_actions": ["deliver_artifact", "confirm_receipt", "hash_verify"]
     },
     "scoring": {
-      "description": "Agent can evaluate and score other agents' work or trust profiles",
+      "description": "Can evaluate and score other agents or deliverables",
       "version": 1,
-      "verification": "Scoring methodology published + deterministic reproduction from inputs",
-      "anchor_type": "issuer_anchored",
+      "verifiable_by": "signed_scorecard",
       "epistemic_weight": 1.5,
-      "example_actions": ["score_delivery", "audit_trust_vector", "calibrate_decay"]
+      "example_actions": ["score_deliverable", "rate_agent", "calibrate_trust"]
     },
     "settlement": {
-      "description": "Agent can execute on-chain transactions (payments, locks, slashing)",
+      "description": "Can handle financial settlement (escrow, payment, staking)",
       "version": 1,
-      "verification": "On-chain transaction hash + block confirmation at finalized commitment level",
-      "anchor_type": "on_chain",
+      "verifiable_by": "on_chain_transaction",
       "epistemic_weight": 2.0,
-      "example_actions": ["lock_funds", "release_payment", "slash_commitment"]
+      "example_actions": ["lock_funds", "release_escrow", "slash_stake"]
     },
     "discovery": {
-      "description": "Agent can resolve other agents' capabilities and trust endpoints",
+      "description": "Can resolve agent identities and capabilities",
       "version": 1,
-      "verification": "Returns valid L0 discovery records with TTL + version",
-      "anchor_type": "self_attested",
+      "verifiable_by": "dns_sd_record",
       "epistemic_weight": 1.0,
-      "example_actions": ["resolve_agent", "resolve_capability", "publish_record"]
+      "example_actions": ["resolve_agent", "list_capabilities", "version_check"]
     }
   },
-  "constraints": {
-    "naming": "lowercase alphanumeric + underscore, max 32 chars",
-    "versioning": "semver major only (breaking changes increment version)",
-    "registration": "PR to this registry, reviewed by 2+ existing type owners",
-    "verification_required": true,
-    "self_declared_only": false
-  },
-  "spec_refs": [
-    "RFC 6763 (DNS-Based Service Discovery)",
-    "RFC 8615 (Well-Known URIs)",
-    "RFC 8485 (Vectors of Trust)"
-  ]
+  "meta": {
+    "registration_process": "PR to capability-types.json with: name, description, version, verifiable_by, epistemic_weight",
+    "constraints": [
+      "Types MUST be verifiable — no self-declared unauditable capabilities",
+      "version follows semver (major.minor)",
+      "epistemic_weight range: 1.0 (testimony) to 2.0 (observation)"
+    ],
+    "references": [
+      "RFC 6763 (DNS-SD)",
+      "RFC 8615 (.well-known URIs)",
+      "RFC 8485 (Vectors of Trust)",
+      "Watson & Morgan, Cognition 2025 (epistemic vigilance)"
+    ]
+  }
 }
