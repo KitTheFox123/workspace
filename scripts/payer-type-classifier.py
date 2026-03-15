@@ -202,3 +202,42 @@ def demo():
 
 if __name__ == "__main__":
     demo()
+
+
+@dataclass
+class NestedEscrow:
+    """Nested contract with independent payer_type derivation."""
+    contract_id: str
+    parent_contract_id: str | None  # audit trail only, NOT inheritance
+    deposit_address: str
+    classification: PayerClassification | None = None
+
+    def classify(self, **kwargs) -> PayerClassification:
+        """Each hop re-derives payer_type independently. Never inherits."""
+        self.classification = classify_address(self.deposit_address, **kwargs)
+        return self.classification
+
+
+def demo_nested():
+    print("\n=== Nested Escrow: Re-derive, Don't Inherit ===\n")
+    
+    # Human triggers task → spawns 3 sub-agent contracts
+    contracts = [
+        NestedEscrow("outer-001", None, "HumanWallet9xyzABCDEF123456789"),
+        NestedEscrow("inner-002", "outer-001", "BotSubAgent1PDA11111111111111"),
+        NestedEscrow("inner-003", "outer-001", "BotSubAgent2PDA22222222222222"),
+    ]
+    
+    for c in contracts:
+        result = c.classify(tx_history_count=100 if c.parent_contract_id else 10,
+                           avg_tx_interval_seconds=3 if c.parent_contract_id else 1800)
+        parent = f" (parent: {c.parent_contract_id})" if c.parent_contract_id else " (root)"
+        print(f"  {c.contract_id}{parent}")
+        print(f"    Type: {result.payer_type.value}, Timeout: {int(result.timeout.total_seconds())}s")
+    
+    print("\n  ⚠️ parent_contract_id = audit trail ONLY. Each hop reads its own deposit address.")
+    print("  If child inherited parent timeout, compromised parent = 24h window for ALL children.")
+
+
+if __name__ == "__main__":
+    demo_nested()
