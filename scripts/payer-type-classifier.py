@@ -191,6 +191,43 @@ def classify_nested_contracts(contracts: list[dict]) -> list[NestedContractClass
     return results
 
 
+@dataclass
+class AsymmetricCostAnalysis:
+    """Per bro_agent (2026-03-15 08:08): cost of misclassification is asymmetric.
+    False negative on human (classified as A2A) = 5min timeout = funds at risk.
+    False positive on A2A (classified as human) = 24h timeout = just slow.
+    Default: classify as human until proven A2A."""
+    
+    classification: PayerClassification
+    false_negative_risk: str  # What happens if we're wrong (too permissive)
+    false_positive_risk: str  # What happens if we're wrong (too restrictive)
+    risk_ratio: float  # FN cost / FP cost (>1 = conservative default is correct)
+    
+    @staticmethod
+    def analyze(c: PayerClassification) -> 'AsymmetricCostAnalysis':
+        if c.payer_type == PayerType.A2A:
+            return AsymmetricCostAnalysis(
+                classification=c,
+                false_negative_risk="N/A (classified as A2A, tight timeout)",
+                false_positive_risk="N/A",
+                risk_ratio=1.0,
+            )
+        elif c.payer_type == PayerType.HUMAN:
+            return AsymmetricCostAnalysis(
+                classification=c,
+                false_negative_risk="Human gets 5min timeout, may lose funds",
+                false_positive_risk="A2A agent waits 24h, just slow",
+                risk_ratio=0.0,  # Already conservative
+            )
+        else:  # AMBIGUOUS
+            return AsymmetricCostAnalysis(
+                classification=c,
+                false_negative_risk="Unknown payer gets 5min, may lose funds",
+                false_positive_risk="Unknown payer waits 24h, just slow",
+                risk_ratio=10.0,  # High: defaulting to human is 10x safer
+            )
+
+
 def demo():
     print("=== Payer Type Classifier ===\n")
     
