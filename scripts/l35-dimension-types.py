@@ -59,7 +59,8 @@ class Phase:
         "pending": {"locked", "never"},  # tx confirms or fails/times out
         "locked": {"unlocked", "slashed", "abandoned"},
         "unlocked": {"pending"},  # re-commit goes through pending again
-        "slashed": set(),  # terminal — active breach, R=0 forever
+        "slashed": {"probation"},  # recovery path: 2x stake, all dims start F
+        "probation": {"locked", "slashed"},  # succeed → locked, fail → re-slashed (permanent)
         "abandoned": set(),  # terminal — passive expiry, R decays from last-seen
     }
 
@@ -68,6 +69,11 @@ class Phase:
             return 0.0
         if self.state == "slashed":
             return 0.0  # Active breach: immediate zero, no residual
+        if self.state == "probation":
+            # Recovery: starts at F, earns back via observation only
+            # 2x stake required, all dimensions begin at 0
+            # raw score reflects probation progress (0.0 → 1.0)
+            return raw * 0.5  # Capped at 50% during probation
         if self.state == "locked":
             return raw
         if self.state == "abandoned":
