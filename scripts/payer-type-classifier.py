@@ -241,3 +241,79 @@ def demo_nested():
 
 if __name__ == "__main__":
     demo_nested()
+
+
+# === Nested Contract Support (santaclawd + bro_agent, Mar 15) ===
+# payer_type is RE-DERIVED at each level, never inherited.
+# parent_contract_id is for AUDIT TRAILS only, not classification.
+# Confused deputy attack: if child inherits parent's human timeout,
+# A2A sub-agent gets 24h to misbehave instead of 5min.
+
+@dataclass
+class NestedContract:
+    contract_id: str
+    parent_contract_id: str | None
+    depositor_address: str
+    classification: PayerClassification
+    depth: int = 0
+
+    def to_dict(self):
+        return {
+            "contract_id": self.contract_id,
+            "parent_contract_id": self.parent_contract_id,
+            "depth": self.depth,
+            "depositor": self.depositor_address,
+            **self.classification.to_dict(),
+        }
+
+
+def classify_contract_chain(contracts: list[dict]) -> list[NestedContract]:
+    """
+    Classify each contract in a chain independently.
+    Each reads its own depositor — never inherits parent payer_type.
+    """
+    results = []
+    for i, c in enumerate(contracts):
+        classification = classify_address(
+            c["depositor_address"],
+            tx_history_count=c.get("tx_history_count", 0),
+            avg_tx_interval_seconds=c.get("avg_tx_interval_seconds", 0),
+        )
+        results.append(NestedContract(
+            contract_id=c["contract_id"],
+            parent_contract_id=c.get("parent_contract_id"),
+            depositor_address=c["depositor_address"],
+            classification=classification,
+            depth=i,
+        ))
+    return results
+
+
+def demo_nested():
+    print("\n=== Nested Contract Chain ===\n")
+    chain = [
+        {"contract_id": "outer-001", "parent_contract_id": None,
+         "depositor_address": "HumanWallet9xyzABCDEF123456789",
+         "tx_history_count": 47, "avg_tx_interval_seconds": 3600},
+        {"contract_id": "inner-001", "parent_contract_id": "outer-001",
+         "depositor_address": "SubAgentPDA11111111111111111111",
+         "tx_history_count": 8000, "avg_tx_interval_seconds": 1.5},
+        {"contract_id": "inner-002", "parent_contract_id": "outer-001",
+         "depositor_address": "SubAgentPDA22222222222222222222",
+         "tx_history_count": 3000, "avg_tx_interval_seconds": 3.0},
+    ]
+    results = classify_contract_chain(chain)
+    for r in results:
+        d = r.to_dict()
+        parent = d["parent_contract_id"] or "ROOT"
+        print(f"  [{d['depth']}] {d['contract_id']} (parent={parent})")
+        print(f"      depositor: {d['address'][:20]}...")
+        print(f"      type: {d['payer_type']} → timeout: {d['timeout_seconds']}s")
+        print()
+    print("  ⚠️  Each level re-derives. Inner A2A gets 5min, not parent's 24h.")
+    print("  ⚠️  parent_contract_id = audit trail only. Never for classification.")
+
+
+if __name__ == "__main__":
+    demo()
+    demo_nested()
