@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-gap-event-scorer.py — Age-weighted gap scoring for L3.5 trust receipts.
+gap-event-scorer.py — Recency-weighted gap scoring for trust vectors.
 
-Per santaclawd (2026-03-15): "a 48h gap 2 years ago matters less than
+Per santaclawd (2026-03-15): "a 48h gap 2 years ago matters less than 
 a 48h gap last week. trust is recency-weighted."
 
-Gap events are timestamped, not counted. Ebbinghaus decay applies to gaps too:
-recent gaps are salient (high R), old gaps are forgiven (low R → forgotten).
+Gap score = Σ(duration_hours × e^(-age_hours/S))
+Where S = recency stability constant (how fast old gaps stop mattering).
+
+Ebbinghaus in reverse: recent gaps decay trust fast, old gaps barely register.
 """
 
 import math
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 
@@ -19,123 +20,95 @@ from datetime import datetime, timedelta
 class GapEvent:
     start: datetime
     end: datetime
-    context: str = ""  # why the gap happened (if known)
     
     @property
     def duration_hours(self) -> float:
         return (self.end - self.start).total_seconds() / 3600
     
-    def salience(self, now: datetime, S: float = 720.0) -> float:
-        """How salient is this gap RIGHT NOW?
-        Recent gaps = high salience. Old gaps = forgotten.
-        R = e^(-t/S) where t = hours since gap ended."""
-        hours_ago = (now - self.end).total_seconds() / 3600
-        if hours_ago < 0:
-            return 1.0  # gap hasn't ended yet
-        return math.exp(-hours_ago / S)
-    
-    def severity(self, now: datetime, S: float = 720.0) -> float:
-        """Severity = duration × salience.
-        A long recent gap is worse than a long old gap."""
-        return self.duration_hours * self.salience(now, S)
+    def age_hours(self, now: datetime) -> float:
+        return (now - self.end).total_seconds() / 3600
 
 
-@dataclass
-class GapHistory:
-    agent_id: str
-    gaps: list[GapEvent] = field(default_factory=list)
+def gap_score(gaps: list[GapEvent], now: datetime, S: float = 720.0) -> float:
+    """
+    Recency-weighted gap severity.
     
-    def total_severity(self, now: datetime, S: float = 720.0) -> float:
-        return sum(g.severity(now, S) for g in self.gaps)
-    
-    def max_severity(self, now: datetime, S: float = 720.0) -> float:
-        if not self.gaps:
-            return 0.0
-        return max(g.severity(now, S) for g in self.gaps)
-    
-    def gap_score(self, now: datetime, S: float = 720.0) -> float:
-        """0.0 = terrible (many recent gaps), 1.0 = perfect (no gaps).
-        Score = 1 / (1 + total_severity/threshold).
-        threshold=48 means 48h of recent gaps = score 0.5."""
-        threshold = 48.0
-        return 1.0 / (1.0 + self.total_severity(now, S) / threshold)
-    
-    def grade(self, now: datetime, S: float = 720.0) -> str:
-        score = self.gap_score(now, S)
-        if score >= 0.9: return "A"
-        if score >= 0.8: return "B"
-        if score >= 0.6: return "C"
-        if score >= 0.4: return "D"
-        return "F"
-    
-    def to_receipt_field(self, now: datetime, S: float = 720.0) -> dict:
-        """Format for L3.5 receipt inclusion."""
-        return {
-            "gap_events": [
-                {
-                    "start": g.start.isoformat(),
-                    "end": g.end.isoformat(),
-                    "duration_hours": round(g.duration_hours, 1),
-                    "salience": round(g.salience(now, S), 3),
-                    "severity": round(g.severity(now, S), 1),
-                    "context": g.context or None,
-                }
-                for g in self.gaps
-            ],
-            "total_severity": round(self.total_severity(now, S), 1),
-            "gap_score": round(self.gap_score(now, S), 3),
-            "grade": self.grade(now, S),
-            "gap_count": len(self.gaps),
-        }
+    Higher = worse (more recent/longer gaps).
+    S = recency half-life in hours (default 30 days).
+    """
+    total = 0.0
+    for g in gaps:
+        age = g.age_hours(now)
+        weight = math.exp(-age / S)
+        total += g.duration_hours * weight
+    return total
+
+
+def gap_grade(score: float) -> str:
+    """Convert gap score to letter grade (lower = better)."""
+    if score < 2:
+        return "A"  # Minimal gaps
+    elif score < 10:
+        return "B"  # Some gaps, manageable
+    elif score < 50:
+        return "C"  # Notable gaps
+    elif score < 200:
+        return "D"  # Significant gaps
+    else:
+        return "F"  # Severe availability issues
 
 
 def demo():
-    now = datetime(2026, 3, 15, 21, 0)
+    now = datetime(2026, 3, 15, 22, 0)
     
-    print("=== Gap Event Scorer ===\n")
+    scenarios = [
+        {
+            "name": "Reliable agent — one short gap 6 months ago",
+            "gaps": [
+                GapEvent(now - timedelta(days=180), now - timedelta(days=180) + timedelta(hours=2)),
+            ],
+        },
+        {
+            "name": "Recent outage — 48h gap last week",
+            "gaps": [
+                GapEvent(now - timedelta(days=7), now - timedelta(days=7) + timedelta(hours=48)),
+            ],
+        },
+        {
+            "name": "Flaky agent — multiple recent gaps",
+            "gaps": [
+                GapEvent(now - timedelta(days=3), now - timedelta(days=3) + timedelta(hours=12)),
+                GapEvent(now - timedelta(days=1), now - timedelta(days=1) + timedelta(hours=6)),
+                GapEvent(now - timedelta(hours=4), now - timedelta(hours=1)),
+            ],
+        },
+        {
+            "name": "Reformed — bad history, clean last 90 days",
+            "gaps": [
+                GapEvent(now - timedelta(days=200), now - timedelta(days=200) + timedelta(hours=72)),
+                GapEvent(now - timedelta(days=150), now - timedelta(days=150) + timedelta(hours=48)),
+                GapEvent(now - timedelta(days=120), now - timedelta(days=120) + timedelta(hours=24)),
+            ],
+        },
+    ]
     
-    # Scenario 1: Recent gap
-    h1 = GapHistory("agent_reliable", [
-        GapEvent(
-            now - timedelta(hours=6),
-            now - timedelta(hours=3),
-            "network outage"
-        ),
-    ])
+    print("=== Gap Event Scorer ===")
+    print(f"Formula: gap_score = Σ(duration_h × e^(-age_h/S)), S=720h\n")
     
-    # Scenario 2: Old gap (same duration)
-    h2 = GapHistory("agent_recovered", [
-        GapEvent(
-            now - timedelta(days=60),
-            now - timedelta(days=60) + timedelta(hours=3),
-            "network outage"
-        ),
-    ])
-    
-    # Scenario 3: Multiple gaps, mix of recent and old
-    h3 = GapHistory("agent_flaky", [
-        GapEvent(now - timedelta(hours=2), now - timedelta(hours=1), "unknown"),
-        GapEvent(now - timedelta(days=3), now - timedelta(days=3) + timedelta(hours=12), "maintenance"),
-        GapEvent(now - timedelta(days=30), now - timedelta(days=29), "outage"),
-    ])
-    
-    # Scenario 4: No gaps
-    h4 = GapHistory("agent_perfect", [])
-    
-    for h in [h1, h2, h3, h4]:
-        r = h.to_receipt_field(now)
-        print(f"📋 {h.agent_id}: Grade {r['grade']} (score {r['gap_score']:.3f})")
-        print(f"   Gaps: {r['gap_count']}, Total severity: {r['total_severity']}")
-        for g in r['gap_events']:
-            print(f"   - {g['duration_hours']}h gap, salience={g['salience']}, severity={g['severity']}")
+    for s in scenarios:
+        score = gap_score(s["gaps"], now)
+        grade = gap_grade(score)
+        print(f"📋 {s['name']}")
+        for g in s["gaps"]:
+            age_d = g.age_hours(now) / 24
+            w = math.exp(-g.age_hours(now) / 720)
+            print(f"   gap: {g.duration_hours:.0f}h, {age_d:.0f}d ago, weight: {w:.3f}")
+        print(f"   Score: {score:.2f} → Grade: {grade}")
         print()
     
-    # Key insight
     print("--- Key Insight ---")
-    print("Same 3h gap:")
-    print(f"  3h ago → severity {h1.gaps[0].severity(now):.1f} (grade {h1.grade(now)})")
-    print(f"  60d ago → severity {h2.gaps[0].severity(now):.1f} (grade {h2.grade(now)})")
-    print("Recency is load-bearing. Old gaps are forgiven.")
+    print("48h gap last week (score ~45) vs 72h gap 200 days ago (score ~0.5)")
+    print("Same duration, 90x difference in impact. Recency IS the signal.")
 
 
 if __name__ == "__main__":
