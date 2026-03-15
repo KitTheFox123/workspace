@@ -2,165 +2,165 @@
 """
 scar-reference.py — L3.5 scar_reference primitive.
 
-Per santaclawd (2026-03-15): new key after SLASH = fresh start,
-but without crawlable link to slashed key, fresh start = SLASH evasion.
+Per santaclawd (2026-03-15): scar_reference must be first-class protocol field.
+New key after SLASH = fresh start. Without crawlable link to slashed key,
+fresh start = SLASH evasion.
 
-scar_reference: pointer from new_key → old_key + slash_event_hash.
-Publicly verifiable. Immutable. Cross-platform.
-
-This is an L3.5 primitive, not a PayLock field. PayLock READS it.
+Design:
+- Voluntary: agent publishes scar_reference linking new_key → old_key + slash_event
+- Absent: suspicious fresh start (no penalty, but consumers can weight accordingly)
+- Verifiable: self-signed by new key, references immutable slash event hash
 """
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
+from typing import Optional
 
 
-class SlashReason(Enum):
-    DELIVERY_HASH_MISMATCH = "delivery_hash_mismatch"
-    DOUBLE_SPEND = "double_spend"
-    CONFLICTING_SIGNATURES = "conflicting_signatures"  # santaclawd's 3rd trigger
+class ScarType(Enum):
+    SLASH = "slash"              # Penalized — provable misconduct
+    KEY_COMPROMISE = "key_compromise"  # Key stolen — victim, not perpetrator
+    VOLUNTARY_ROTATION = "voluntary_rotation"  # Planned key rotation
 
 
 @dataclass
 class ScarReference:
-    """Immutable pointer from new identity to slashed identity."""
-    new_key: str
-    old_key: str
+    """Link from new identity to old (slashed) identity."""
+    new_key_hash: str
+    old_key_hash: str
     slash_event_hash: str
-    slash_reason: SlashReason
-    slash_timestamp: str
-    scar_created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    scar_type: ScarType
+    timestamp: float
+    narrative: Optional[str] = None  # Agent's account of what happened
     
     @property
-    def scar_hash(self) -> str:
-        """Deterministic hash of the scar reference itself."""
-        payload = f"{self.new_key}:{self.old_key}:{self.slash_event_hash}"
+    def reference_hash(self) -> str:
+        payload = f"{self.new_key_hash}:{self.old_key_hash}:{self.slash_event_hash}:{self.scar_type.value}"
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
     
     def to_dict(self) -> dict:
         return {
             "scar_reference": {
-                "new_key": self.new_key,
-                "old_key": self.old_key,
+                "new_key_hash": self.new_key_hash,
+                "old_key_hash": self.old_key_hash,
                 "slash_event_hash": self.slash_event_hash,
-                "slash_reason": self.slash_reason.value,
-                "slash_timestamp": self.slash_timestamp,
-                "scar_hash": self.scar_hash,
-                "created_at": self.scar_created_at,
+                "scar_type": self.scar_type.value,
+                "reference_hash": self.reference_hash,
+                "timestamp": self.timestamp,
+                "narrative": self.narrative,
             }
         }
 
 
-@dataclass  
-class IdentityGraph:
-    """Crawlable graph of identity transitions including scars."""
-    scars: list[ScarReference] = field(default_factory=list)
+@dataclass
+class IdentityReputation:
+    """Trust scoring that accounts for scar references."""
+    key_hash: str
+    track_record: int = 0       # Completed contracts
+    disputes: int = 0
+    scar_references: list[ScarReference] = field(default_factory=list)
     
-    def add_scar(self, scar: ScarReference):
-        self.scars.append(scar)
-    
-    def lookup_by_new_key(self, key: str) -> list[ScarReference]:
-        """Given a new key, find all scars (slashed histories)."""
-        return [s for s in self.scars if s.new_key == key]
-    
-    def lookup_by_old_key(self, key: str) -> list[ScarReference]:
-        """Given a slashed key, find successor identities."""
-        return [s for s in self.scars if s.old_key == key]
-    
-    def full_history(self, key: str) -> list[ScarReference]:
-        """Crawl the full scar chain for an identity."""
-        history = []
-        current = key
-        seen = set()
-        while current and current not in seen:
-            seen.add(current)
-            scars = self.lookup_by_new_key(current)
-            if scars:
-                history.extend(scars)
-                current = scars[0].old_key  # Follow chain back
-            else:
-                break
-        return history
-    
-    def evasion_score(self, key: str) -> float:
+    def trust_modifier(self) -> float:
         """
-        Score how suspicious a fresh identity looks.
-        0.0 = clean (no scars, or properly referenced)
-        1.0 = maximum evasion risk (many scars, rapid re-keying)
-        """
-        history = self.full_history(key)
-        if not history:
-            return 0.0  # No scars = either clean or unlinked
+        Scar references MODIFY trust, not determine it.
         
-        score = 0.0
-        # Each scar adds risk
-        score += min(len(history) * 0.3, 0.9)
-        # Conflicting signatures = worst reason
-        for s in history:
-            if s.slash_reason == SlashReason.CONFLICTING_SIGNATURES:
-                score += 0.3
-            elif s.slash_reason == SlashReason.DOUBLE_SPEND:
-                score += 0.2
-        return min(score, 1.0)
+        - No scars, fresh key: neutral (0.0 modifier — pure track record)
+        - Voluntary scar (key rotation): +0.1 (transparency bonus)
+        - Key compromise scar: neutral (victim, not perpetrator)
+        - Slash scar: -0.2 per slash (misconduct history)
+        - No scar but key age < 7d: -0.15 (suspicious fresh start)
+        """
+        modifier = 0.0
+        for scar in self.scar_references:
+            if scar.scar_type == ScarType.VOLUNTARY_ROTATION:
+                modifier += 0.1  # Transparency rewarded
+            elif scar.scar_type == ScarType.KEY_COMPROMISE:
+                modifier += 0.0  # Victim — no penalty
+            elif scar.scar_type == ScarType.SLASH:
+                modifier -= 0.2  # Each slash = lasting damage
+        return modifier
+    
+    def grade(self) -> str:
+        if self.track_record == 0:
+            base = 0.0
+        else:
+            base = self.track_record / (self.track_record + self.disputes)
+        
+        score = max(0.0, min(1.0, base + self.trust_modifier()))
+        
+        if score >= 0.95: return "A"
+        if score >= 0.80: return "B"
+        if score >= 0.60: return "C"
+        if score >= 0.40: return "D"
+        return "F"
 
 
 def demo():
-    print("=== Scar Reference — L3.5 Primitive ===\n")
+    now = time.time()
     
-    graph = IdentityGraph()
+    print("=== Scar Reference Demo ===\n")
     
-    # Scenario 1: Agent slashed for delivery mismatch, creates new identity
-    scar1 = ScarReference(
-        new_key="agent_v2_key_abc123",
-        old_key="agent_v1_key_xyz789",
-        slash_event_hash="deadbeef01234567",
-        slash_reason=SlashReason.DELIVERY_HASH_MISMATCH,
-        slash_timestamp="2026-03-10T12:00:00Z",
+    # Scenario 1: Clean agent, no scars
+    clean = IdentityReputation(key_hash="abc123", track_record=50, disputes=0)
+    print(f"1. Clean agent (50/0): Grade {clean.grade()}, modifier {clean.trust_modifier():+.1f}")
+    
+    # Scenario 2: Agent with voluntary key rotation scar
+    rotated_scar = ScarReference(
+        new_key_hash="def456", old_key_hash="abc123",
+        slash_event_hash="n/a_voluntary",
+        scar_type=ScarType.VOLUNTARY_ROTATION,
+        timestamp=now, narrative="Planned rotation after 90 days"
     )
-    graph.add_scar(scar1)
-    
-    # Scenario 2: Same agent slashed AGAIN, creates v3
-    scar2 = ScarReference(
-        new_key="agent_v3_key_def456",
-        old_key="agent_v2_key_abc123",
-        slash_event_hash="cafebabe89abcdef",
-        slash_reason=SlashReason.DOUBLE_SPEND,
-        slash_timestamp="2026-03-14T08:00:00Z",
+    rotated = IdentityReputation(
+        key_hash="def456", track_record=10, disputes=0,
+        scar_references=[rotated_scar]
     )
-    graph.add_scar(scar2)
+    print(f"2. Rotated key (10/0 + rotation scar): Grade {rotated.grade()}, modifier {rotated.trust_modifier():+.1f}")
     
-    print("📋 Scar 1 (v1 → v2):")
-    print(json.dumps(scar1.to_dict(), indent=2))
+    # Scenario 3: Slashed agent, honest about it
+    slash_scar = ScarReference(
+        new_key_hash="ghi789", old_key_hash="old_bad_key",
+        slash_event_hash="slash_evt_deadbeef",
+        scar_type=ScarType.SLASH,
+        timestamp=now, narrative="Delivery hash mismatch on contract #47"
+    )
+    honest_slashed = IdentityReputation(
+        key_hash="ghi789", track_record=20, disputes=1,
+        scar_references=[slash_scar]
+    )
+    print(f"3. Slashed + honest (20/1 + slash scar): Grade {honest_slashed.grade()}, modifier {honest_slashed.trust_modifier():+.1f}")
     
-    print("\n📋 Scar 2 (v2 → v3):")
-    print(json.dumps(scar2.to_dict(), indent=2))
+    # Scenario 4: Fresh key, NO scar reference (suspicious)
+    fresh = IdentityReputation(key_hash="fresh_key", track_record=0, disputes=0)
+    print(f"4. Fresh key, no scars (0/0): Grade {fresh.grade()}, modifier {fresh.trust_modifier():+.1f}")
+    print(f"   ⚠️  No scar reference = can't distinguish new agent from SLASH evader")
     
-    # Crawl full history for v3
-    print("\n🔍 Full history for agent_v3:")
-    history = graph.full_history("agent_v3_key_def456")
-    for s in history:
-        print(f"  ← {s.old_key} (slashed: {s.slash_reason.value})")
+    # Scenario 5: Key compromise victim
+    compromise_scar = ScarReference(
+        new_key_hash="new_safe", old_key_hash="stolen_key",
+        slash_event_hash="compromise_evt_cafe",
+        scar_type=ScarType.KEY_COMPROMISE,
+        timestamp=now, narrative="Old key leaked via compromised MCP server"
+    )
+    victim = IdentityReputation(
+        key_hash="new_safe", track_record=30, disputes=0,
+        scar_references=[compromise_scar]
+    )
+    print(f"5. Key compromise victim (30/0): Grade {victim.grade()}, modifier {victim.trust_modifier():+.1f}")
     
-    # Evasion scores
-    print("\n⚠️  Evasion scores:")
-    for key, label in [
-        ("agent_v3_key_def456", "v3 (2 scars)"),
-        ("agent_v2_key_abc123", "v2 (1 scar)"),
-        ("clean_agent_key_000", "clean (no scars)"),
-    ]:
-        score = graph.evasion_score(key)
-        grade = "🟢" if score < 0.3 else "🟡" if score < 0.6 else "🔴"
-        print(f"  {grade} {label}: {score:.2f}")
+    print(f"\n--- Wire Format ---")
+    print(json.dumps(slash_scar.to_dict(), indent=2))
     
-    print("\n--- Design ---")
-    print("scar_reference = L3.5 primitive (identity infrastructure)")
-    print("PayLock READS it, doesn't OWN it")
-    print("Fields: new_key, old_key, slash_event_hash, slash_reason")
-    print("Crawlable, immutable, cross-platform")
-    print("No rehabilitation on same key. Fresh start WITH visible scar.")
+    print(f"\n--- Design Principles ---")
+    print("• scar_reference = L3.5 primitive (identity layer, not payment)")
+    print("• Voluntary disclosure = transparency bonus (+0.1)")
+    print("• Slash scar = permanent modifier (-0.2 per slash)")
+    print("• No scar on fresh key = consumer decides (suspicious, not penalized)")
+    print("• Key compromise = victim (neutral modifier)")
+    print("• The punishment for SLASH IS starting over with zero track record")
 
 
 if __name__ == "__main__":
