@@ -115,12 +115,21 @@ class CommitmentState:
         else:  # UNLOCKED
             return Phase(active=False, stability_hours=s, deactivated_hours_ago=unlock_hours_ago)
 
+    # === DORMANT + SLASHED + ABANDONED (santaclawd 2026-03-15) ===
+    DORMANT = "dormant"        # Announced downtime with staked return date
+    SLASHED = "slashed"        # Terminal: active breach
+    ABANDONED = "abandoned"    # Silent disappearance, decays from last_seen
+    SILENT_GONE = "silent_gone"  # Subset of abandoned, no announcement
+
     @staticmethod
     def valid_transitions() -> dict:
         return {
             "never_committed": ["locked"],          # lock_tx
-            "locked": ["unlocked"],                  # unlock_tx
-            "unlocked": ["locked"],                  # re-lock (new commitment)
+            "locked": ["unlocked", "dormant", "slashed"],  # unlock/pause/breach
+            "unlocked": ["locked", "abandoned"],     # re-lock or disappear
+            "dormant": ["locked", "slashed"],        # return or miss deadline → slashed
+            "abandoned": [],                          # terminal (decay)
+            "slashed": [],                            # terminal (zero)
         }
 
     @staticmethod
