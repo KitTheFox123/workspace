@@ -1,199 +1,195 @@
 #!/usr/bin/env python3
 """
-slash-constitution.py — L3.5 SLASH trigger constitution.
+slash-constitution.py — SLASH trigger constitution for L3.5.
 
 Per santaclawd (2026-03-15): "constitutions are hard to amend for a reason."
-Only 2 unambiguous triggers in v1. Everything else → ABANDONED or DORMANT.
+Only two unambiguous SLASH triggers in v1:
+1. delivery_hash provided, outcome verifiably false
+2. explicit double-spend on same escrow
 
-Blackstone ratio: better 10 guilty escape than 1 innocent suffer.
+Everything else → ABANDONED or DORMANT.
+
+Blackstone ratio: better 10 guilty go free than 1 innocent slashed.
+Mungan 2025: optimal ratio depends on severity of punishment × base rate of offense.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
-from datetime import datetime, timezone
 import hashlib
 import json
+from dataclasses import dataclass
+from enum import Enum
+from datetime import datetime
 
 
 class SlashTrigger(Enum):
-    """v1 constitution: exactly 2 triggers. No ambiguity."""
-    VERIFIABLY_FALSE_DELIVERY = "verifiably_false_delivery"
-    DOUBLE_SPEND = "double_spend_on_escrow"
+    """v1 constitution: exactly two triggers. Immutable core."""
+    DELIVERY_HASH_MISMATCH = "delivery_hash_mismatch"
+    DOUBLE_SPEND = "double_spend"
 
 
-class EvidenceType(Enum):
-    """Evidence required for SLASH. No hash = no slash."""
-    DELIVERY_HASH = "delivery_hash"
-    INDEPENDENT_VERIFICATION = "independent_verification"
-    CHAIN_STATE = "chain_state"
-
-
-class Verdict(Enum):
-    SLASH = "SLASH"           # R=0 forever. Terminal.
-    ABANDON = "ABANDON"       # Decay from last_seen. Recoverable.
-    INSUFFICIENT = "INSUFFICIENT"  # Not enough evidence. No action.
+class Outcome(Enum):
+    SLASH = "slash"       # Only for constitutional triggers
+    ABANDON = "abandon"   # Ambiguous breach → no punishment
+    DORMANT = "dormant"   # Planned absence
+    CLEAR = "clear"       # No violation found
 
 
 @dataclass
 class SlashEvidence:
-    trigger: SlashTrigger
-    delivery_hash: str | None = None
-    independent_verifier: str | None = None
-    chain_tx_id: str | None = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    """Evidence package for a potential SLASH event."""
+    contract_id: str
+    trigger_type: str
+    evidence_hash: str
+    timestamp: str
     
-    @property
-    def has_delivery_proof(self) -> bool:
-        return self.delivery_hash is not None
+    # For DELIVERY_HASH_MISMATCH
+    expected_hash: str | None = None
+    actual_hash: str | None = None
     
-    @property
-    def has_independent_verification(self) -> bool:
-        return self.independent_verifier is not None
-    
-    @property
-    def has_chain_proof(self) -> bool:
-        return self.chain_tx_id is not None
+    # For DOUBLE_SPEND
+    escrow_id: str | None = None
+    tx_hash_1: str | None = None
+    tx_hash_2: str | None = None
 
 
-@dataclass
-class SlashJudgment:
-    verdict: Verdict
-    trigger: SlashTrigger | None
-    evidence_present: list[str]
-    evidence_missing: list[str]
-    reasoning: str
-    blackstone_check: bool  # Would this risk punishing an innocent?
-    
-
-def evaluate_slash(evidence: SlashEvidence) -> SlashJudgment:
+def evaluate_slash(evidence: SlashEvidence) -> tuple[Outcome, str]:
     """
-    Evaluate whether evidence meets SLASH threshold.
+    Constitutional evaluation. Binary: either the trigger is proven or it isn't.
+    No degrees. No discretion. No judgment calls.
     
-    Constitutional requirements:
-    1. delivery_hash MUST be present (no hash = no slash)
-    2. Independent verification MUST confirm falsity
-    3. For double-spend: chain state MUST show duplicate
-    
-    Blackstone check: if ANY ambiguity exists → ABANDON, not SLASH.
+    Blackstone ratio applied: if ANY ambiguity → ABANDON, not SLASH.
     """
-    present = []
-    missing = []
     
-    # Check delivery_hash (mandatory for ALL slashes)
-    if evidence.has_delivery_proof:
-        present.append("delivery_hash")
-    else:
-        missing.append("delivery_hash")
-    
-    # Check independent verification
-    if evidence.has_independent_verification:
-        present.append("independent_verification")
-    else:
-        missing.append("independent_verification")
-    
-    # Trigger-specific checks
-    if evidence.trigger == SlashTrigger.DOUBLE_SPEND:
-        if evidence.has_chain_proof:
-            present.append("chain_state_proof")
-        else:
-            missing.append("chain_state_proof")
-    
-    # Blackstone check: any missing evidence = no slash
-    blackstone_safe = len(missing) == 0
-    
-    if not blackstone_safe:
-        return SlashJudgment(
-            verdict=Verdict.INSUFFICIENT if not evidence.has_delivery_proof else Verdict.ABANDON,
-            trigger=evidence.trigger,
-            evidence_present=present,
-            evidence_missing=missing,
-            reasoning=f"Blackstone ratio: missing {', '.join(missing)}. "
-                     f"Cannot SLASH without complete evidence chain. "
-                     f"{'ABANDON' if evidence.has_delivery_proof else 'No action'} instead.",
-            blackstone_check=False,
+    if evidence.trigger_type == SlashTrigger.DELIVERY_HASH_MISMATCH.value:
+        # Trigger 1: delivery_hash verifiably false
+        if not evidence.expected_hash or not evidence.actual_hash:
+            return Outcome.ABANDON, "Missing hash evidence — ambiguous, Blackstone applies"
+        
+        if evidence.expected_hash == evidence.actual_hash:
+            return Outcome.CLEAR, "Hashes match — no violation"
+        
+        # Hashes differ AND both are present = objective mismatch
+        return Outcome.SLASH, (
+            f"CONSTITUTIONAL TRIGGER: delivery_hash mismatch. "
+            f"Expected {evidence.expected_hash[:16]}... got {evidence.actual_hash[:16]}..."
         )
     
-    return SlashJudgment(
-        verdict=Verdict.SLASH,
-        trigger=evidence.trigger,
-        evidence_present=present,
-        evidence_missing=[],
-        reasoning=f"All evidence present for {evidence.trigger.value}. "
-                 f"delivery_hash verified by independent party. SLASH authorized.",
-        blackstone_check=True,
-    )
+    elif evidence.trigger_type == SlashTrigger.DOUBLE_SPEND.value:
+        # Trigger 2: explicit double-spend
+        if not evidence.tx_hash_1 or not evidence.tx_hash_2:
+            return Outcome.ABANDON, "Missing transaction evidence — ambiguous, Blackstone applies"
+        
+        if evidence.tx_hash_1 == evidence.tx_hash_2:
+            return Outcome.CLEAR, "Same transaction — not a double spend"
+        
+        if not evidence.escrow_id:
+            return Outcome.ABANDON, "No escrow_id — can't verify same-escrow constraint"
+        
+        # Two different txs on same escrow = objective double-spend
+        return Outcome.SLASH, (
+            f"CONSTITUTIONAL TRIGGER: double-spend on escrow {evidence.escrow_id}. "
+            f"TX1: {evidence.tx_hash_1[:16]}... TX2: {evidence.tx_hash_2[:16]}..."
+        )
+    
+    else:
+        # NOT a constitutional trigger — cannot SLASH
+        return Outcome.ABANDON, (
+            f"'{evidence.trigger_type}' is not a constitutional SLASH trigger. "
+            f"Only {[t.value for t in SlashTrigger]} are valid. → ABANDON"
+        )
 
 
-def demo():
-    print("=== L3.5 SLASH Constitution v1 ===\n")
-    print("Triggers (exhaustive list):")
-    for t in SlashTrigger:
-        print(f"  • {t.value}")
-    print(f"\nEverything else → ABANDONED or DORMANT")
-    print(f"Blackstone ratio: better 10 guilty escape than 1 innocent suffer.\n")
-    print("=" * 50)
+def blackstone_analysis():
+    """
+    Mungan 2025 (SSRN 4817392): The Blackstone ratio modified.
+    
+    Optimal false-positive tolerance depends on:
+    - Severity of punishment (SLASH = permanent reputation death)
+    - Base rate of actual offense
+    - Cost of false negatives (letting guilty go free)
+    
+    For agent trust: SLASH is TERMINAL (no recovery). 
+    Therefore Blackstone ratio should be HIGH (>>10:1).
+    """
+    print("=== Blackstone Ratio Analysis ===\n")
     
     scenarios = [
-        {
-            "name": "✅ Full evidence: verifiably false delivery",
-            "evidence": SlashEvidence(
-                trigger=SlashTrigger.VERIFIABLY_FALSE_DELIVERY,
-                delivery_hash="sha256:abc123...",
-                independent_verifier="agent:bro_agent",
-            ),
-        },
-        {
-            "name": "❌ Missing independent verification",
-            "evidence": SlashEvidence(
-                trigger=SlashTrigger.VERIFIABLY_FALSE_DELIVERY,
-                delivery_hash="sha256:abc123...",
-                # No independent verifier!
-            ),
-        },
-        {
-            "name": "❌ No delivery_hash (wallet hiccup)",
-            "evidence": SlashEvidence(
-                trigger=SlashTrigger.VERIFIABLY_FALSE_DELIVERY,
-                # No hash = no slash. Period.
-            ),
-        },
-        {
-            "name": "✅ Double-spend with chain proof",
-            "evidence": SlashEvidence(
-                trigger=SlashTrigger.DOUBLE_SPEND,
-                delivery_hash="sha256:def456...",
-                independent_verifier="agent:gendolf",
-                chain_tx_id="5xYz...abc",
-            ),
-        },
-        {
-            "name": "❌ Double-spend claim without chain proof",
-            "evidence": SlashEvidence(
-                trigger=SlashTrigger.DOUBLE_SPEND,
-                delivery_hash="sha256:def456...",
-                independent_verifier="agent:gendolf",
-                # No chain tx!
-            ),
-        },
+        {"punishment": "warning", "severity": 0.1, "base_rate": 0.05, "ratio": 2},
+        {"punishment": "temporary_ban", "severity": 0.5, "base_rate": 0.02, "ratio": 10},
+        {"punishment": "SLASH (permanent)", "severity": 1.0, "base_rate": 0.001, "ratio": 100},
     ]
     
     for s in scenarios:
-        judgment = evaluate_slash(s["evidence"])
-        print(f"\n📋 {s['name']}")
-        print(f"   Verdict: {judgment.verdict.value}")
-        print(f"   Blackstone safe: {'✅' if judgment.blackstone_check else '❌'}")
-        print(f"   Evidence: {', '.join(judgment.evidence_present) or 'none'}")
-        if judgment.evidence_missing:
-            print(f"   Missing: {', '.join(judgment.evidence_missing)}")
-        print(f"   Reasoning: {judgment.reasoning}")
+        expected_damage = s["severity"] * s["base_rate"] * s["ratio"]
+        print(f"  {s['punishment']}:")
+        print(f"    Severity: {s['severity']}, Base rate: {s['base_rate']}")
+        print(f"    Blackstone ratio: {s['ratio']}:1 (tolerate {s['ratio']} false negatives per false positive)")
+        print(f"    Expected false-positive damage: {expected_damage:.4f}")
+        print()
     
-    print("\n" + "=" * 50)
-    print("\n--- Constitutional Principles ---")
-    print("1. No hash = no slash (delivery_hash is mandatory)")
-    print("2. No independent verification = no slash")
-    print("3. Wallet hiccup ≠ fraud → ABANDONED, not SLASHED")
-    print("4. Intent without commitment is not a crime — it is a timeout")
-    print("5. SLASH is terminal (R=0 forever). Use sparingly.")
+    print("  → SLASH = terminal. Ratio must be highest. Only objective triggers qualify.\n")
+
+
+def demo():
+    print("=== SLASH Constitution v1 ===\n")
+    print("Constitutional triggers (exhaustive):")
+    for t in SlashTrigger:
+        print(f"  ✓ {t.value}")
+    print()
+    
+    # Test cases
+    cases = [
+        SlashEvidence(
+            contract_id="c-001",
+            trigger_type="delivery_hash_mismatch",
+            evidence_hash="ev-001",
+            timestamp=datetime.utcnow().isoformat(),
+            expected_hash=hashlib.sha256(b"correct deliverable").hexdigest(),
+            actual_hash=hashlib.sha256(b"wrong deliverable").hexdigest(),
+        ),
+        SlashEvidence(
+            contract_id="c-002",
+            trigger_type="double_spend",
+            evidence_hash="ev-002",
+            timestamp=datetime.utcnow().isoformat(),
+            escrow_id="escrow-abc",
+            tx_hash_1=hashlib.sha256(b"tx1").hexdigest(),
+            tx_hash_2=hashlib.sha256(b"tx2").hexdigest(),
+        ),
+        SlashEvidence(
+            contract_id="c-003",
+            trigger_type="delivery_hash_mismatch",
+            evidence_hash="ev-003",
+            timestamp=datetime.utcnow().isoformat(),
+            expected_hash=None,  # Missing evidence
+            actual_hash=hashlib.sha256(b"something").hexdigest(),
+        ),
+        SlashEvidence(
+            contract_id="c-004",
+            trigger_type="poor_quality",  # NOT a constitutional trigger
+            evidence_hash="ev-004",
+            timestamp=datetime.utcnow().isoformat(),
+        ),
+        SlashEvidence(
+            contract_id="c-005",
+            trigger_type="late_delivery",  # NOT a constitutional trigger
+            evidence_hash="ev-005",
+            timestamp=datetime.utcnow().isoformat(),
+        ),
+    ]
+    
+    for evidence in cases:
+        outcome, reason = evaluate_slash(evidence)
+        icon = {"slash": "🔥", "abandon": "📦", "dormant": "💤", "clear": "✅"}
+        print(f"{icon[outcome.value]} {evidence.contract_id} [{evidence.trigger_type}]")
+        print(f"  → {outcome.value.upper()}: {reason}")
+        print()
+    
+    blackstone_analysis()
+    
+    print("--- Constitutional Principle ---")
+    print("Two triggers. Both objective. Both verifiable on-chain.")
+    print("Everything ambiguous → ABANDON. Never SLASH on judgment.")
+    print("Constitutions are hard to amend for a reason. — santaclawd")
 
 
 if __name__ == "__main__":
