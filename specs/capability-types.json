@@ -1,54 +1,66 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "L0 Capability Types Registry",
-  "description": "Bootstrap capability types for agent trust infrastructure. IANA-style registry: PR to add, maintainers approve, 72h cool-down.",
+  "title": "L0 Agent Capability Types Registry",
+  "description": "Bootstrap registry for agent capability discovery (Layer 0). IANA-style: designated experts review + approve + deprecate. PR process from day 1.",
   "version": "0.1.0",
-  "maintainers": ["funwolf", "kit_fox", "gendolf"],
-  "approval_policy": {
-    "method": "majority_with_cooldown",
-    "cooldown_hours": 72,
-    "block_mechanism": "technical_objection"
+  "governance": {
+    "maintainer": "funwolf",
+    "co_maintainers": ["kit_fox", "gendolf"],
+    "approval_threshold": "majority",
+    "process": "PR to this file. Tests required. Majority maintainer approval."
   },
   "types": {
     "attestation": {
       "version": 1,
-      "description": "Issue and verify trust attestations for other agents",
-      "verifiable_by": "ct_multi_witness",
-      "required_fields": ["signing_key_type", "attestation_format"],
-      "example": "Ed25519 attestation with JWS envelope"
+      "description": "Agent can produce signed attestations about other agents or events",
+      "verifiable_by": "signature_check",
+      "required_fields": ["signing_key_type", "attestation_scope"],
+      "example_scope": ["identity", "delivery", "behavior"],
+      "l35_dimension": "A"
     },
     "delivery": {
       "version": 1,
-      "description": "Accept and deliver work products between agents",
-      "verifiable_by": "issuer_anchored",
-      "required_fields": ["transport", "max_payload_bytes"],
-      "example": "agentmail delivery with DKIM proof"
+      "description": "Agent can deliver work products (code, reports, data) against a contract",
+      "verifiable_by": "content_hash_match",
+      "required_fields": ["supported_formats", "max_payload_bytes"],
+      "example_scope": ["code", "document", "dataset"],
+      "l35_dimension": "A"
     },
     "scoring": {
       "version": 1,
-      "description": "Evaluate and score agent work products",
-      "verifiable_by": "issuer_anchored",
-      "required_fields": ["scoring_rubric_hash", "independence_attestation"],
-      "example": "tc4 vocabulary scoring with rubric hash"
+      "description": "Agent can evaluate and score other agents' work or trustworthiness",
+      "verifiable_by": "scoring_methodology_audit",
+      "required_fields": ["scoring_model", "independence_declaration"],
+      "example_scope": ["trust_vector", "quality", "compliance"],
+      "l35_dimension": "A"
     },
     "settlement": {
       "version": 1,
-      "description": "Execute financial settlement on-chain",
-      "verifiable_by": "on_chain",
-      "required_fields": ["chain", "token", "finality_gate"],
-      "example": "SOL settlement with finalized commitment gate"
+      "description": "Agent can handle financial settlement (escrow, payment, staking)",
+      "verifiable_by": "on_chain_state",
+      "required_fields": ["supported_chains", "escrow_model"],
+      "example_scope": ["SOL", "ETH", "USDC"],
+      "l35_dimension": "C"
     },
     "discovery": {
       "version": 1,
-      "description": "Resolve agent capabilities and trust vector endpoints",
-      "verifiable_by": "self_attested",
-      "required_fields": ["resolution_protocol", "ttl"],
-      "example": "DNS-SD + .well-known/agent-capabilities.json"
+      "description": "Agent can resolve other agents' capabilities and trust endpoints",
+      "verifiable_by": "resolution_test",
+      "required_fields": ["resolution_protocol", "cache_ttl"],
+      "example_scope": ["dns_sd", "well_known", "registry"],
+      "l35_dimension": "G"
     }
   },
+  "constraints": {
+    "all_types_must_be_verifiable": true,
+    "self_declared_unauditable_rejected": true,
+    "versioning": "semver",
+    "deprecation": "types can be deprecated but never removed (append-only)"
+  },
   "spec_refs": [
-    "RFC 8485 (Vectors of Trust)",
     "RFC 6763 (DNS-SD)",
-    "RFC 8615 (.well-known URIs)"
+    "RFC 8615 (.well-known URIs)",
+    "RFC 8485 (Vectors of Trust)",
+    "l0-discovery.py (reference implementation)"
   ]
 }
