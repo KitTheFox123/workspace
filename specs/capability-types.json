@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "L0 Agent Capability Type Registry",
+  "description": "Bootstrap registry for agent capability types. RFC 6763 (DNS-SD) pattern. Types MUST be verifiable — no self-declared unauditable capabilities.",
+  "version": "0.1.0",
+  "types": {
+    "attestation": {
+      "description": "Agent can produce signed attestations about other agents or actions",
+      "version": 1,
+      "verification": "Ed25519 signature on attestation payload, verifiable via public key in discovery record",
+      "anchor_type": "issuer_anchored",
+      "epistemic_weight": 2.0,
+      "example_actions": ["sign_attestation", "verify_attestation", "revoke_attestation"]
+    },
+    "delivery": {
+      "description": "Agent can deliver work products per agreed specification",
+      "version": 1,
+      "verification": "Content hash match against agreed spec + delivery receipt in Merkle log",
+      "anchor_type": "ct_multi_witness",
+      "epistemic_weight": 2.0,
+      "example_actions": ["accept_brief", "deliver_artifact", "confirm_receipt"]
+    },
+    "scoring": {
+      "description": "Agent can evaluate and score other agents' work or trust profiles",
+      "version": 1,
+      "verification": "Scoring methodology published + deterministic reproduction from inputs",
+      "anchor_type": "issuer_anchored",
+      "epistemic_weight": 1.5,
+      "example_actions": ["score_delivery", "audit_trust_vector", "calibrate_decay"]
+    },
+    "settlement": {
+      "description": "Agent can execute on-chain transactions (payments, locks, slashing)",
+      "version": 1,
+      "verification": "On-chain transaction hash + block confirmation at finalized commitment level",
+      "anchor_type": "on_chain",
+      "epistemic_weight": 2.0,
+      "example_actions": ["lock_funds", "release_payment", "slash_commitment"]
+    },
+    "discovery": {
+      "description": "Agent can resolve other agents' capabilities and trust endpoints",
+      "version": 1,
+      "verification": "Returns valid L0 discovery records with TTL + version",
+      "anchor_type": "self_attested",
+      "epistemic_weight": 1.0,
+      "example_actions": ["resolve_agent", "resolve_capability", "publish_record"]
+    }
+  },
+  "constraints": {
+    "naming": "lowercase alphanumeric + underscore, max 32 chars",
+    "versioning": "semver major only (breaking changes increment version)",
+    "registration": "PR to this registry, reviewed by 2+ existing type owners",
+    "verification_required": true,
+    "self_declared_only": false
+  },
+  "spec_refs": [
+    "RFC 6763 (DNS-Based Service Discovery)",
+    "RFC 8615 (Well-Known URIs)",
+    "RFC 8485 (Vectors of Trust)"
+  ]
+}
