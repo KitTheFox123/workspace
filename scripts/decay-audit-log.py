@@ -1,140 +1,140 @@
 #!/usr/bin/env python3
 """
-decay-audit-log.py — Empirical S calibration via consumption logging.
+decay-audit-log.py — Trust Vector Consumption Audit Log
 
-Per riverholybot's suggestion: log (t, R) at consumption time,
-then fit S empirically. Ebbinghaus measured, not assumed.
+Records every trust vector consumption: {agent_id, dimension, t, R, outcome}.
+After accumulation, enables per-relationship S calibration via curve fitting.
 
-Records every trust vector consumption with timestamps,
-then fits optimal S per dimension using least-squares.
+Addresses riverholybot's question: S=4h is a placeholder.
+Production needs per-relationship S learned from observable data.
 
 Usage: python3 decay-audit-log.py
 """
 
 import json
 import math
-import random
+import time
 from dataclasses import dataclass, field
 from typing import Optional
+import random
 
 
 @dataclass
 class ConsumptionRecord:
     """Single trust vector consumption event."""
+    consumer_id: str
+    agent_id: str
     dimension: str  # T, G, A, S, C
+    age_hours: float  # t at consumption time
     raw_score: float
-    age_hours: float
-    computed_R: float
-    S_used: float
-    consumer_accepted: bool  # did the consumer proceed with this score?
-    timestamp: str = ""
+    decayed_score: float  # R at consumption time
+    stability_used: float  # S used for this computation
+    outcome: str  # "accepted", "rejected", "degraded", "timeout"
+    timestamp: str
 
 
 @dataclass
 class DecayAuditLog:
-    """Collects consumption records for S calibration."""
+    """Append-only log of trust vector consumptions."""
     records: list[ConsumptionRecord] = field(default_factory=list)
 
-    def log(self, dim: str, raw: float, age: float, S: float, accepted: bool):
-        R = raw * math.exp(-age / S) if S != float("inf") else raw
-        self.records.append(ConsumptionRecord(
-            dimension=dim, raw_score=raw, age_hours=age,
-            computed_R=R, S_used=S, consumer_accepted=accepted,
-        ))
+    def log(self, consumer_id: str, agent_id: str, dimension: str,
+            age_hours: float, raw_score: float, stability: float,
+            outcome: str) -> ConsumptionRecord:
+        decayed = raw_score * math.exp(-age_hours / stability) if stability != float("inf") else raw_score
+        record = ConsumptionRecord(
+            consumer_id=consumer_id,
+            agent_id=agent_id,
+            dimension=dimension,
+            age_hours=age_hours,
+            raw_score=raw_score,
+            decayed_score=round(decayed, 4),
+            stability_used=stability,
+            outcome=outcome,
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        self.records.append(record)
+        return record
 
-    def fit_S(self, dimension: str) -> Optional[float]:
-        """Fit optimal S for a dimension using acceptance boundary.
-        Find S where acceptance probability transitions from high to low.
+    def fit_stability(self, agent_id: str, dimension: str) -> Optional[float]:
+        """Fit S from observed {t, outcome} pairs.
+        Simple heuristic: find the age where acceptance rate drops below 50%.
+        Production would use scipy.optimize.curve_fit on R vs outcome.
         """
-        dim_records = [r for r in self.records if r.dimension == dimension and r.age_hours > 0]
-        if len(dim_records) < 10:
-            return None  # not enough data
+        relevant = [r for r in self.records
+                    if r.agent_id == agent_id and r.dimension == dimension]
+        if len(relevant) < 10:
+            return None  # Not enough data
 
-        # Binary search for S that best separates accepted from rejected
-        best_S = None
-        best_accuracy = 0
+        # Bin by age, compute acceptance rate per bin
+        bins = {}
+        for r in relevant:
+            bin_key = int(r.age_hours)  # 1-hour bins
+            if bin_key not in bins:
+                bins[bin_key] = {"accept": 0, "total": 0}
+            bins[bin_key]["total"] += 1
+            if r.outcome == "accepted":
+                bins[bin_key]["accept"] += 1
 
-        for S_candidate in [0.5, 1, 2, 4, 8, 12, 24, 48, 168, 336, 720, 1440]:
-            correct = 0
-            for r in dim_records:
-                R = r.raw_score * math.exp(-r.age_hours / S_candidate)
-                predicted_accept = R >= 0.3  # threshold
-                if predicted_accept == r.consumer_accepted:
-                    correct += 1
-            accuracy = correct / len(dim_records)
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-                best_S = S_candidate
+        # Find crossover point (acceptance < 50%)
+        for age in sorted(bins.keys()):
+            rate = bins[age]["accept"] / bins[age]["total"]
+            if rate < 0.5 and bins[age]["total"] >= 3:
+                # S ≈ age / ln(2) at 50% crossover (from R = e^(-t/S) = 0.5)
+                return round(age / math.log(2), 1)
 
-        return best_S
+        return None  # No crossover found
 
-    def summary(self, dimension: str) -> dict:
-        dim_records = [r for r in self.records if r.dimension == dimension]
-        if not dim_records:
-            return {"dimension": dimension, "n": 0}
-
-        accepted = [r for r in dim_records if r.consumer_accepted]
-        rejected = [r for r in dim_records if not r.consumer_accepted]
-
-        fitted_S = self.fit_S(dimension)
-        current_S = dim_records[0].S_used if dim_records else None
-
+    def summary(self, agent_id: str, dimension: str) -> dict:
+        relevant = [r for r in self.records
+                    if r.agent_id == agent_id and r.dimension == dimension]
+        if not relevant:
+            return {"count": 0}
+        accepted = sum(1 for r in relevant if r.outcome == "accepted")
+        avg_age = sum(r.age_hours for r in relevant) / len(relevant)
+        fitted_s = self.fit_stability(agent_id, dimension)
         return {
-            "dimension": dimension,
-            "n": len(dim_records),
-            "acceptance_rate": round(len(accepted) / len(dim_records), 3),
-            "avg_age_accepted": round(sum(r.age_hours for r in accepted) / max(len(accepted), 1), 1),
-            "avg_age_rejected": round(sum(r.age_hours for r in rejected) / max(len(rejected), 1), 1),
-            "current_S": current_S,
-            "fitted_S": fitted_S,
-            "S_drift": round(abs((fitted_S or current_S) - current_S) / current_S, 3) if current_S and fitted_S else None,
+            "count": len(relevant),
+            "accept_rate": round(accepted / len(relevant), 3),
+            "avg_age_hours": round(avg_age, 1),
+            "current_S": relevant[-1].stability_used,
+            "fitted_S": fitted_s,
+            "calibration": "ready" if fitted_s else "needs_more_data",
         }
 
 
-def simulate_consumption(log: DecayAuditLog, dimension: str, true_S: float, configured_S: float, n: int = 100):
-    """Simulate consumers with a 'true' acceptance boundary."""
-    for _ in range(n):
-        raw = random.uniform(0.7, 1.0)
-        age = random.expovariate(1 / (true_S * 1.5))  # exponential age distribution
-        true_R = raw * math.exp(-age / true_S)
-        accepted = true_R >= 0.3 + random.gauss(0, 0.05)  # noisy threshold
-        log.log(dimension, raw, age, configured_S, accepted)
-
-
 def demo():
-    print("=== Decay Audit Log — Empirical S Calibration ===\n")
-    random.seed(42)
-
+    print("=== Decay Audit Log — S Calibration ===\n")
     log = DecayAuditLog()
 
-    # Simulate: configured S=4h for gossip, but true acceptance boundary suggests S=6h
-    simulate_consumption(log, "G", true_S=6.0, configured_S=4.0, n=200)
+    # Simulate 200 consumptions of gossip from agent_alice
+    # True S is ~6h but we're using placeholder S=4h
+    random.seed(42)
+    true_s = 6.0
+    placeholder_s = 4.0
 
-    # Simulate: configured S=168h for sleeper, true S ≈ 120h
-    simulate_consumption(log, "S", true_S=120.0, configured_S=168.0, n=200)
+    for _ in range(200):
+        age = random.expovariate(1 / 5)  # mean 5 hours
+        true_r = math.exp(-age / true_s)
+        # Outcome depends on true freshness, not our decay estimate
+        outcome = "accepted" if true_r > 0.3 + random.gauss(0, 0.1) else "rejected"
+        log.log("consumer_bob", "agent_alice", "G", round(age, 2), 0.92, placeholder_s, outcome)
 
-    # Simulate: configured S=720h for attestation, true S ≈ 720h (well calibrated)
-    simulate_consumption(log, "A", true_S=720.0, configured_S=720.0, n=200)
+    summary = log.summary("agent_alice", "G")
+    print(f"Agent: agent_alice, Dimension: G (gossip)")
+    print(f"  Records: {summary['count']}")
+    print(f"  Accept rate: {summary['accept_rate']}")
+    print(f"  Avg age: {summary['avg_age_hours']}h")
+    print(f"  Current S (placeholder): {summary['current_S']}h")
+    print(f"  Fitted S (from data): {summary['fitted_S']}h")
+    print(f"  Calibration: {summary['calibration']}")
+    print()
 
-    print("--- Per-Dimension Calibration ---\n")
-    for dim in ["G", "S", "A"]:
-        s = log.summary(dim)
-        print(f"  {dim}: n={s['n']}, acceptance={s['acceptance_rate']}")
-        print(f"     current S={s['current_S']}h, fitted S={s['fitted_S']}h")
-        if s['S_drift'] is not None:
-            drift_pct = s['S_drift'] * 100
-            status = "✅ well calibrated" if drift_pct < 20 else f"⚠️ {drift_pct:.0f}% drift — recalibrate"
-            print(f"     drift: {status}")
-        print(f"     avg age accepted={s['avg_age_accepted']}h, rejected={s['avg_age_rejected']}h")
-        print()
-
-    print("--- Recommendation ---")
-    for dim in ["G", "S", "A"]:
-        s = log.summary(dim)
-        if s['S_drift'] and s['S_drift'] > 0.2:
-            print(f"  {dim}: RECALIBRATE S from {s['current_S']}h → {s['fitted_S']}h")
-        else:
-            print(f"  {dim}: S={s['current_S']}h is well calibrated")
+    if summary['fitted_S']:
+        delta = summary['fitted_S'] - placeholder_s
+        print(f"  → Placeholder S=4h was {'too aggressive' if delta > 0 else 'too lenient'}")
+        print(f"  → Data suggests S={summary['fitted_S']}h (Δ={delta:+.1f}h)")
+        print(f"  → Recommendation: update gossip stability constant")
 
 
 if __name__ == "__main__":
