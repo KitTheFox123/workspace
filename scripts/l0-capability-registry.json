@@ -1,70 +1,57 @@
 {
-  "l0_capability_registry": {
-    "version": "0.1.0",
-    "description": "Canonical capability types for agent discovery (Layer 0). IANA-style registry — grow via PRs.",
-    "types": [
-      {
-        "name": "attestation",
-        "description": "Can attest to claims about other agents (identity, behavior, deliverables)",
-        "current_version": 3,
-        "anchor_types": ["ct_multi_witness", "issuer_anchored", "self_attested"],
-        "registered": "2026-03-14"
-      },
-      {
-        "name": "delivery",
-        "description": "Can deliver work products (code, reports, data) with verifiable receipts",
-        "current_version": 2,
-        "anchor_types": ["issuer_anchored", "self_attested"],
-        "registered": "2026-03-14"
-      },
-      {
-        "name": "scoring",
-        "description": "Can evaluate and score other agents' trust vectors or deliverables",
-        "current_version": 1,
-        "anchor_types": ["issuer_anchored"],
-        "registered": "2026-03-14"
-      },
-      {
-        "name": "settlement",
-        "description": "Can execute financial transactions (escrow, payment, staking)",
-        "current_version": 1,
-        "anchor_types": ["on_chain"],
-        "registered": "2026-03-14"
-      },
-      {
-        "name": "custody",
-        "description": "Can hold assets on behalf of other agents (wallets, keys, data)",
-        "current_version": 2,
-        "anchor_types": ["on_chain", "ct_multi_witness"],
-        "registered": "2026-03-14"
-      },
-      {
-        "name": "discovery",
-        "description": "Can resolve agent IDs to capability records and trust vector endpoints",
-        "current_version": 1,
-        "anchor_types": ["self_attested"],
-        "registered": "2026-03-14"
-      },
-      {
-        "name": "revocation",
-        "description": "Can issue revocation entries for attestations, commitments, or keys",
-        "current_version": 1,
-        "anchor_types": ["ct_multi_witness", "issuer_anchored"],
-        "registered": "2026-03-14"
-      },
-      {
-        "name": "gossip",
-        "description": "Can propagate trust signals across agent networks",
-        "current_version": 1,
-        "anchor_types": ["self_attested"],
-        "registered": "2026-03-14"
-      }
-    ],
-    "anchor_type_definitions": {
-      "self_attested": {"weight": 1.0, "description": "Single witness, agent's own claim"},
-      "issuer_anchored": {"weight": 1.5, "description": "Delegated observation, issuer signs"},
-      "ct_multi_witness": {"weight": 2.0, "description": "Multiple independent witnesses, CT-style log"},
-      "on_chain": {"weight": 2.0, "description": "Observable on-chain state, verifiable by anyone"}
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "L0 Agent Capability Type Registry",
+  "description": "Canonical capability types for agent discovery. PR to add new types.",
+  "version": "0.1.0",
+  "types": {
+    "attestation": {
+      "description": "Can attest to facts about other agents or actions",
+      "version": 1,
+      "required_trust_dimensions": ["T", "A"],
+      "min_trust_level": {"T": 2, "A": 2},
+      "anchor_type": "issuer_anchored"
+    },
+    "delivery": {
+      "description": "Can deliver work products against a brief",
+      "version": 1,
+      "required_trust_dimensions": ["A", "S"],
+      "min_trust_level": {"A": 1, "S": 1},
+      "anchor_type": "self_attested"
+    },
+    "scoring": {
+      "description": "Can evaluate and score other agents or deliverables",
+      "version": 1,
+      "required_trust_dimensions": ["T", "A", "S"],
+      "min_trust_level": {"T": 2, "A": 2, "S": 2},
+      "anchor_type": "ct_multi_witness"
+    },
+    "settlement": {
+      "description": "Can execute financial transactions (on-chain)",
+      "version": 1,
+      "required_trust_dimensions": ["T", "C"],
+      "min_trust_level": {"T": 3, "C": 3},
+      "anchor_type": "on_chain"
+    },
+    "custody": {
+      "description": "Can hold assets on behalf of other agents",
+      "version": 1,
+      "required_trust_dimensions": ["T", "A", "C"],
+      "min_trust_level": {"T": 4, "A": 3, "C": 4},
+      "anchor_type": "on_chain"
     }
+  },
+  "dimension_codes": {
+    "T": "tile_proof",
+    "G": "gossip_liveness",
+    "A": "attestation_chain",
+    "S": "sleeper_resistance",
+    "C": "commitment"
+  },
+  "trust_levels": {
+    "0": "F (score < 0.3)",
+    "1": "D (score 0.3-0.5)",
+    "2": "C (score 0.5-0.7)",
+    "3": "B (score 0.7-0.9)",
+    "4": "A (score >= 0.9)"
   }
 }
