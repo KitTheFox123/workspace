@@ -1,57 +1,49 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "L0 Capability Types Registry",
-  "description": "Bootstrap registry for agent capability types. RFC 6763 pattern. PR process for new types.",
+  "title": "L0 Agent Capability Types Registry",
+  "description": "Bootstrap capability types for Layer 0 Agent Discovery. PR process for additions.",
   "version": "0.1.0",
   "types": {
     "attestation": {
-      "description": "Can attest to facts about other agents or actions",
+      "description": "Can issue signed attestations about other agents or actions",
       "version": 1,
-      "verifiable_by": "merkle_inclusion_proof",
-      "epistemic_weight": 2.0,
-      "example_actions": ["sign_attestation", "verify_claim", "issue_certificate"]
+      "verifiable_by": "signature_check",
+      "required_fields": ["signing_algorithm", "public_key_endpoint"],
+      "example_ttl_seconds": 3600
     },
     "delivery": {
-      "description": "Can deliver work products with verifiable receipts",
+      "description": "Can deliver work products (code, data, reports) with verifiable receipts",
       "version": 1,
       "verifiable_by": "content_hash_match",
-      "epistemic_weight": 1.5,
-      "example_actions": ["deliver_artifact", "confirm_receipt", "hash_verify"]
+      "required_fields": ["supported_formats", "max_size_bytes"],
+      "example_ttl_seconds": 1800
     },
     "scoring": {
-      "description": "Can evaluate and score other agents or deliverables",
+      "description": "Can evaluate and score other agents' work or trust profiles",
       "version": 1,
-      "verifiable_by": "signed_scorecard",
-      "epistemic_weight": 1.5,
-      "example_actions": ["score_deliverable", "rate_agent", "calibrate_trust"]
+      "verifiable_by": "scoring_methodology_hash",
+      "required_fields": ["scoring_dimensions", "methodology_version"],
+      "example_ttl_seconds": 7200
     },
     "settlement": {
-      "description": "Can handle financial settlement (escrow, payment, staking)",
+      "description": "Can execute financial settlement (escrow, payment, staking)",
       "version": 1,
-      "verifiable_by": "on_chain_transaction",
-      "epistemic_weight": 2.0,
-      "example_actions": ["lock_funds", "release_escrow", "slash_stake"]
+      "verifiable_by": "on_chain_state",
+      "required_fields": ["supported_chains", "settlement_contract"],
+      "example_ttl_seconds": 300
     },
     "discovery": {
-      "description": "Can resolve agent identities and capabilities",
+      "description": "Can resolve agent_id to capabilities and trust vector endpoints",
       "version": 1,
-      "verifiable_by": "dns_sd_record",
-      "epistemic_weight": 1.0,
-      "example_actions": ["resolve_agent", "list_capabilities", "version_check"]
+      "verifiable_by": "resolution_test",
+      "required_fields": ["resolution_endpoint", "supported_protocols"],
+      "example_ttl_seconds": 3600
     }
   },
-  "meta": {
-    "registration_process": "PR to capability-types.json with: name, description, version, verifiable_by, epistemic_weight",
-    "constraints": [
-      "Types MUST be verifiable — no self-declared unauditable capabilities",
-      "version follows semver (major.minor)",
-      "epistemic_weight range: 1.0 (testimony) to 2.0 (observation)"
-    ],
-    "references": [
-      "RFC 6763 (DNS-SD)",
-      "RFC 8615 (.well-known URIs)",
-      "RFC 8485 (Vectors of Trust)",
-      "Watson & Morgan, Cognition 2025 (epistemic vigilance)"
-    ]
+  "registration_rules": {
+    "naming": "lowercase_alphanumeric_underscore",
+    "versioning": "semver_major_only",
+    "verifiable_by_required": true,
+    "pr_process": "Submit PR to capability-types.json with: name, description, version, verifiable_by, required_fields, example_ttl_seconds"
   }
 }
