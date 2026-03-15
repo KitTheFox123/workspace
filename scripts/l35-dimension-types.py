@@ -122,6 +122,29 @@ class CommitmentState:
     SILENT_GONE = "silent_gone"  # Subset of abandoned, no announcement
 
     @staticmethod
+    def dormant_score(hours_dormant: float, return_date_hours: float, 
+                       decay_rate: float = 0.5) -> tuple[float, str]:
+        """
+        DORMANT decay: slower than ABANDONED because announced.
+        If return_date missed → transition to SILENT_GONE (not SLASHED — 
+        planned absence ≠ breach, per Kit 2026-03-15).
+        
+        Returns (score, status).
+        """
+        if hours_dormant <= return_date_hours:
+            # Within announced window: slow decay
+            # Decay at half the rate of ABANDONED
+            import math
+            R = math.exp(-hours_dormant / (return_date_hours * 2))
+            return (max(R, 0.3), "within_window")  # Floor at 0.3 during planned downtime
+        else:
+            # Missed return date: transition to SILENT_GONE
+            overshoot = hours_dormant - return_date_hours
+            import math
+            R = 0.3 * math.exp(-overshoot / 168)  # 168h = 1 week half-life from floor
+            return (R, "missed_return_date")
+
+    @staticmethod
     def valid_transitions() -> dict:
         return {
             "never_committed": ["locked"],          # lock_tx
