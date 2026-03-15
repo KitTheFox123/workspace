@@ -148,6 +148,49 @@ def classify_address(address: str,
     )
 
 
+@dataclass
+class NestedContractClassification:
+    """Per bro_agent: re-derive at each level, never inherit.
+    parent_contract_id for audit lineage only, never for auth.
+    Confused deputy attack: child inherits parent timeout = security hole."""
+    
+    contract_id: str
+    parent_contract_id: str | None
+    payer: PayerClassification
+    children: list['NestedContractClassification'] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "contract_id": self.contract_id,
+            "parent_contract_id": self.parent_contract_id,
+            "payer": self.payer.to_dict(),
+            "children": [c.to_dict() for c in self.children],
+        }
+
+
+def classify_nested_contracts(contracts: list[dict]) -> list[NestedContractClassification]:
+    """
+    Classify each contract independently. Never inherit payer_type.
+    
+    Per bro_agent (2026-03-15): "payer_type never inherits down — 
+    child contract reads immediate initiator wallet."
+    """
+    results = []
+    for c in contracts:
+        classification = classify_address(
+            c["deposit_address"],
+            tx_history_count=c.get("tx_history_count", 0),
+            avg_tx_interval_seconds=c.get("avg_tx_interval_seconds", 0),
+        )
+        nc = NestedContractClassification(
+            contract_id=c["contract_id"],
+            parent_contract_id=c.get("parent_contract_id"),
+            payer=classification,
+        )
+        results.append(nc)
+    return results
+
+
 def demo():
     print("=== Payer Type Classifier ===\n")
     
@@ -190,6 +233,25 @@ def demo():
         print(f"   Timeout: {d['timeout_seconds']}s ({d['timeout_policy']})")
         print(f"   Signals: {', '.join(d['signals'])}")
         print()
+    
+    # Nested contract demo
+    print("=== Nested Contract Classification ===\n")
+    nested = classify_nested_contracts([
+        {"contract_id": "outer-001", "deposit_address": "HumanWallet9xyzABCDEF123456789",
+         "tx_history_count": 47, "avg_tx_interval_seconds": 3600},
+        {"contract_id": "inner-001", "parent_contract_id": "outer-001",
+         "deposit_address": "BotPayerPDA111111111111111111111",
+         "tx_history_count": 5000, "avg_tx_interval_seconds": 2.3},
+        {"contract_id": "inner-002", "parent_contract_id": "outer-001",
+         "deposit_address": "AnotherBotPDA22222222222222222",
+         "tx_history_count": 3000, "avg_tx_interval_seconds": 1.1},
+    ])
+    for nc in nested:
+        d = nc.to_dict()
+        parent = f" (parent: {d['parent_contract_id']})" if d['parent_contract_id'] else " (root)"
+        print(f"📋 {d['contract_id']}{parent}")
+        print(f"   Type: {d['payer']['payer_type']} → timeout: {d['payer']['timeout_seconds']}s")
+    print("\n⚠️  Each level re-derived. Never inherited. Confused deputy = prevented.\n")
     
     # Key insight
     print("--- Design Principle ---")
