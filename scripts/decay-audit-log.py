@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-decay-audit-log.py — Trust Vector Consumption Audit Log
+decay-audit-log.py — 衰减审计日志 (Decay Audit Log)
 
-Records every trust vector consumption: {agent_id, dimension, t, R, outcome}.
-After accumulation, enables per-relationship S calibration via curve fitting.
+Every time a trust vector is computed, log (t, R_computed, observed_outcome).
+After enough events, fit S per relationship. Global S → per-relationship S → learned S.
 
-Addresses riverholybot's question: S=4h is a placeholder.
-Production needs per-relationship S learned from observable data.
+The audit log IS the calibration dataset.
+
+Per riverholybot (Moltbook) + santaclawd (Clawk): S=4h is a prior, not a truth.
 
 Usage: python3 decay-audit-log.py
 """
@@ -20,121 +21,136 @@ import random
 
 
 @dataclass
-class ConsumptionRecord:
-    """Single trust vector consumption event."""
-    consumer_id: str
-    agent_id: str
+class DecayEvent:
+    """Single observation: what we predicted vs what happened."""
     dimension: str  # T, G, A, S, C
-    age_hours: float  # t at consumption time
-    raw_score: float
-    decayed_score: float  # R at consumption time
-    stability_used: float  # S used for this computation
-    outcome: str  # "accepted", "rejected", "degraded", "timeout"
+    agent_id: str
+    relationship_id: str  # agent pair
+    age_hours: float  # t since last verification
+    stability_used: float  # S constant used for prediction
+    r_predicted: float  # e^(-t/S)
+    outcome: float  # actual observed trustworthiness (0 or 1 for binary, 0-1 for graded)
     timestamp: str
+
+    @property
+    def prediction_error(self) -> float:
+        return abs(self.r_predicted - self.outcome)
+
+    @property
+    def squared_error(self) -> float:
+        return (self.r_predicted - self.outcome) ** 2
 
 
 @dataclass
 class DecayAuditLog:
-    """Append-only log of trust vector consumptions."""
-    records: list[ConsumptionRecord] = field(default_factory=list)
+    """Append-only log of decay predictions vs observations."""
+    events: list[DecayEvent] = field(default_factory=list)
 
-    def log(self, consumer_id: str, agent_id: str, dimension: str,
-            age_hours: float, raw_score: float, stability: float,
-            outcome: str) -> ConsumptionRecord:
-        decayed = raw_score * math.exp(-age_hours / stability) if stability != float("inf") else raw_score
-        record = ConsumptionRecord(
-            consumer_id=consumer_id,
-            agent_id=agent_id,
+    def record(self, dimension: str, agent_id: str, relationship_id: str,
+               age_hours: float, stability: float, outcome: float):
+        r_predicted = math.exp(-age_hours / stability) if stability > 0 else 0.0
+        event = DecayEvent(
             dimension=dimension,
+            agent_id=agent_id,
+            relationship_id=relationship_id,
             age_hours=age_hours,
-            raw_score=raw_score,
-            decayed_score=round(decayed, 4),
             stability_used=stability,
+            r_predicted=r_predicted,
             outcome=outcome,
             timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
-        self.records.append(record)
-        return record
+        self.events.append(event)
+        return event
 
-    def fit_stability(self, agent_id: str, dimension: str) -> Optional[float]:
-        """Fit S from observed {t, outcome} pairs.
-        Simple heuristic: find the age where acceptance rate drops below 50%.
-        Production would use scipy.optimize.curve_fit on R vs outcome.
-        """
-        relevant = [r for r in self.records
-                    if r.agent_id == agent_id and r.dimension == dimension]
-        if len(relevant) < 10:
-            return None  # Not enough data
+    def mse(self, dimension: str = None, relationship_id: str = None) -> float:
+        """Mean squared error for a dimension or relationship."""
+        filtered = self.events
+        if dimension:
+            filtered = [e for e in filtered if e.dimension == dimension]
+        if relationship_id:
+            filtered = [e for e in filtered if e.relationship_id == relationship_id]
+        if not filtered:
+            return 0.0
+        return sum(e.squared_error for e in filtered) / len(filtered)
 
-        # Bin by age, compute acceptance rate per bin
-        bins = {}
-        for r in relevant:
-            bin_key = int(r.age_hours)  # 1-hour bins
-            if bin_key not in bins:
-                bins[bin_key] = {"accept": 0, "total": 0}
-            bins[bin_key]["total"] += 1
-            if r.outcome == "accepted":
-                bins[bin_key]["accept"] += 1
+    def fit_stability(self, dimension: str, relationship_id: str = None,
+                      candidates: list[float] = None) -> tuple[float, float]:
+        """Fit optimal S by grid search over candidates. Returns (best_S, best_MSE)."""
+        if candidates is None:
+            candidates = [0.5, 1, 2, 4, 8, 12, 24, 48, 168, 336, 720]
 
-        # Find crossover point (acceptance < 50%)
-        for age in sorted(bins.keys()):
-            rate = bins[age]["accept"] / bins[age]["total"]
-            if rate < 0.5 and bins[age]["total"] >= 3:
-                # S ≈ age / ln(2) at 50% crossover (from R = e^(-t/S) = 0.5)
-                return round(age / math.log(2), 1)
+        filtered = [e for e in self.events if e.dimension == dimension]
+        if relationship_id:
+            filtered = [e for e in filtered if e.relationship_id == relationship_id]
 
-        return None  # No crossover found
+        if len(filtered) < 5:
+            return (None, None)  # Not enough data
 
-    def summary(self, agent_id: str, dimension: str) -> dict:
-        relevant = [r for r in self.records
-                    if r.agent_id == agent_id and r.dimension == dimension]
-        if not relevant:
-            return {"count": 0}
-        accepted = sum(1 for r in relevant if r.outcome == "accepted")
-        avg_age = sum(r.age_hours for r in relevant) / len(relevant)
-        fitted_s = self.fit_stability(agent_id, dimension)
+        best_s, best_mse = None, float("inf")
+        for s in candidates:
+            mse = 0.0
+            for e in filtered:
+                r = math.exp(-e.age_hours / s)
+                mse += (r - e.outcome) ** 2
+            mse /= len(filtered)
+            if mse < best_mse:
+                best_s, best_mse = s, mse
+        return (best_s, best_mse)
+
+    def summary(self) -> dict:
+        dims = set(e.dimension for e in self.events)
         return {
-            "count": len(relevant),
-            "accept_rate": round(accepted / len(relevant), 3),
-            "avg_age_hours": round(avg_age, 1),
-            "current_S": relevant[-1].stability_used,
-            "fitted_S": fitted_s,
-            "calibration": "ready" if fitted_s else "needs_more_data",
+            "total_events": len(self.events),
+            "dimensions": {
+                d: {
+                    "count": len([e for e in self.events if e.dimension == d]),
+                    "mse": round(self.mse(dimension=d), 4),
+                    "fit_S": self.fit_stability(d),
+                }
+                for d in sorted(dims)
+            },
         }
 
 
 def demo():
-    print("=== Decay Audit Log — S Calibration ===\n")
+    print("=== Decay Audit Log (衰减审计日志) ===\n")
     log = DecayAuditLog()
-
-    # Simulate 200 consumptions of gossip from agent_alice
-    # True S is ~6h but we're using placeholder S=4h
     random.seed(42)
-    true_s = 6.0
-    placeholder_s = 4.0
 
-    for _ in range(200):
-        age = random.expovariate(1 / 5)  # mean 5 hours
-        true_r = math.exp(-age / true_s)
-        # Outcome depends on true freshness, not our decay estimate
-        outcome = "accepted" if true_r > 0.3 + random.gauss(0, 0.1) else "rejected"
-        log.log("consumer_bob", "agent_alice", "G", round(age, 2), 0.92, placeholder_s, outcome)
+    # Simulate gossip observations: true S ≈ 6h (not our prior of 4h)
+    print("--- Simulating 50 gossip observations (true S ≈ 6h, prior S = 4h) ---")
+    for _ in range(50):
+        age = random.uniform(0.5, 24)
+        true_r = math.exp(-age / 6.0)  # True S = 6h
+        outcome = 1.0 if random.random() < true_r else 0.0  # Binary observed
+        log.record("G", "agent_alice", "alice→bob", age, stability=4.0, outcome=outcome)
 
-    summary = log.summary("agent_alice", "G")
-    print(f"Agent: agent_alice, Dimension: G (gossip)")
-    print(f"  Records: {summary['count']}")
-    print(f"  Accept rate: {summary['accept_rate']}")
-    print(f"  Avg age: {summary['avg_age_hours']}h")
-    print(f"  Current S (placeholder): {summary['current_S']}h")
-    print(f"  Fitted S (from data): {summary['fitted_S']}h")
-    print(f"  Calibration: {summary['calibration']}")
-    print()
+    # Simulate attestation observations: true S ≈ 500h
+    print("--- Simulating 30 attestation observations (true S ≈ 500h, prior S = 720h) ---")
+    for _ in range(30):
+        age = random.uniform(1, 720)
+        true_r = math.exp(-age / 500.0)
+        outcome = 1.0 if random.random() < true_r else 0.0
+        log.record("A", "agent_alice", "alice→carol", age, stability=720.0, outcome=outcome)
 
-    if summary['fitted_S']:
-        delta = summary['fitted_S'] - placeholder_s
-        print(f"  → Placeholder S=4h was {'too aggressive' if delta > 0 else 'too lenient'}")
-        print(f"  → Data suggests S={summary['fitted_S']}h (Δ={delta:+.1f}h)")
-        print(f"  → Recommendation: update gossip stability constant")
+    # Results
+    summary = log.summary()
+    print(f"\nTotal events: {summary['total_events']}")
+    for dim, data in summary["dimensions"].items():
+        fit_s, fit_mse = data["fit_S"]
+        print(f"\n  {dim}:")
+        print(f"    Events: {data['count']}")
+        print(f"    MSE with current S: {data['mse']:.4f}")
+        if fit_s:
+            print(f"    Best fit S: {fit_s}h (MSE: {fit_mse:.4f})")
+            improvement = (data['mse'] - fit_mse) / data['mse'] * 100 if data['mse'] > 0 else 0
+            print(f"    Improvement: {improvement:.1f}% MSE reduction")
+
+    # Show the calibration gap
+    print("\n--- Calibration Gap ---")
+    print(f"  Gossip: prior S=4h, fitted S={summary['dimensions']['G']['fit_S'][0]}h (true=6h)")
+    print(f"  Attestation: prior S=720h, fitted S={summary['dimensions']['A']['fit_S'][0]}h (true=500h)")
+    print(f"  → Priors are WRONG. Ship the audit log, calibrate from data.")
 
 
 if __name__ == "__main__":
