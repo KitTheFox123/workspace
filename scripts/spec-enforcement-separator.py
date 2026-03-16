@@ -1,336 +1,227 @@
 #!/usr/bin/env python3
 """
-spec-enforcement-separator.py — Formal separation of spec and enforcement layers.
+spec-enforcement-separator.py — Validate spec/enforcement separation in protocol design.
 
-Per santaclawd: "Make the SPEC product-neutral so enforcement can move between runtimes."
-Chrome CT model: IETF owns RFC 6962 (spec), Chrome enforces (policy), any browser can enforce independently.
+The Pattern (TCP/IP → HTML → CT → L3.5):
+  - Spec org ≠ enforcement org
+  - DARPA wrote TCP/IP, BSD enforced it
+  - W3C writes HTML, browsers render it
+  - IETF wrote CT (RFC 6962), Chrome enforced it
+  - When they merge → vendor lock-in (ActiveX, Flash, AMP)
 
-Key principle: spec defines WIRE FORMAT, enforcement defines POLICY.
-- Spec: what a valid receipt looks like (schema, fields, proof structure)
-- Enforcement: what to DO with invalid receipts (reject, warn, log, ignore)
+Design principle: prescribe WIRE FORMAT (interop), leave POLICY to consumers.
+RFC 9413 lesson: Postel's Law ("be liberal") caused ossification.
 
-This is the IETF/browser split applied to agent trust:
-- L3.5 wire format = RFC (open, product-neutral, versioned)
-- Runtime enforcement = Chrome CT policy (per-product, graduated, rollback-capable)
-
-Anti-patterns:
-1. Spec includes scoring algorithm → every impl disagrees on weights → forks
-2. Spec is too loose → "be liberal in acceptance" → ossification (RFC 9413)
-3. Enforcement is spec-coupled → can't change policy without spec revision
+This tool audits a protocol spec for separation violations:
+  1. Does the spec mandate scoring algorithms? (violation: policy in spec)
+  2. Does the spec mandate specific implementations? (violation: enforcement in spec)
+  3. Is the wire format self-describing? (requirement: interop without shared code)
+  4. Can a new enforcer adopt the spec without the original org? (portability test)
 """
 
-import json
-import hashlib
-import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Any
+from typing import Optional
 
 
-# ============================================================
-# SPEC LAYER: Wire format only. No policy. No scoring.
-# ============================================================
-
-class ReceiptVersion(Enum):
-    V1 = "1.0"
-    V1_1 = "1.1"
-
-
-@dataclass
-class WireReceipt:
-    """L3.5 wire format. Spec-defined. Product-neutral."""
-    version: ReceiptVersion
-    receipt_id: str
-    agent_id: str
-    action_type: str
-    timestamp: float
-    
-    # Merkle proof (spec-mandated structure)
-    leaf_hash: str
-    inclusion_proof: list[str]
-    merkle_root: str
-    
-    # Witness signatures (spec-mandated: ≥1, enforcement decides minimum)
-    witnesses: list[dict]  # [{operator_id, org, sig, timestamp}]
-    
-    # Diversity hash (spec-mandated field, enforcement decides threshold)
-    diversity_hash: Optional[str] = None
-    
-    # Extension fields (spec allows, enforcement interprets)
-    extensions: dict[str, Any] = field(default_factory=dict)
-    
-    def to_wire(self) -> bytes:
-        """Serialize to canonical wire format."""
-        canonical = {
-            "version": self.version.value,
-            "receipt_id": self.receipt_id,
-            "agent_id": self.agent_id,
-            "action_type": self.action_type,
-            "timestamp": self.timestamp,
-            "leaf_hash": self.leaf_hash,
-            "inclusion_proof": self.inclusion_proof,
-            "merkle_root": self.merkle_root,
-            "witnesses": sorted(self.witnesses, key=lambda w: w.get("operator_id", "")),
-            "diversity_hash": self.diversity_hash,
-        }
-        return json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-    
-    def content_hash(self) -> str:
-        """Content-addressable hash of wire format."""
-        return hashlib.sha256(self.to_wire()).hexdigest()
+class Layer(Enum):
+    WIRE_FORMAT = "wire_format"       # What goes on the wire (SPEC)
+    VALIDATION = "validation"         # Is the data well-formed? (SPEC)
+    POLICY = "policy"                 # What do we do with it? (ENFORCEMENT)
+    SCORING = "scoring"               # How do we rank/weight? (ENFORCEMENT)
+    GOVERNANCE = "governance"         # Who decides changes? (SPEC ORG)
+    ENFORCEMENT = "enforcement"       # Who rejects non-compliance? (ENFORCER)
 
 
-class SpecValidator:
-    """
-    Validates wire format compliance. Spec-only, no policy.
-    
-    Returns: which spec requirements are met/violated.
-    Does NOT decide what to do about violations — that's enforcement.
-    """
-    
-    REQUIRED_FIELDS = ["version", "receipt_id", "agent_id", "action_type",
-                       "timestamp", "leaf_hash", "merkle_root"]
-    
-    @staticmethod
-    def validate(receipt: WireReceipt) -> dict:
-        """Check spec compliance. Returns findings, not decisions."""
-        findings = {
-            "spec_version": receipt.version.value,
-            "has_required_fields": True,
-            "has_merkle_proof": len(receipt.inclusion_proof) > 0,
-            "has_witnesses": len(receipt.witnesses) > 0,
-            "witness_count": len(receipt.witnesses),
-            "has_diversity_hash": receipt.diversity_hash is not None,
-            "merkle_proof_valid": False,
-            "unique_witness_orgs": 0,
-            "violations": [],
-        }
-        
-        # Check required fields
-        for f in SpecValidator.REQUIRED_FIELDS:
-            if not getattr(receipt, f, None):
-                findings["has_required_fields"] = False
-                findings["violations"].append(f"missing_field:{f}")
-        
-        # Verify Merkle proof
-        if findings["has_merkle_proof"]:
-            findings["merkle_proof_valid"] = SpecValidator._verify_merkle(receipt)
-            if not findings["merkle_proof_valid"]:
-                findings["violations"].append("invalid_merkle_proof")
-        else:
-            findings["violations"].append("no_merkle_proof")
-        
-        # Count unique witness orgs (fact, not policy)
-        orgs = set()
-        for w in receipt.witnesses:
-            org = w.get("org", "unknown")
-            orgs.add(org)
-        findings["unique_witness_orgs"] = len(orgs)
-        
-        # Timestamp sanity (spec: must be positive, not in future)
-        if receipt.timestamp <= 0:
-            findings["violations"].append("invalid_timestamp")
-        elif receipt.timestamp > time.time() + 300:  # 5min clock skew tolerance
-            findings["violations"].append("future_timestamp")
-        
-        return findings
-    
-    @staticmethod
-    def _verify_merkle(receipt: WireReceipt) -> bool:
-        """Verify Merkle inclusion proof."""
-        current = receipt.leaf_hash
-        for sibling in receipt.inclusion_proof:
-            if current < sibling:
-                combined = current + sibling
-            else:
-                combined = sibling + current
-            current = hashlib.sha256(combined.encode()).hexdigest()
-        return current == receipt.merkle_root
-
-
-# ============================================================
-# ENFORCEMENT LAYER: Policy decisions. Product-specific.
-# ============================================================
-
-class EnforcementAction(Enum):
-    ACCEPT = "accept"
-    WARN = "warn"
-    REJECT = "reject"
-    QUARANTINE = "quarantine"
+class Coupling(Enum):
+    """How tightly spec and enforcement are coupled."""
+    SEPARATED = "separated"     # IETF/Chrome model — gold standard
+    LOOSE = "loose"             # Same org but different teams
+    COUPLED = "coupled"         # Same codebase, different modules
+    FUSED = "fused"             # Vendor lock-in (ActiveX model)
 
 
 @dataclass
-class EnforcementPolicy:
-    """
-    Runtime-specific enforcement policy. NOT part of the spec.
-    
-    Different runtimes can have different policies:
-    - OpenClaw: STRICT (reject without 2+ witnesses)
-    - LangChain: PERMISSIVE (accept all, log violations)
-    - Custom: WARN (accept but surface to user)
-    """
+class SpecElement:
+    """A single element of a protocol specification."""
     name: str
-    min_witnesses: int = 2
-    require_diversity_hash: bool = True
-    max_receipt_age_s: float = 86400  # 24h
-    require_merkle_proof: bool = True
-    min_unique_orgs: int = 2
+    layer: Layer
+    description: str
+    in_spec: bool          # Should this be in the spec?
+    in_enforcer: bool      # Should this be in the enforcer?
+    currently_in_spec: bool     # Where is it actually?
+    currently_in_enforcer: bool
     
-    # Graduation state
-    phase: str = "report"  # permissive, report, warn, strict
+    @property
+    def correctly_placed(self) -> bool:
+        return (self.in_spec == self.currently_in_spec and 
+                self.in_enforcer == self.currently_in_enforcer)
     
-    def decide(self, findings: dict) -> tuple[EnforcementAction, list[str]]:
-        """Apply policy to spec findings. Returns action + reasons."""
-        reasons = []
-        
-        if not findings["has_required_fields"]:
-            reasons.append("missing_required_fields")
-        
-        if self.require_merkle_proof and not findings["merkle_proof_valid"]:
-            reasons.append("invalid_merkle_proof")
-        
-        if findings["witness_count"] < self.min_witnesses:
-            reasons.append(f"insufficient_witnesses:{findings['witness_count']}/{self.min_witnesses}")
-        
-        if self.require_diversity_hash and not findings["has_diversity_hash"]:
-            reasons.append("missing_diversity_hash")
-        
-        if findings["unique_witness_orgs"] < self.min_unique_orgs:
-            reasons.append(f"insufficient_org_diversity:{findings['unique_witness_orgs']}/{self.min_unique_orgs}")
-        
-        # Determine action based on phase
-        if not reasons:
-            return EnforcementAction.ACCEPT, []
-        
-        if self.phase == "strict":
-            return EnforcementAction.REJECT, reasons
-        elif self.phase == "warn":
-            return EnforcementAction.WARN, reasons
-        elif self.phase == "report":
-            return EnforcementAction.ACCEPT, reasons  # Accept but log
-        else:  # permissive
-            return EnforcementAction.ACCEPT, []
+    @property
+    def violation_type(self) -> Optional[str]:
+        if self.correctly_placed:
+            return None
+        if self.currently_in_spec and not self.in_spec:
+            return "policy_in_spec"  # Enforcement logic leaked into spec
+        if self.currently_in_enforcer and not self.in_enforcer:
+            return "spec_in_enforcer"  # Spec logic locked in enforcer
+        return "misplaced"
 
 
-# ============================================================
-# RUNTIME: Combines spec validation + policy enforcement
-# ============================================================
-
-class AgentRuntime:
-    """
-    An agent runtime that enforces receipts.
-    Spec validation is shared. Enforcement policy is runtime-specific.
-    """
+@dataclass
+class SeparationAudit:
+    """Audit result for spec/enforcement separation."""
+    protocol_name: str
+    elements: list[SpecElement]
+    coupling: Coupling
+    spec_org: str
+    enforcement_org: str
     
-    def __init__(self, name: str, policy: EnforcementPolicy):
-        self.name = name
-        self.policy = policy
-        self.spec_validator = SpecValidator()
-        self.log: list[dict] = []
+    @property
+    def violations(self) -> list[SpecElement]:
+        return [e for e in self.elements if not e.correctly_placed]
     
-    def process_receipt(self, receipt: WireReceipt) -> dict:
-        """Validate spec compliance, then apply enforcement policy."""
-        # Step 1: Spec validation (same for all runtimes)
-        findings = self.spec_validator.validate(receipt)
+    @property
+    def policy_in_spec_count(self) -> int:
+        return sum(1 for e in self.violations if e.violation_type == "policy_in_spec")
+    
+    @property  
+    def spec_in_enforcer_count(self) -> int:
+        return sum(1 for e in self.violations if e.violation_type == "spec_in_enforcer")
+    
+    @property
+    def separation_score(self) -> float:
+        if not self.elements:
+            return 0.0
+        return sum(1 for e in self.elements if e.correctly_placed) / len(self.elements)
+    
+    @property
+    def portability(self) -> float:
+        """Can a new enforcer adopt without the original org?"""
+        # Portability = 1 - (fraction of spec locked in enforcer)
+        enforcer_locked = sum(1 for e in self.elements 
+                            if e.in_spec and e.currently_in_enforcer and not e.currently_in_spec)
+        if not self.elements:
+            return 0.0
+        return 1.0 - (enforcer_locked / len(self.elements))
+    
+    def grade(self) -> str:
+        score = self.separation_score
+        if score >= 0.95 and self.coupling in (Coupling.SEPARATED, Coupling.LOOSE):
+            return "A"
+        elif score >= 0.85:
+            return "B"
+        elif score >= 0.70:
+            return "C"
+        elif score >= 0.50:
+            return "D"
+        return "F"
+    
+    def report(self) -> str:
+        lines = [
+            f"=== Spec/Enforcement Separation Audit: {self.protocol_name} ===",
+            f"Spec org: {self.spec_org}",
+            f"Enforcement org: {self.enforcement_org}",
+            f"Coupling: {self.coupling.value}",
+            f"Separation: {self.separation_score:.0%} ({self.grade()})",
+            f"Portability: {self.portability:.0%}",
+            f"Violations: {len(self.violations)}/{len(self.elements)}",
+        ]
         
-        # Step 2: Enforcement policy (runtime-specific)
-        action, reasons = self.policy.decide(findings)
+        if self.policy_in_spec_count:
+            lines.append(f"  ⚠️ Policy in spec: {self.policy_in_spec_count}")
+        if self.spec_in_enforcer_count:
+            lines.append(f"  ⚠️ Spec in enforcer: {self.spec_in_enforcer_count}")
         
-        result = {
-            "runtime": self.name,
-            "receipt_id": receipt.receipt_id,
-            "spec_violations": findings["violations"],
-            "policy_phase": self.policy.phase,
-            "action": action.value,
-            "reasons": reasons,
-        }
+        for v in self.violations:
+            lines.append(f"  ❌ {v.name}: {v.violation_type} ({v.layer.value})")
         
-        self.log.append(result)
-        return result
+        return "\n".join(lines)
 
 
-def _make_receipt(valid=True, witnesses=2, diversity=True) -> WireReceipt:
-    """Helper to create test receipts."""
-    now = time.time()
-    leaf = hashlib.sha256(b"test_action").hexdigest()
-    sibling = hashlib.sha256(b"sibling").hexdigest()
-    if leaf < sibling:
-        root = hashlib.sha256((leaf + sibling).encode()).hexdigest()
-    else:
-        root = hashlib.sha256((sibling + leaf).encode()).hexdigest()
-    
-    witness_list = []
-    for i in range(witnesses):
-        witness_list.append({
-            "operator_id": f"op_{i}",
-            "org": f"Org{'ABCDE'[i]}" if valid else "SameOrg",
-            "sig": f"sig_{i}",
-            "timestamp": now,
-        })
-    
-    return WireReceipt(
-        version=ReceiptVersion.V1,
-        receipt_id=f"r_{int(now)}",
-        agent_id="agent:test",
-        action_type="delivery",
-        timestamp=now,
-        leaf_hash=leaf,
-        inclusion_proof=[sibling] if valid else [],
-        merkle_root=root if valid else "bad_root",
-        witnesses=witness_list,
-        diversity_hash="div_hash" if diversity else None,
-    )
+# Historical case studies
+CASE_STUDIES = {
+    "CT (RFC 6962 + Chrome)": SeparationAudit(
+        protocol_name="Certificate Transparency",
+        spec_org="IETF",
+        enforcement_org="Google Chrome",
+        coupling=Coupling.SEPARATED,
+        elements=[
+            SpecElement("SCT format", Layer.WIRE_FORMAT, "Signed Certificate Timestamp",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=False),
+            SpecElement("Log API", Layer.WIRE_FORMAT, "Append/query interface",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=False),
+            SpecElement("Merkle proof", Layer.VALIDATION, "Inclusion proof format",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=False),
+            SpecElement("SCT count policy", Layer.POLICY, "How many SCTs required",
+                       in_spec=False, in_enforcer=True, currently_in_spec=False, currently_in_enforcer=True),
+            SpecElement("Log operator list", Layer.ENFORCEMENT, "Which logs are trusted",
+                       in_spec=False, in_enforcer=True, currently_in_spec=False, currently_in_enforcer=True),
+            SpecElement("Enforcement date", Layer.ENFORCEMENT, "When to reject non-CT certs",
+                       in_spec=False, in_enforcer=True, currently_in_spec=False, currently_in_enforcer=True),
+        ],
+    ),
+    "L3.5 Trust (current design)": SeparationAudit(
+        protocol_name="L3.5 Trust Receipts",
+        spec_org="isnad-rfc (GitHub)",
+        enforcement_org="TBD (first mover)",
+        coupling=Coupling.SEPARATED,
+        elements=[
+            SpecElement("Receipt wire format", Layer.WIRE_FORMAT, "T/G/A/S/C dimensions",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=False),
+            SpecElement("Merkle inclusion proof", Layer.VALIDATION, "Receipt tree proof",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=False),
+            SpecElement("Witness signature format", Layer.WIRE_FORMAT, "Attestation envelope",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=False),
+            SpecElement("Scoring algorithm", Layer.SCORING, "How to weight dimensions",
+                       in_spec=False, in_enforcer=True, currently_in_spec=False, currently_in_enforcer=True),
+            SpecElement("SLASH triggers", Layer.POLICY, "What warrants slashing",
+                       in_spec=True, in_enforcer=True, currently_in_spec=True, currently_in_enforcer=True),
+            SpecElement("Graduation schedule", Layer.ENFORCEMENT, "REPORT→STRICT timeline",
+                       in_spec=False, in_enforcer=True, currently_in_spec=False, currently_in_enforcer=True),
+            SpecElement("Min witness count", Layer.POLICY, "N≥2 requirement",
+                       in_spec=True, in_enforcer=True, currently_in_spec=True, currently_in_enforcer=False),
+        ],
+    ),
+    "ActiveX (anti-pattern)": SeparationAudit(
+        protocol_name="ActiveX Controls",
+        spec_org="Microsoft",
+        enforcement_org="Microsoft IE",
+        coupling=Coupling.FUSED,
+        elements=[
+            SpecElement("COM interface", Layer.WIRE_FORMAT, "Component Object Model",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=True),
+            SpecElement("Security zones", Layer.POLICY, "Trust levels per origin",
+                       in_spec=False, in_enforcer=True, currently_in_spec=True, currently_in_enforcer=True),
+            SpecElement("Code signing", Layer.VALIDATION, "Authenticode signatures",
+                       in_spec=True, in_enforcer=False, currently_in_spec=True, currently_in_enforcer=True),
+            SpecElement("Registry permissions", Layer.ENFORCEMENT, "Which controls allowed",
+                       in_spec=False, in_enforcer=True, currently_in_spec=True, currently_in_enforcer=True),
+            SpecElement("Update mechanism", Layer.ENFORCEMENT, "Windows Update only",
+                       in_spec=False, in_enforcer=True, currently_in_spec=True, currently_in_enforcer=True),
+        ],
+    ),
+}
 
 
 def demo():
-    """Show spec/enforcement separation across multiple runtimes."""
-    print("=" * 70)
-    print("SPEC/ENFORCEMENT SEPARATION")
-    print("Same receipt, same spec validation, different runtime policies")
-    print("=" * 70)
+    for name, audit in CASE_STUDIES.items():
+        print(f"\n{audit.report()}")
+        print()
     
-    # Define runtime policies (like Chrome, Firefox, Safari each enforcing CT differently)
-    runtimes = [
-        AgentRuntime("OpenClaw-Strict", EnforcementPolicy(
-            name="strict", min_witnesses=2, require_diversity_hash=True,
-            min_unique_orgs=2, phase="strict"
-        )),
-        AgentRuntime("LangChain-Report", EnforcementPolicy(
-            name="report", min_witnesses=2, require_diversity_hash=True,
-            min_unique_orgs=2, phase="report"
-        )),
-        AgentRuntime("Custom-Permissive", EnforcementPolicy(
-            name="permissive", min_witnesses=1, require_diversity_hash=False,
-            min_unique_orgs=1, phase="permissive"
-        )),
-    ]
+    # Summary comparison
+    print("=" * 60)
+    print("COMPARISON: Spec/Enforcement Separation")
+    print("=" * 60)
+    print(f"{'Protocol':<30} {'Grade':>5} {'Sep%':>5} {'Port%':>5} {'Coupling':<12}")
+    print("-" * 60)
+    for name, audit in CASE_STUDIES.items():
+        print(f"{name:<30} {audit.grade():>5} {audit.separation_score:>4.0%} {audit.portability:>4.0%} {audit.coupling.value:<12}")
     
-    receipts = [
-        ("Valid receipt (2 orgs, Merkle, diversity)", _make_receipt(True, 2, True)),
-        ("Single witness, no diversity hash", _make_receipt(True, 1, False)),
-        ("Same org witnesses, bad Merkle proof", _make_receipt(False, 2, True)),
-    ]
-    
-    for receipt_name, receipt in receipts:
-        print(f"\n📄 {receipt_name}")
-        print("-" * 50)
-        
-        # Spec validation (same for all)
-        findings = SpecValidator.validate(receipt)
-        print(f"  Spec violations: {findings['violations'] or 'none'}")
-        
-        # Each runtime decides independently
-        for runtime in runtimes:
-            result = runtime.process_receipt(receipt)
-            icon = {"accept": "✅", "warn": "⚠️", "reject": "❌", "quarantine": "🔒"}
-            print(f"  {icon.get(result['action'], '?')} {runtime.name}: "
-                  f"{result['action'].upper()}"
-                  f"{' — ' + ', '.join(result['reasons']) if result['reasons'] else ''}")
-    
-    print(f"\n{'=' * 70}")
-    print("KEY INSIGHT: Same wire format, same spec validation,")
-    print("different enforcement decisions. The spec outlives any single enforcer.")
-    print(f"{'=' * 70}")
+    print(f"\n💡 Key insight: CT scores A because IETF owns the spec,")
+    print(f"   Chrome owns the enforcement. Neither can lock out the other.")
+    print(f"   ActiveX scored F because Microsoft owned both → vendor lock-in.")
+    print(f"   L3.5 follows CT model: GitHub spec, runtime enforcement.")
 
 
 if __name__ == "__main__":
