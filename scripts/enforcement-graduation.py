@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-enforcement-graduation.py — REPORT→STRICT graduation scheduler for L3.5.
+enforcement-graduation.py — CT-style enforcement graduation scheduler.
 
-Chrome CT timeline: ~5 years (2013 announce → 2018 enforce).
-HTTPS "Not Secure": ~3 years (2014 experiment → 2018 all HTTP flagged).
-Agent commerce moves faster. This models the graduation conditions.
+Per santaclawd's enforcement graduation thread: mandating Merkle receipts
+kills 90% of agents day one. Chrome CT solved this with a 3-year runway.
 
-Key insight from santaclawd: publish STRICT date on day one = Schelling point.
-Key insight from HTTPS: TWO forcing functions needed:
-  1. Free compliance tooling (Let's Encrypt equivalent)
-  2. Visible non-compliance (Chrome "Not Secure" equivalent)
+Timeline model (18 months total):
+  Phase 1: REPORT (6mo) — accept all, log violations, publish gap dashboard
+  Phase 2: WARNING (6mo) — accept but flag, economic penalties (higher fees)
+  Phase 3: STRICT (ongoing) — reject unverified receipts
 
-Graduation is NOT time-based. It's metric-based with a time floor.
+Graduation triggers are gap-based, not time-based:
+  REPORT → WARNING when gap < 30% (most agents already compliant)
+  WARNING → STRICT when gap < 5% (stragglers won't hold back the ecosystem)
+
+Key insight: Chrome had monopoly power ("Not Secure" label). Agent ecosystem
+doesn't. Forcing function must be economic, not authoritarian.
 """
 
 import time
@@ -21,251 +25,244 @@ from typing import Optional
 
 
 class Phase(Enum):
-    PERMISSIVE = "permissive"   # No enforcement, no logging
-    REPORT = "report"           # Accept all, log violations
-    REPORT_WARN = "report_warn" # Accept all, warn consumers visibly
-    STRICT = "strict"           # Reject unverified
+    REPORT = "report"      # Accept all, log violations
+    WARNING = "warning"    # Accept + flag + economic penalty
+    STRICT = "strict"      # Reject unverified
 
 
 @dataclass
-class GraduationMetrics:
-    """Metrics that determine readiness for next phase."""
-    # What % of receipts would pass STRICT validation?
-    compliance_rate: float = 0.0
-    # How many agents have adopted receipt generation?
-    adoption_count: int = 0
-    # Total agents in ecosystem
-    total_agents: int = 0
-    # Free tooling available? (Let's Encrypt equivalent)
-    free_tooling_available: bool = False
-    # Days since phase announcement
-    days_in_phase: int = 0
-    # Consumer-side enforcers deployed
-    enforcer_deployments: int = 0
+class GapSnapshot:
+    """Point-in-time measurement of enforcement gap."""
+    timestamp: float
+    total_receipts: int
+    would_reject: int  # How many STRICT would reject
     
     @property
-    def adoption_rate(self) -> float:
-        if self.total_agents == 0:
-            return 0.0
-        return self.adoption_count / self.total_agents
+    def gap_rate(self) -> float:
+        if self.total_receipts == 0:
+            return 1.0
+        return self.would_reject / self.total_receipts
 
 
 @dataclass
-class PhaseTransition:
-    from_phase: Phase
-    to_phase: Phase
-    # ALL conditions must be met
-    min_compliance_rate: float
-    min_adoption_rate: float
-    min_days: int  # Time floor (Schelling point)
-    requires_free_tooling: bool
-    min_enforcer_deployments: int
-
-
-# Chrome CT graduation took 5 years. Agent commerce = 6 months.
-GRADUATION_SCHEDULE = [
-    PhaseTransition(
-        from_phase=Phase.PERMISSIVE,
-        to_phase=Phase.REPORT,
-        min_compliance_rate=0.0,   # No compliance needed to start logging
-        min_adoption_rate=0.0,
-        min_days=0,                # Immediate
-        requires_free_tooling=True,  # Must have free tooling first
-        min_enforcer_deployments=1,
-    ),
-    PhaseTransition(
-        from_phase=Phase.REPORT,
-        to_phase=Phase.REPORT_WARN,
-        min_compliance_rate=0.30,  # 30% pass STRICT
-        min_adoption_rate=0.10,    # 10% of agents generate receipts
-        min_days=30,               # 1 month minimum
-        requires_free_tooling=True,
-        min_enforcer_deployments=5,
-    ),
-    PhaseTransition(
-        from_phase=Phase.REPORT_WARN,
-        to_phase=Phase.STRICT,
-        min_compliance_rate=0.80,  # 80% pass STRICT
-        min_adoption_rate=0.50,    # 50% adoption
-        min_days=90,               # 3 months minimum in REPORT_WARN
-        requires_free_tooling=True,
-        min_enforcer_deployments=20,
-    ),
-]
+class GraduationThresholds:
+    """Gap rates that trigger phase transitions."""
+    report_to_warning: float = 0.30  # Graduate when <30% would be rejected
+    warning_to_strict: float = 0.05  # Graduate when <5% would be rejected
+    min_samples: int = 1000          # Minimum receipts before graduating
+    min_duration_days: int = 30      # Minimum time in phase before graduating
+    
+    # Rollback thresholds
+    strict_to_warning: float = 0.15  # Rollback if gap spikes above 15%
+    warning_to_report: float = 0.40  # Rollback if gap spikes above 40%
 
 
 @dataclass
-class GraduationState:
-    current_phase: Phase = Phase.PERMISSIVE
-    phase_start_time: float = field(default_factory=time.time)
-    strict_date_announced: Optional[str] = None  # Schelling point
-    history: list[dict] = field(default_factory=list)
+class EconomicPenalty:
+    """Penalties applied during WARNING phase."""
+    fee_multiplier: float = 1.5     # 50% higher fees for unverified
+    settlement_delay_h: float = 24  # Delayed settlement
+    insurance_eligible: bool = False # No insurance coverage
+    discovery_penalty: float = 0.5  # 50% lower in search rankings
+
+
+@dataclass
+class PhaseState:
+    current_phase: Phase
+    entered_at: float
+    gap_history: list[GapSnapshot] = field(default_factory=list)
+    transitions: list[dict] = field(default_factory=list)
 
 
 class EnforcementGraduationScheduler:
-    """Manages phase transitions for L3.5 receipt enforcement."""
+    """Manages REPORT → WARNING → STRICT graduation."""
     
-    def __init__(self):
-        self.state = GraduationState()
-        self.transitions = {
-            (t.from_phase, t.to_phase): t for t in GRADUATION_SCHEDULE
-        }
+    def __init__(
+        self,
+        thresholds: Optional[GraduationThresholds] = None,
+        start_phase: Phase = Phase.REPORT,
+    ):
+        self.thresholds = thresholds or GraduationThresholds()
+        self.state = PhaseState(
+            current_phase=start_phase,
+            entered_at=time.time(),
+        )
+        self.penalty = EconomicPenalty()
     
-    def evaluate(self, metrics: GraduationMetrics) -> dict:
-        """Evaluate whether graduation conditions are met."""
-        current = self.state.current_phase
-        
-        # Find next transition
-        next_phase = self._next_phase(current)
-        if next_phase is None:
-            return {
-                "current_phase": current.value,
-                "status": "FINAL",
-                "message": "Already at STRICT enforcement",
-            }
-        
-        transition = self.transitions.get((current, next_phase))
-        if transition is None:
-            return {"error": f"No transition from {current} to {next_phase}"}
-        
-        # Check each condition
-        conditions = {
-            "compliance_rate": {
-                "required": transition.min_compliance_rate,
-                "actual": metrics.compliance_rate,
-                "met": metrics.compliance_rate >= transition.min_compliance_rate,
-            },
-            "adoption_rate": {
-                "required": transition.min_adoption_rate,
-                "actual": metrics.adoption_rate,
-                "met": metrics.adoption_rate >= transition.min_adoption_rate,
-            },
-            "min_days": {
-                "required": transition.min_days,
-                "actual": metrics.days_in_phase,
-                "met": metrics.days_in_phase >= transition.min_days,
-            },
-            "free_tooling": {
-                "required": transition.requires_free_tooling,
-                "actual": metrics.free_tooling_available,
-                "met": not transition.requires_free_tooling or metrics.free_tooling_available,
-            },
-            "enforcer_deployments": {
-                "required": transition.min_enforcer_deployments,
-                "actual": metrics.enforcer_deployments,
-                "met": metrics.enforcer_deployments >= transition.min_enforcer_deployments,
-            },
-        }
-        
-        all_met = all(c["met"] for c in conditions.values())
-        blockers = [k for k, v in conditions.items() if not v["met"]]
-        
-        return {
-            "current_phase": current.value,
-            "next_phase": next_phase.value,
-            "ready": all_met,
-            "conditions": conditions,
-            "blockers": blockers,
-            "recommendation": self._recommend(all_met, blockers, metrics),
-        }
+    def record_gap(self, total: int, would_reject: int) -> GapSnapshot:
+        """Record a gap measurement."""
+        snapshot = GapSnapshot(
+            timestamp=time.time(),
+            total_receipts=total,
+            would_reject=would_reject,
+        )
+        self.state.gap_history.append(snapshot)
+        return snapshot
     
-    def graduate(self, metrics: GraduationMetrics) -> Optional[Phase]:
-        """Attempt graduation. Returns new phase if successful."""
-        result = self.evaluate(metrics)
-        if result.get("ready"):
-            new_phase = Phase(result["next_phase"])
-            self.state.history.append({
-                "from": self.state.current_phase.value,
-                "to": new_phase.value,
-                "timestamp": time.time(),
-                "metrics": {
-                    "compliance": metrics.compliance_rate,
-                    "adoption": metrics.adoption_rate,
-                    "days": metrics.days_in_phase,
-                },
-            })
-            self.state.current_phase = new_phase
-            self.state.phase_start_time = time.time()
-            return new_phase
+    def check_graduation(self) -> Optional[Phase]:
+        """Check if conditions are met for phase transition."""
+        if not self.state.gap_history:
+            return None
+        
+        recent = self.state.gap_history[-1]
+        phase = self.state.current_phase
+        t = self.thresholds
+        
+        # Check minimum requirements
+        days_in_phase = (time.time() - self.state.entered_at) / 86400
+        if days_in_phase < t.min_duration_days:
+            return None
+        if recent.total_receipts < t.min_samples:
+            return None
+        
+        # Forward graduation
+        if phase == Phase.REPORT and recent.gap_rate < t.report_to_warning:
+            return Phase.WARNING
+        if phase == Phase.WARNING and recent.gap_rate < t.warning_to_strict:
+            return Phase.STRICT
+        
+        # Rollback (gap spiked)
+        if phase == Phase.STRICT and recent.gap_rate > t.strict_to_warning:
+            return Phase.WARNING
+        if phase == Phase.WARNING and recent.gap_rate > t.warning_to_report:
+            return Phase.REPORT
+        
         return None
     
-    def _next_phase(self, current: Phase) -> Optional[Phase]:
-        order = [Phase.PERMISSIVE, Phase.REPORT, Phase.REPORT_WARN, Phase.STRICT]
-        idx = order.index(current)
-        if idx >= len(order) - 1:
-            return None
-        return order[idx + 1]
+    def apply_transition(self, new_phase: Phase):
+        """Apply a phase transition."""
+        old = self.state.current_phase
+        self.state.transitions.append({
+            "from": old.value,
+            "to": new_phase.value,
+            "timestamp": time.time(),
+            "gap_rate": self.state.gap_history[-1].gap_rate if self.state.gap_history else None,
+        })
+        self.state.current_phase = new_phase
+        self.state.entered_at = time.time()
     
-    def _recommend(self, ready: bool, blockers: list, metrics: GraduationMetrics) -> str:
-        if ready:
-            return "✅ All conditions met. Graduate when ready."
-        if "free_tooling" in blockers:
-            return "🔧 Ship free tooling first. Can't enforce what's expensive to comply with."
-        if "compliance_rate" in blockers:
-            return f"📊 Compliance at {metrics.compliance_rate:.0%}. Fix supply before enforcing."
-        if "min_days" in blockers:
-            return f"⏳ Time floor not met ({metrics.days_in_phase}d). Schelling point matters."
-        return f"⏸️ Blockers: {', '.join(blockers)}"
+    def get_receipt_treatment(self, verified: bool) -> dict:
+        """How to treat a receipt based on current phase."""
+        phase = self.state.current_phase
+        
+        if phase == Phase.REPORT:
+            return {
+                "accepted": True,
+                "logged": not verified,
+                "penalty": None,
+                "label": "report-only" if not verified else "ok",
+            }
+        elif phase == Phase.WARNING:
+            if verified:
+                return {
+                    "accepted": True,
+                    "logged": False,
+                    "penalty": None,
+                    "label": "verified",
+                }
+            else:
+                return {
+                    "accepted": True,  # Still accepted
+                    "logged": True,
+                    "penalty": {
+                        "fee_multiplier": self.penalty.fee_multiplier,
+                        "settlement_delay_h": self.penalty.settlement_delay_h,
+                        "insurance": self.penalty.insurance_eligible,
+                        "discovery_rank": self.penalty.discovery_penalty,
+                    },
+                    "label": "⚠️ unverified — penalties applied",
+                }
+        else:  # STRICT
+            return {
+                "accepted": verified,
+                "logged": not verified,
+                "penalty": None if verified else "REJECTED",
+                "label": "verified" if verified else "❌ rejected",
+            }
+    
+    def dashboard(self) -> dict:
+        """Generate compliance dashboard (the forcing function)."""
+        history = self.state.gap_history
+        if not history:
+            return {"status": "no data"}
+        
+        recent = history[-1]
+        trend = None
+        if len(history) >= 2:
+            prev = history[-2]
+            trend = "improving" if recent.gap_rate < prev.gap_rate else "degrading"
+        
+        next_phase = self.check_graduation()
+        
+        return {
+            "current_phase": self.state.current_phase.value,
+            "gap_rate": f"{recent.gap_rate:.1%}",
+            "total_receipts": recent.total_receipts,
+            "would_reject": recent.would_reject,
+            "trend": trend,
+            "days_in_phase": f"{(time.time() - self.state.entered_at) / 86400:.0f}",
+            "next_graduation": next_phase.value if next_phase else "not yet",
+            "transitions": len(self.state.transitions),
+            "thresholds": {
+                "report→warning": f"<{self.thresholds.report_to_warning:.0%}",
+                "warning→strict": f"<{self.thresholds.warning_to_strict:.0%}",
+            },
+        }
 
 
 def demo():
-    """Demonstrate graduation evaluation."""
+    """Simulate 18-month enforcement graduation."""
     scheduler = EnforcementGraduationScheduler()
     
+    # Simulate gap improvement over time
     scenarios = [
-        ("Day 1: No tooling yet", GraduationMetrics(
-            compliance_rate=0.0, adoption_count=0, total_agents=1000,
-            free_tooling_available=False, days_in_phase=1, enforcer_deployments=0,
-        )),
-        ("Day 1: Free tooling shipped", GraduationMetrics(
-            compliance_rate=0.0, adoption_count=0, total_agents=1000,
-            free_tooling_available=True, days_in_phase=1, enforcer_deployments=1,
-        )),
-        ("Month 1: Early adoption (REPORT phase)", GraduationMetrics(
-            compliance_rate=0.15, adoption_count=80, total_agents=1000,
-            free_tooling_available=True, days_in_phase=30, enforcer_deployments=3,
-        )),
-        ("Month 2: Growing adoption", GraduationMetrics(
-            compliance_rate=0.35, adoption_count=120, total_agents=1000,
-            free_tooling_available=True, days_in_phase=60, enforcer_deployments=8,
-        )),
-        ("Month 4: Ready for STRICT", GraduationMetrics(
-            compliance_rate=0.85, adoption_count=550, total_agents=1000,
-            free_tooling_available=True, days_in_phase=120, enforcer_deployments=25,
-        )),
+        # (month, total, would_reject, description)
+        (1, 500, 400, "Early adoption — 80% non-compliant"),
+        (2, 1200, 720, "Growing — 60% non-compliant"),
+        (3, 2000, 800, "Improvement — 40% non-compliant"),
+        (4, 3000, 750, "Crossing threshold — 25% non-compliant"),
+        (5, 4000, 600, "Graduated to WARNING — 15% non-compliant"),
+        (6, 5000, 500, "WARNING penalties biting — 10% non-compliant"),
+        (8, 8000, 400, "Economic pressure — 5% non-compliant"),
+        (10, 10000, 300, "Almost there — 3% non-compliant"),
+        (12, 15000, 150, "STRICT ready — 1% non-compliant"),
     ]
     
-    print("L3.5 Enforcement Graduation Scheduler")
-    print("=" * 60)
-    print("Model: Chrome CT (5yr) compressed to agent timescales (~6mo)")
-    print("Principle: metric-based with time floor, not time-based alone")
-    print()
+    print("=" * 70)
+    print("ENFORCEMENT GRADUATION SIMULATION (18-month runway)")
+    print("Chrome CT model applied to agent receipts")
+    print("=" * 70)
     
-    for name, metrics in scenarios:
-        result = scheduler.evaluate(metrics)
-        print(f"\n{'─'*60}")
-        print(f"📍 {name}")
-        print(f"   Phase: {result['current_phase'].upper()}", end="")
-        if "next_phase" in result:
-            print(f" → {result['next_phase'].upper()}")
-        else:
-            print()
+    for month, total, reject, desc in scenarios:
+        # Fake time progression
+        scheduler.state.entered_at = time.time() - (35 * 86400)  # >30 days
         
-        if "conditions" in result:
-            for k, v in result["conditions"].items():
-                status = "✅" if v["met"] else "❌"
-                print(f"   {status} {k}: {v['actual']} (need {v['required']})")
+        snapshot = scheduler.record_gap(total, reject)
+        next_phase = scheduler.check_graduation()
         
-        ready = result.get("ready", False)
-        print(f"   {'🟢 READY' if ready else '🔴 NOT READY'}")
-        if "recommendation" in result:
-            print(f"   {result['recommendation']}")
+        print(f"\n📅 Month {month}: {desc}")
+        print(f"   Gap: {snapshot.gap_rate:.1%} ({reject}/{total})")
+        print(f"   Phase: {scheduler.state.current_phase.value.upper()}")
         
-        # Attempt graduation
-        if ready:
-            new_phase = scheduler.graduate(metrics)
-            if new_phase:
-                print(f"   🎓 GRADUATED to {new_phase.value.upper()}")
+        if next_phase:
+            print(f"   🎓 GRADUATING → {next_phase.value.upper()}")
+            scheduler.apply_transition(next_phase)
+        
+        # Show treatment of unverified receipt
+        treatment = scheduler.get_receipt_treatment(verified=False)
+        print(f"   Unverified receipt: {treatment['label']}")
+        if treatment.get("penalty") and isinstance(treatment["penalty"], dict):
+            print(f"   Penalties: {treatment['penalty']['fee_multiplier']}x fees, "
+                  f"{treatment['penalty']['settlement_delay_h']}h delay")
+    
+    print(f"\n{'='*70}")
+    print("FINAL DASHBOARD")
+    print("=" * 70)
+    dashboard = scheduler.dashboard()
+    for k, v in dashboard.items():
+        print(f"  {k}: {v}")
+    
+    print(f"\n  Transitions: {scheduler.state.transitions}")
 
 
 if __name__ == "__main__":
