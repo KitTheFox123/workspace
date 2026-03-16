@@ -419,3 +419,125 @@ def demo_graduation():
 if __name__ == "__main__":
     demo()
     demo_graduation()
+
+
+# === GRADUATION SCHEDULER ===
+
+@dataclass
+class GraduationMilestone:
+    """CT-style enforcement graduation milestone."""
+    name: str
+    policy: EnforcementPolicy
+    required_gap_below: float  # Max enforcement gap to proceed
+    min_checked: int           # Minimum receipts checked at this level
+    duration_days: int         # Minimum days at this level
+
+
+class EnforcementGraduator:
+    """
+    Manage REPORT → STRICT graduation per Chrome CT model.
+    
+    Chrome timeline:
+    - 2013: CT proposed (RFC 6962)
+    - 2015: EV cert enforcement (REPORT for others)
+    - April 2018: Full STRICT enforcement
+    
+    Agent commerce is smaller. Proposed:
+    - Month 0-3: PERMISSIVE (collect baseline)
+    - Month 3-6: REPORT (measure gap)
+    - Month 6+: STRICT (if gap < 5%)
+    """
+    
+    MILESTONES = [
+        GraduationMilestone("baseline", EnforcementPolicy.PERMISSIVE, 1.0, 100, 90),
+        GraduationMilestone("report", EnforcementPolicy.REPORT, 0.20, 500, 90),
+        GraduationMilestone("strict", EnforcementPolicy.STRICT, 0.05, 1000, 0),
+    ]
+    
+    def __init__(self):
+        self.current_index = 0
+        self.days_at_current = 0
+        self.receipts_checked = 0
+    
+    @property
+    def current_milestone(self) -> GraduationMilestone:
+        return self.MILESTONES[self.current_index]
+    
+    def check_graduation(self, enforcer: ConsumerReceiptEnforcer) -> dict:
+        """Check if ready to graduate to next enforcement level."""
+        ms = self.current_milestone
+        gap = enforcer.stats.enforcement_gap
+        checked = enforcer.stats.total_checked
+        
+        ready = (
+            self.current_index < len(self.MILESTONES) - 1
+            and gap <= ms.required_gap_below
+            and checked >= ms.min_checked
+            and self.days_at_current >= ms.duration_days
+        )
+        
+        blockers = []
+        if gap > ms.required_gap_below:
+            blockers.append(f"gap {gap:.1%} > {ms.required_gap_below:.0%}")
+        if checked < ms.min_checked:
+            blockers.append(f"checked {checked} < {ms.min_checked}")
+        if self.days_at_current < ms.duration_days:
+            blockers.append(f"days {self.days_at_current} < {ms.duration_days}")
+        
+        next_ms = (
+            self.MILESTONES[self.current_index + 1]
+            if self.current_index < len(self.MILESTONES) - 1
+            else None
+        )
+        
+        return {
+            "current": ms.name,
+            "policy": ms.policy.value,
+            "ready_to_graduate": ready,
+            "next": next_ms.name if next_ms else "FINAL",
+            "blockers": blockers if not ready else [],
+            "enforcement_gap": f"{gap:.1%}",
+        }
+
+
+def demo_graduation():
+    """Show graduation readiness."""
+    print("\n" + "=" * 60)
+    print("ENFORCEMENT GRADUATION (CT-style)")
+    print("=" * 60)
+    
+    grad = EnforcementGraduator()
+    
+    # Simulate: just started, low volume
+    enforcer = ConsumerReceiptEnforcer(EnforcementPolicy.PERMISSIVE)
+    grad.days_at_current = 30
+    # Fake some stats
+    enforcer.stats.total_checked = 50
+    enforcer.stats.strict_would_reject = 20
+    
+    report = grad.check_graduation(enforcer)
+    print(f"\n  Phase: {report['current']} ({report['policy']})")
+    print(f"  Ready: {report['ready_to_graduate']}")
+    print(f"  Next: {report['next']}")
+    print(f"  Gap: {report['enforcement_gap']}")
+    if report['blockers']:
+        print(f"  Blockers: {report['blockers']}")
+    
+    # Simulate: 90 days, good gap
+    grad.days_at_current = 95
+    enforcer.stats.total_checked = 200
+    enforcer.stats.strict_would_reject = 10
+    
+    report = grad.check_graduation(enforcer)
+    print(f"\n  Phase: {report['current']} ({report['policy']}) — after 95 days")
+    print(f"  Ready: {report['ready_to_graduate']}")
+    print(f"  Gap: {report['enforcement_gap']}")
+    if report['blockers']:
+        print(f"  Blockers: {report['blockers']}")
+    else:
+        print(f"  → READY to graduate to {report['next']}")
+
+
+if __name__ == "__main__":
+    demo()
+    demo_graduation()
