@@ -231,6 +231,62 @@ def _make_merkle_proof(leaf: str) -> tuple[str, list[str], str]:
     return leaf_hash, [sibling1], root
 
 
+@dataclass
+class GraduationSchedule:
+    """Chrome CT-style enforcement graduation.
+    
+    Timeline (per santaclawd's enforcement graduation problem):
+    - Phase 1: REPORT mode (log violations, accept all)
+    - Phase 2: STRICT for high-value transactions
+    - Phase 3: STRICT for all transactions
+    
+    Chrome CT: announced Oct 2016, enforced July 2018 (21 months).
+    HTTPS "Not Secure": Jan 2017 passwords, July 2018 all pages.
+    """
+    report_start: float          # Unix timestamp
+    strict_high_value_date: float  # STRICT for tx > threshold
+    strict_all_date: float        # STRICT for everything
+    high_value_threshold: float = 1.0  # SOL or equivalent
+    
+    def current_policy(self, tx_value: float = 0.0) -> EnforcementPolicy:
+        """Determine policy based on current date and tx value."""
+        now = time.time()
+        if now >= self.strict_all_date:
+            return EnforcementPolicy.STRICT
+        elif now >= self.strict_high_value_date and tx_value >= self.high_value_threshold:
+            return EnforcementPolicy.STRICT
+        elif now >= self.report_start:
+            return EnforcementPolicy.REPORT
+        else:
+            return EnforcementPolicy.PERMISSIVE
+    
+    def phase_name(self, tx_value: float = 0.0) -> str:
+        policy = self.current_policy(tx_value)
+        now = time.time()
+        if now < self.report_start:
+            days_to = (self.report_start - now) / 86400
+            return f"PRE-REPORT ({days_to:.0f}d to Phase 1)"
+        elif now < self.strict_high_value_date:
+            days_to = (self.strict_high_value_date - now) / 86400
+            return f"REPORT ({days_to:.0f}d to Phase 2)"
+        elif now < self.strict_all_date:
+            days_to = (self.strict_all_date - now) / 86400
+            return f"STRICT-HIGH ({days_to:.0f}d to Phase 3)"
+        else:
+            return "STRICT-ALL (fully enforced)"
+    
+    @classmethod
+    def chrome_ct_model(cls, start: Optional[float] = None) -> "GraduationSchedule":
+        """Create schedule based on Chrome CT timeline (21 months)."""
+        s = start or time.time()
+        return cls(
+            report_start=s,
+            strict_high_value_date=s + 180 * 86400,   # 6 months
+            strict_all_date=s + 540 * 86400,           # 18 months
+            high_value_threshold=1.0,
+        )
+
+
 def demo():
     """Demonstrate enforcement modes with test receipts."""
     now = time.time()
@@ -318,5 +374,48 @@ def demo():
         print(f"    → {report['recommendation']}")
 
 
+def demo_graduation():
+    """Demo enforcement graduation schedule."""
+    print("\n" + "=" * 60)
+    print("ENFORCEMENT GRADUATION (Chrome CT model)")
+    print("=" * 60)
+    
+    now = time.time()
+    schedule = GraduationSchedule.chrome_ct_model(start=now)
+    
+    test_cases = [
+        ("Small tx today", 0.1, now),
+        ("Large tx today", 5.0, now),
+        ("Small tx +7mo", 0.1, now + 210 * 86400),
+        ("Large tx +7mo", 5.0, now + 210 * 86400),
+        ("Any tx +19mo", 0.1, now + 570 * 86400),
+    ]
+    
+    for name, value, when in test_cases:
+        # Temporarily shift time for demo
+        orig = schedule.strict_high_value_date
+        phase = "REPORT" if when < schedule.strict_high_value_date else (
+            "STRICT-HIGH" if when < schedule.strict_all_date else "STRICT-ALL"
+        )
+        if when < schedule.report_start:
+            phase = "PRE-REPORT"
+        
+        policy = EnforcementPolicy.REPORT
+        if when >= schedule.strict_all_date:
+            policy = EnforcementPolicy.STRICT
+        elif when >= schedule.strict_high_value_date and value >= schedule.high_value_threshold:
+            policy = EnforcementPolicy.STRICT
+        
+        print(f"\n  {name}: {phase} → {policy.value}")
+        print(f"    Value: {value} SOL, Policy: {policy.value}")
+    
+    print(f"\n  📅 Schedule:")
+    print(f"    Phase 1 (REPORT):      Day 0")
+    print(f"    Phase 2 (STRICT >1 SOL): Day 180 (~6 months)")
+    print(f"    Phase 3 (STRICT all):  Day 540 (~18 months)")
+    print(f"    Modeled on Chrome CT: Oct 2016 → Jul 2018")
+
+
 if __name__ == "__main__":
     demo()
+    demo_graduation()
