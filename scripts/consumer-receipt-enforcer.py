@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+consumer-receipt-enforcer.py — Client-side receipt verification enforcer.
+
+Inspired by Chrome's CT enforcement model: reject unverified receipts by DEFAULT.
+Consumer opt-out, not opt-in. Per santaclawd's observation that "the hardest part
+is getting consumers to actually verify."
+
+CT lesson: Chrome REJECTS certs without SCTs. That's why CT adoption hit 100%.
+Recommendation-based verification never works (RFC 9413: Postel's Law = ossification).
+
+Design:
+- EnforcementPolicy: STRICT (reject unverified), REPORT (accept + log), PERMISSIVE (skip)
+- Receipt validation: Merkle inclusion proof, witness diversity, temporal freshness
+- Degradation tracking: how often would STRICT have rejected what REPORT accepted?
+"""
+
+import hashlib
+import json
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class EnforcementPolicy(Enum):
+    STRICT = "strict"       # Reject unverified (Chrome CT model)
+    REPORT = "report"       # Accept but log violations (CT report-only mode)
+    PERMISSIVE = "permissive"  # Skip verification (legacy compat)
+
+
+class RejectionReason(Enum):
+    NO_MERKLE_PROOF = "no_merkle_proof"
+    INVALID_PROOF = "invalid_proof"
+    INSUFFICIENT_WITNESSES = "insufficient_witnesses"
+    STALE_RECEIPT = "stale_receipt"
+    DUPLICATE_OPERATORS = "duplicate_operators"
+    MISSING_DIVERSITY_HASH = "missing_diversity_hash"
+
+
+@dataclass
+class WitnessSignature:
+    operator_id: str
+    operator_org: str
+    infra_hash: str  # hash(hosting + key_material)
+    timestamp: float
+    signature: str
+
+
+@dataclass
+class Receipt:
+    receipt_id: str
+    agent_id: str
+    action_type: str
+    merkle_root: str
+    inclusion_proof: list[str]  # Sibling hashes for verification
+    leaf_hash: str
+    witnesses: list[WitnessSignature]
+    diversity_hash: Optional[str] = None
+    created_at: float = 0.0
+
+
+@dataclass
+class VerificationResult:
+    valid: bool
+    policy: EnforcementPolicy
+    accepted: bool  # Whether the receipt was accepted (depends on policy)
+    rejections: list[RejectionReason] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    verification_time_ms: float = 0.0
+
+
+@dataclass
+class EnforcementStats:
+    total_checked: int = 0
+    strict_would_reject: int = 0
+    report_violations: int = 0
+    accepted: int = 0
+    rejected: int = 0
+    
+    @property
+    def enforcement_gap(self) -> float:
+        """How many receipts REPORT accepts that STRICT would reject."""
+        if self.total_checked == 0:
+            return 0.0
+        return self.strict_would_reject / self.total_checked
+
+
+class ConsumerReceiptEnforcer:
+    """Client-side receipt verification with CT-style enforcement."""
+    
+    # Chrome CT: 2-3 SCTs from independent logs
+    MIN_WITNESSES = 2
+    # Receipts older than 24h need re-verification
+    FRESHNESS_THRESHOLD_S = 86400
+    
+    def __init__(self, policy: EnforcementPolicy = EnforcementPolicy.STRICT):
+        self.policy = policy
+        self.stats = EnforcementStats()
+        self.violation_log: list[dict] = []
+    
+    def verify_receipt(self, receipt: Receipt) -> VerificationResult:
+        """Verify a receipt according to enforcement policy."""
+        start = time.monotonic()
+        rejections = []
+        warnings = []
+        
+        # 1. Merkle inclusion proof
+        if not receipt.inclusion_proof:
+            rejections.append(RejectionReason.NO_MERKLE_PROOF)
+        elif not self._verify_merkle_proof(receipt):
+            rejections.append(RejectionReason.INVALID_PROOF)
+        
+        # 2. Witness count (CT: 2-3 SCTs minimum)
+        if len(receipt.witnesses) < self.MIN_WITNESSES:
+            rejections.append(RejectionReason.INSUFFICIENT_WITNESSES)
+        
+        # 3. Witness independence (same org = 1 witness)
+        unique_orgs = set()
+        unique_infra = set()
+        for w in receipt.witnesses:
+            unique_orgs.add(w.operator_org)
+            unique_infra.add(w.infra_hash)
+        
+        if len(unique_orgs) < self.MIN_WITNESSES:
+            rejections.append(RejectionReason.DUPLICATE_OPERATORS)
+            warnings.append(
+                f"{len(receipt.witnesses)} witnesses but only "
+                f"{len(unique_orgs)} unique orgs"
+            )
+        
+        # 4. Diversity hash present (self-certifying artifact)
+        if not receipt.diversity_hash:
+            rejections.append(RejectionReason.MISSING_DIVERSITY_HASH)
+        
+        # 5. Temporal freshness
+        age_s = time.time() - receipt.created_at
+        if age_s > self.FRESHNESS_THRESHOLD_S:
+            rejections.append(RejectionReason.STALE_RECEIPT)
+            warnings.append(f"Receipt age: {age_s/3600:.1f}h")
+        
+        elapsed = (time.monotonic() - start) * 1000
+        valid = len(rejections) == 0
+        
+        # Policy-based acceptance
+        if self.policy == EnforcementPolicy.STRICT:
+            accepted = valid
+        elif self.policy == EnforcementPolicy.REPORT:
+            accepted = True  # Accept but log
+            if not valid:
+                self._log_violation(receipt, rejections)
+        else:  # PERMISSIVE
+            accepted = True
+        
+        # Track enforcement gap
+        self.stats.total_checked += 1
+        if not valid:
+            self.stats.strict_would_reject += 1
+        if accepted:
+            self.stats.accepted += 1
+        else:
+            self.stats.rejected += 1
+        if self.policy == EnforcementPolicy.REPORT and not valid:
+            self.stats.report_violations += 1
+        
+        return VerificationResult(
+            valid=valid,
+            policy=self.policy,
+            accepted=accepted,
+            rejections=rejections,
+            warnings=warnings,
+            verification_time_ms=elapsed,
+        )
+    
+    def _verify_merkle_proof(self, receipt: Receipt) -> bool:
+        """Verify Merkle inclusion proof. O(log n)."""
+        current = receipt.leaf_hash
+        for sibling in receipt.inclusion_proof:
+            # Consistent ordering: smaller hash first
+            if current < sibling:
+                combined = current + sibling
+            else:
+                combined = sibling + current
+            current = hashlib.sha256(combined.encode()).hexdigest()
+        return current == receipt.merkle_root
+    
+    def _log_violation(self, receipt: Receipt, reasons: list[RejectionReason]):
+        """Log violation for REPORT mode analysis."""
+        self.violation_log.append({
+            "receipt_id": receipt.receipt_id,
+            "agent_id": receipt.agent_id,
+            "reasons": [r.value for r in reasons],
+            "timestamp": time.time(),
+        })
+    
+    def enforcement_report(self) -> dict:
+        """Generate enforcement gap report."""
+        return {
+            "policy": self.policy.value,
+            "total_checked": self.stats.total_checked,
+            "accepted": self.stats.accepted,
+            "rejected": self.stats.rejected,
+            "enforcement_gap": f"{self.stats.enforcement_gap:.1%}",
+            "strict_would_reject": self.stats.strict_would_reject,
+            "recommendation": self._recommend_policy(),
+        }
+    
+    def _recommend_policy(self) -> str:
+        """Recommend policy upgrade based on gap analysis."""
+        gap = self.stats.enforcement_gap
+        if gap == 0:
+            return "STRICT safe to deploy — zero rejections"
+        elif gap < 0.05:
+            return f"STRICT recommended — only {gap:.1%} would be rejected"
+        elif gap < 0.20:
+            return f"Caution — {gap:.1%} rejection rate. Fix supply first."
+        else:
+            return f"High gap ({gap:.1%}). Stay in REPORT until supply improves."
+
+
+def _make_merkle_proof(leaf: str) -> tuple[str, list[str], str]:
+    """Helper: create a valid Merkle proof for testing."""
+    leaf_hash = hashlib.sha256(leaf.encode()).hexdigest()
+    sibling1 = hashlib.sha256(b"sibling1").hexdigest()
+    # Compute parent
+    if leaf_hash < sibling1:
+        combined = leaf_hash + sibling1
+    else:
+        combined = sibling1 + leaf_hash
+    root = hashlib.sha256(combined.encode()).hexdigest()
+    return leaf_hash, [sibling1], root
+
+
+def demo():
+    """Demonstrate enforcement modes with test receipts."""
+    now = time.time()
+    
+    # Build valid receipt
+    leaf_hash, proof, root = _make_merkle_proof("action:deliver:abc123")
+    
+    valid_receipt = Receipt(
+        receipt_id="r001",
+        agent_id="agent:kit",
+        action_type="delivery",
+        merkle_root=root,
+        inclusion_proof=proof,
+        leaf_hash=leaf_hash,
+        witnesses=[
+            WitnessSignature("w1", "OrgA", "infra_a", now, "sig1"),
+            WitnessSignature("w2", "OrgB", "infra_b", now, "sig2"),
+        ],
+        diversity_hash="div_abc",
+        created_at=now - 3600,  # 1h old
+    )
+    
+    # Receipt with problems: single org, no diversity hash
+    bad_receipt = Receipt(
+        receipt_id="r002",
+        agent_id="agent:shady",
+        action_type="delivery",
+        merkle_root=root,
+        inclusion_proof=proof,
+        leaf_hash=leaf_hash,
+        witnesses=[
+            WitnessSignature("w1", "SameOrg", "infra_x", now, "sig1"),
+            WitnessSignature("w2", "SameOrg", "infra_y", now, "sig2"),
+        ],
+        diversity_hash=None,
+        created_at=now - 3600,
+    )
+    
+    # Stale receipt (48h old)
+    stale_receipt = Receipt(
+        receipt_id="r003",
+        agent_id="agent:old",
+        action_type="attestation",
+        merkle_root=root,
+        inclusion_proof=proof,
+        leaf_hash=leaf_hash,
+        witnesses=[
+            WitnessSignature("w1", "OrgC", "infra_c", now, "sig1"),
+            WitnessSignature("w2", "OrgD", "infra_d", now, "sig2"),
+        ],
+        diversity_hash="div_xyz",
+        created_at=now - 172800,  # 48h old
+    )
+    
+    scenarios = [
+        ("Valid receipt", valid_receipt),
+        ("Same-org witnesses + no diversity hash", bad_receipt),
+        ("Stale receipt (48h)", stale_receipt),
+    ]
+    
+    for policy in EnforcementPolicy:
+        print(f"\n{'='*60}")
+        print(f"Policy: {policy.value.upper()}")
+        print(f"{'='*60}")
+        
+        enforcer = ConsumerReceiptEnforcer(policy=policy)
+        
+        for name, receipt in scenarios:
+            result = enforcer.verify_receipt(receipt)
+            status = "✅ ACCEPTED" if result.accepted else "❌ REJECTED"
+            valid = "valid" if result.valid else "invalid"
+            print(f"\n  {name}: {status} ({valid})")
+            if result.rejections:
+                print(f"    Reasons: {[r.value for r in result.rejections]}")
+            if result.warnings:
+                print(f"    Warnings: {result.warnings}")
+            print(f"    Verification: {result.verification_time_ms:.2f}ms")
+        
+        report = enforcer.enforcement_report()
+        print(f"\n  📊 Gap Report:")
+        print(f"    Checked: {report['total_checked']}")
+        print(f"    Accepted: {report['accepted']}")
+        print(f"    Rejected: {report['rejected']}")
+        print(f"    Enforcement gap: {report['enforcement_gap']}")
+        print(f"    → {report['recommendation']}")
+
+
+if __name__ == "__main__":
+    demo()
