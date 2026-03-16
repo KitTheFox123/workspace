@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-spec-enforcer-separation.py — Models the spec-body/enforcer pattern.
+spec-enforcer-separation.py — Formalizes the WHAT/WHO pattern from web standards.
 
-Every successful internet standard has TWO components:
-1. Spec body (legitimacy): IETF, W3C, ISO — owns the format, neutral
-2. First-mover enforcer (leverage): Chrome, BSD, AWS — has market share
+Per Clawk thread (santaclawd, bro_agent, Kit):
+  The pattern that works: spec body owns the WHAT, product enforces the WHO.
+  - IETF/TLS + Chrome/CT enforcement
+  - W3C/HTML + browsers/rendering  
+  - IETF/DKIM + Gmail/spam filtering
+  - L3.5 wire format + agent runtimes/receipt verification
 
-Historical patterns:
-  TCP/IP: DARPA spec + BSD implementation (free, bundled with Unix)
-  HTML: W3C spec + Netscape/IE browser wars (race to implement)
-  TLS/CT: IETF RFC 6962 + Chrome enforcement (reject without SCTs)
-  HTTPS: CA/Browser Forum + Chrome "Not Secure" label
+IE6 lesson: enforcer owning the spec = spec dies with the product.
+Chrome CT lesson: IETF-owned spec survives any single enforcer losing market share.
 
-Key insight (per santaclawd): spec product-neutral, enforcement product-specific.
-The spec survived because IETF owned it. The enforcement happened because Chrome
-had 65% market share. Separation of powers.
-
-For L3.5: who is the spec body? who is Chrome?
+This tool audits a protocol deployment for healthy separation between
+spec ownership and enforcement, detecting anti-patterns.
 """
 
 from dataclasses import dataclass, field
@@ -24,212 +21,253 @@ from enum import Enum
 from typing import Optional
 
 
-class SpecBodyType(Enum):
-    STANDARDS_ORG = "standards_org"     # IETF, W3C, ISO
-    CONSORTIUM = "consortium"           # CA/Browser Forum
-    DE_FACTO = "de_facto"              # One company's spec adopted
-    OPEN_SOURCE = "open_source"        # Community-owned
+class CouplingRisk(Enum):
+    """Risk levels for spec-enforcer coupling."""
+    HEALTHY = "healthy"       # Spec and enforcer fully separated
+    CONCERNING = "concerning"  # Some coupling detected
+    DANGEROUS = "dangerous"    # Enforcer controls spec evolution
+    FATAL = "fatal"           # Spec and enforcer are same entity (IE6 pattern)
 
 
-class EnforcerType(Enum):
-    DOMINANT_CLIENT = "dominant_client"     # Chrome, BSD
-    PLATFORM_GATE = "platform_gate"        # App Store, npm
-    ECONOMIC_INCENTIVE = "economic_incentive"  # Let's Encrypt (free)
-    SOCIAL_PRESSURE = "social_pressure"    # Gap reports, naming
+class AntiPattern(Enum):
+    """Known spec-enforcer coupling anti-patterns."""
+    SINGLE_ENFORCER = "single_enforcer"           # Only one product enforces
+    SPEC_OWNER_IS_ENFORCER = "spec_owner_is_enforcer"  # Same org owns both
+    PROPRIETARY_EXTENSIONS = "proprietary_extensions"   # Enforcer-specific additions
+    NO_REFERENCE_IMPL = "no_reference_impl"        # No independent implementation
+    ENFORCEMENT_LEAKS_INTO_SPEC = "enforcement_leaks"  # Policy in wire format
+    NO_GRADUATION_PATH = "no_graduation_path"      # Binary enforce/don't
+    VENDOR_LOCK_IN = "vendor_lock_in"              # Switching enforcers breaks compat
 
 
 @dataclass
-class HistoricalPrecedent:
+class SpecBody:
+    """Standards organization owning the spec."""
     name: str
-    spec_body: str
-    spec_body_type: SpecBodyType
-    enforcer: str
-    enforcer_type: EnforcerType
-    enforcer_market_share: float  # At time of enforcement
-    years_spec_to_enforcement: float
-    adoption_before: float  # Before enforcement
-    adoption_after: float   # After enforcement
-    key_mechanism: str
-    
-    @property
-    def adoption_delta(self) -> float:
-        return self.adoption_after - self.adoption_before
-    
-    @property
-    def enforcement_leverage(self) -> float:
-        """Market share × adoption delta = enforcement power."""
-        return self.enforcer_market_share * self.adoption_delta
+    governance: str  # "multi-stakeholder", "single-vendor", "community"
+    spec_id: str     # e.g., "RFC 6962", "L3.5 wire format"
+    open_process: bool = True
+    multiple_implementations: int = 0
 
 
-PRECEDENTS = [
-    HistoricalPrecedent(
-        name="TCP/IP",
-        spec_body="DARPA/IETF",
-        spec_body_type=SpecBodyType.STANDARDS_ORG,
-        enforcer="BSD Unix",
-        enforcer_type=EnforcerType.ECONOMIC_INCENTIVE,
-        enforcer_market_share=0.80,  # Unix market in academia
-        years_spec_to_enforcement=5,
-        adoption_before=0.05,
-        adoption_after=0.95,
-        key_mechanism="Free implementation bundled with OS",
-    ),
-    HistoricalPrecedent(
-        name="Certificate Transparency",
-        spec_body="IETF (RFC 6962)",
-        spec_body_type=SpecBodyType.STANDARDS_ORG,
-        enforcer="Chrome",
-        enforcer_type=EnforcerType.DOMINANT_CLIENT,
-        enforcer_market_share=0.65,
-        years_spec_to_enforcement=5,  # 2013 RFC → 2018 enforcement
-        adoption_before=0.10,
-        adoption_after=0.99,
-        key_mechanism="Reject certs without SCTs",
-    ),
-    HistoricalPrecedent(
-        name="HTTPS (Not Secure)",
-        spec_body="CA/Browser Forum",
-        spec_body_type=SpecBodyType.CONSORTIUM,
-        enforcer="Chrome + Let's Encrypt",
-        enforcer_type=EnforcerType.DOMINANT_CLIENT,
-        enforcer_market_share=0.65,
-        years_spec_to_enforcement=1.5,  # 2017-2018
-        adoption_before=0.40,
-        adoption_after=0.95,
-        key_mechanism="'Not Secure' label + free certs",
-    ),
-    HistoricalPrecedent(
-        name="HTML5",
-        spec_body="W3C/WHATWG",
-        spec_body_type=SpecBodyType.STANDARDS_ORG,
-        enforcer="Chrome/Firefox",
-        enforcer_type=EnforcerType.DOMINANT_CLIENT,
-        enforcer_market_share=0.70,  # Combined
-        years_spec_to_enforcement=6,
-        adoption_before=0.30,
-        adoption_after=0.98,
-        key_mechanism="Deprecate Flash, implement spec",
-    ),
-]
+@dataclass 
+class Enforcer:
+    """Product or runtime enforcing the spec."""
+    name: str
+    market_share: float  # 0.0-1.0
+    owns_spec: bool = False
+    proprietary_extensions: list[str] = field(default_factory=list)
+    has_graduation: bool = False
+    fallback_on_failure: str = "reject"  # "reject", "warn", "accept"
 
 
 @dataclass
-class L35Readiness:
-    """Assess L3.5's readiness for the spec/enforcer pattern."""
-    spec_maturity: float        # 0-1: how complete is the wire format
-    enforcer_candidates: list[str]
-    largest_enforcer_share: float  # Market share of largest potential enforcer
-    supply_side_ready: float    # Free tooling available (Let's Encrypt equivalent)
-    gap_report_infra: float     # Can we name non-compliant agents?
+class Deployment:
+    """A spec + enforcer(s) deployment."""
+    spec: SpecBody
+    enforcers: list[Enforcer]
+    reference_impl_count: int = 0
+    years_deployed: float = 0.0
+
+
+@dataclass
+class AuditResult:
+    """Result of separation audit."""
+    risk: CouplingRisk
+    anti_patterns: list[AntiPattern]
+    warnings: list[str]
+    recommendations: list[str]
+    score: float  # 0.0 (fatal) to 1.0 (healthy)
+    historical_parallel: Optional[str] = None
+
+
+class SpecEnforcerAuditor:
+    """Audit spec-enforcer separation health."""
     
-    def readiness_score(self) -> float:
-        """Weighted readiness for enforcement."""
-        weights = {
-            "spec": 0.25,
-            "enforcer": 0.30,  # Most important — Chrome was the key
-            "supply": 0.25,
-            "gap_infra": 0.20,
-        }
-        return (
-            weights["spec"] * self.spec_maturity
-            + weights["enforcer"] * self.largest_enforcer_share
-            + weights["supply"] * self.supply_side_ready
-            + weights["gap_infra"] * self.gap_report_infra
+    def audit(self, deployment: Deployment) -> AuditResult:
+        anti_patterns = []
+        warnings = []
+        recommendations = []
+        score = 1.0
+        
+        # Check: single enforcer
+        if len(deployment.enforcers) == 1:
+            anti_patterns.append(AntiPattern.SINGLE_ENFORCER)
+            score -= 0.15
+            warnings.append(
+                f"Only {deployment.enforcers[0].name} enforces. "
+                f"If it dies, enforcement dies."
+            )
+            recommendations.append("Recruit 2+ additional enforcers before STRICT phase")
+        
+        # Check: spec owner is enforcer
+        for e in deployment.enforcers:
+            if e.owns_spec:
+                anti_patterns.append(AntiPattern.SPEC_OWNER_IS_ENFORCER)
+                score -= 0.25
+                warnings.append(
+                    f"{e.name} both owns spec and enforces = IE6 pattern"
+                )
+                recommendations.append(
+                    "Transfer spec to multi-stakeholder body (IETF, W3C equivalent)"
+                )
+        
+        # Check: proprietary extensions
+        for e in deployment.enforcers:
+            if e.proprietary_extensions:
+                anti_patterns.append(AntiPattern.PROPRIETARY_EXTENSIONS)
+                score -= 0.10 * len(e.proprietary_extensions)
+                warnings.append(
+                    f"{e.name} has {len(e.proprietary_extensions)} proprietary extensions"
+                )
+        
+        # Check: reference implementations
+        if deployment.reference_impl_count == 0:
+            anti_patterns.append(AntiPattern.NO_REFERENCE_IMPL)
+            score -= 0.20
+            recommendations.append("Ship reference implementation alongside spec")
+        
+        # Check: graduation path
+        enforcers_with_graduation = sum(1 for e in deployment.enforcers if e.has_graduation)
+        if enforcers_with_graduation == 0:
+            anti_patterns.append(AntiPattern.NO_GRADUATION_PATH)
+            score -= 0.10
+            recommendations.append(
+                "Add graduated enforcement (REPORT→WARN→STRICT)"
+            )
+        
+        # Check: governance
+        if deployment.spec.governance == "single-vendor":
+            score -= 0.30
+            warnings.append("Single-vendor governance = spec dies with vendor")
+        
+        # Check: enforcement leaks into spec
+        for e in deployment.enforcers:
+            if e.fallback_on_failure == "reject" and not e.has_graduation:
+                anti_patterns.append(AntiPattern.ENFORCEMENT_LEAKS_INTO_SPEC)
+                score -= 0.05
+                warnings.append(
+                    f"{e.name} hard-rejects without graduation = policy in wire format"
+                )
+        
+        # Determine risk level
+        score = max(0.0, min(1.0, score))
+        if score >= 0.80:
+            risk = CouplingRisk.HEALTHY
+        elif score >= 0.60:
+            risk = CouplingRisk.CONCERNING
+        elif score >= 0.30:
+            risk = CouplingRisk.DANGEROUS
+        else:
+            risk = CouplingRisk.FATAL
+        
+        # Historical parallel
+        parallel = self._find_parallel(anti_patterns, deployment)
+        
+        return AuditResult(
+            risk=risk,
+            anti_patterns=anti_patterns,
+            warnings=warnings,
+            recommendations=recommendations,
+            score=score,
+            historical_parallel=parallel,
         )
     
-    def grade(self) -> str:
-        score = self.readiness_score()
-        if score >= 0.8: return "A — Ready for enforcement"
-        if score >= 0.6: return "B — Close, need enforcer commitment"
-        if score >= 0.4: return "C — Spec ready, no enforcer yet"
-        if score >= 0.2: return "D — Early stage"
-        return "F — Not ready"
-    
-    def bottleneck(self) -> str:
-        """Identify the primary bottleneck."""
-        scores = {
-            "spec_maturity": self.spec_maturity,
-            "enforcer_share": self.largest_enforcer_share,
-            "supply_tooling": self.supply_side_ready,
-            "gap_reporting": self.gap_report_infra,
-        }
-        worst = min(scores, key=scores.get)
-        return f"{worst} ({scores[worst]:.0%})"
+    def _find_parallel(self, patterns: list[AntiPattern], 
+                       deployment: Deployment) -> Optional[str]:
+        if AntiPattern.SPEC_OWNER_IS_ENFORCER in patterns:
+            return (
+                "IE6 (1999-2006): Microsoft owned HTML rendering AND dominated "
+                "market share. Extensions became de facto standards. When IE lost "
+                "share, proprietary features broke the web. Took a decade to recover."
+            )
+        if AntiPattern.SINGLE_ENFORCER in patterns and deployment.enforcers:
+            e = deployment.enforcers[0]
+            if e.market_share > 0.60:
+                return (
+                    f"Chrome CT (2015-2018): Chrome had {e.market_share:.0%}-equivalent "
+                    f"leverage. Worked because spec was IETF-owned (RFC 6962). "
+                    f"But single-enforcer risk remains — what if Chrome dropped CT?"
+                )
+        if len(deployment.enforcers) >= 3:
+            return (
+                "TLS ecosystem (mature): Multiple browsers enforce, IETF owns spec. "
+                "No single enforcer can unilaterally change requirements. "
+                "The healthiest pattern in web standards."
+            )
+        return None
 
 
-def analyze_precedents():
-    """Analyze historical spec/enforcer patterns."""
-    print("=" * 70)
-    print("SPEC BODY / ENFORCER SEPARATION ANALYSIS")
-    print("=" * 70)
+def demo():
+    """Audit real and hypothetical deployments."""
+    auditor = SpecEnforcerAuditor()
     
-    for p in PRECEDENTS:
-        print(f"\n  📋 {p.name}")
-        print(f"    Spec: {p.spec_body} ({p.spec_body_type.value})")
-        print(f"    Enforcer: {p.enforcer} ({p.enforcer_type.value})")
-        print(f"    Market share: {p.enforcer_market_share:.0%}")
-        print(f"    Spec → Enforcement: {p.years_spec_to_enforcement:.1f} years")
-        print(f"    Adoption: {p.adoption_before:.0%} → {p.adoption_after:.0%} "
-              f"(Δ{p.adoption_delta:.0%})")
-        print(f"    Leverage: {p.enforcement_leverage:.2f}")
-        print(f"    Mechanism: {p.key_mechanism}")
+    cases = [
+        # 1. Chrome CT (real, 2018)
+        Deployment(
+            spec=SpecBody("IETF", "multi-stakeholder", "RFC 6962", True, 5),
+            enforcers=[
+                Enforcer("Chrome", 0.65, False, [], True, "reject"),
+                Enforcer("Safari", 0.18, False, [], True, "reject"),
+            ],
+            reference_impl_count=3,
+            years_deployed=5.0,
+        ),
+        # 2. IE6 HTML (anti-pattern)
+        Deployment(
+            spec=SpecBody("Microsoft", "single-vendor", "IE HTML", False, 1),
+            enforcers=[
+                Enforcer("IE6", 0.95, True, ["ActiveX", "VBScript", "CSS filters"], False, "accept"),
+            ],
+            reference_impl_count=0,
+            years_deployed=7.0,
+        ),
+        # 3. L3.5 (current state)
+        Deployment(
+            spec=SpecBody("Community (Kit+santaclawd+bro_agent)", "community", "L3.5 wire format", True, 4),
+            enforcers=[
+                Enforcer("OpenClaw (proposed)", 0.05, False, [], True, "report"),
+            ],
+            reference_impl_count=12,  # All my scripts
+            years_deployed=0.1,
+        ),
+        # 4. L3.5 (target state)
+        Deployment(
+            spec=SpecBody("Agent Standards Body", "multi-stakeholder", "L3.5 wire format v1.0", True, 10),
+            enforcers=[
+                Enforcer("OpenClaw", 0.15, False, [], True, "warn"),
+                Enforcer("PayLock", 0.10, False, [], True, "report"),
+                Enforcer("AgentRuntime3", 0.08, False, [], True, "report"),
+            ],
+            reference_impl_count=12,
+            years_deployed=1.0,
+        ),
+    ]
     
-    # Pattern extraction
-    avg_years = sum(p.years_spec_to_enforcement for p in PRECEDENTS) / len(PRECEDENTS)
-    avg_share = sum(p.enforcer_market_share for p in PRECEDENTS) / len(PRECEDENTS)
-    avg_delta = sum(p.adoption_delta for p in PRECEDENTS) / len(PRECEDENTS)
+    names = [
+        "Chrome CT (2018) — HEALTHY reference",
+        "IE6 HTML (2001) — FATAL anti-pattern", 
+        "L3.5 current — early stage",
+        "L3.5 target — multi-enforcer goal",
+    ]
     
-    print(f"\n  📊 Pattern Summary:")
-    print(f"    Avg spec→enforcement: {avg_years:.1f} years")
-    print(f"    Avg enforcer market share: {avg_share:.0%}")
-    print(f"    Avg adoption delta: {avg_delta:.0%}")
-    print(f"    Key: dominant client (>60% share) + open spec + 3-5yr ramp")
-
-
-def assess_l35():
-    """Assess L3.5 readiness."""
-    print(f"\n{'=' * 70}")
-    print("L3.5 TRUST RECEIPT READINESS")
-    print("=" * 70)
-    
-    current = L35Readiness(
-        spec_maturity=0.35,  # Wire format partially defined
-        enforcer_candidates=["OpenClaw", "LangChain", "CrewAI", "AutoGen"],
-        largest_enforcer_share=0.15,  # OpenClaw's estimated share
-        supply_side_ready=0.20,  # Some reference impls, no npm package
-        gap_report_infra=0.40,  # enforcement-graduator.py exists
-    )
-    
-    print(f"\n  Current State:")
-    print(f"    Spec maturity: {current.spec_maturity:.0%}")
-    print(f"    Enforcer candidates: {', '.join(current.enforcer_candidates)}")
-    print(f"    Largest enforcer share: {current.largest_enforcer_share:.0%}")
-    print(f"    Supply-side tooling: {current.supply_side_ready:.0%}")
-    print(f"    Gap report infra: {current.gap_report_infra:.0%}")
-    print(f"\n    Readiness: {current.readiness_score():.0%} — {current.grade()}")
-    print(f"    Bottleneck: {current.bottleneck()}")
-    
-    # What would change with a committed enforcer?
-    with_enforcer = L35Readiness(
-        spec_maturity=0.60,
-        enforcer_candidates=["OpenClaw"],
-        largest_enforcer_share=0.40,  # If OpenClaw grows
-        supply_side_ready=0.70,  # npm package + docs
-        gap_report_infra=0.80,
-    )
-    
-    print(f"\n  With Committed Enforcer (projected):")
-    print(f"    Readiness: {with_enforcer.readiness_score():.0%} — {with_enforcer.grade()}")
-    print(f"    Bottleneck: {with_enforcer.bottleneck()}")
-    
-    print(f"\n  🎯 Recommendation:")
-    print(f"    1. Finish wire format spec (current bottleneck)")
-    print(f"    2. Ship npm package (Let's Encrypt equivalent)")
-    print(f"    3. Publish weekly gap reports (social pressure)")
-    print(f"    4. Get ONE runtime to commit to REPORT mode")
-    print(f"    5. Patience: avg 4.4 years from spec to enforcement")
+    for name, case in zip(names, cases):
+        result = auditor.audit(case)
+        print(f"\n{'='*60}")
+        print(f"  {name}")
+        print(f"{'='*60}")
+        print(f"  Risk: {result.risk.value} (score: {result.score:.2f})")
+        if result.anti_patterns:
+            print(f"  Anti-patterns: {[p.value for p in result.anti_patterns]}")
+        if result.warnings:
+            for w in result.warnings:
+                print(f"  ⚠️  {w}")
+        if result.recommendations:
+            for r in result.recommendations:
+                print(f"  → {r}")
+        if result.historical_parallel:
+            print(f"  📚 {result.historical_parallel}")
 
 
 if __name__ == "__main__":
-    analyze_precedents()
-    assess_l35()
+    demo()
