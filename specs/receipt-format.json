@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/KitTheFox123/isnad-rfc/receipt-format.json",
+  "title": "L3.5 Trust Receipt",
+  "description": "Wire format for L3.5 trust receipts. Spec-level: defines format only, not scoring policy. Per CT model: prescribe wire format, leave policy to consumers.",
+  "type": "object",
+  "required": ["version", "receipt_id", "agent_id", "action_type", "dimensions", "merkle_proof", "witnesses", "created_at"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "0.1.0",
+      "description": "Schema version. Semantic versioning."
+    },
+    "receipt_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique receipt identifier."
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Agent identifier (key fingerprint or DID)."
+    },
+    "action_type": {
+      "type": "string",
+      "enum": ["delivery", "attestation", "revocation", "slash", "dormant", "liveness"],
+      "description": "Type of action this receipt covers."
+    },
+    "dimensions": {
+      "type": "object",
+      "description": "L3.5 trust dimensions. Raw observations, not scores. Consumer derives scores locally.",
+      "properties": {
+        "T": {
+          "type": "object",
+          "description": "Timeliness — delivery timing observations.",
+          "properties": {
+            "promised_at": { "type": "string", "format": "date-time" },
+            "delivered_at": { "type": ["string", "null"], "format": "date-time" },
+            "delivery_hash": { "type": ["string", "null"], "description": "SHA-256 of delivered content. Set at creation = commitment device." }
+          }
+        },
+        "G": {
+          "type": "object", 
+          "description": "Gossip — third-party observations.",
+          "properties": {
+            "witness_count": { "type": "integer", "minimum": 0 },
+            "anchor_type": { 
+              "type": "string", 
+              "enum": ["self_reported", "single_witness", "ct_grade", "full_quorum"],
+              "description": "Epistemic class. Watson & Morgan weighting: self=1x, single=1.5x, ct=2x, quorum=2.5x."
+            }
+          }
+        },
+        "A": {
+          "type": "object",
+          "description": "Availability — liveness and gap observations.",
+          "properties": {
+            "last_seen": { "type": "string", "format": "date-time" },
+            "gap_events": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "start": { "type": "string", "format": "date-time" },
+                  "end": { "type": ["string", "null"], "format": "date-time" },
+                  "declared": { "type": "boolean", "description": "DORMANT (true) vs SILENT_GONE (false)." },
+                  "return_date": { "type": ["string", "null"], "format": "date-time" }
+                }
+              }
+            }
+          }
+        },
+        "S": {
+          "type": "object",
+          "description": "Stability — behavioral consistency observations.",
+          "properties": {
+            "attestation_streak": { "type": "integer", "minimum": 0 },
+            "leitner_box": { "type": "integer", "minimum": 0, "maximum": 5 },
+            "scar_count": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "C": {
+          "type": "object",
+          "description": "Commitment — economic skin-in-the-game observations.",
+          "properties": {
+            "payer_type": { 
+              "type": "string", 
+              "enum": ["human", "a2a", "ambiguous"],
+              "description": "Derived from chain state, never self-reported."
+            },
+            "escrow_amount": { "type": ["number", "null"] },
+            "escrow_currency": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "merkle_proof": {
+      "type": "object",
+      "description": "Merkle inclusion proof. O(log n) verification.",
+      "required": ["leaf_hash", "proof", "root"],
+      "properties": {
+        "leaf_hash": { "type": "string", "description": "SHA-256 of receipt content." },
+        "proof": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Sibling hashes for inclusion proof."
+        },
+        "root": { "type": "string", "description": "Merkle tree root hash." }
+      }
+    },
+    "witnesses": {
+      "type": "array",
+      "description": "Independent witness signatures. CT model: N>=2 from distinct operators.",
+      "items": {
+        "type": "object",
+        "required": ["operator_id", "operator_org", "signature", "timestamp"],
+        "properties": {
+          "operator_id": { "type": "string" },
+          "operator_org": { "type": "string", "description": "Organizational identity. Same org = 1 effective witness." },
+          "infra_hash": { "type": "string", "description": "hash(hosting + key_material). Detects shared infrastructure." },
+          "signature": { "type": "string", "description": "Ed25519 signature over receipt content." },
+          "timestamp": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "diversity_hash": {
+      "type": ["string", "null"],
+      "description": "hash(operator_orgs + infra_hashes). Self-certifying diversity artifact."
+    },
+    "scar_reference": {
+      "type": ["object", "null"],
+      "description": "Post-SLASH identity continuity. Links new key to old slashed key.",
+      "properties": {
+        "old_key_hash": { "type": "string" },
+        "slash_event_hash": { "type": "string" },
+        "slash_reason": { "type": "string", "enum": ["delivery_hash_mismatch", "double_spend", "key_compromise"] },
+        "self_signed_by_new_key": { "type": "string" }
+      }
+    },
+    "decision_type": {
+      "type": "string",
+      "enum": ["action", "inaction", "refusal"],
+      "description": "Action/inaction/refusal. Inaction logged = liveness proof. Gap = silence."
+    },
+    "parent_contract_id": {
+      "type": ["string", "null"],
+      "description": "Audit lineage only. Never used for classification (confused deputy prevention)."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
