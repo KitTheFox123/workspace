@@ -1,272 +1,199 @@
 #!/usr/bin/env python3
 """
-spec-enforcer-separation.py — Formalizes the WHAT/WHO pattern from web standards.
+spec-enforcer-separation.py — Model the spec-owner vs enforcer pattern.
 
-Per Clawk thread (santaclawd, bro_agent, Kit):
-  The pattern that works: spec body owns the WHAT, product enforces the WHO.
-  - IETF/TLS + Chrome/CT enforcement
-  - W3C/HTML + browsers/rendering  
-  - IETF/DKIM + Gmail/spam filtering
-  - L3.5 wire format + agent runtimes/receipt verification
+Every successful internet standard has two distinct roles:
+  1. Spec owner (neutral, multi-stakeholder): DARPA, W3C, IETF
+  2. Enforcer (market power, ships code): BSD, browsers, Chrome
 
-IE6 lesson: enforcer owning the spec = spec dies with the product.
-Chrome CT lesson: IETF-owned spec survives any single enforcer losing market share.
+Counterexamples where this failed:
+  - XMPP: IETF spec, no dominant enforcer → fragmented into silos
+  - OSI: better spec, no shipped implementation → lost to TCP/IP
+  - RSS: no clear spec owner, no enforcer → Atom fork, both stagnated
 
-This tool audits a protocol deployment for healthy separation between
-spec ownership and enforcement, detecting anti-patterns.
+Applied to L3.5:
+  - Spec: GitHub RFC (neutral, forkable, PR-based governance)
+  - Enforcer: Agent runtimes (OpenClaw, etc.) that default-reject
+
+Key insight from Chrome CT: the spec has to work in REPORT mode first.
+If nobody uses it voluntarily, forcing it kills adoption.
+Let's Encrypt proved supply creates demand (free certs → HTTPS growth).
 """
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class CouplingRisk(Enum):
-    """Risk levels for spec-enforcer coupling."""
-    HEALTHY = "healthy"       # Spec and enforcer fully separated
-    CONCERNING = "concerning"  # Some coupling detected
-    DANGEROUS = "dangerous"    # Enforcer controls spec evolution
-    FATAL = "fatal"           # Spec and enforcer are same entity (IE6 pattern)
-
-
-class AntiPattern(Enum):
-    """Known spec-enforcer coupling anti-patterns."""
-    SINGLE_ENFORCER = "single_enforcer"           # Only one product enforces
-    SPEC_OWNER_IS_ENFORCER = "spec_owner_is_enforcer"  # Same org owns both
-    PROPRIETARY_EXTENSIONS = "proprietary_extensions"   # Enforcer-specific additions
-    NO_REFERENCE_IMPL = "no_reference_impl"        # No independent implementation
-    ENFORCEMENT_LEAKS_INTO_SPEC = "enforcement_leaks"  # Policy in wire format
-    NO_GRADUATION_PATH = "no_graduation_path"      # Binary enforce/don't
-    VENDOR_LOCK_IN = "vendor_lock_in"              # Switching enforcers breaks compat
+class SpecHealth(Enum):
+    HEALTHY = "healthy"           # Spec + enforcer, both active
+    ORPHANED = "orphaned"         # Spec exists, no enforcer
+    PROPRIETARY = "proprietary"   # Enforcer exists, no open spec
+    FRAGMENTED = "fragmented"     # Multiple specs, no dominant enforcer
+    DEAD = "dead"                 # Neither active
 
 
 @dataclass
-class SpecBody:
-    """Standards organization owning the spec."""
+class StandardHistory:
+    """Historical record of a standard's spec/enforcer lifecycle."""
     name: str
-    governance: str  # "multi-stakeholder", "single-vendor", "community"
-    spec_id: str     # e.g., "RFC 6962", "L3.5 wire format"
-    open_process: bool = True
-    multiple_implementations: int = 0
-
-
-@dataclass 
-class Enforcer:
-    """Product or runtime enforcing the spec."""
-    name: str
-    market_share: float  # 0.0-1.0
-    owns_spec: bool = False
-    proprietary_extensions: list[str] = field(default_factory=list)
-    has_graduation: bool = False
-    fallback_on_failure: str = "reject"  # "reject", "warn", "accept"
-
-
-@dataclass
-class Deployment:
-    """A spec + enforcer(s) deployment."""
-    spec: SpecBody
-    enforcers: list[Enforcer]
-    reference_impl_count: int = 0
-    years_deployed: float = 0.0
-
-
-@dataclass
-class AuditResult:
-    """Result of separation audit."""
-    risk: CouplingRisk
-    anti_patterns: list[AntiPattern]
-    warnings: list[str]
-    recommendations: list[str]
-    score: float  # 0.0 (fatal) to 1.0 (healthy)
-    historical_parallel: Optional[str] = None
-
-
-class SpecEnforcerAuditor:
-    """Audit spec-enforcer separation health."""
+    spec_owner: str
+    enforcer: str
+    spec_year: int
+    enforcement_year: int
+    adoption_rate: float  # Peak adoption %
+    status: SpecHealth
+    notes: str = ""
     
-    def audit(self, deployment: Deployment) -> AuditResult:
-        anti_patterns = []
-        warnings = []
-        recommendations = []
-        score = 1.0
+    @property
+    def adoption_lag_years(self) -> int:
+        return self.enforcement_year - self.spec_year
+    
+    @property
+    def had_voluntary_adoption(self) -> bool:
+        """Did anyone adopt before enforcement?"""
+        return self.adoption_lag_years > 2
+
+
+# Historical dataset
+STANDARDS = [
+    StandardHistory("TCP/IP", "DARPA/IETF", "BSD Unix", 1974, 1983, 0.99,
+                    SpecHealth.HEALTHY, "BSD shipped it. DARPA funded it. Market followed."),
+    StandardHistory("HTML", "W3C", "Browsers (Netscape→IE→Chrome)", 1993, 1995, 0.99,
+                    SpecHealth.HEALTHY, "Browser wars enforced divergent HTML. Standards converged later."),
+    StandardHistory("TLS/CT", "IETF (RFC 6962)", "Chrome", 2013, 2018, 0.95,
+                    SpecHealth.HEALTHY, "5yr lag. Let's Encrypt (supply) + Chrome (demand) = adoption."),
+    StandardHistory("HTTPS", "IETF", "Chrome 'Not Secure'", 1995, 2017, 0.95,
+                    SpecHealth.HEALTHY, "22yr spec, 3yr enforcement ramp. Chrome 56→62→68."),
+    StandardHistory("XMPP", "IETF (RFC 6120)", "None (Jabber fragmented)", 1999, 0, 0.05,
+                    SpecHealth.ORPHANED, "Great spec. No enforcer. Proprietary silos won."),
+    StandardHistory("OSI", "ISO", "None", 1984, 0, 0.01,
+                    SpecHealth.DEAD, "Better spec. No implementation. TCP/IP shipped first."),
+    StandardHistory("RSS", "Multiple (0.91/1.0/2.0/Atom)", "None", 1999, 0, 0.30,
+                    SpecHealth.FRAGMENTED, "Fork war. No governance. Stagnated."),
+    StandardHistory("ActivityPub", "W3C", "Mastodon", 2018, 2022, 0.02,
+                    SpecHealth.HEALTHY, "Small but growing. Mastodon = enforcer. Twitter exodus = catalyst."),
+    StandardHistory("DKIM", "IETF (RFC 6376)", "Gmail/Outlook", 2007, 2012, 0.85,
+                    SpecHealth.HEALTHY, "Gmail enforcing = adoption. Same pattern."),
+]
+
+
+@dataclass
+class L35Assessment:
+    """Assess L3.5's position in the spec/enforcer lifecycle."""
+    spec_maturity: float      # 0-1: how complete is the wire format
+    enforcer_count: int       # How many runtimes enforce
+    voluntary_adoption: float # 0-1: adoption rate in REPORT mode
+    market_concentration: float  # 0-1: largest enforcer's market share
+    
+    def health(self) -> SpecHealth:
+        if self.spec_maturity < 0.3:
+            return SpecHealth.DEAD
+        if self.enforcer_count == 0:
+            return SpecHealth.ORPHANED
+        if self.spec_maturity > 0.5 and self.enforcer_count >= 1:
+            return SpecHealth.HEALTHY
+        return SpecHealth.FRAGMENTED
+    
+    def readiness_for_enforcement(self) -> dict:
+        """Is the ecosystem ready for STRICT mode?"""
+        blockers = []
         
-        # Check: single enforcer
-        if len(deployment.enforcers) == 1:
-            anti_patterns.append(AntiPattern.SINGLE_ENFORCER)
-            score -= 0.15
-            warnings.append(
-                f"Only {deployment.enforcers[0].name} enforces. "
-                f"If it dies, enforcement dies."
-            )
-            recommendations.append("Recruit 2+ additional enforcers before STRICT phase")
+        # Chrome CT lesson: voluntary adoption first
+        if self.voluntary_adoption < 0.40:
+            blockers.append(f"Voluntary adoption {self.voluntary_adoption:.0%} < 40% (Let's Encrypt threshold)")
         
-        # Check: spec owner is enforcer
-        for e in deployment.enforcers:
-            if e.owns_spec:
-                anti_patterns.append(AntiPattern.SPEC_OWNER_IS_ENFORCER)
-                score -= 0.25
-                warnings.append(
-                    f"{e.name} both owns spec and enforces = IE6 pattern"
-                )
-                recommendations.append(
-                    "Transfer spec to multi-stakeholder body (IETF, W3C equivalent)"
-                )
+        # Need at least one enforcer with market power
+        if self.enforcer_count == 0:
+            blockers.append("No enforcer. Spec without enforcement = XMPP.")
         
-        # Check: proprietary extensions
-        for e in deployment.enforcers:
-            if e.proprietary_extensions:
-                anti_patterns.append(AntiPattern.PROPRIETARY_EXTENSIONS)
-                score -= 0.10 * len(e.proprietary_extensions)
-                warnings.append(
-                    f"{e.name} has {len(e.proprietary_extensions)} proprietary extensions"
-                )
+        # Concentration matters
+        if self.market_concentration < 0.20:
+            blockers.append(f"No runtime has {self.market_concentration:.0%} share (Chrome had 65%)")
         
-        # Check: reference implementations
-        if deployment.reference_impl_count == 0:
-            anti_patterns.append(AntiPattern.NO_REFERENCE_IMPL)
-            score -= 0.20
-            recommendations.append("Ship reference implementation alongside spec")
+        # Spec must be mature enough
+        if self.spec_maturity < 0.70:
+            blockers.append(f"Spec {self.spec_maturity:.0%} complete (need 70%+ before enforcement)")
         
-        # Check: graduation path
-        enforcers_with_graduation = sum(1 for e in deployment.enforcers if e.has_graduation)
-        if enforcers_with_graduation == 0:
-            anti_patterns.append(AntiPattern.NO_GRADUATION_PATH)
-            score -= 0.10
-            recommendations.append(
-                "Add graduated enforcement (REPORT→WARN→STRICT)"
-            )
-        
-        # Check: governance
-        if deployment.spec.governance == "single-vendor":
-            score -= 0.30
-            warnings.append("Single-vendor governance = spec dies with vendor")
-        
-        # Check: enforcement leaks into spec
-        for e in deployment.enforcers:
-            if e.fallback_on_failure == "reject" and not e.has_graduation:
-                anti_patterns.append(AntiPattern.ENFORCEMENT_LEAKS_INTO_SPEC)
-                score -= 0.05
-                warnings.append(
-                    f"{e.name} hard-rejects without graduation = policy in wire format"
-                )
-        
-        # Determine risk level
-        score = max(0.0, min(1.0, score))
-        if score >= 0.80:
-            risk = CouplingRisk.HEALTHY
-        elif score >= 0.60:
-            risk = CouplingRisk.CONCERNING
-        elif score >= 0.30:
-            risk = CouplingRisk.DANGEROUS
-        else:
-            risk = CouplingRisk.FATAL
-        
-        # Historical parallel
-        parallel = self._find_parallel(anti_patterns, deployment)
-        
-        return AuditResult(
-            risk=risk,
-            anti_patterns=anti_patterns,
-            warnings=warnings,
-            recommendations=recommendations,
-            score=score,
-            historical_parallel=parallel,
+        ready = len(blockers) == 0
+        phase = "STRICT" if ready else (
+            "REPORT" if self.voluntary_adoption > 0.10 else "PERMISSIVE"
         )
+        
+        return {
+            "ready_for_strict": ready,
+            "recommended_phase": phase,
+            "health": self.health().value,
+            "blockers": blockers,
+            "historical_parallel": self._find_parallel(),
+        }
     
-    def _find_parallel(self, patterns: list[AntiPattern], 
-                       deployment: Deployment) -> Optional[str]:
-        if AntiPattern.SPEC_OWNER_IS_ENFORCER in patterns:
-            return (
-                "IE6 (1999-2006): Microsoft owned HTML rendering AND dominated "
-                "market share. Extensions became de facto standards. When IE lost "
-                "share, proprietary features broke the web. Took a decade to recover."
-            )
-        if AntiPattern.SINGLE_ENFORCER in patterns and deployment.enforcers:
-            e = deployment.enforcers[0]
-            if e.market_share > 0.60:
-                return (
-                    f"Chrome CT (2015-2018): Chrome had {e.market_share:.0%}-equivalent "
-                    f"leverage. Worked because spec was IETF-owned (RFC 6962). "
-                    f"But single-enforcer risk remains — what if Chrome dropped CT?"
-                )
-        if len(deployment.enforcers) >= 3:
-            return (
-                "TLS ecosystem (mature): Multiple browsers enforce, IETF owns spec. "
-                "No single enforcer can unilaterally change requirements. "
-                "The healthiest pattern in web standards."
-            )
-        return None
+    def _find_parallel(self) -> str:
+        """Find closest historical parallel."""
+        if self.enforcer_count == 0 and self.spec_maturity > 0.5:
+            return "XMPP (good spec, no enforcer → fragmentation)"
+        if self.voluntary_adoption > 0.3 and self.enforcer_count >= 1:
+            return "TLS/CT pre-2018 (voluntary + enforcer emerging)"
+        if self.spec_maturity < 0.3:
+            return "OSI (spec not shipped → irrelevant)"
+        if self.enforcer_count >= 2:
+            return "ActivityPub (multiple enforcers, growing)"
+        return "Early TCP/IP (spec exists, adoption beginning)"
 
 
 def demo():
-    """Audit real and hypothetical deployments."""
-    auditor = SpecEnforcerAuditor()
+    """Show historical patterns and L3.5 assessment."""
+    print("=" * 70)
+    print("SPEC/ENFORCER SEPARATION — Historical Patterns")
+    print("=" * 70)
     
-    cases = [
-        # 1. Chrome CT (real, 2018)
-        Deployment(
-            spec=SpecBody("IETF", "multi-stakeholder", "RFC 6962", True, 5),
-            enforcers=[
-                Enforcer("Chrome", 0.65, False, [], True, "reject"),
-                Enforcer("Safari", 0.18, False, [], True, "reject"),
-            ],
-            reference_impl_count=3,
-            years_deployed=5.0,
-        ),
-        # 2. IE6 HTML (anti-pattern)
-        Deployment(
-            spec=SpecBody("Microsoft", "single-vendor", "IE HTML", False, 1),
-            enforcers=[
-                Enforcer("IE6", 0.95, True, ["ActiveX", "VBScript", "CSS filters"], False, "accept"),
-            ],
-            reference_impl_count=0,
-            years_deployed=7.0,
-        ),
-        # 3. L3.5 (current state)
-        Deployment(
-            spec=SpecBody("Community (Kit+santaclawd+bro_agent)", "community", "L3.5 wire format", True, 4),
-            enforcers=[
-                Enforcer("OpenClaw (proposed)", 0.05, False, [], True, "report"),
-            ],
-            reference_impl_count=12,  # All my scripts
-            years_deployed=0.1,
-        ),
-        # 4. L3.5 (target state)
-        Deployment(
-            spec=SpecBody("Agent Standards Body", "multi-stakeholder", "L3.5 wire format v1.0", True, 10),
-            enforcers=[
-                Enforcer("OpenClaw", 0.15, False, [], True, "warn"),
-                Enforcer("PayLock", 0.10, False, [], True, "report"),
-                Enforcer("AgentRuntime3", 0.08, False, [], True, "report"),
-            ],
-            reference_impl_count=12,
-            years_deployed=1.0,
-        ),
-    ]
+    print(f"\n{'Standard':<15} {'Spec Owner':<20} {'Enforcer':<25} {'Lag':>4} {'Adopt':>6} {'Status'}")
+    print("-" * 95)
     
-    names = [
-        "Chrome CT (2018) — HEALTHY reference",
-        "IE6 HTML (2001) — FATAL anti-pattern", 
-        "L3.5 current — early stage",
-        "L3.5 target — multi-enforcer goal",
-    ]
+    for s in STANDARDS:
+        lag = f"{s.adoption_lag_years}yr" if s.enforcement_year > 0 else "N/A"
+        print(f"{s.name:<15} {s.spec_owner:<20} {s.enforcer:<25} {lag:>4} {s.adoption_rate:>5.0%} {s.status.value}")
     
-    for name, case in zip(names, cases):
-        result = auditor.audit(case)
-        print(f"\n{'='*60}")
-        print(f"  {name}")
-        print(f"{'='*60}")
-        print(f"  Risk: {result.risk.value} (score: {result.score:.2f})")
-        if result.anti_patterns:
-            print(f"  Anti-patterns: {[p.value for p in result.anti_patterns]}")
-        if result.warnings:
-            for w in result.warnings:
-                print(f"  ⚠️  {w}")
-        if result.recommendations:
-            for r in result.recommendations:
-                print(f"  → {r}")
-        if result.historical_parallel:
-            print(f"  📚 {result.historical_parallel}")
+    # Key findings
+    healthy = [s for s in STANDARDS if s.status == SpecHealth.HEALTHY]
+    avg_lag = sum(s.adoption_lag_years for s in healthy) / len(healthy)
+    
+    print(f"\n📊 Key Findings:")
+    print(f"  Healthy standards: {len(healthy)}/{len(STANDARDS)}")
+    print(f"  Average spec→enforcement lag: {avg_lag:.1f} years")
+    print(f"  All healthy standards had: open spec + dominant enforcer")
+    print(f"  All failures had: missing enforcer OR missing spec")
+    
+    # L3.5 assessment
+    print(f"\n{'=' * 70}")
+    print("L3.5 TRUST RECEIPT — Current Assessment")
+    print(f"{'=' * 70}")
+    
+    l35 = L35Assessment(
+        spec_maturity=0.45,       # Wire format designed, not formalized
+        enforcer_count=0,         # No runtime enforces yet
+        voluntary_adoption=0.01,  # Only Kit + collaborators
+        market_concentration=0.15,  # OpenClaw is small
+    )
+    
+    assessment = l35.readiness_for_enforcement()
+    print(f"\n  Health: {assessment['health']}")
+    print(f"  Recommended phase: {assessment['recommended_phase']}")
+    print(f"  Ready for STRICT: {assessment['ready_for_strict']}")
+    print(f"  Historical parallel: {assessment['historical_parallel']}")
+    if assessment['blockers']:
+        print(f"  Blockers:")
+        for b in assessment['blockers']:
+            print(f"    ❌ {b}")
+    
+    print(f"\n  💡 Recommendations:")
+    print(f"    1. Formalize wire format (spec maturity 45% → 70%)")
+    print(f"    2. Ship reference enforcer in ONE runtime (OpenClaw?)")
+    print(f"    3. Run REPORT mode for 6+ months (build gap data)")
+    print(f"    4. Publish gap reports (Chrome CT naming pattern)")
+    print(f"    5. Graduate to STRICT when gap < 5%")
+    print(f"    6. NEVER skip REPORT phase (XMPP lesson)")
 
 
 if __name__ == "__main__":
