@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """
-enforcement-graduator.py — Chrome CT enforcement graduation model for L3.5.
+enforcement-graduator.py — Chrome CT-style graduated enforcement for L3.5 receipts.
 
-santaclawd's insight: "mandating Merkle receipts kills 90% of current agents day one."
-Chrome CT solution: 3-phase graduation over 18 months.
+Per santaclawd's insight: "mandating Merkle receipts kills 90% of current agents day one."
+Chrome solved this: 2 years REPORT mode before STRICT. HTTPS "Not Secure" had 3 phases.
 
-Phase model (Chrome HTTPS timeline):
-  Phase 1 (REPORT): Log violations, accept everything. Build supply.
-    Chrome 56 (Jan 2017): warn on password pages only.
-  Phase 2 (WARN): Flag unverified to consumers. Create demand pressure.
-    Chrome 62 (Oct 2017): warn on any input field.
-  Phase 3 (ENFORCE): Reject unverified by default. Opt-out available.
-    Chrome 68 (Jul 2018): all HTTP = "Not Secure."
+Chrome CT timeline:
+  - RFC 6962 published: June 2013
+  - Chrome EV enforcement: Jan 2015
+  - Chrome full enforcement: April 2018 (Chrome 68)
+  - Total: ~5 years proposal to full enforcement
 
-Graduation gates: advance when pass_rate exceeds threshold.
-Gap log = public coordination mechanism (Chrome published CA compliance rates).
+Chrome HTTPS "Not Secure" timeline:
+  - Chrome 56 (Jan 2017): Warn on password pages
+  - Chrome 62 (Oct 2017): Warn on any input field  
+  - Chrome 68 (Jul 2018): All HTTP = "Not Secure"
+  - 18 months, 3 phases, pass-rate-gated
+
+Key insight: publish gap reports (name CAs by compliance rate). 
+Public shaming + clear deadline = adoption. Spec alone = shelf ware.
+
+Two forcing functions needed:
+  1. Supply: Free receipt libraries (= Let's Encrypt for trust)
+  2. Demand: Client enforcement (= Chrome "Not Secure" label)
 """
 
 import time
@@ -24,257 +32,299 @@ from typing import Optional
 
 
 class Phase(Enum):
-    REPORT = "report"      # Accept all, log violations
-    WARN = "warn"          # Accept but flag to consumer
-    ENFORCE = "enforce"    # Reject unverified by default
+    PERMISSIVE = "permissive"  # Accept everything, no logging
+    REPORT = "report"          # Accept everything, log violations
+    WARN = "warn"              # Accept but surface warning to consumer
+    STRICT = "strict"          # Reject unverified by default
 
 
 @dataclass
-class GraduationGate:
-    """Conditions to advance to next phase."""
-    min_pass_rate: float         # % of receipts that pass verification
-    min_supply_count: int        # Minimum verified receipt supply
-    min_duration_days: int       # Minimum time in current phase
-    phase_from: Phase
-    phase_to: Phase
-
-
-@dataclass
-class ComplianceRecord:
-    agent_id: str
-    total_receipts: int = 0
-    verified_receipts: int = 0
-    violations: list[str] = field(default_factory=list)
-    
-    @property
-    def pass_rate(self) -> float:
-        if self.total_receipts == 0:
-            return 0.0
-        return self.verified_receipts / self.total_receipts
-
-
-@dataclass 
-class EcosystemSnapshot:
-    timestamp: float
+class PhaseConfig:
     phase: Phase
-    total_agents: int
-    compliant_agents: int
-    overall_pass_rate: float
-    top_violators: list[tuple[str, float]]  # (agent_id, pass_rate)
+    min_days: int                    # Minimum days at this phase
+    min_receipts_checked: int        # Minimum volume before graduation eligible
+    max_gap_to_graduate: float       # Enforcement gap must be below this to graduate
+    consecutive_checks: int = 10     # Consecutive checks above threshold needed
+    description: str = ""
+
+
+@dataclass
+class GapReport:
+    """Public compliance report (Chrome CT model: name providers by compliance rate)."""
+    phase: str
+    total_checked: int
+    total_valid: int
+    enforcement_gap: float  # Fraction that would fail STRICT
+    worst_agents: list[tuple[str, float]]  # (agent_id, failure_rate)
+    generated_at: float = 0.0
     
-    @property
-    def compliance_rate(self) -> float:
-        if self.total_agents == 0:
-            return 0.0
-        return self.compliant_agents / self.total_agents
+    def summary(self) -> str:
+        lines = [
+            f"=== Enforcement Gap Report ({self.phase}) ===",
+            f"Checked: {self.total_checked}",
+            f"Valid: {self.total_valid} ({self.total_valid/max(self.total_checked,1):.1%})",
+            f"Gap: {self.enforcement_gap:.1%} would fail STRICT",
+        ]
+        if self.worst_agents:
+            lines.append("Worst agents:")
+            for agent, rate in self.worst_agents[:5]:
+                lines.append(f"  {agent}: {rate:.0%} failure rate")
+        return "\n".join(lines)
+
+
+@dataclass
+class ReceiptCheck:
+    """Result of checking a single receipt."""
+    receipt_id: str
+    agent_id: str
+    valid: bool
+    reasons: list[str] = field(default_factory=list)
 
 
 class EnforcementGraduator:
-    """Manages phased enforcement rollout."""
+    """
+    Chrome CT-style graduated enforcement rollout.
     
-    # Chrome CT graduation gates
-    DEFAULT_GATES = [
-        GraduationGate(
-            min_pass_rate=0.50,       # 50% pass rate
-            min_supply_count=100,     # 100 verified receipts exist
-            min_duration_days=90,     # 90 days minimum
-            phase_from=Phase.REPORT,
-            phase_to=Phase.WARN,
+    Phase progression:
+      PERMISSIVE → REPORT → WARN → STRICT
+    
+    Each phase has:
+      - Minimum duration (can't rush)
+      - Minimum volume (need statistical significance)
+      - Maximum gap (ecosystem must be ready)
+      - Consecutive checks (not just one good day)
+    
+    Graduation is pass-rate-gated, not time-gated.
+    If the ecosystem isn't ready, we don't graduate.
+    """
+    
+    PHASES = [
+        PhaseConfig(
+            Phase.PERMISSIVE, min_days=30, min_receipts_checked=100,
+            max_gap_to_graduate=1.0, consecutive_checks=1,
+            description="Collect baseline. No enforcement. Measure current state."
         ),
-        GraduationGate(
-            min_pass_rate=0.80,       # 80% pass rate
-            min_supply_count=1000,    # 1000 verified receipts
-            min_duration_days=180,    # 180 days minimum
-            phase_from=Phase.WARN,
-            phase_to=Phase.ENFORCE,
+        PhaseConfig(
+            Phase.REPORT, min_days=90, min_receipts_checked=1000,
+            max_gap_to_graduate=0.20, consecutive_checks=10,
+            description="Accept all, log violations. Publish gap reports weekly."
+        ),
+        PhaseConfig(
+            Phase.WARN, min_days=90, min_receipts_checked=5000,
+            max_gap_to_graduate=0.05, consecutive_checks=20,
+            description="Accept but surface 'Unverified Receipt' to consumers."
+        ),
+        PhaseConfig(
+            Phase.STRICT, min_days=0, min_receipts_checked=0,
+            max_gap_to_graduate=0.0, consecutive_checks=0,
+            description="Reject unverified. Opt-out logged but available."
         ),
     ]
     
-    def __init__(self, gates: Optional[list[GraduationGate]] = None):
-        self.gates = gates or self.DEFAULT_GATES
-        self.current_phase = Phase.REPORT
-        self.phase_start = time.time()
-        self.records: dict[str, ComplianceRecord] = {}
-        self.snapshots: list[EcosystemSnapshot] = []
+    def __init__(self):
+        self.current_phase_idx = 0
+        self.phase_start_time = time.time()
+        self.checks: list[ReceiptCheck] = []
+        self.agent_stats: dict[str, dict] = {}  # agent_id → {checked, failed}
+        self.consecutive_above = 0
+        self.graduation_history: list[dict] = []
     
-    def record_receipt(self, agent_id: str, verified: bool, 
-                       violation: Optional[str] = None):
-        """Record a receipt verification result."""
-        if agent_id not in self.records:
-            self.records[agent_id] = ComplianceRecord(agent_id=agent_id)
-        rec = self.records[agent_id]
-        rec.total_receipts += 1
-        if verified:
-            rec.verified_receipts += 1
-        if violation:
-            rec.violations.append(violation)
+    @property
+    def current_config(self) -> PhaseConfig:
+        return self.PHASES[self.current_phase_idx]
     
-    def should_accept(self, verified: bool) -> tuple[bool, str]:
-        """Decide whether to accept a receipt based on current phase."""
-        if self.current_phase == Phase.REPORT:
-            return True, "REPORT: accepted (violation logged)" if not verified else "REPORT: accepted (valid)"
+    @property
+    def current_phase(self) -> Phase:
+        return self.current_config.phase
+    
+    @property
+    def days_in_phase(self) -> float:
+        return (time.time() - self.phase_start_time) / 86400
+    
+    def record_check(self, receipt_id: str, agent_id: str, valid: bool, 
+                     reasons: list[str] = None) -> dict:
+        """Record a receipt check and return enforcement decision."""
+        check = ReceiptCheck(receipt_id, agent_id, valid, reasons or [])
+        self.checks.append(check)
+        
+        # Track per-agent stats
+        if agent_id not in self.agent_stats:
+            self.agent_stats[agent_id] = {"checked": 0, "failed": 0}
+        self.agent_stats[agent_id]["checked"] += 1
+        if not valid:
+            self.agent_stats[agent_id]["failed"] += 1
+        
+        # Check graduation
+        graduation = self._check_graduation()
+        
+        # Enforcement decision based on current phase
+        if self.current_phase == Phase.STRICT:
+            accepted = valid
         elif self.current_phase == Phase.WARN:
-            msg = "WARN: ⚠️ unverified receipt" if not verified else "WARN: verified"
-            return True, msg
-        else:  # ENFORCE
-            if verified:
-                return True, "ENFORCE: accepted"
-            return False, "ENFORCE: ❌ rejected (unverified)"
+            accepted = True  # Accept but warn
+        else:
+            accepted = True  # Accept silently or with log
+        
+        return {
+            "accepted": accepted,
+            "phase": self.current_phase.value,
+            "valid": valid,
+            "graduated": graduation,
+            "warning": not valid and self.current_phase == Phase.WARN,
+        }
     
-    def check_graduation(self) -> Optional[Phase]:
-        """Check if conditions are met to advance to next phase."""
-        for gate in self.gates:
-            if gate.phase_from != self.current_phase:
-                continue
-            
-            # Check duration
-            days_in_phase = (time.time() - self.phase_start) / 86400
-            if days_in_phase < gate.min_duration_days:
-                continue
-            
-            # Check pass rate
-            total = sum(r.total_receipts for r in self.records.values())
-            verified = sum(r.verified_receipts for r in self.records.values())
-            pass_rate = verified / total if total > 0 else 0
-            
-            if pass_rate < gate.min_pass_rate:
-                continue
-            
-            # Check supply
-            if verified < gate.min_supply_count:
-                continue
-            
-            return gate.phase_to
+    def _check_graduation(self) -> Optional[str]:
+        """Check if ready to graduate. Returns new phase name or None."""
+        if self.current_phase_idx >= len(self.PHASES) - 1:
+            return None  # Already at STRICT
+        
+        config = self.current_config
+        gap = self.enforcement_gap
+        
+        # Check all graduation criteria
+        if (len(self.checks) >= config.min_receipts_checked
+                and self.days_in_phase >= config.min_days
+                and gap <= config.max_gap_to_graduate):
+            self.consecutive_above += 1
+        else:
+            self.consecutive_above = 0
+        
+        if self.consecutive_above >= config.consecutive_checks:
+            return self._graduate()
         
         return None
     
-    def graduate(self, new_phase: Phase):
-        """Advance to new phase."""
-        self.current_phase = new_phase
-        self.phase_start = time.time()
+    def _graduate(self) -> str:
+        """Move to next phase."""
+        old = self.current_phase.value
+        self.graduation_history.append({
+            "from": old,
+            "to": self.PHASES[self.current_phase_idx + 1].phase.value,
+            "gap_at_graduation": self.enforcement_gap,
+            "receipts_checked": len(self.checks),
+            "days_in_phase": self.days_in_phase,
+            "timestamp": time.time(),
+        })
+        self.current_phase_idx += 1
+        self.phase_start_time = time.time()
+        self.consecutive_above = 0
+        self.checks = []
+        self.agent_stats = {}
+        return self.current_phase.value
     
-    def take_snapshot(self) -> EcosystemSnapshot:
+    @property
+    def enforcement_gap(self) -> float:
+        """Fraction of receipts that would fail STRICT."""
+        if not self.checks:
+            return 1.0
+        failed = sum(1 for c in self.checks if not c.valid)
+        return failed / len(self.checks)
+    
+    def gap_report(self) -> GapReport:
         """Generate public compliance report (Chrome CT model)."""
-        total = sum(r.total_receipts for r in self.records.values())
-        verified = sum(r.verified_receipts for r in self.records.values())
+        total = len(self.checks)
+        valid = sum(1 for c in self.checks if c.valid)
         
-        # Compliant = pass_rate >= threshold for current phase
-        threshold = 0.5 if self.current_phase == Phase.REPORT else 0.8
-        compliant = sum(
-            1 for r in self.records.values() 
-            if r.pass_rate >= threshold
+        # Worst agents by failure rate (min 5 checks)
+        worst = []
+        for agent_id, stats in self.agent_stats.items():
+            if stats["checked"] >= 5:
+                rate = stats["failed"] / stats["checked"]
+                if rate > 0:
+                    worst.append((agent_id, rate))
+        worst.sort(key=lambda x: -x[1])
+        
+        return GapReport(
+            phase=self.current_phase.value,
+            total_checked=total,
+            total_valid=valid,
+            enforcement_gap=self.enforcement_gap,
+            worst_agents=worst[:10],
+            generated_at=time.time(),
         )
+    
+    def status(self) -> dict:
+        """Current graduation status."""
+        config = self.current_config
+        blockers = []
         
-        # Top violators (public shaming)
-        violators = sorted(
-            [(r.agent_id, r.pass_rate) for r in self.records.values()],
-            key=lambda x: x[1]
-        )[:5]
+        if len(self.checks) < config.min_receipts_checked:
+            blockers.append(f"volume: {len(self.checks)}/{config.min_receipts_checked}")
+        if self.days_in_phase < config.min_days:
+            blockers.append(f"duration: {self.days_in_phase:.0f}/{config.min_days} days")
+        if self.enforcement_gap > config.max_gap_to_graduate:
+            blockers.append(f"gap: {self.enforcement_gap:.1%} > {config.max_gap_to_graduate:.0%}")
+        if self.consecutive_above < config.consecutive_checks:
+            blockers.append(f"consecutive: {self.consecutive_above}/{config.consecutive_checks}")
         
-        snapshot = EcosystemSnapshot(
-            timestamp=time.time(),
-            phase=self.current_phase,
-            total_agents=len(self.records),
-            compliant_agents=compliant,
-            overall_pass_rate=verified / total if total > 0 else 0,
-            top_violators=violators,
-        )
-        self.snapshots.append(snapshot)
-        return snapshot
+        return {
+            "phase": self.current_phase.value,
+            "description": config.description,
+            "phase_index": f"{self.current_phase_idx + 1}/{len(self.PHASES)}",
+            "days_in_phase": f"{self.days_in_phase:.1f}",
+            "receipts_checked": len(self.checks),
+            "enforcement_gap": f"{self.enforcement_gap:.1%}",
+            "ready_to_graduate": len(blockers) == 0 and self.current_phase_idx < len(self.PHASES) - 1,
+            "blockers": blockers,
+            "history": self.graduation_history,
+        }
 
 
 def demo():
-    """Simulate enforcement graduation with ecosystem data."""
+    """Simulate enforcement graduation."""
+    import random
+    
+    print("=" * 60)
+    print("ENFORCEMENT GRADUATION SIMULATION")
+    print("Chrome CT model applied to L3.5 receipts")
+    print("=" * 60)
+    
     grad = EnforcementGraduator()
     
-    # Simulate 3 phases of ecosystem growth
+    # Simulate 4 phases of ecosystem maturation
     scenarios = [
-        {
-            "phase_label": "Phase 1: REPORT (early adoption)",
-            "agents": {
-                "agent:reliable": (50, 48),    # 96% pass
-                "agent:learning": (50, 25),    # 50% pass  
-                "agent:legacy": (50, 5),       # 10% pass
-                "agent:new": (20, 18),         # 90% pass
-            }
-        },
-        {
-            "phase_label": "Phase 2: WARN (pressure building)",
-            "agents": {
-                "agent:reliable": (100, 98),   # 98% pass
-                "agent:learning": (100, 75),   # 75% pass (improved!)
-                "agent:legacy": (100, 60),     # 60% pass (improving)
-                "agent:new": (100, 95),        # 95% pass
-                "agent:newcomer": (50, 45),    # 90% pass
-            }
-        },
-        {
-            "phase_label": "Phase 3: ENFORCE (compliance)",
-            "agents": {
-                "agent:reliable": (200, 198),  # 99% pass
-                "agent:learning": (200, 185),  # 92.5% pass
-                "agent:legacy": (200, 170),    # 85% pass
-                "agent:new": (200, 196),       # 98% pass
-                "agent:newcomer": (200, 190),  # 95% pass
-            }
-        },
+        ("Early ecosystem (70% valid)", 0.70, 150),
+        ("Improving (85% valid)", 0.85, 200),
+        ("Maturing (92% valid)", 0.92, 300),
+        ("Production-ready (98% valid)", 0.98, 500),
     ]
     
-    for i, scenario in enumerate(scenarios):
-        print(f"\n{'='*60}")
-        print(f"{scenario['phase_label']}")
-        print(f"Current enforcement: {grad.current_phase.value.upper()}")
-        print(f"{'='*60}")
+    for scenario_name, valid_rate, count in scenarios:
+        print(f"\n--- {scenario_name} ---")
         
-        # Record receipts
-        grad.records.clear()
-        for agent_id, (total, verified) in scenario["agents"].items():
-            for j in range(total):
-                is_verified = j < verified
-                violation = None if is_verified else "missing_merkle_proof"
-                grad.record_receipt(agent_id, is_verified, violation)
+        # Fast-forward time for demo
+        grad.phase_start_time = time.time() - 100 * 86400
         
-        # Take snapshot
-        snap = grad.take_snapshot()
-        print(f"\n  📊 Compliance Report:")
-        print(f"    Agents: {snap.total_agents}")
-        print(f"    Compliant: {snap.compliant_agents}/{snap.total_agents} "
-              f"({snap.compliance_rate:.0%})")
-        print(f"    Overall pass rate: {snap.overall_pass_rate:.1%}")
-        print(f"\n  Bottom 5 (public gap log):")
-        for agent_id, rate in snap.top_violators:
-            status = "✅" if rate >= 0.8 else "⚠️" if rate >= 0.5 else "❌"
-            print(f"    {status} {agent_id}: {rate:.0%}")
+        for i in range(count):
+            valid = random.random() < valid_rate
+            agent = f"agent:{random.choice(['alpha', 'beta', 'gamma', 'delta', 'epsilon'])}"
+            reasons = [] if valid else ["missing_merkle_proof"]
+            result = grad.record_check(f"r{i}", agent, valid, reasons)
+            
+            if result.get("graduated"):
+                print(f"  🎓 GRADUATED to {result['graduated']}!")
         
-        # Test acceptance
-        print(f"\n  Receipt decisions ({grad.current_phase.value}):")
-        for verified in [True, False]:
-            accepted, msg = grad.should_accept(verified)
-            print(f"    {'verified' if verified else 'unverified'}: {msg}")
-        
-        # Simulate graduation (override time check for demo)
-        if i < 2:
-            next_phase = Phase.WARN if i == 0 else Phase.ENFORCE
-            grad.graduate(next_phase)
-            print(f"\n  ⬆️ Graduating to {next_phase.value.upper()}")
+        status = grad.status()
+        print(f"  Phase: {status['phase']} ({status['phase_index']})")
+        print(f"  Gap: {status['enforcement_gap']}")
+        print(f"  Receipts: {status['receipts_checked']}")
+        if status['blockers']:
+            print(f"  Blockers: {status['blockers']}")
+        if status['ready_to_graduate']:
+            print(f"  ✅ Ready to graduate!")
     
-    # Summary
-    print(f"\n{'='*60}")
-    print("GRADUATION TIMELINE (Chrome CT parallel)")
-    print(f"{'='*60}")
-    print("  Phase 1 REPORT  → Chrome 56 (Jan 2017): warn passwords only")
-    print("  Phase 2 WARN    → Chrome 62 (Oct 2017): warn all inputs")
-    print("  Phase 3 ENFORCE → Chrome 68 (Jul 2018): all HTTP = Not Secure")
-    print("  ")
-    print("  Key insight: graduation gates are DATA-DRIVEN.")
-    print("  Advance when ecosystem pass_rate crosses threshold.")
-    print("  Gap log = public coordination. CAs fixed infra because")
-    print("  Chrome published who was behind.")
-    print("  ")
-    print("  L3.5 equivalent:")
-    print("  REPORT (log)  → WARN (flag)  → ENFORCE (reject)")
-    print("  50% pass rate → 80% pass rate → default-reject")
-    print("  90 days min   → 180 days min  → permanent")
+    # Final gap report
+    report = grad.gap_report()
+    print(f"\n{report.summary()}")
+    
+    # Show graduation history
+    if grad.graduation_history:
+        print(f"\n📜 Graduation History:")
+        for h in grad.graduation_history:
+            print(f"  {h['from']} → {h['to']} "
+                  f"(gap={h['gap_at_graduation']:.1%}, "
+                  f"receipts={h['receipts_checked']}, "
+                  f"days={h['days_in_phase']:.0f})")
 
 
 if __name__ == "__main__":
