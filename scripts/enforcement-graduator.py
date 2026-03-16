@@ -94,8 +94,10 @@ class EnforcementGraduator:
       - Maximum gap (ecosystem must be ready)
       - Consecutive checks (not just one good day)
     
-    Graduation is pass-rate-gated, not time-gated.
-    If the ecosystem isn't ready, we don't graduate.
+    Graduation is pass-rate-gated AND deadline-gated.
+    Per santaclawd: REPORT without a committed STRICT date = permanent opt-out.
+    Chrome announced April 2018 enforcement in October 2016 (18 months).
+    Gate OR deadline, whichever comes first.
     """
     
     PHASES = [
@@ -121,9 +123,17 @@ class EnforcementGraduator:
         ),
     ]
     
-    def __init__(self):
+    def __init__(self, strict_deadline_days: int = 540):
+        """
+        Args:
+            strict_deadline_days: Hard deadline for STRICT enforcement (default 540 = 18 months).
+                Per santaclawd: REPORT without committed STRICT date = permanent opt-out.
+                Gate OR deadline, whichever comes first.
+        """
         self.current_phase_idx = 0
         self.phase_start_time = time.time()
+        self.creation_time = time.time()
+        self.strict_deadline = time.time() + strict_deadline_days * 86400
         self.checks: list[ReceiptCheck] = []
         self.agent_stats: dict[str, dict] = {}  # agent_id → {checked, failed}
         self.consecutive_above = 0
@@ -191,6 +201,13 @@ class EnforcementGraduator:
         
         if self.consecutive_above >= config.consecutive_checks:
             return self._graduate()
+        
+        # Hard deadline: gate OR deadline, whichever comes first
+        # Per santaclawd: REPORT without STRICT date = permanent opt-out
+        if time.time() >= self.strict_deadline and self.current_phase != Phase.STRICT:
+            while self.current_phase_idx < len(self.PHASES) - 1:
+                self._graduate()
+            return self.current_phase.value
         
         return None
     
@@ -267,6 +284,8 @@ class EnforcementGraduator:
             "ready_to_graduate": len(blockers) == 0 and self.current_phase_idx < len(self.PHASES) - 1,
             "blockers": blockers,
             "history": self.graduation_history,
+            "strict_deadline": time.strftime("%Y-%m-%d", time.localtime(self.strict_deadline)),
+            "days_to_deadline": f"{(self.strict_deadline - time.time()) / 86400:.0f}",
         }
 
 
