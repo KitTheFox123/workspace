@@ -363,6 +363,98 @@ class EnforcementGraduator:
         return False
 
 
+class EnforcementGraduator:
+    """Chrome CT graduation model for L3.5 receipt verification.
+    
+    Chrome's 3-phase HTTPS enforcement:
+      Phase 1 (Chrome 56, Jan 2017): Warn on password pages only
+      Phase 2 (Chrome 62, Oct 2017): Warn on any input field
+      Phase 3 (Chrome 68, Jul 2018): All HTTP = "Not Secure"
+    
+    L3.5 equivalent:
+      Phase 1 (REPORT): Accept all, log violations. Publish gap reports.
+      Phase 2 (WARN): Accept but surface warnings to consumers.
+      Phase 3 (STRICT): Reject unverified receipts by default.
+    
+    Graduation trigger: pass-rate exceeds threshold for N consecutive checks.
+    """
+    
+    PHASES = [
+        {"name": "REPORT", "policy": EnforcementPolicy.REPORT, 
+         "pass_rate_to_graduate": 0.80, "min_samples": 100},
+        {"name": "WARN", "policy": EnforcementPolicy.REPORT,
+         "pass_rate_to_graduate": 0.95, "min_samples": 500},
+        {"name": "STRICT", "policy": EnforcementPolicy.STRICT,
+         "pass_rate_to_graduate": 1.0, "min_samples": 0},  # Terminal
+    ]
+    
+    def __init__(self):
+        self.current_phase = 0
+        self.enforcer = ConsumerReceiptEnforcer(
+            policy=self.PHASES[0]["policy"]
+        )
+        self.phase_history: list[dict] = []
+        self.consecutive_above_threshold = 0
+        self.GRADUATION_WINDOW = 10  # Consecutive checks above threshold
+    
+    @property
+    def phase_name(self) -> str:
+        return self.PHASES[self.current_phase]["name"]
+    
+    def check_receipt(self, receipt: Receipt) -> VerificationResult:
+        """Verify receipt and check for phase graduation."""
+        result = self.enforcer.verify_receipt(receipt)
+        self._check_graduation()
+        return result
+    
+    def _check_graduation(self):
+        """Graduate to next phase if pass rate exceeds threshold."""
+        if self.current_phase >= len(self.PHASES) - 1:
+            return  # Already at STRICT
+        
+        phase = self.PHASES[self.current_phase]
+        stats = self.enforcer.stats
+        
+        if stats.total_checked < phase["min_samples"]:
+            return
+        
+        pass_rate = 1.0 - self.enforcer.stats.enforcement_gap
+        if pass_rate >= phase["pass_rate_to_graduate"]:
+            self.consecutive_above_threshold += 1
+        else:
+            self.consecutive_above_threshold = 0
+        
+        if self.consecutive_above_threshold >= self.GRADUATION_WINDOW:
+            self._graduate()
+    
+    def _graduate(self):
+        """Move to next enforcement phase."""
+        old_phase = self.phase_name
+        self.phase_history.append({
+            "from": old_phase,
+            "to": self.PHASES[self.current_phase + 1]["name"],
+            "samples": self.enforcer.stats.total_checked,
+            "pass_rate": 1.0 - self.enforcer.stats.enforcement_gap,
+            "timestamp": time.time(),
+        })
+        self.current_phase += 1
+        self.enforcer = ConsumerReceiptEnforcer(
+            policy=self.PHASES[self.current_phase]["policy"]
+        )
+        self.consecutive_above_threshold = 0
+    
+    def status(self) -> dict:
+        return {
+            "phase": self.phase_name,
+            "phase_index": f"{self.current_phase + 1}/{len(self.PHASES)}",
+            "total_checked": self.enforcer.stats.total_checked,
+            "pass_rate": f"{1.0 - self.enforcer.stats.enforcement_gap:.1%}",
+            "consecutive_above_threshold": self.consecutive_above_threshold,
+            "graduation_window": self.GRADUATION_WINDOW,
+            "history": self.phase_history,
+        }
+
+
 def demo():
     """Demonstrate enforcement modes with test receipts."""
     now = time.time()
