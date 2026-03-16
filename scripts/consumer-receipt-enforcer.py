@@ -287,6 +287,82 @@ class GraduationSchedule:
         )
 
 
+class EnforcementGraduator:
+    """Chrome-style graduated enforcement rollout.
+    
+    Chrome CT timeline:
+    - Chrome 56 (Jan 2017): warn on password pages only
+    - Chrome 62 (Oct 2017): warn on any input field
+    - Chrome 68 (Jul 2018): all HTTP = "Not Secure"
+    
+    L3.5 equivalent:
+    - Phase 1: REPORT mode, publish gap stats (name and shame)
+    - Phase 2: WARN mode, flag unverified but accept
+    - Phase 3: STRICT mode, reject unverified by default
+    """
+    
+    def __init__(self):
+        self.phases = [
+            {
+                "name": "Phase 1: Report",
+                "policy": EnforcementPolicy.REPORT,
+                "duration_days": 180,
+                "graduation_threshold": 0.80,  # 80% of receipts must pass
+                "description": "Accept all, log violations. Publish compliance reports.",
+            },
+            {
+                "name": "Phase 2: Warn",
+                "policy": EnforcementPolicy.REPORT,  # Accept but prominently warn
+                "duration_days": 180,
+                "graduation_threshold": 0.95,  # 95% pass rate to graduate
+                "description": "Accept but flag. Consumer sees 'Unverified Receipt' warning.",
+            },
+            {
+                "name": "Phase 3: Enforce",
+                "policy": EnforcementPolicy.STRICT,
+                "duration_days": None,  # Permanent
+                "graduation_threshold": None,
+                "description": "Reject unverified. Opt-out available but logged.",
+            },
+        ]
+        self.current_phase = 0
+    
+    def evaluate_graduation(self, enforcer: ConsumerReceiptEnforcer) -> dict:
+        """Check if current enforcement phase should graduate."""
+        phase = self.phases[self.current_phase]
+        stats = enforcer.stats
+        
+        if stats.total_checked == 0:
+            return {"phase": phase["name"], "ready": False, "reason": "No data yet"}
+        
+        pass_rate = 1.0 - enforcer.stats.enforcement_gap
+        threshold = phase.get("graduation_threshold")
+        
+        if threshold is None:
+            return {
+                "phase": phase["name"],
+                "ready": False,
+                "reason": "Final phase — no graduation needed",
+            }
+        
+        ready = pass_rate >= threshold
+        return {
+            "phase": phase["name"],
+            "pass_rate": f"{pass_rate:.1%}",
+            "threshold": f"{threshold:.0%}",
+            "ready": ready,
+            "next_phase": self.phases[self.current_phase + 1]["name"] if ready and self.current_phase + 1 < len(self.phases) else None,
+            "recommendation": f"Graduate to {self.phases[self.current_phase + 1]['name']}" if ready and self.current_phase + 1 < len(self.phases) else "Stay in current phase" if not ready else "At final phase",
+        }
+    
+    def graduate(self) -> bool:
+        """Move to next enforcement phase."""
+        if self.current_phase + 1 < len(self.phases):
+            self.current_phase += 1
+            return True
+        return False
+
+
 def demo():
     """Demonstrate enforcement modes with test receipts."""
     now = time.time()
