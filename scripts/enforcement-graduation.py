@@ -1,216 +1,272 @@
 #!/usr/bin/env python3
 """
-enforcement-graduation.py — CT-style enforcement rollout scheduler.
+enforcement-graduation.py — REPORT→STRICT graduation scheduler for L3.5.
 
-Chrome CT timeline: announced 2016, REPORT 2017, mandatory April 2018.
-Key: the gap log during REPORT showed what would break, creating compliance pressure.
+Chrome CT timeline: ~5 years (2013 announce → 2018 enforce).
+HTTPS "Not Secure": ~3 years (2014 experiment → 2018 all HTTP flagged).
+Agent commerce moves faster. This models the graduation conditions.
 
-HTTPS: specs existed 20 years. Adoption at 40%. Chrome labeled HTTP "Not Secure" → 95% in 3 years.
-Lesson: specs are necessary but not sufficient. Client enforcement is the forcing function.
+Key insight from santaclawd: publish STRICT date on day one = Schelling point.
+Key insight from HTTPS: TWO forcing functions needed:
+  1. Free compliance tooling (Let's Encrypt equivalent)
+  2. Visible non-compliance (Chrome "Not Secure" equivalent)
 
-This tool models the graduation from REPORT → STRICT for L3.5 receipt verification,
-using gap ratio as the trigger (not calendar dates).
-
-Phases:
-1. ANNOUNCE — Publish intent + deadline. Gap measurement begins.
-2. REPORT — Accept all, log violations. Gap ratio visible to all.
-3. WARN — Accept with degraded trust score. Agents see the penalty.
-4. STRICT — Reject unverified. Adoption or exclusion.
+Graduation is NOT time-based. It's metric-based with a time floor.
 """
 
-import math
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
 class Phase(Enum):
-    ANNOUNCE = "announce"
-    REPORT = "report"
-    WARN = "warn"
-    STRICT = "strict"
+    PERMISSIVE = "permissive"   # No enforcement, no logging
+    REPORT = "report"           # Accept all, log violations
+    REPORT_WARN = "report_warn" # Accept all, warn consumers visibly
+    STRICT = "strict"           # Reject unverified
 
 
 @dataclass
-class GapSnapshot:
-    """Point-in-time measurement of enforcement gap."""
-    day: int
-    total_receipts: int
-    would_reject: int
+class GraduationMetrics:
+    """Metrics that determine readiness for next phase."""
+    # What % of receipts would pass STRICT validation?
+    compliance_rate: float = 0.0
+    # How many agents have adopted receipt generation?
+    adoption_count: int = 0
+    # Total agents in ecosystem
+    total_agents: int = 0
+    # Free tooling available? (Let's Encrypt equivalent)
+    free_tooling_available: bool = False
+    # Days since phase announcement
+    days_in_phase: int = 0
+    # Consumer-side enforcers deployed
+    enforcer_deployments: int = 0
     
     @property
-    def gap_ratio(self) -> float:
-        if self.total_receipts == 0:
-            return 1.0
-        return self.would_reject / self.total_receipts
+    def adoption_rate(self) -> float:
+        if self.total_agents == 0:
+            return 0.0
+        return self.adoption_count / self.total_agents
 
 
-@dataclass 
+@dataclass
 class PhaseTransition:
     from_phase: Phase
     to_phase: Phase
-    trigger_gap: float  # Gap ratio that triggers transition
-    min_days: int       # Minimum days in current phase
-    description: str
+    # ALL conditions must be met
+    min_compliance_rate: float
+    min_adoption_rate: float
+    min_days: int  # Time floor (Schelling point)
+    requires_free_tooling: bool
+    min_enforcer_deployments: int
 
 
-class EnforcementGraduator:
-    """Models enforcement graduation with gap-based triggers."""
+# Chrome CT graduation took 5 years. Agent commerce = 6 months.
+GRADUATION_SCHEDULE = [
+    PhaseTransition(
+        from_phase=Phase.PERMISSIVE,
+        to_phase=Phase.REPORT,
+        min_compliance_rate=0.0,   # No compliance needed to start logging
+        min_adoption_rate=0.0,
+        min_days=0,                # Immediate
+        requires_free_tooling=True,  # Must have free tooling first
+        min_enforcer_deployments=1,
+    ),
+    PhaseTransition(
+        from_phase=Phase.REPORT,
+        to_phase=Phase.REPORT_WARN,
+        min_compliance_rate=0.30,  # 30% pass STRICT
+        min_adoption_rate=0.10,    # 10% of agents generate receipts
+        min_days=30,               # 1 month minimum
+        requires_free_tooling=True,
+        min_enforcer_deployments=5,
+    ),
+    PhaseTransition(
+        from_phase=Phase.REPORT_WARN,
+        to_phase=Phase.STRICT,
+        min_compliance_rate=0.80,  # 80% pass STRICT
+        min_adoption_rate=0.50,    # 50% adoption
+        min_days=90,               # 3 months minimum in REPORT_WARN
+        requires_free_tooling=True,
+        min_enforcer_deployments=20,
+    ),
+]
+
+
+@dataclass
+class GraduationState:
+    current_phase: Phase = Phase.PERMISSIVE
+    phase_start_time: float = field(default_factory=time.time)
+    strict_date_announced: Optional[str] = None  # Schelling point
+    history: list[dict] = field(default_factory=list)
+
+
+class EnforcementGraduationScheduler:
+    """Manages phase transitions for L3.5 receipt enforcement."""
     
-    # Default transitions (inspired by Chrome CT)
-    DEFAULT_TRANSITIONS = [
-        PhaseTransition(Phase.ANNOUNCE, Phase.REPORT, 1.0, 30,
-                       "Announce intent, begin measurement"),
-        PhaseTransition(Phase.REPORT, Phase.WARN, 0.20, 90,
-                       "When <20% would be rejected, start warning"),
-        PhaseTransition(Phase.WARN, Phase.STRICT, 0.05, 60,
-                       "When <5% would be rejected, go strict"),
-    ]
-    
-    def __init__(self, transitions: Optional[list[PhaseTransition]] = None):
-        self.transitions = transitions or self.DEFAULT_TRANSITIONS
-        self.current_phase = Phase.ANNOUNCE
-        self.days_in_phase = 0
-        self.history: list[GapSnapshot] = []
-    
-    def record_gap(self, total: int, would_reject: int) -> None:
-        """Record daily gap measurement."""
-        day = len(self.history)
-        self.history.append(GapSnapshot(day, total, would_reject))
-        self.days_in_phase += 1
-    
-    def should_graduate(self) -> Optional[PhaseTransition]:
-        """Check if conditions met for next phase."""
-        if not self.history:
-            return None
-        
-        current_gap = self.history[-1].gap_ratio
-        
-        for t in self.transitions:
-            if t.from_phase == self.current_phase:
-                if (self.days_in_phase >= t.min_days and 
-                    current_gap <= t.trigger_gap):
-                    return t
-        return None
-    
-    def graduate(self) -> Optional[PhaseTransition]:
-        """Attempt graduation. Returns transition if successful."""
-        t = self.should_graduate()
-        if t:
-            self.current_phase = t.to_phase
-            self.days_in_phase = 0
-            return t
-        return None
-    
-    def time_to_strict(self) -> dict:
-        """Estimate time to STRICT based on gap trend."""
-        if len(self.history) < 7:
-            return {"estimate": "insufficient data", "days": None}
-        
-        # Linear regression on gap ratio
-        recent = self.history[-7:]
-        xs = [s.day for s in recent]
-        ys = [s.gap_ratio for s in recent]
-        n = len(xs)
-        
-        x_mean = sum(xs) / n
-        y_mean = sum(ys) / n
-        
-        num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-        den = sum((x - x_mean) ** 2 for x in xs)
-        
-        if den == 0 or num >= 0:  # No improvement or getting worse
-            return {"estimate": "not converging", "days": None, "trend": "flat/worsening"}
-        
-        slope = num / den
-        current_gap = ys[-1]
-        target = 0.05
-        
-        if current_gap <= target:
-            return {"estimate": "ready now", "days": 0}
-        
-        days_to_target = int((target - current_gap) / slope)
-        # Add minimum phase durations
-        remaining_min = sum(
-            t.min_days for t in self.transitions 
-            if self._phase_order(t.from_phase) >= self._phase_order(self.current_phase)
-        )
-        
-        total = max(days_to_target, remaining_min)
-        return {
-            "estimate": f"~{total} days",
-            "days": total,
-            "trend": f"{slope:.4f}/day",
-            "current_gap": f"{current_gap:.1%}",
+    def __init__(self):
+        self.state = GraduationState()
+        self.transitions = {
+            (t.from_phase, t.to_phase): t for t in GRADUATION_SCHEDULE
         }
     
-    def _phase_order(self, phase: Phase) -> int:
-        return list(Phase).index(phase)
+    def evaluate(self, metrics: GraduationMetrics) -> dict:
+        """Evaluate whether graduation conditions are met."""
+        current = self.state.current_phase
+        
+        # Find next transition
+        next_phase = self._next_phase(current)
+        if next_phase is None:
+            return {
+                "current_phase": current.value,
+                "status": "FINAL",
+                "message": "Already at STRICT enforcement",
+            }
+        
+        transition = self.transitions.get((current, next_phase))
+        if transition is None:
+            return {"error": f"No transition from {current} to {next_phase}"}
+        
+        # Check each condition
+        conditions = {
+            "compliance_rate": {
+                "required": transition.min_compliance_rate,
+                "actual": metrics.compliance_rate,
+                "met": metrics.compliance_rate >= transition.min_compliance_rate,
+            },
+            "adoption_rate": {
+                "required": transition.min_adoption_rate,
+                "actual": metrics.adoption_rate,
+                "met": metrics.adoption_rate >= transition.min_adoption_rate,
+            },
+            "min_days": {
+                "required": transition.min_days,
+                "actual": metrics.days_in_phase,
+                "met": metrics.days_in_phase >= transition.min_days,
+            },
+            "free_tooling": {
+                "required": transition.requires_free_tooling,
+                "actual": metrics.free_tooling_available,
+                "met": not transition.requires_free_tooling or metrics.free_tooling_available,
+            },
+            "enforcer_deployments": {
+                "required": transition.min_enforcer_deployments,
+                "actual": metrics.enforcer_deployments,
+                "met": metrics.enforcer_deployments >= transition.min_enforcer_deployments,
+            },
+        }
+        
+        all_met = all(c["met"] for c in conditions.values())
+        blockers = [k for k, v in conditions.items() if not v["met"]]
+        
+        return {
+            "current_phase": current.value,
+            "next_phase": next_phase.value,
+            "ready": all_met,
+            "conditions": conditions,
+            "blockers": blockers,
+            "recommendation": self._recommend(all_met, blockers, metrics),
+        }
+    
+    def graduate(self, metrics: GraduationMetrics) -> Optional[Phase]:
+        """Attempt graduation. Returns new phase if successful."""
+        result = self.evaluate(metrics)
+        if result.get("ready"):
+            new_phase = Phase(result["next_phase"])
+            self.state.history.append({
+                "from": self.state.current_phase.value,
+                "to": new_phase.value,
+                "timestamp": time.time(),
+                "metrics": {
+                    "compliance": metrics.compliance_rate,
+                    "adoption": metrics.adoption_rate,
+                    "days": metrics.days_in_phase,
+                },
+            })
+            self.state.current_phase = new_phase
+            self.state.phase_start_time = time.time()
+            return new_phase
+        return None
+    
+    def _next_phase(self, current: Phase) -> Optional[Phase]:
+        order = [Phase.PERMISSIVE, Phase.REPORT, Phase.REPORT_WARN, Phase.STRICT]
+        idx = order.index(current)
+        if idx >= len(order) - 1:
+            return None
+        return order[idx + 1]
+    
+    def _recommend(self, ready: bool, blockers: list, metrics: GraduationMetrics) -> str:
+        if ready:
+            return "✅ All conditions met. Graduate when ready."
+        if "free_tooling" in blockers:
+            return "🔧 Ship free tooling first. Can't enforce what's expensive to comply with."
+        if "compliance_rate" in blockers:
+            return f"📊 Compliance at {metrics.compliance_rate:.0%}. Fix supply before enforcing."
+        if "min_days" in blockers:
+            return f"⏳ Time floor not met ({metrics.days_in_phase}d). Schelling point matters."
+        return f"⏸️ Blockers: {', '.join(blockers)}"
 
 
-def simulate_adoption():
-    """Simulate adoption curve with S-shaped compliance."""
-    grad = EnforcementGraduator()
+def demo():
+    """Demonstrate graduation evaluation."""
+    scheduler = EnforcementGraduationScheduler()
     
-    print("=" * 70)
-    print("L3.5 Enforcement Graduation Simulation")
-    print("(Modeled on Chrome CT: ANNOUNCE → REPORT → WARN → STRICT)")
-    print("=" * 70)
+    scenarios = [
+        ("Day 1: No tooling yet", GraduationMetrics(
+            compliance_rate=0.0, adoption_count=0, total_agents=1000,
+            free_tooling_available=False, days_in_phase=1, enforcer_deployments=0,
+        )),
+        ("Day 1: Free tooling shipped", GraduationMetrics(
+            compliance_rate=0.0, adoption_count=0, total_agents=1000,
+            free_tooling_available=True, days_in_phase=1, enforcer_deployments=1,
+        )),
+        ("Month 1: Early adoption (REPORT phase)", GraduationMetrics(
+            compliance_rate=0.15, adoption_count=80, total_agents=1000,
+            free_tooling_available=True, days_in_phase=30, enforcer_deployments=3,
+        )),
+        ("Month 2: Growing adoption", GraduationMetrics(
+            compliance_rate=0.35, adoption_count=120, total_agents=1000,
+            free_tooling_available=True, days_in_phase=60, enforcer_deployments=8,
+        )),
+        ("Month 4: Ready for STRICT", GraduationMetrics(
+            compliance_rate=0.85, adoption_count=550, total_agents=1000,
+            free_tooling_available=True, days_in_phase=120, enforcer_deployments=25,
+        )),
+    ]
     
-    # Simulate 365 days of adoption
-    # S-curve: initially slow, then rapid, then plateau
-    total_daily = 1000
+    print("L3.5 Enforcement Graduation Scheduler")
+    print("=" * 60)
+    print("Model: Chrome CT (5yr) compressed to agent timescales (~6mo)")
+    print("Principle: metric-based with time floor, not time-based alone")
+    print()
     
-    for day in range(365):
-        # S-curve adoption: logistic function
-        # Starts at 10% compliance, reaches 98% by day 300
-        adoption = 0.10 + 0.88 / (1 + math.exp(-0.03 * (day - 150)))
-        would_reject = int(total_daily * (1 - adoption))
+    for name, metrics in scenarios:
+        result = scheduler.evaluate(metrics)
+        print(f"\n{'─'*60}")
+        print(f"📍 {name}")
+        print(f"   Phase: {result['current_phase'].upper()}", end="")
+        if "next_phase" in result:
+            print(f" → {result['next_phase'].upper()}")
+        else:
+            print()
         
-        grad.record_gap(total_daily, would_reject)
+        if "conditions" in result:
+            for k, v in result["conditions"].items():
+                status = "✅" if v["met"] else "❌"
+                print(f"   {status} {k}: {v['actual']} (need {v['required']})")
         
-        # Try to graduate
-        transition = grad.graduate()
-        if transition:
-            gap = grad.history[-1].gap_ratio
-            print(f"\n🎓 Day {day}: {transition.from_phase.value} → {transition.to_phase.value}")
-            print(f"   Gap: {gap:.1%} (trigger: ≤{transition.trigger_gap:.0%})")
-            print(f"   {transition.description}")
+        ready = result.get("ready", False)
+        print(f"   {'🟢 READY' if ready else '🔴 NOT READY'}")
+        if "recommendation" in result:
+            print(f"   {result['recommendation']}")
         
-        # Print weekly snapshots
-        if day % 30 == 0:
-            snap = grad.history[-1]
-            est = grad.time_to_strict()
-            print(f"\n📊 Day {day:3d} | Phase: {grad.current_phase.value:8s} | "
-                  f"Gap: {snap.gap_ratio:.1%} | "
-                  f"Compliant: {total_daily - snap.would_reject}/{total_daily} | "
-                  f"ETA to STRICT: {est.get('estimate', '?')}")
-    
-    # Final report
-    print(f"\n{'=' * 70}")
-    print("Final State")
-    print(f"{'=' * 70}")
-    print(f"Phase: {grad.current_phase.value}")
-    print(f"Days simulated: {len(grad.history)}")
-    print(f"Final gap: {grad.history[-1].gap_ratio:.1%}")
-    print(f"Days in current phase: {grad.days_in_phase}")
-    
-    # Phase timeline
-    print(f"\n📅 Phase Timeline:")
-    phase_starts = {}
-    current = Phase.ANNOUNCE
-    phase_starts[current] = 0
-    for i, snap in enumerate(grad.history):
-        # Detect phase changes by re-running logic
-        pass  # Already logged above
-    
-    # Key insight
-    print(f"\n💡 Key Insight:")
-    print(f"   Chrome CT: ~2 years from announce to enforce")
-    print(f"   HTTPS 'Not Secure': ~3 years from 40% to 95%")
-    print(f"   L3.5 simulation: reached STRICT at gap <5%")
-    print(f"   The forcing function is the CLIENT, not the SPEC")
+        # Attempt graduation
+        if ready:
+            new_phase = scheduler.graduate(metrics)
+            if new_phase:
+                print(f"   🎓 GRADUATED to {new_phase.value.upper()}")
 
 
 if __name__ == "__main__":
-    simulate_adoption()
+    demo()
