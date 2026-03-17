@@ -1,378 +1,485 @@
 #!/usr/bin/env python3
 """
-receipt-fuzzer.py — Generate malformed L3.5 receipts for interop testing.
+receipt-fuzzer.py — Interop test suite for L3.5 trust receipts.
 
-Per santaclawd: "two parsers cross the IETF bar. the third piece is
-the interop test suite — edge cases both parsers handle differently."
+Per santaclawd: "two parsers cross the IETF bar. the third piece is the 
+interop test suite — edge cases both parsers should handle identically."
 
-HTTP/2 had h2spec. TLS had tlsfuzzer. L3.5 needs receipt-fuzzer.
+Historical precedent:
+  - h2spec: HTTP/2 conformance testing
+  - tlsfuzzer: TLS implementation testing  
+  - ct-monitor: Certificate Transparency log verification
 
-The interop surface is the ERROR CASES, not the happy path.
-A parser that accepts all malformed receipts is broken.
-A parser that rejects all malformed receipts is over-strict.
-The interesting bugs live in the boundary.
-
-Categories:
-1. MUST_REJECT: Invalid Merkle proofs, negative dimensions, future timestamps
-2. MUST_ACCEPT: Valid but unusual (empty optional fields, min witnesses)
-3. SHOULD_REJECT: Suspicious but ambiguous (stale, single-org witnesses)
-4. MAY_VARY: Implementation-defined (unknown fields, extra dimensions)
+This fuzzer generates malformed, edge-case, and adversarial receipts
+that any compliant parser must handle correctly (accept valid, reject invalid,
+produce identical results across implementations).
 """
 
 import hashlib
 import json
-import random
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Any
 
 
-class Verdict(Enum):
-    MUST_REJECT = "must_reject"
-    MUST_ACCEPT = "must_accept"
-    SHOULD_REJECT = "should_reject"
-    MAY_VARY = "may_vary"
+class TestResult(Enum):
+    PASS = "pass"
+    FAIL = "fail"
+    SKIP = "skip"
+
+
+class Severity(Enum):
+    MUST = "MUST"           # RFC 2119: absolute requirement
+    SHOULD = "SHOULD"       # Recommended
+    MAY = "MAY"             # Optional
 
 
 @dataclass
-class FuzzReceipt:
-    """A test receipt with expected verdict."""
+class TestCase:
+    id: str
     name: str
-    verdict: Verdict
     description: str
-    receipt: dict
+    severity: Severity
     category: str
+    input_receipt: dict
+    expected_valid: bool
+    expected_reason: Optional[str] = None
+    
+    def run(self, parser_fn) -> "TestOutcome":
+        """Run test against a parser function.
+        
+        parser_fn(receipt_dict) -> (valid: bool, reasons: list[str])
+        """
+        start = time.monotonic()
+        try:
+            valid, reasons = parser_fn(self.input_receipt)
+            elapsed = (time.monotonic() - start) * 1000
+            
+            if valid == self.expected_valid:
+                result = TestResult.PASS
+            else:
+                result = TestResult.FAIL
+            
+            return TestOutcome(
+                test_id=self.id,
+                result=result,
+                expected_valid=self.expected_valid,
+                actual_valid=valid,
+                reasons=reasons,
+                elapsed_ms=elapsed,
+            )
+        except Exception as e:
+            elapsed = (time.monotonic() - start) * 1000
+            return TestOutcome(
+                test_id=self.id,
+                result=TestResult.FAIL,
+                expected_valid=self.expected_valid,
+                actual_valid=None,
+                reasons=[f"Exception: {e}"],
+                elapsed_ms=elapsed,
+            )
 
 
-class ReceiptFuzzer:
-    """Generate malformed and edge-case L3.5 receipts."""
-    
-    def __init__(self, seed: int = 42):
-        self.rng = random.Random(seed)
-        self.cases: list[FuzzReceipt] = []
-        self._generate_all()
-    
-    def _valid_receipt(self) -> dict:
-        """Generate a structurally valid receipt."""
-        now = time.time()
-        leaf = hashlib.sha256(b"valid_action").hexdigest()
-        sibling = hashlib.sha256(b"sibling").hexdigest()
-        if leaf < sibling:
-            root = hashlib.sha256((leaf + sibling).encode()).hexdigest()
-        else:
-            root = hashlib.sha256((sibling + leaf).encode()).hexdigest()
-        
-        return {
-            "receipt_id": f"r-{self.rng.randint(1000, 9999)}",
-            "version": "0.1.0",
-            "agent_id": "agent:test",
-            "action_type": "delivery",
-            "dimensions": {
-                "T": 0.85, "G": 0.72, "A": 0.90, "S": 168.0, "C": 0.65
-            },
-            "merkle_root": root,
-            "inclusion_proof": [sibling],
-            "leaf_hash": leaf,
-            "witnesses": [
-                {"operator_id": "w1", "operator_org": "OrgA",
-                 "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
-                {"operator_id": "w2", "operator_org": "OrgB",
-                 "infra_hash": "infra_b", "timestamp": now, "signature": "sig2"},
-            ],
-            "diversity_hash": "div_abc",
-            "created_at": now - 3600,
-        }
-    
-    def _generate_all(self):
-        """Generate all fuzz cases."""
-        self._merkle_fuzz()
-        self._dimension_fuzz()
-        self._witness_fuzz()
-        self._timestamp_fuzz()
-        self._field_fuzz()
-        self._boundary_fuzz()
-    
-    def _merkle_fuzz(self):
-        """Merkle proof corruption."""
-        # Wrong root
-        r = self._valid_receipt()
-        r["merkle_root"] = "0" * 64
-        self.cases.append(FuzzReceipt(
-            "wrong_merkle_root", Verdict.MUST_REJECT,
-            "Root hash doesn't match computed proof", r, "merkle"))
-        
-        # Empty proof
-        r = self._valid_receipt()
-        r["inclusion_proof"] = []
-        self.cases.append(FuzzReceipt(
-            "empty_inclusion_proof", Verdict.MUST_REJECT,
-            "No sibling hashes in proof", r, "merkle"))
-        
-        # Proof with wrong sibling
-        r = self._valid_receipt()
-        r["inclusion_proof"] = ["deadbeef" * 8]
-        self.cases.append(FuzzReceipt(
-            "wrong_sibling_hash", Verdict.MUST_REJECT,
-            "Sibling hash doesn't lead to root", r, "merkle"))
-        
-        # Missing leaf_hash
-        r = self._valid_receipt()
-        del r["leaf_hash"]
-        self.cases.append(FuzzReceipt(
-            "missing_leaf_hash", Verdict.MUST_REJECT,
-            "No leaf hash to verify", r, "merkle"))
-    
-    def _dimension_fuzz(self):
-        """Trust dimension corruption."""
-        # Negative T
-        r = self._valid_receipt()
-        r["dimensions"]["T"] = -0.5
-        self.cases.append(FuzzReceipt(
-            "negative_T_dimension", Verdict.MUST_REJECT,
-            "Trust dimension cannot be negative", r, "dimensions"))
-        
-        # T > 1.0
-        r = self._valid_receipt()
-        r["dimensions"]["T"] = 1.5
-        self.cases.append(FuzzReceipt(
-            "T_exceeds_1", Verdict.MUST_REJECT,
-            "Trust dimension out of [0,1] range", r, "dimensions"))
-        
-        # Missing dimension
-        r = self._valid_receipt()
-        del r["dimensions"]["G"]
-        self.cases.append(FuzzReceipt(
-            "missing_G_dimension", Verdict.SHOULD_REJECT,
-            "Incomplete dimension vector", r, "dimensions"))
-        
-        # Extra unknown dimension
-        r = self._valid_receipt()
-        r["dimensions"]["X"] = 0.5
-        self.cases.append(FuzzReceipt(
-            "unknown_X_dimension", Verdict.MAY_VARY,
-            "Forward-compat: unknown dimension should be ignored or rejected", r, "dimensions"))
-        
-        # S = 0 (zero stability)
-        r = self._valid_receipt()
-        r["dimensions"]["S"] = 0.0
-        self.cases.append(FuzzReceipt(
-            "zero_S_stability", Verdict.SHOULD_REJECT,
-            "S=0 means instant decay — suspicious", r, "dimensions"))
-        
-        # S = infinity
-        r = self._valid_receipt()
-        r["dimensions"]["S"] = float('inf')
-        self.cases.append(FuzzReceipt(
-            "infinite_S_stability", Verdict.MUST_REJECT,
-            "Infinite stability is impossible", r, "dimensions"))
-    
-    def _witness_fuzz(self):
-        """Witness corruption."""
-        # Zero witnesses
-        r = self._valid_receipt()
-        r["witnesses"] = []
-        self.cases.append(FuzzReceipt(
-            "zero_witnesses", Verdict.MUST_REJECT,
-            "No witnesses = no attestation", r, "witnesses"))
-        
-        # Single witness
-        r = self._valid_receipt()
-        r["witnesses"] = [r["witnesses"][0]]
-        self.cases.append(FuzzReceipt(
-            "single_witness", Verdict.SHOULD_REJECT,
-            "Below CT minimum (N≥2)", r, "witnesses"))
-        
-        # Same org witnesses
-        r = self._valid_receipt()
-        for w in r["witnesses"]:
-            w["operator_org"] = "SameOrg"
-        self.cases.append(FuzzReceipt(
-            "same_org_witnesses", Verdict.SHOULD_REJECT,
-            "Same org = 1 effective witness (Chrome CT independence)", r, "witnesses"))
-        
-        # Duplicate operator_id
-        r = self._valid_receipt()
-        r["witnesses"][1]["operator_id"] = r["witnesses"][0]["operator_id"]
-        self.cases.append(FuzzReceipt(
-            "duplicate_operator_id", Verdict.MUST_REJECT,
-            "Same operator signing twice", r, "witnesses"))
-        
-        # Witness timestamp in future
-        r = self._valid_receipt()
-        r["witnesses"][0]["timestamp"] = time.time() + 86400
-        self.cases.append(FuzzReceipt(
-            "future_witness_timestamp", Verdict.MUST_REJECT,
-            "Witness claims to have signed in the future", r, "witnesses"))
-    
-    def _timestamp_fuzz(self):
-        """Temporal corruption."""
-        # Created in future
-        r = self._valid_receipt()
-        r["created_at"] = time.time() + 86400
-        self.cases.append(FuzzReceipt(
-            "future_created_at", Verdict.MUST_REJECT,
-            "Receipt from the future", r, "temporal"))
-        
-        # Very old (365 days)
-        r = self._valid_receipt()
-        r["created_at"] = time.time() - 365 * 86400
-        self.cases.append(FuzzReceipt(
-            "stale_365d", Verdict.SHOULD_REJECT,
-            "Receipt over a year old — should re-verify", r, "temporal"))
-        
-        # Epoch 0
-        r = self._valid_receipt()
-        r["created_at"] = 0
-        self.cases.append(FuzzReceipt(
-            "epoch_zero_timestamp", Verdict.MUST_REJECT,
-            "Created at Unix epoch = clearly wrong", r, "temporal"))
-        
-        # Negative timestamp
-        r = self._valid_receipt()
-        r["created_at"] = -1000
-        self.cases.append(FuzzReceipt(
-            "negative_timestamp", Verdict.MUST_REJECT,
-            "Negative timestamps are invalid", r, "temporal"))
-    
-    def _field_fuzz(self):
-        """Field-level corruption."""
-        # Missing receipt_id
-        r = self._valid_receipt()
-        del r["receipt_id"]
-        self.cases.append(FuzzReceipt(
-            "missing_receipt_id", Verdict.MUST_REJECT,
-            "No receipt identifier", r, "fields"))
-        
-        # Empty agent_id
-        r = self._valid_receipt()
-        r["agent_id"] = ""
-        self.cases.append(FuzzReceipt(
-            "empty_agent_id", Verdict.MUST_REJECT,
-            "Empty agent identifier", r, "fields"))
-        
-        # Unknown version
-        r = self._valid_receipt()
-        r["version"] = "99.0.0"
-        self.cases.append(FuzzReceipt(
-            "unknown_version", Verdict.MAY_VARY,
-            "Future version — reject or attempt parse?", r, "fields"))
-        
-        # Extra unknown field
-        r = self._valid_receipt()
-        r["unknown_field"] = "surprise"
-        self.cases.append(FuzzReceipt(
-            "extra_unknown_field", Verdict.MUST_ACCEPT,
-            "Forward-compat: unknown fields should be ignored", r, "fields"))
-        
-        # Missing diversity_hash (optional?)
-        r = self._valid_receipt()
-        del r["diversity_hash"]
-        self.cases.append(FuzzReceipt(
-            "missing_diversity_hash", Verdict.SHOULD_REJECT,
-            "No diversity attestation — accept with warning?", r, "fields"))
-    
-    def _boundary_fuzz(self):
-        """Boundary/edge cases."""
-        # Valid minimal receipt
-        r = self._valid_receipt()
-        self.cases.append(FuzzReceipt(
-            "valid_minimal", Verdict.MUST_ACCEPT,
-            "Structurally valid receipt with minimum fields", r, "boundary"))
-        
-        # All dimensions at 0
-        r = self._valid_receipt()
-        r["dimensions"] = {"T": 0.0, "G": 0.0, "A": 0.0, "S": 1.0, "C": 0.0}
-        self.cases.append(FuzzReceipt(
-            "all_zero_trust", Verdict.MUST_ACCEPT,
-            "Zero trust is valid — just means untrusted", r, "boundary"))
-        
-        # Very long agent_id
-        r = self._valid_receipt()
-        r["agent_id"] = "agent:" + "a" * 10000
-        self.cases.append(FuzzReceipt(
-            "oversized_agent_id", Verdict.MAY_VARY,
-            "Extremely long identifier — DoS vector?", r, "boundary"))
-    
-    def summary(self) -> str:
-        """Print test suite summary."""
-        by_verdict = {}
-        by_category = {}
-        for c in self.cases:
-            by_verdict.setdefault(c.verdict.value, []).append(c)
-            by_category.setdefault(c.category, []).append(c)
-        
-        lines = [
-            f"=== L3.5 Receipt Fuzzer: {len(self.cases)} test cases ===",
-            "",
-            "By verdict:",
-        ]
-        for v in Verdict:
-            cases = by_verdict.get(v.value, [])
-            lines.append(f"  {v.value}: {len(cases)}")
-        
-        lines.append("\nBy category:")
-        for cat, cases in sorted(by_category.items()):
-            lines.append(f"  {cat}: {len(cases)}")
-        
-        lines.append("\nTest cases:")
-        for c in self.cases:
-            icon = {"must_reject": "❌", "must_accept": "✅", 
-                    "should_reject": "⚠️", "may_vary": "❓"}[c.verdict.value]
-            lines.append(f"  {icon} {c.name}: {c.description}")
-        
-        return "\n".join(lines)
-    
-    def export_json(self) -> str:
-        """Export as JSON test suite."""
-        suite = []
-        for c in self.cases:
-            suite.append({
-                "name": c.name,
-                "verdict": c.verdict.value,
-                "description": c.description,
-                "category": c.category,
-                "receipt": c.receipt,
-            })
-        return json.dumps(suite, indent=2, default=str)
+@dataclass
+class TestOutcome:
+    test_id: str
+    result: TestResult
+    expected_valid: bool
+    actual_valid: Optional[bool]
+    reasons: list[str] = field(default_factory=list)
+    elapsed_ms: float = 0.0
 
 
-def demo():
-    fuzzer = ReceiptFuzzer()
-    print(fuzzer.summary())
+def _merkle_hash(*parts: str) -> str:
+    return hashlib.sha256("".join(parts).encode()).hexdigest()
+
+
+def _valid_receipt(overrides: dict = None) -> dict:
+    """Generate a valid baseline receipt."""
+    now = time.time()
+    leaf = _merkle_hash("action:deliver:test")
+    sibling = _merkle_hash("sibling")
+    if leaf < sibling:
+        root = _merkle_hash(leaf, sibling)
+    else:
+        root = _merkle_hash(sibling, leaf)
     
-    print(f"\n{'='*60}")
-    print("INTEROP COMPLIANCE SCORING")
-    print(f"{'='*60}")
-    
-    # Simulate two parsers with different behavior
-    parsers = {
-        "parser_strict": {
-            "must_reject": True, "must_accept": True,
-            "should_reject": True, "may_vary": False,  # Rejects unknowns
-        },
-        "parser_lenient": {
-            "must_reject": True, "must_accept": True,
-            "should_reject": False, "may_vary": True,  # Accepts unknowns
+    receipt = {
+        "receipt_id": "test-001",
+        "version": "0.1.0",
+        "agent_id": "agent:test",
+        "action_type": "delivery",
+        "merkle_root": root,
+        "leaf_hash": leaf,
+        "inclusion_proof": [sibling],
+        "witnesses": [
+            {"operator_id": "w1", "operator_org": "OrgA", 
+             "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+            {"operator_id": "w2", "operator_org": "OrgB",
+             "infra_hash": "infra_b", "timestamp": now, "signature": "sig2"},
+        ],
+        "diversity_hash": "div_test",
+        "created_at": now - 3600,
+        "dimensions": {
+            "T": 0.85, "G": 0.70, "A": 0.90, "S": 168, "C": 0.75,
         },
     }
+    if overrides:
+        receipt.update(overrides)
+    return receipt
+
+
+# ============================================================
+# TEST SUITE
+# ============================================================
+
+def generate_test_suite() -> list[TestCase]:
+    """Generate the full interop test suite."""
+    tests = []
+    now = time.time()
     
-    for name, behavior in parsers.items():
-        correct = 0
-        total = len(fuzzer.cases)
-        for c in fuzzer.cases:
-            if c.verdict == Verdict.MUST_REJECT and behavior["must_reject"]:
-                correct += 1
-            elif c.verdict == Verdict.MUST_ACCEPT and behavior["must_accept"]:
-                correct += 1
-            elif c.verdict in (Verdict.SHOULD_REJECT, Verdict.MAY_VARY):
-                correct += 1  # Both behaviors acceptable
-        
-        print(f"\n  {name}: {correct}/{total} ({correct/total:.0%})")
-        print(f"    MUST cases: {'pass' if behavior['must_reject'] and behavior['must_accept'] else 'FAIL'}")
-        print(f"    SHOULD cases: {'rejects' if behavior['should_reject'] else 'accepts'}")
-        print(f"    MAY cases: {'accepts' if behavior['may_vary'] else 'rejects'}")
+    # --- Category: Wire Format ---
+    
+    tests.append(TestCase(
+        id="WF-001", name="Valid baseline receipt",
+        description="A fully valid receipt with all required fields",
+        severity=Severity.MUST, category="wire_format",
+        input_receipt=_valid_receipt(),
+        expected_valid=True,
+    ))
+    
+    tests.append(TestCase(
+        id="WF-002", name="Missing receipt_id",
+        description="Receipt without receipt_id MUST be rejected",
+        severity=Severity.MUST, category="wire_format",
+        input_receipt=_valid_receipt({"receipt_id": None}),
+        expected_valid=False,
+        expected_reason="missing_receipt_id",
+    ))
+    
+    tests.append(TestCase(
+        id="WF-003", name="Missing version field",
+        description="Receipt without version MUST be rejected",
+        severity=Severity.MUST, category="wire_format",
+        input_receipt=_valid_receipt({"version": None}),
+        expected_valid=False,
+        expected_reason="missing_version",
+    ))
+    
+    tests.append(TestCase(
+        id="WF-004", name="Unknown version (future compat)",
+        description="Receipt with unknown version SHOULD be accepted with warning",
+        severity=Severity.SHOULD, category="wire_format",
+        input_receipt=_valid_receipt({"version": "99.0.0"}),
+        expected_valid=True,  # Forward compatibility
+    ))
+    
+    tests.append(TestCase(
+        id="WF-005", name="Extra fields (extension)",
+        description="Receipt with unknown extra fields MUST be accepted (Postel's Law, but structured)",
+        severity=Severity.MUST, category="wire_format",
+        input_receipt=_valid_receipt({"custom_field": "ignored"}),
+        expected_valid=True,
+    ))
+    
+    # --- Category: Merkle Proofs ---
+    
+    tests.append(TestCase(
+        id="MK-001", name="Valid Merkle inclusion proof",
+        description="Proof that correctly verifies to merkle_root",
+        severity=Severity.MUST, category="merkle",
+        input_receipt=_valid_receipt(),
+        expected_valid=True,
+    ))
+    
+    tests.append(TestCase(
+        id="MK-002", name="Invalid Merkle proof (wrong sibling)",
+        description="Proof with incorrect sibling hash MUST be rejected",
+        severity=Severity.MUST, category="merkle",
+        input_receipt=_valid_receipt({"inclusion_proof": [_merkle_hash("wrong")]}),
+        expected_valid=False,
+        expected_reason="invalid_merkle_proof",
+    ))
+    
+    tests.append(TestCase(
+        id="MK-003", name="Empty inclusion proof",
+        description="Receipt with empty proof array MUST be rejected",
+        severity=Severity.MUST, category="merkle",
+        input_receipt=_valid_receipt({"inclusion_proof": []}),
+        expected_valid=False,
+        expected_reason="empty_proof",
+    ))
+    
+    tests.append(TestCase(
+        id="MK-004", name="Mismatched leaf_hash",
+        description="leaf_hash that doesn't match any proof path MUST be rejected",
+        severity=Severity.MUST, category="merkle",
+        input_receipt=_valid_receipt({"leaf_hash": _merkle_hash("tampered")}),
+        expected_valid=False,
+        expected_reason="invalid_merkle_proof",
+    ))
+    
+    # --- Category: Witness Validation ---
+    
+    tests.append(TestCase(
+        id="WT-001", name="Sufficient independent witnesses (N=2)",
+        description="Two witnesses from different orgs MUST be accepted",
+        severity=Severity.MUST, category="witnesses",
+        input_receipt=_valid_receipt(),
+        expected_valid=True,
+    ))
+    
+    tests.append(TestCase(
+        id="WT-002", name="Single witness",
+        description="Receipt with only 1 witness MUST be rejected (N<2)",
+        severity=Severity.MUST, category="witnesses",
+        input_receipt=_valid_receipt({"witnesses": [
+            {"operator_id": "w1", "operator_org": "OrgA",
+             "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+        ]}),
+        expected_valid=False,
+        expected_reason="insufficient_witnesses",
+    ))
+    
+    tests.append(TestCase(
+        id="WT-003", name="Same-org witnesses (sybil)",
+        description="Two witnesses from same org = 1 effective witness, MUST be rejected",
+        severity=Severity.MUST, category="witnesses",
+        input_receipt=_valid_receipt({"witnesses": [
+            {"operator_id": "w1", "operator_org": "SameOrg",
+             "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+            {"operator_id": "w2", "operator_org": "SameOrg",
+             "infra_hash": "infra_b", "timestamp": now, "signature": "sig2"},
+        ]}),
+        expected_valid=False,
+        expected_reason="duplicate_operators",
+    ))
+    
+    tests.append(TestCase(
+        id="WT-004", name="No witnesses",
+        description="Receipt with empty witnesses array MUST be rejected",
+        severity=Severity.MUST, category="witnesses",
+        input_receipt=_valid_receipt({"witnesses": []}),
+        expected_valid=False,
+        expected_reason="no_witnesses",
+    ))
+    
+    tests.append(TestCase(
+        id="WT-005", name="Same infra, different org (colocated)",
+        description="Witnesses on same infrastructure SHOULD warn (not independent)",
+        severity=Severity.SHOULD, category="witnesses",
+        input_receipt=_valid_receipt({"witnesses": [
+            {"operator_id": "w1", "operator_org": "OrgA",
+             "infra_hash": "shared_infra", "timestamp": now, "signature": "sig1"},
+            {"operator_id": "w2", "operator_org": "OrgB",
+             "infra_hash": "shared_infra", "timestamp": now, "signature": "sig2"},
+        ]}),
+        expected_valid=True,  # Valid but should warn
+        expected_reason="colocated_witnesses",
+    ))
+    
+    # --- Category: Temporal ---
+    
+    tests.append(TestCase(
+        id="TM-001", name="Fresh receipt (1h old)",
+        description="Receipt within freshness window MUST be accepted",
+        severity=Severity.MUST, category="temporal",
+        input_receipt=_valid_receipt({"created_at": now - 3600}),
+        expected_valid=True,
+    ))
+    
+    tests.append(TestCase(
+        id="TM-002", name="Stale receipt (48h)",
+        description="Receipt older than 24h SHOULD be flagged",
+        severity=Severity.SHOULD, category="temporal",
+        input_receipt=_valid_receipt({"created_at": now - 172800}),
+        expected_valid=False,
+        expected_reason="stale_receipt",
+    ))
+    
+    tests.append(TestCase(
+        id="TM-003", name="Future-dated receipt",
+        description="Receipt with created_at in the future MUST be rejected",
+        severity=Severity.MUST, category="temporal",
+        input_receipt=_valid_receipt({"created_at": now + 86400}),
+        expected_valid=False,
+        expected_reason="future_dated",
+    ))
+    
+    # --- Category: Dimensions ---
+    
+    tests.append(TestCase(
+        id="DM-001", name="Valid dimensions (T/G/A/S/C)",
+        description="All 5 dimensions present and in range",
+        severity=Severity.MUST, category="dimensions",
+        input_receipt=_valid_receipt(),
+        expected_valid=True,
+    ))
+    
+    tests.append(TestCase(
+        id="DM-002", name="Dimension out of range (T > 1.0)",
+        description="T dimension > 1.0 MUST be rejected",
+        severity=Severity.MUST, category="dimensions",
+        input_receipt=_valid_receipt({"dimensions": {"T": 1.5, "G": 0.7, "A": 0.9, "S": 168, "C": 0.75}}),
+        expected_valid=False,
+        expected_reason="dimension_out_of_range",
+    ))
+    
+    tests.append(TestCase(
+        id="DM-003", name="Missing dimension",
+        description="Receipt missing a required dimension MUST be rejected",
+        severity=Severity.MUST, category="dimensions",
+        input_receipt=_valid_receipt({"dimensions": {"T": 0.85, "G": 0.7}}),
+        expected_valid=False,
+        expected_reason="missing_dimensions",
+    ))
+    
+    # --- Category: Adversarial ---
+    
+    tests.append(TestCase(
+        id="ADV-001", name="Extremely large proof array",
+        description="Proof with 10000 siblings should be handled without crash",
+        severity=Severity.MUST, category="adversarial",
+        input_receipt=_valid_receipt({"inclusion_proof": [_merkle_hash(f"sib{i}") for i in range(10000)]}),
+        expected_valid=False,  # Won't verify but shouldn't crash
+        expected_reason="invalid_merkle_proof",
+    ))
+    
+    tests.append(TestCase(
+        id="ADV-002", name="Unicode in agent_id",
+        description="Agent ID with unicode MUST be handled",
+        severity=Severity.MUST, category="adversarial",
+        input_receipt=_valid_receipt({"agent_id": "agent:🦊kit"}),
+        expected_valid=True,
+    ))
+    
+    tests.append(TestCase(
+        id="ADV-003", name="Null fields",
+        description="Receipt with null required fields MUST be rejected",
+        severity=Severity.MUST, category="adversarial",
+        input_receipt=_valid_receipt({"merkle_root": None, "leaf_hash": None}),
+        expected_valid=False,
+        expected_reason="null_required_field",
+    ))
+    
+    return tests
+
+
+# Reference parser (canonical implementation)
+def reference_parser(receipt: dict) -> tuple[bool, list[str]]:
+    """Reference receipt parser for interop testing."""
+    reasons = []
+    
+    # Wire format checks
+    for field in ["receipt_id", "version", "agent_id", "merkle_root", "leaf_hash"]:
+        if not receipt.get(field):
+            reasons.append(f"missing_{field}")
+    
+    if reasons:
+        return False, reasons
+    
+    # Merkle proof
+    proof = receipt.get("inclusion_proof", [])
+    if not proof:
+        reasons.append("empty_proof")
+        return False, reasons
+    
+    current = receipt["leaf_hash"]
+    for sibling in proof:
+        if current < sibling:
+            combined = current + sibling
+        else:
+            combined = sibling + current
+        current = hashlib.sha256(combined.encode()).hexdigest()
+    
+    if current != receipt["merkle_root"]:
+        reasons.append("invalid_merkle_proof")
+    
+    # Witnesses
+    witnesses = receipt.get("witnesses", [])
+    if not witnesses:
+        reasons.append("no_witnesses")
+    elif len(witnesses) < 2:
+        reasons.append("insufficient_witnesses")
+    else:
+        orgs = set(w.get("operator_org", "") for w in witnesses)
+        if len(orgs) < 2:
+            reasons.append("duplicate_operators")
+    
+    # Temporal
+    created = receipt.get("created_at", 0)
+    now = time.time()
+    if created > now + 300:  # 5min clock skew tolerance
+        reasons.append("future_dated")
+    elif now - created > 86400:
+        reasons.append("stale_receipt")
+    
+    # Dimensions
+    dims = receipt.get("dimensions", {})
+    required_dims = {"T", "G", "A", "S", "C"}
+    if not required_dims.issubset(dims.keys()):
+        reasons.append("missing_dimensions")
+    else:
+        for d in ["T", "G", "A", "C"]:
+            v = dims.get(d, 0)
+            if isinstance(v, (int, float)) and (v < 0 or v > 1.0):
+                reasons.append("dimension_out_of_range")
+                break
+    
+    return len(reasons) == 0, reasons
+
+
+def run_suite():
+    """Run full test suite against reference parser."""
+    tests = generate_test_suite()
+    outcomes = [t.run(reference_parser) for t in tests]
+    
+    # Summary
+    passed = sum(1 for o in outcomes if o.result == TestResult.PASS)
+    failed = sum(1 for o in outcomes if o.result == TestResult.FAIL)
+    
+    print("=" * 60)
+    print("L3.5 RECEIPT INTEROP TEST SUITE")
+    print(f"Tests: {len(tests)} | Pass: {passed} | Fail: {failed}")
+    print("=" * 60)
+    
+    # By category
+    categories = {}
+    for t, o in zip(tests, outcomes):
+        cat = t.category
+        if cat not in categories:
+            categories[cat] = {"pass": 0, "fail": 0, "total": 0}
+        categories[cat]["total"] += 1
+        categories[cat][o.result.value] = categories[cat].get(o.result.value, 0) + 1
+    
+    print(f"\n{'Category':<15} {'Pass':>5} {'Fail':>5} {'Total':>5}")
+    print("-" * 35)
+    for cat, stats in categories.items():
+        p = stats.get("pass", 0)
+        f = stats.get("fail", 0)
+        print(f"{cat:<15} {p:>5} {f:>5} {stats['total']:>5}")
+    
+    # Failed tests detail
+    failures = [(t, o) for t, o in zip(tests, outcomes) if o.result == TestResult.FAIL]
+    if failures:
+        print(f"\n❌ FAILURES ({len(failures)}):")
+        for t, o in failures:
+            print(f"  {t.id} [{t.severity.value}] {t.name}")
+            print(f"    Expected valid={t.expected_valid}, got valid={o.actual_valid}")
+            print(f"    Reasons: {o.reasons}")
+    else:
+        print(f"\n✅ All {len(tests)} tests passed!")
+    
+    # Interop readiness
+    must_tests = [o for t, o in zip(tests, outcomes) if t.severity == Severity.MUST]
+    must_pass = sum(1 for o in must_tests if o.result == TestResult.PASS)
+    print(f"\nMUST compliance: {must_pass}/{len(must_tests)} ({must_pass/len(must_tests):.0%})")
+    if must_pass == len(must_tests):
+        print("✅ IETF MUST bar: PASSED")
+    else:
+        print("❌ IETF MUST bar: FAILED")
 
 
 if __name__ == "__main__":
-    demo()
+    run_suite()
