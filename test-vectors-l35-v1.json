@@ -1,0 +1,308 @@
+{
+  "version": "l3.5-v1",
+  "generated": 1773706797.4632907,
+  "tests": [
+    {
+      "name": "serialize_minimal",
+      "category": "serialize",
+      "description": "Serialize a minimal valid receipt",
+      "input": {
+        "agent_id": "agent:test",
+        "action_type": "delivery",
+        "dimensions": {
+          "T": 0.8,
+          "G": 0.6,
+          "A": 0.7,
+          "S": 168.0,
+          "C": 0.9
+        }
+      },
+      "expected": {
+        "has_version": true,
+        "has_receipt_hash": true,
+        "dimension_count": 5
+      }
+    },
+    {
+      "name": "serialize_zero_dimensions",
+      "category": "serialize",
+      "description": "Receipt with all zero dimensions must still be valid",
+      "input": {
+        "agent_id": "agent:new",
+        "action_type": "registration",
+        "dimensions": {
+          "T": 0,
+          "G": 0,
+          "A": 0,
+          "S": 0,
+          "C": 0
+        }
+      },
+      "expected": {
+        "valid": true,
+        "all_zeros": true
+      }
+    },
+    {
+      "name": "parse_valid_receipt",
+      "category": "parse",
+      "description": "Parse a canonically-encoded receipt",
+      "input": {
+        "version": "l3.5-v1",
+        "agent_id": "agent:kit",
+        "action_type": "delivery",
+        "dimensions": {
+          "T": 0.85,
+          "G": 0.72,
+          "A": 0.91,
+          "S": 336.0,
+          "C": 0.88
+        },
+        "witnesses": [
+          {
+            "operator_id": "w1",
+            "operator_org": "OrgA",
+            "sig": "abc123"
+          }
+        ],
+        "merkle_root": "133402664cf238be909da968683c7f6a973c3a07c0fcdfe2dd013427680f890f",
+        "inclusion_proof": [
+          "38abf58de827b0bd9fa021588dd1cf362c4473fb67b39641dc6f0fc51e827d3d",
+          "385cd4cefe6f5a119893a84d2cc7951d49da7e94bda7a0b1ae0e292f5b6b78bc"
+        ],
+        "created_at": 1773706797.4629407,
+        "receipt_hash": "bfff3f7ba4cf3d75f10e8083bbf1452265dccbfa499d240d8297906ecfbe1f9a"
+      },
+      "expected": {
+        "agent_id": "agent:kit",
+        "dimension_T": 0.85
+      }
+    },
+    {
+      "name": "parse_extra_fields",
+      "category": "parse",
+      "description": "Receipt with extra fields must still parse (forward compat)",
+      "input": {
+        "version": "l3.5-v1",
+        "agent_id": "agent:kit",
+        "action_type": "delivery",
+        "dimensions": {
+          "T": 0.85,
+          "G": 0.72,
+          "A": 0.91,
+          "S": 336.0,
+          "C": 0.88
+        },
+        "witnesses": [
+          {
+            "operator_id": "w1",
+            "operator_org": "OrgA",
+            "sig": "abc123"
+          }
+        ],
+        "merkle_root": "133402664cf238be909da968683c7f6a973c3a07c0fcdfe2dd013427680f890f",
+        "inclusion_proof": [
+          "38abf58de827b0bd9fa021588dd1cf362c4473fb67b39641dc6f0fc51e827d3d",
+          "385cd4cefe6f5a119893a84d2cc7951d49da7e94bda7a0b1ae0e292f5b6b78bc"
+        ],
+        "created_at": 1773706797.4629407,
+        "receipt_hash": "bfff3f7ba4cf3d75f10e8083bbf1452265dccbfa499d240d8297906ecfbe1f9a",
+        "future_field": "unknown_value",
+        "v2_data": [
+          1,
+          2,
+          3
+        ]
+      },
+      "expected": {
+        "parseable": true,
+        "extra_fields_ignored": true
+      }
+    },
+    {
+      "name": "verify_valid_proof",
+      "category": "verify",
+      "description": "Verify a valid Merkle inclusion proof",
+      "input": {
+        "leaf": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+        "proof": [
+          "38abf58de827b0bd9fa021588dd1cf362c4473fb67b39641dc6f0fc51e827d3d",
+          "385cd4cefe6f5a119893a84d2cc7951d49da7e94bda7a0b1ae0e292f5b6b78bc"
+        ],
+        "root": "133402664cf238be909da968683c7f6a973c3a07c0fcdfe2dd013427680f890f"
+      },
+      "expected": {
+        "valid": true
+      }
+    },
+    {
+      "name": "verify_tampered_leaf",
+      "category": "verify",
+      "description": "Tampered leaf must fail verification",
+      "input": {
+        "leaf": "d121be3103007b41edf96f8262925f8c7d61894afe9a041843b631f69445bc57",
+        "proof": [
+          "38abf58de827b0bd9fa021588dd1cf362c4473fb67b39641dc6f0fc51e827d3d",
+          "385cd4cefe6f5a119893a84d2cc7951d49da7e94bda7a0b1ae0e292f5b6b78bc"
+        ],
+        "root": "133402664cf238be909da968683c7f6a973c3a07c0fcdfe2dd013427680f890f"
+      },
+      "expected": {
+        "valid": false
+      }
+    },
+    {
+      "name": "verify_empty_proof",
+      "category": "verify",
+      "description": "Empty proof with leaf != root must fail",
+      "input": {
+        "leaf": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+        "proof": [],
+        "root": "133402664cf238be909da968683c7f6a973c3a07c0fcdfe2dd013427680f890f"
+      },
+      "expected": {
+        "valid": false
+      }
+    },
+    {
+      "name": "verify_single_leaf_tree",
+      "category": "verify",
+      "description": "Single-leaf tree: leaf == root, empty proof",
+      "input": {
+        "leaf": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+        "proof": [],
+        "root": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4"
+      },
+      "expected": {
+        "valid": true
+      }
+    },
+    {
+      "name": "edge_dimension_bounds",
+      "category": "edge",
+      "description": "Dimensions outside [0,1] (except S which is hours): parsers must agree on handling",
+      "input": {
+        "dimensions": {
+          "T": 1.5,
+          "G": -0.1,
+          "A": 0.5,
+          "S": 99999,
+          "C": 0
+        }
+      },
+      "expected": {
+        "T_clamped_or_rejected": true,
+        "G_clamped_or_rejected": true
+      }
+    },
+    {
+      "name": "edge_zero_witnesses",
+      "category": "edge",
+      "description": "Receipt with zero witnesses: valid format, low trust",
+      "input": {
+        "witnesses": []
+      },
+      "expected": {
+        "parseable": true,
+        "trust_warning": true
+      }
+    },
+    {
+      "name": "edge_unicode_agent_id",
+      "category": "edge",
+      "description": "Agent ID with unicode characters",
+      "input": {
+        "agent_id": "agent:\u043a\u0438\u0442_\u0444\u043e\u043a\u0441_\ud83e\udd8a"
+      },
+      "expected": {
+        "parseable": true
+      }
+    },
+    {
+      "name": "edge_max_proof_depth",
+      "category": "edge",
+      "description": "Merkle proof with 32 levels (2^32 leaf tree)",
+      "input": {
+        "proof_depth": 32
+      },
+      "expected": {
+        "verifiable": true,
+        "within_limits": true
+      }
+    },
+    {
+      "name": "reject_missing_version",
+      "category": "reject",
+      "description": "Receipt without version field must be rejected",
+      "input": {
+        "agent_id": "agent:test",
+        "dimensions": {}
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "missing_version"
+      }
+    },
+    {
+      "name": "reject_unknown_version",
+      "category": "reject",
+      "description": "Receipt with unrecognized version must be rejected",
+      "input": {
+        "version": "l3.5-v999",
+        "agent_id": "agent:test"
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "unknown_version"
+      }
+    },
+    {
+      "name": "reject_missing_dimensions",
+      "category": "reject",
+      "description": "Receipt without dimensions object must be rejected",
+      "input": {
+        "version": "l3.5-v1",
+        "agent_id": "agent:test"
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "missing_dimensions"
+      }
+    },
+    {
+      "name": "reject_duplicate_receipt_hash",
+      "category": "reject",
+      "description": "Receipt with hash not matching content must be rejected",
+      "input": {
+        "version": "l3.5-v1",
+        "agent_id": "agent:kit",
+        "action_type": "delivery",
+        "dimensions": {
+          "T": 0.85,
+          "G": 0.72,
+          "A": 0.91,
+          "S": 336.0,
+          "C": 0.88
+        },
+        "witnesses": [
+          {
+            "operator_id": "w1",
+            "operator_org": "OrgA",
+            "sig": "abc123"
+          }
+        ],
+        "merkle_root": "133402664cf238be909da968683c7f6a973c3a07c0fcdfe2dd013427680f890f",
+        "inclusion_proof": [
+          "38abf58de827b0bd9fa021588dd1cf362c4473fb67b39641dc6f0fc51e827d3d",
+          "385cd4cefe6f5a119893a84d2cc7951d49da7e94bda7a0b1ae0e292f5b6b78bc"
+        ],
+        "created_at": 1773706797.4629407,
+        "receipt_hash": "0000000000000000"
+      },
+      "expected": {
+        "rejected": true,
+        "reason": "hash_mismatch"
+      }
+    }
+  ]
+}
