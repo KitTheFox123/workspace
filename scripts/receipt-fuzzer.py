@@ -2,21 +2,19 @@
 """
 receipt-fuzzer.py — Interop test suite for L3.5 trust receipts.
 
-Per santaclawd: "two parsers cross the IETF bar. the third piece is the
-interop test suite — edge cases both parsers handle wrong the same way."
+Per santaclawd: "the third piece is the interop test suite — edge cases
+both parsers must handle the same way."
 
-HTTP/2 had h2spec. TLS had tlsfuzzer. L3.5 needs receipt-fuzzer.
+Modeled on:
+- h2spec (HTTP/2 conformance): 146 test cases
+- tlsfuzzer (TLS): protocol fuzzing + conformance
+- CT test vectors (RFC 6962): known-good and known-bad SCTs
 
-Generates malformed, edge-case, and adversarial receipts to test parser
-robustness. Any parser claiming L3.5 compliance must pass all MUST cases
-and handle SHOULD cases gracefully.
-
-Test categories:
-  1. Well-formed (baseline — must parse)
-  2. Malformed Merkle proofs (must reject)
-  3. Missing required fields (must reject)
-  4. Boundary conditions (timestamps, sizes)
-  5. Adversarial (crafted to exploit common bugs)
+Categories:
+1. Well-formed receipts (must accept)
+2. Malformed receipts (must reject)
+3. Edge cases (spec-defined behavior)
+4. Adversarial (active attacks)
 """
 
 import hashlib
@@ -24,334 +22,377 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
-
-
-class TestLevel(Enum):
-    MUST = "MUST"       # RFC 2119: parser MUST handle correctly
-    SHOULD = "SHOULD"   # Parser SHOULD handle, failure = warning
-    MAY = "MAY"         # Optional behavior
+from typing import Optional
 
 
 class TestResult(Enum):
     PASS = "pass"
     FAIL = "fail"
     SKIP = "skip"
-    ERROR = "error"
+
+
+class Severity(Enum):
+    MUST = "MUST"           # RFC 2119: absolute requirement
+    SHOULD = "SHOULD"       # Recommended but not required
+    MAY = "MAY"             # Optional behavior
 
 
 @dataclass
-class FuzzCase:
-    """A single fuzz test case."""
+class FuzzVector:
+    """A single test vector for receipt parsing."""
     id: str
     name: str
     category: str
-    level: TestLevel
-    receipt: dict
-    expected_valid: bool
+    severity: Severity
+    receipt_json: dict
+    expected: str  # "accept" or "reject"
     description: str
-    attack_type: Optional[str] = None  # For adversarial cases
+    attack_type: Optional[str] = None
 
 
 @dataclass
 class FuzzResult:
-    case: FuzzCase
+    vector: FuzzVector
     result: TestResult
-    parser_said_valid: Optional[bool] = None
-    error_message: Optional[str] = None
+    actual: str  # What the parser did
+    error: Optional[str] = None
     
     @property
     def correct(self) -> bool:
-        return self.parser_said_valid == self.case.expected_valid
+        return self.actual == self.vector.expected
 
 
-def _sha256(data: str) -> str:
-    return hashlib.sha256(data.encode()).hexdigest()
+def _merkle_hash(*parts: str) -> str:
+    return hashlib.sha256("".join(parts).encode()).hexdigest()
 
 
-def _make_valid_receipt() -> dict:
-    """Generate a well-formed L3.5 receipt."""
+def _valid_receipt(overrides: dict = None) -> dict:
+    """Generate a valid baseline receipt."""
     now = time.time()
-    leaf = _sha256("action:deliver:test123")
-    sibling = _sha256("sibling_node")
+    leaf = _merkle_hash("action:deliver:abc123")
+    sibling = _merkle_hash("sibling1")
     if leaf < sibling:
-        root = _sha256(leaf + sibling)
+        root = _merkle_hash(leaf, sibling)
     else:
-        root = _sha256(sibling + leaf)
+        root = _merkle_hash(sibling, leaf)
     
-    return {
-        "version": "0.1.0",
-        "receipt_id": "r-fuzz-001",
+    receipt = {
+        "version": "1.0",
+        "receipt_id": "r-test-001",
         "agent_id": "agent:test",
         "action_type": "delivery",
-        "dimensions": {
-            "T": {"score": 0.85, "anchor": "chain_state"},
-            "G": {"score": 0.70, "anchor": "gossip"},
-            "A": {"score": 0.90, "anchor": "attestation"},
-            "S": {"stability_hours": 168, "anchor": "observation"},
-            "C": {"score": 0.80, "anchor": "chain_state"},
-        },
-        "merkle": {
-            "root": root,
-            "leaf_hash": leaf,
-            "inclusion_proof": [sibling],
-        },
+        "merkle_root": root,
+        "leaf_hash": leaf,
+        "inclusion_proof": [sibling],
         "witnesses": [
-            {
-                "operator_id": "w1",
-                "operator_org": "OrgA",
-                "infra_hash": _sha256("infra_a"),
-                "timestamp": now,
-                "signature": _sha256("sig1"),
-            },
-            {
-                "operator_id": "w2",
-                "operator_org": "OrgB",
-                "infra_hash": _sha256("infra_b"),
-                "timestamp": now,
-                "signature": _sha256("sig2"),
-            },
+            {"operator_id": "w1", "operator_org": "OrgA", 
+             "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+            {"operator_id": "w2", "operator_org": "OrgB",
+             "infra_hash": "infra_b", "timestamp": now, "signature": "sig2"},
         ],
-        "diversity_hash": _sha256("OrgA|OrgB|infra_a|infra_b"),
+        "diversity_hash": _merkle_hash("OrgA", "OrgB"),
         "created_at": now,
+        "dimensions": {
+            "T": 0.85, "G": 0.90, "A": 0.75, "S": 0.80, "C": 0.70
+        },
     }
+    if overrides:
+        receipt.update(overrides)
+    return receipt
 
 
-def generate_fuzz_suite() -> list[FuzzCase]:
-    """Generate comprehensive fuzz test suite."""
-    cases = []
-    valid = _make_valid_receipt()
+# =====================================================
+# TEST VECTORS
+# =====================================================
+
+def generate_vectors() -> list[FuzzVector]:
+    vectors = []
+    now = time.time()
     
-    # === Category 1: Well-formed (must parse) ===
-    cases.append(FuzzCase(
-        id="WF-001", name="Valid receipt", category="well-formed",
-        level=TestLevel.MUST, receipt=valid, expected_valid=True,
-        description="Baseline valid receipt with all required fields",
+    # === Category 1: Well-formed (MUST accept) ===
+    
+    vectors.append(FuzzVector(
+        id="WF-001", name="Valid baseline receipt",
+        category="well-formed", severity=Severity.MUST,
+        receipt_json=_valid_receipt(),
+        expected="accept",
+        description="Minimal valid receipt with 2 independent witnesses.",
     ))
     
-    cases.append(FuzzCase(
-        id="WF-002", name="Minimal valid receipt", category="well-formed",
-        level=TestLevel.MUST,
-        receipt={**valid, "dimensions": {"T": valid["dimensions"]["T"]}},
-        expected_valid=True,
-        description="Receipt with only T dimension (minimum required)",
+    vectors.append(FuzzVector(
+        id="WF-002", name="Receipt with 5 witnesses",
+        category="well-formed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "witnesses": [
+                {"operator_id": f"w{i}", "operator_org": f"Org{chr(65+i)}",
+                 "infra_hash": f"infra_{i}", "timestamp": now, "signature": f"sig{i}"}
+                for i in range(5)
+            ],
+        }),
+        expected="accept",
+        description="Receipt with more than minimum witnesses.",
     ))
     
-    # === Category 2: Malformed Merkle proofs ===
-    bad_proof = {**valid, "merkle": {**valid["merkle"], "root": _sha256("wrong")}}
-    cases.append(FuzzCase(
-        id="MK-001", name="Wrong Merkle root", category="merkle",
-        level=TestLevel.MUST, receipt=bad_proof, expected_valid=False,
-        description="Inclusion proof doesn't verify against stated root",
+    vectors.append(FuzzVector(
+        id="WF-003", name="Receipt with all dimension scores at 0.0",
+        category="well-formed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "dimensions": {"T": 0.0, "G": 0.0, "A": 0.0, "S": 0.0, "C": 0.0}
+        }),
+        expected="accept",
+        description="Zero scores are valid — new or slashed agent.",
     ))
     
-    empty_proof = {**valid, "merkle": {**valid["merkle"], "inclusion_proof": []}}
-    cases.append(FuzzCase(
-        id="MK-002", name="Empty inclusion proof", category="merkle",
-        level=TestLevel.MUST, receipt=empty_proof, expected_valid=False,
-        description="No siblings in inclusion proof (leaf != root)",
+    vectors.append(FuzzVector(
+        id="WF-004", name="Receipt with scar_reference",
+        category="well-formed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "scar_reference": {
+                "old_key_hash": _merkle_hash("old_key"),
+                "slash_event_hash": _merkle_hash("slash_event"),
+                "slash_reason": "delivery_hash_mismatch",
+            }
+        }),
+        expected="accept",
+        description="Post-SLASH agent with visible scar.",
     ))
     
-    null_root = {**valid, "merkle": {**valid["merkle"], "root": None}}
-    cases.append(FuzzCase(
-        id="MK-003", name="Null Merkle root", category="merkle",
-        level=TestLevel.MUST, receipt=null_root, expected_valid=False,
-        description="Merkle root is null",
+    # === Category 2: Malformed (MUST reject) ===
+    
+    vectors.append(FuzzVector(
+        id="MF-001", name="Missing merkle_root",
+        category="malformed", severity=Severity.MUST,
+        receipt_json={k: v for k, v in _valid_receipt().items() if k != "merkle_root"},
+        expected="reject",
+        description="Receipt without merkle_root is unverifiable.",
     ))
     
-    # === Category 3: Missing required fields ===
-    no_witnesses = {**valid, "witnesses": []}
-    cases.append(FuzzCase(
-        id="RF-001", name="No witnesses", category="required_fields",
-        level=TestLevel.MUST, receipt=no_witnesses, expected_valid=False,
-        description="Zero witnesses (minimum is 2 per CT model)",
+    vectors.append(FuzzVector(
+        id="MF-002", name="Empty inclusion_proof",
+        category="malformed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({"inclusion_proof": []}),
+        expected="reject",
+        description="Empty proof = no path from leaf to root.",
     ))
     
-    one_witness = {**valid, "witnesses": [valid["witnesses"][0]]}
-    cases.append(FuzzCase(
-        id="RF-002", name="Single witness", category="required_fields",
-        level=TestLevel.MUST, receipt=one_witness, expected_valid=False,
-        description="Only 1 witness (N≥2 required for CT-grade)",
+    vectors.append(FuzzVector(
+        id="MF-003", name="Zero witnesses",
+        category="malformed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({"witnesses": []}),
+        expected="reject",
+        description="No witnesses = no attestation.",
     ))
     
-    no_agent = {k: v for k, v in valid.items() if k != "agent_id"}
-    cases.append(FuzzCase(
-        id="RF-003", name="Missing agent_id", category="required_fields",
-        level=TestLevel.MUST, receipt=no_agent, expected_valid=False,
-        description="Receipt without agent identifier",
+    vectors.append(FuzzVector(
+        id="MF-004", name="Invalid merkle proof (wrong root)",
+        category="malformed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({"merkle_root": _merkle_hash("wrong")}),
+        expected="reject",
+        description="Proof doesn't verify against claimed root.",
     ))
     
-    no_version = {k: v for k, v in valid.items() if k != "version"}
-    cases.append(FuzzCase(
-        id="RF-004", name="Missing version", category="required_fields",
-        level=TestLevel.MUST, receipt=no_version, expected_valid=False,
-        description="No version field — breaks forward compatibility",
+    vectors.append(FuzzVector(
+        id="MF-005", name="Future timestamp",
+        category="malformed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({"created_at": now + 86400}),
+        expected="reject",
+        description="Receipt from the future = clock manipulation.",
     ))
     
-    # === Category 4: Boundary conditions ===
-    future = {**valid, "created_at": time.time() + 86400 * 365}
-    cases.append(FuzzCase(
-        id="BC-001", name="Future timestamp", category="boundary",
-        level=TestLevel.SHOULD, receipt=future, expected_valid=False,
-        description="Receipt created 1 year in the future",
+    vectors.append(FuzzVector(
+        id="MF-006", name="Dimension score > 1.0",
+        category="malformed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "dimensions": {"T": 1.5, "G": 0.9, "A": 0.7, "S": 0.8, "C": 0.7}
+        }),
+        expected="reject",
+        description="Dimension scores must be in [0.0, 1.0].",
     ))
     
-    ancient = {**valid, "created_at": 0}
-    cases.append(FuzzCase(
-        id="BC-002", name="Epoch timestamp", category="boundary",
-        level=TestLevel.SHOULD, receipt=ancient, expected_valid=False,
-        description="Receipt created at Unix epoch (1970)",
+    vectors.append(FuzzVector(
+        id="MF-007", name="Negative dimension score",
+        category="malformed", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "dimensions": {"T": -0.1, "G": 0.9, "A": 0.7, "S": 0.8, "C": 0.7}
+        }),
+        expected="reject",
+        description="Negative scores are invalid.",
     ))
     
-    huge_score = {**valid, "dimensions": {"T": {"score": 999.0, "anchor": "chain_state"}}}
-    cases.append(FuzzCase(
-        id="BC-003", name="Score > 1.0", category="boundary",
-        level=TestLevel.MUST, receipt=huge_score, expected_valid=False,
-        description="Dimension score exceeds valid range [0, 1]",
+    # === Category 3: Edge cases (spec-defined) ===
+    
+    vectors.append(FuzzVector(
+        id="EC-001", name="Single witness (below minimum)",
+        category="edge-case", severity=Severity.SHOULD,
+        receipt_json=_valid_receipt({
+            "witnesses": [
+                {"operator_id": "w1", "operator_org": "OrgA",
+                 "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"}
+            ],
+        }),
+        expected="reject",
+        description="N<2 witnesses = testimony not observation (CT requires 2+ SCTs).",
     ))
     
-    neg_score = {**valid, "dimensions": {"T": {"score": -0.5, "anchor": "chain_state"}}}
-    cases.append(FuzzCase(
-        id="BC-004", name="Negative score", category="boundary",
-        level=TestLevel.MUST, receipt=neg_score, expected_valid=False,
-        description="Negative dimension score",
+    vectors.append(FuzzVector(
+        id="EC-002", name="Two witnesses, same org",
+        category="edge-case", severity=Severity.SHOULD,
+        receipt_json=_valid_receipt({
+            "witnesses": [
+                {"operator_id": "w1", "operator_org": "SameOrg",
+                 "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+                {"operator_id": "w2", "operator_org": "SameOrg",
+                 "infra_hash": "infra_b", "timestamp": now, "signature": "sig2"},
+            ],
+        }),
+        expected="reject",
+        description="Same org = 1 effective witness. Chrome CT: distinct operators.",
     ))
     
-    # === Category 5: Adversarial ===
-    same_org = {**valid, "witnesses": [
-        {**valid["witnesses"][0], "operator_org": "SameOrg"},
-        {**valid["witnesses"][1], "operator_org": "SameOrg"},
-    ]}
-    cases.append(FuzzCase(
-        id="ADV-001", name="Same-org witnesses", category="adversarial",
-        level=TestLevel.MUST, receipt=same_org, expected_valid=False,
-        description="Two witnesses from same org (sybil)",
-        attack_type="sybil_witnesses",
+    vectors.append(FuzzVector(
+        id="EC-003", name="Receipt exactly 24h old",
+        category="edge-case", severity=Severity.SHOULD,
+        receipt_json=_valid_receipt({"created_at": now - 86400}),
+        expected="accept",
+        description="Boundary: exactly at freshness threshold.",
     ))
     
-    no_diversity = {**valid, "diversity_hash": None}
-    cases.append(FuzzCase(
-        id="ADV-002", name="Missing diversity hash", category="adversarial",
-        level=TestLevel.SHOULD, receipt=no_diversity, expected_valid=False,
-        description="No diversity hash — can't verify witness independence",
-        attack_type="diversity_evasion",
+    vectors.append(FuzzVector(
+        id="EC-004", name="Receipt 24h + 1s old",
+        category="edge-case", severity=Severity.SHOULD,
+        receipt_json=_valid_receipt({"created_at": now - 86401}),
+        expected="reject",
+        description="Just past freshness threshold.",
     ))
     
-    # Replay: valid receipt but with manipulated agent_id
-    replayed = {**valid, "agent_id": "agent:impersonator"}
-    cases.append(FuzzCase(
-        id="ADV-003", name="Agent ID mismatch", category="adversarial",
-        level=TestLevel.MUST, receipt=replayed, expected_valid=False,
-        description="Receipt's agent_id doesn't match leaf hash content",
-        attack_type="replay",
+    vectors.append(FuzzVector(
+        id="EC-005", name="Missing diversity_hash",
+        category="edge-case", severity=Severity.SHOULD,
+        receipt_json=_valid_receipt({"diversity_hash": None}),
+        expected="reject",
+        description="Diversity hash = self-certifying witness independence.",
     ))
     
-    # Giant inclusion proof (DoS)
-    giant = {**valid, "merkle": {
-        **valid["merkle"],
-        "inclusion_proof": [_sha256(f"node_{i}") for i in range(10000)]
-    }}
-    cases.append(FuzzCase(
-        id="ADV-004", name="Giant Merkle proof", category="adversarial",
-        level=TestLevel.SHOULD, receipt=giant, expected_valid=False,
-        description="10,000 siblings in proof (DoS via verification cost)",
+    # === Category 4: Adversarial (active attacks) ===
+    
+    vectors.append(FuzzVector(
+        id="ADV-001", name="Duplicate witness signatures",
+        category="adversarial", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "witnesses": [
+                {"operator_id": "w1", "operator_org": "OrgA",
+                 "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+                {"operator_id": "w1", "operator_org": "OrgA",
+                 "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+            ],
+        }),
+        expected="reject",
+        description="Replayed witness = sybil attack.",
+        attack_type="sybil",
+    ))
+    
+    vectors.append(FuzzVector(
+        id="ADV-002", name="Merkle proof for different leaf",
+        category="adversarial", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "leaf_hash": _merkle_hash("different_action"),
+        }),
+        expected="reject",
+        description="Proof doesn't match claimed leaf = substitution attack.",
+        attack_type="substitution",
+    ))
+    
+    vectors.append(FuzzVector(
+        id="ADV-003", name="Extremely long inclusion proof",
+        category="adversarial", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "inclusion_proof": [_merkle_hash(f"node_{i}") for i in range(1000)],
+        }),
+        expected="reject",
+        description="Proof depth > log2(max_receipts) = DoS or fabrication.",
         attack_type="dos",
     ))
     
-    return cases
-
-
-def run_suite(parser_fn=None) -> dict:
-    """Run the fuzz suite against a parser function.
+    vectors.append(FuzzVector(
+        id="ADV-004", name="JSON injection in agent_id",
+        category="adversarial", severity=Severity.MUST,
+        receipt_json=_valid_receipt({
+            "agent_id": 'agent:test", "dimensions": {"T": 1.0}',
+        }),
+        expected="reject",
+        description="Injection via agent_id field.",
+        attack_type="injection",
+    ))
     
-    parser_fn(receipt: dict) -> bool  (True = valid, False = invalid)
-    If None, uses a reference validator.
+    return vectors
+
+
+def run_fuzzer(parser_fn=None):
+    """Run all test vectors against a parser function.
+    
+    parser_fn(receipt_json) -> "accept" | "reject"
+    If None, runs in report-only mode.
     """
-    cases = generate_fuzz_suite()
+    vectors = generate_vectors()
     results = []
     
-    for case in cases:
+    for v in vectors:
         if parser_fn:
             try:
-                said_valid = parser_fn(case.receipt)
-                result = TestResult.PASS if (said_valid == case.expected_valid) else TestResult.FAIL
-                results.append(FuzzResult(case, result, said_valid))
+                actual = parser_fn(v.receipt_json)
+                result = TestResult.PASS if actual == v.expected else TestResult.FAIL
+                results.append(FuzzResult(v, result, actual))
             except Exception as e:
-                results.append(FuzzResult(case, TestResult.ERROR, error_message=str(e)))
+                results.append(FuzzResult(v, TestResult.FAIL, "error", str(e)))
         else:
-            results.append(FuzzResult(case, TestResult.SKIP))
+            results.append(FuzzResult(v, TestResult.SKIP, "skip"))
     
-    # Summary
-    by_level = {level: [] for level in TestLevel}
-    for r in results:
-        by_level[r.case.level].append(r)
-    
-    return {
-        "total": len(results),
-        "by_category": _group_by(results, lambda r: r.case.category),
-        "by_level": {
-            level.value: {
-                "total": len(rs),
-                "pass": sum(1 for r in rs if r.result == TestResult.PASS),
-                "fail": sum(1 for r in rs if r.result == TestResult.FAIL),
-            }
-            for level, rs in by_level.items()
-        },
-        "results": results,
-    }
-
-
-def _group_by(items, key_fn):
-    groups = {}
-    for item in items:
-        k = key_fn(item)
-        groups.setdefault(k, []).append(item)
-    return {k: len(v) for k, v in groups.items()}
+    return results
 
 
 def demo():
-    """Show the fuzz suite."""
-    cases = generate_fuzz_suite()
+    vectors = generate_vectors()
     
-    print("=" * 60)
-    print("L3.5 RECEIPT FUZZ SUITE")
-    print(f"h2spec for trust receipts — {len(cases)} test cases")
-    print("=" * 60)
+    print("=" * 70)
+    print("L3.5 RECEIPT FUZZER — Interop Test Suite")
+    print(f"  {len(vectors)} test vectors across 4 categories")
+    print("=" * 70)
     
-    by_cat = {}
-    for c in cases:
-        by_cat.setdefault(c.category, []).append(c)
+    categories = {}
+    for v in vectors:
+        categories.setdefault(v.category, []).append(v)
     
-    for cat, cat_cases in by_cat.items():
-        print(f"\n--- {cat.upper()} ({len(cat_cases)} cases) ---")
-        for c in cat_cases:
-            valid = "✅ expect valid" if c.expected_valid else "❌ expect reject"
-            level = c.level.value
-            attack = f" [{c.attack_type}]" if c.attack_type else ""
-            print(f"  [{c.id}] {c.name} ({level}) {valid}{attack}")
-            print(f"         {c.description}")
+    for cat, vecs in categories.items():
+        must = sum(1 for v in vecs if v.severity == Severity.MUST)
+        should = sum(1 for v in vecs if v.severity == Severity.SHOULD)
+        print(f"\n{'—'*70}")
+        print(f"Category: {cat.upper()} ({len(vecs)} vectors, {must} MUST, {should} SHOULD)")
+        print(f"{'—'*70}")
+        
+        for v in vecs:
+            attack = f" [{v.attack_type}]" if v.attack_type else ""
+            print(f"  {v.id} [{v.severity.value}] {v.name}")
+            print(f"    Expected: {v.expected}{attack}")
+            print(f"    {v.description}")
     
     # Summary
-    must = sum(1 for c in cases if c.level == TestLevel.MUST)
-    should = sum(1 for c in cases if c.level == TestLevel.SHOULD)
-    print(f"\n📊 Suite: {len(cases)} total, {must} MUST, {should} SHOULD")
-    print(f"   A compliant parser MUST pass all MUST cases.")
-    print(f"   SHOULD failures = warnings, not compliance failures.")
+    print(f"\n{'='*70}")
+    print("SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Total vectors: {len(vectors)}")
+    print(f"  MUST:   {sum(1 for v in vectors if v.severity == Severity.MUST)}")
+    print(f"  SHOULD: {sum(1 for v in vectors if v.severity == Severity.SHOULD)}")
+    print(f"  Accept: {sum(1 for v in vectors if v.expected == 'accept')}")
+    print(f"  Reject: {sum(1 for v in vectors if v.expected == 'reject')}")
     
-    # Export as JSON for cross-parser testing
-    suite_json = []
-    for c in cases:
-        suite_json.append({
-            "id": c.id,
-            "name": c.name,
-            "category": c.category,
-            "level": c.level.value,
-            "expected_valid": c.expected_valid,
-            "receipt": c.receipt,
-        })
+    attacks = [v for v in vectors if v.attack_type]
+    if attacks:
+        print(f"\n  Attack types covered:")
+        for a in set(v.attack_type for v in attacks):
+            print(f"    - {a}")
     
-    print(f"\n💾 Suite exportable as JSON ({len(json.dumps(suite_json))} bytes)")
-    print(f"   Two parsers + this suite = IETF interop bar")
+    print(f"\n  Usage: import receipt_fuzzer; results = run_fuzzer(my_parser)")
+    print(f"  Parser signature: fn(receipt_json: dict) -> 'accept' | 'reject'")
 
 
 if __name__ == "__main__":
