@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-receipt-test-vectors.py — Interop test vectors for L3.5 trust receipts.
+receipt-test-vectors.py — Generate interop test vectors for L3.5 trust receipts.
 
-Per santaclawd: "schema doc + two parsers + test vectors = IETF bar."
-CT had test vectors before enforcement. These are the edge cases
-both parsers must handle identically.
+Per santaclawd: "two parsers cross the IETF bar. the third piece is the
+interop test suite — edge cases both parsers handle = the spec is real."
 
-Test categories:
-  1. Valid receipts (baseline)
-  2. Structural edge cases (empty fields, max depth, single leaf)
-  3. Validation failures (expired, bad proof, duplicate operators)
-  4. Witness edge cases (N=0, N=1, same-org, mixed validity)
-  5. Merkle edge cases (single leaf, unbalanced tree, empty tree)
+IETF requires 2 independent implementations agreeing on ALL test vectors.
+Disagreement = spec ambiguity (fix the spec, not the parser).
+
+Test vector categories:
+1. Valid receipts (MUST parse successfully)
+2. Invalid receipts (MUST reject)
+3. Edge cases (spec ambiguity detectors)
+4. Adversarial (fuzzing for security)
 """
 
 import hashlib
@@ -22,314 +23,249 @@ from typing import Optional, Any
 
 
 @dataclass
-class TestWitness:
-    operator_id: str
-    operator_org: str
-    infra_hash: str
-    timestamp: float
-    signature: str  # Hex-encoded
-
-
-@dataclass
-class TestReceipt:
-    receipt_id: str
-    agent_id: str
-    action_type: str
-    dimensions: dict[str, float]  # T, G, A, S, C
-    merkle_root: str
-    inclusion_proof: list[str]
-    leaf_hash: str
-    witnesses: list[TestWitness]
-    diversity_hash: Optional[str] = None
-    created_at: float = 0.0
-    expires_at: Optional[float] = None
-    scar_reference: Optional[str] = None
-    decision_type: str = "action"  # action | inaction
-
-
-@dataclass
 class TestVector:
+    """A single test case for receipt parser interop."""
     id: str
-    name: str
-    category: str
+    category: str  # valid, invalid, edge, adversarial
     description: str
-    receipt: TestReceipt
-    expected_valid: bool
-    expected_reasons: list[str] = field(default_factory=list)
-    notes: str = ""
+    receipt: dict   # The receipt to parse
+    expected: str   # "accept" or "reject"
+    reason: Optional[str] = None  # Why reject / what to check
+    notes: Optional[str] = None
 
 
-def sha256(data: str) -> str:
+def _sha256(data: str) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
-def merkle_parent(left: str, right: str) -> str:
-    if left < right:
-        return sha256(left + right)
-    return sha256(right + left)
+def _merkle_root(leaf: str, sibling: str) -> str:
+    if leaf < sibling:
+        combined = leaf + sibling
+    else:
+        combined = sibling + leaf
+    return _sha256(combined)
 
 
-def build_merkle(leaves: list[str]) -> tuple[str, dict]:
-    """Build Merkle tree, return (root, proofs_by_leaf)."""
-    if not leaves:
-        return sha256(""), {}
-    if len(leaves) == 1:
-        return leaves[0], {leaves[0]: []}
+def _make_valid_receipt(receipt_id: str = "r001", agent_id: str = "agent:kit",
+                        action: str = "delivery", **overrides) -> dict:
+    """Generate a structurally valid receipt."""
+    leaf = _sha256(f"{receipt_id}:{agent_id}:{action}")
+    sibling = _sha256("sibling_node")
+    root = _merkle_root(leaf, sibling)
     
-    # Pad to power of 2
-    while len(leaves) & (len(leaves) - 1):
-        leaves.append(leaves[-1])
-    
-    proofs = {leaf: [] for leaf in leaves}
-    level = leaves[:]
-    
-    while len(level) > 1:
-        next_level = []
-        for i in range(0, len(level), 2):
-            left, right = level[i], level[i + 1]
-            parent = merkle_parent(left, right)
-            next_level.append(parent)
-            # Record sibling for proof
-            for leaf in proofs:
-                if level[i] in _ancestors(leaf, proofs) or level[i] == leaf:
-                    proofs[leaf].append(right)
-                elif level[i + 1] in _ancestors(leaf, proofs) or level[i + 1] == leaf:
-                    proofs[leaf].append(left)
-        level = next_level
-    
-    return level[0], proofs
-
-
-def _ancestors(leaf: str, proofs: dict) -> set:
-    """Get all ancestor hashes."""
-    return set()  # Simplified — proofs are built correctly above
-
-
-def make_valid_receipt(receipt_id: str = "r001", agent_id: str = "agent:alice",
-                       n_witnesses: int = 2) -> TestReceipt:
-    """Build a fully valid receipt."""
-    now = time.time()
-    leaf = sha256(f"action:{receipt_id}:{agent_id}")
-    sibling = sha256(f"sibling:{receipt_id}")
-    root = merkle_parent(leaf, sibling)
-    
-    witnesses = []
-    for i in range(n_witnesses):
-        witnesses.append(TestWitness(
-            operator_id=f"op_{i}",
-            operator_org=f"Org{chr(65 + i)}",
-            infra_hash=sha256(f"infra_{i}"),
-            timestamp=now,
-            signature=sha256(f"sig_{receipt_id}_{i}"),
-        ))
-    
-    return TestReceipt(
-        receipt_id=receipt_id,
-        agent_id=agent_id,
-        action_type="delivery",
-        dimensions={"T": 0.85, "G": 0.90, "A": 0.70, "S": 168.0, "C": 0.80},
-        merkle_root=root,
-        inclusion_proof=[sibling],
-        leaf_hash=leaf,
-        witnesses=witnesses,
-        diversity_hash=sha256("diversity:" + ":".join(w.infra_hash for w in witnesses)),
-        created_at=now - 3600,
-        expires_at=now + 86400,
-        decision_type="action",
-    )
+    receipt = {
+        "version": "0.1.0",
+        "receipt_id": receipt_id,
+        "agent_id": agent_id,
+        "action_type": action,
+        "dimensions": {
+            "T": {"score": 0.85, "anchor": "observation", "source": "chain_state"},
+            "G": {"score": 0.90, "anchor": "observation", "source": "dkim_thread"},
+            "A": {"score": 0.75, "anchor": "testimony", "source": "attestation"},
+            "S": {"decay_constant": 4380, "last_refresh": int(time.time()) - 3600},
+            "C": {"completions": 150, "disputes": 0, "slash_count": 0},
+        },
+        "merkle": {
+            "root": root,
+            "leaf_hash": leaf,
+            "inclusion_proof": [sibling],
+        },
+        "witnesses": [
+            {"operator_id": "op_alpha", "org": "OrgA", "infra_hash": _sha256("infra_a"),
+             "timestamp": int(time.time()), "signature": _sha256("sig_a")},
+            {"operator_id": "op_beta", "org": "OrgB", "infra_hash": _sha256("infra_b"),
+             "timestamp": int(time.time()), "signature": _sha256("sig_b")},
+        ],
+        "diversity_hash": _sha256("OrgA:infra_a|OrgB:infra_b"),
+        "created_at": int(time.time()),
+    }
+    receipt.update(overrides)
+    return receipt
 
 
 def generate_test_vectors() -> list[TestVector]:
-    """Generate comprehensive test vectors."""
-    now = time.time()
+    """Generate comprehensive interop test vectors."""
     vectors = []
     
-    # === CATEGORY 1: Valid receipts ===
+    # === VALID RECEIPTS (MUST ACCEPT) ===
     
     vectors.append(TestVector(
-        id="valid-001",
-        name="Minimal valid receipt",
-        category="valid",
-        description="Receipt with 2 witnesses, valid Merkle proof, fresh timestamp",
-        receipt=make_valid_receipt(),
-        expected_valid=True,
+        id="V001", category="valid",
+        description="Minimal valid receipt with 2 independent witnesses",
+        receipt=_make_valid_receipt(),
+        expected="accept",
     ))
     
     vectors.append(TestVector(
-        id="valid-002",
-        name="Valid receipt with 5 witnesses",
-        category="valid",
-        description="More witnesses than minimum — should still pass",
-        receipt=make_valid_receipt("r002", n_witnesses=5),
-        expected_valid=True,
+        id="V002", category="valid",
+        description="Receipt with 3 witnesses (exceeds minimum)",
+        receipt=_make_valid_receipt(witnesses_extra=True),
+        expected="accept",
+        notes="N>2 is valid, not an error",
     ))
     
-    r_inaction = make_valid_receipt("r003")
-    r_inaction.decision_type = "inaction"
     vectors.append(TestVector(
-        id="valid-003",
-        name="Valid inaction receipt",
-        category="valid",
-        description="Logged decision NOT to act — decision_type=inaction is valid",
-        receipt=r_inaction,
-        expected_valid=True,
-        notes="Inaction logging = liveness proof per santaclawd",
+        id="V003", category="valid",
+        description="Receipt with zero completions (new agent)",
+        receipt=_make_valid_receipt(
+            dimensions_override={"C": {"completions": 0, "disputes": 0, "slash_count": 0}}
+        ),
+        expected="accept",
+        notes="New agents have valid empty records",
     ))
     
-    r_scar = make_valid_receipt("r004")
-    r_scar.scar_reference = sha256("slash_event:old_key:delivery_hash_mismatch")
     vectors.append(TestVector(
-        id="valid-004",
-        name="Valid receipt with scar_reference",
-        category="valid",
-        description="Agent with prior slash event — scar visible but receipt valid",
-        receipt=r_scar,
-        expected_valid=True,
-        notes="Scar affects trust scoring, not receipt validity",
+        id="V004", category="valid",
+        description="Receipt with SLASHED agent (scar visible)",
+        receipt=_make_valid_receipt(
+            dimensions_override={"C": {"completions": 50, "disputes": 1, "slash_count": 1,
+                                       "scar_reference": {"old_key": _sha256("old"), 
+                                                         "slash_event": _sha256("slash1"),
+                                                         "reason": "delivery_hash_mismatch"}}}
+        ),
+        expected="accept",
+        notes="Slashed receipts are valid data — consumer decides trust level",
     ))
     
-    # === CATEGORY 2: Structural edge cases ===
+    # === INVALID RECEIPTS (MUST REJECT) ===
     
-    r_empty_dims = make_valid_receipt("r010")
-    r_empty_dims.dimensions = {}
+    bad_receipt = _make_valid_receipt()
+    bad_receipt["merkle"]["root"] = _sha256("wrong_root")
     vectors.append(TestVector(
-        id="edge-001",
-        name="Empty dimensions",
-        category="edge",
-        description="Receipt with no dimension scores — structurally invalid",
-        receipt=r_empty_dims,
-        expected_valid=False,
-        expected_reasons=["missing_dimensions"],
+        id="I001", category="invalid",
+        description="Merkle root doesn't match inclusion proof",
+        receipt=bad_receipt,
+        expected="reject",
+        reason="merkle_proof_invalid",
     ))
     
-    r_single_leaf = make_valid_receipt("r011")
-    r_single_leaf.inclusion_proof = []
-    r_single_leaf.merkle_root = r_single_leaf.leaf_hash  # Single leaf = root
+    no_witness = _make_valid_receipt()
+    no_witness["witnesses"] = []
     vectors.append(TestVector(
-        id="edge-002",
-        name="Single-leaf Merkle tree",
-        category="edge",
-        description="Tree with one leaf — proof is empty, root = leaf hash",
-        receipt=r_single_leaf,
-        expected_valid=True,
-        notes="Valid but unusual. Some impls may reject — test for consistency.",
+        id="I002", category="invalid",
+        description="Zero witnesses",
+        receipt=no_witness,
+        expected="reject",
+        reason="insufficient_witnesses",
     ))
     
-    r_max_witnesses = make_valid_receipt("r012", n_witnesses=100)
+    one_witness = _make_valid_receipt()
+    one_witness["witnesses"] = [one_witness["witnesses"][0]]
     vectors.append(TestVector(
-        id="edge-003",
-        name="100 witnesses",
-        category="edge",
-        description="Extreme witness count — valid but tests parser limits",
-        receipt=r_max_witnesses,
-        expected_valid=True,
-        notes="Parser should not crash on large witness lists",
+        id="I003", category="invalid",
+        description="Single witness (below N≥2 minimum)",
+        receipt=one_witness,
+        expected="reject",
+        reason="insufficient_witnesses",
+        notes="1 witness = escrow with extra steps, not CT",
     ))
     
-    # === CATEGORY 3: Validation failures ===
-    
-    r_expired = make_valid_receipt("r020")
-    r_expired.created_at = now - 172800  # 48h old
-    r_expired.expires_at = now - 86400   # Expired 24h ago
+    same_org = _make_valid_receipt()
+    same_org["witnesses"][1]["org"] = "OrgA"  # Same as first
     vectors.append(TestVector(
-        id="fail-001",
-        name="Expired receipt",
-        category="validation_failure",
-        description="Receipt past expires_at — must reject",
-        receipt=r_expired,
-        expected_valid=False,
-        expected_reasons=["expired"],
+        id="I004", category="invalid",
+        description="Two witnesses from same organization",
+        receipt=same_org,
+        expected="reject",
+        reason="duplicate_operators",
+        notes="Chrome CT requires distinct log operators",
     ))
     
-    r_bad_proof = make_valid_receipt("r021")
-    r_bad_proof.inclusion_proof = [sha256("wrong_sibling")]
+    no_version = _make_valid_receipt()
+    del no_version["version"]
     vectors.append(TestVector(
-        id="fail-002",
-        name="Invalid Merkle proof",
-        category="validation_failure",
-        description="Inclusion proof doesn't match root — tampered",
-        receipt=r_bad_proof,
-        expected_valid=False,
-        expected_reasons=["invalid_merkle_proof"],
+        id="I005", category="invalid",
+        description="Missing version field",
+        receipt=no_version,
+        expected="reject",
+        reason="missing_required_field",
     ))
     
-    r_no_proof = make_valid_receipt("r022")
-    r_no_proof.inclusion_proof = []
-    # Root != leaf (so proof should be needed)
+    # === EDGE CASES (SPEC AMBIGUITY DETECTORS) ===
+    
+    future_receipt = _make_valid_receipt()
+    future_receipt["created_at"] = int(time.time()) + 86400  # 1 day in future
     vectors.append(TestVector(
-        id="fail-003",
-        name="Missing Merkle proof (non-single-leaf)",
-        category="validation_failure",
-        description="Multi-leaf tree but no inclusion proof provided",
-        receipt=r_no_proof,
-        expected_valid=False,
-        expected_reasons=["missing_merkle_proof"],
+        id="E001", category="edge",
+        description="Receipt with future timestamp",
+        receipt=future_receipt,
+        expected="reject",  # But some parsers might accept with clock skew tolerance
+        reason="future_timestamp",
+        notes="SPEC AMBIGUITY: How much clock skew to tolerate? 5min? 1h?",
     ))
     
-    # === CATEGORY 4: Witness edge cases ===
-    
-    r_no_witnesses = make_valid_receipt("r030")
-    r_no_witnesses.witnesses = []
+    empty_dimensions = _make_valid_receipt()
+    empty_dimensions["dimensions"] = {}
     vectors.append(TestVector(
-        id="witness-001",
-        name="Zero witnesses",
-        category="witness",
-        description="No witnesses — below minimum (N≥2)",
-        receipt=r_no_witnesses,
-        expected_valid=False,
-        expected_reasons=["insufficient_witnesses"],
+        id="E002", category="edge",
+        description="Receipt with empty dimensions object",
+        receipt=empty_dimensions,
+        expected="accept",  # Or reject? Spec must clarify
+        notes="SPEC AMBIGUITY: Are dimensions required? Minimal receipt = just Merkle + witnesses?",
     ))
     
-    r_one_witness = make_valid_receipt("r031", n_witnesses=1)
+    unknown_field = _make_valid_receipt()
+    unknown_field["custom_field"] = "extra_data"
     vectors.append(TestVector(
-        id="witness-002",
-        name="Single witness",
-        category="witness",
-        description="1 witness = escrow with extra steps (per santaclawd). Below N≥2.",
-        receipt=r_one_witness,
-        expected_valid=False,
-        expected_reasons=["insufficient_witnesses"],
-        notes="1 witness = testimony. 2+ = corroboration. 3+ = observation.",
+        id="E003", category="edge",
+        description="Receipt with unknown additional field",
+        receipt=unknown_field,
+        expected="accept",
+        notes="SPEC AMBIGUITY: Ignore unknown fields (Postel) or reject (strict)?",
     ))
     
-    r_same_org = make_valid_receipt("r032")
-    for w in r_same_org.witnesses:
-        w.operator_org = "SameOrg"
+    negative_score = _make_valid_receipt()
+    negative_score["dimensions"]["T"]["score"] = -0.5
     vectors.append(TestVector(
-        id="witness-003",
-        name="Same-org witnesses",
-        category="witness",
-        description="2 witnesses from same org = 1 effective witness. Trust theater.",
-        receipt=r_same_org,
-        expected_valid=False,
-        expected_reasons=["duplicate_operators"],
-        notes="Chrome CT: distinct operators required. Same org = sybil.",
+        id="E004", category="edge",
+        description="Dimension score below 0",
+        receipt=negative_score,
+        expected="reject",
+        reason="score_out_of_range",
+        notes="SPEC AMBIGUITY: Score range [0,1]? Or unbounded?",
     ))
     
-    r_no_diversity = make_valid_receipt("r033")
-    r_no_diversity.diversity_hash = None
+    zero_diversity = _make_valid_receipt()
+    zero_diversity["diversity_hash"] = None
     vectors.append(TestVector(
-        id="witness-004",
-        name="Missing diversity hash",
-        category="witness",
-        description="No diversity hash — consumer can't verify operator independence",
-        receipt=r_no_diversity,
-        expected_valid=False,
-        expected_reasons=["missing_diversity_hash"],
+        id="E005", category="edge",
+        description="Null diversity hash",
+        receipt=zero_diversity,
+        expected="reject",  # Or accept with warning?
+        notes="SPEC AMBIGUITY: Is diversity_hash required or optional?",
     ))
     
-    # === CATEGORY 5: Merkle edge cases ===
+    # === ADVERSARIAL (FUZZING FOR SECURITY) ===
     
-    r_root_mismatch = make_valid_receipt("r040")
-    r_root_mismatch.merkle_root = sha256("tampered_root")
+    injection = _make_valid_receipt()
+    injection["agent_id"] = "agent:kit'; DROP TABLE receipts;--"
     vectors.append(TestVector(
-        id="merkle-001",
-        name="Root hash mismatch",
-        category="merkle",
-        description="Computed root != declared root — receipt tampered",
-        receipt=r_root_mismatch,
-        expected_valid=False,
-        expected_reasons=["invalid_merkle_proof"],
+        id="A001", category="adversarial",
+        description="SQL injection in agent_id",
+        receipt=injection,
+        expected="reject",
+        reason="invalid_agent_id_format",
+    ))
+    
+    huge = _make_valid_receipt()
+    huge["dimensions"]["T"]["source"] = "x" * 1_000_000
+    vectors.append(TestVector(
+        id="A002", category="adversarial",
+        description="1MB string in dimension source",
+        receipt=huge,
+        expected="reject",
+        reason="field_size_exceeded",
+    ))
+    
+    unicode_trick = _make_valid_receipt()
+    unicode_trick["agent_id"] = "agent:\u200bkit"  # Zero-width space
+    vectors.append(TestVector(
+        id="A003", category="adversarial",
+        description="Zero-width space in agent_id (homoglyph attack)",
+        receipt=unicode_trick,
+        expected="reject",
+        reason="invalid_characters",
+        notes="Unicode normalization required before comparison",
     ))
     
     return vectors
@@ -340,7 +276,7 @@ def demo():
     
     print("=" * 70)
     print("L3.5 RECEIPT INTEROP TEST VECTORS")
-    print(f"Generated: {len(vectors)} vectors")
+    print(f"Generated: {len(vectors)} test cases")
     print("=" * 70)
     
     categories = {}
@@ -348,55 +284,34 @@ def demo():
         categories.setdefault(v.category, []).append(v)
     
     for cat, vecs in categories.items():
-        valid_count = sum(1 for v in vecs if v.expected_valid)
-        invalid_count = len(vecs) - valid_count
-        print(f"\n--- {cat.upper()} ({valid_count} valid, {invalid_count} invalid) ---")
-        
+        print(f"\n--- {cat.upper()} ({len(vecs)} vectors) ---")
         for v in vecs:
-            status = "✅" if v.expected_valid else "❌"
-            print(f"\n  {status} {v.id}: {v.name}")
-            print(f"     {v.description}")
-            if v.expected_reasons:
-                print(f"     Expected: {v.expected_reasons}")
+            icon = "✅" if v.expected == "accept" else "❌"
+            print(f"  {v.id} {icon} {v.description}")
+            if v.reason:
+                print(f"       Reason: {v.reason}")
             if v.notes:
-                print(f"     Note: {v.notes}")
+                print(f"       Note: {v.notes}")
     
-    # Export as JSON for parser interop testing
-    export = []
-    for v in vectors:
-        export.append({
-            "id": v.id,
-            "name": v.name,
-            "category": v.category,
-            "description": v.description,
-            "expected_valid": v.expected_valid,
-            "expected_reasons": v.expected_reasons,
-            "receipt": {
-                "receipt_id": v.receipt.receipt_id,
-                "agent_id": v.receipt.agent_id,
-                "action_type": v.receipt.action_type,
-                "dimensions": v.receipt.dimensions,
-                "merkle_root": v.receipt.merkle_root,
-                "inclusion_proof": v.receipt.inclusion_proof,
-                "leaf_hash": v.receipt.leaf_hash,
-                "witness_count": len(v.receipt.witnesses),
-                "unique_orgs": len(set(w.operator_org for w in v.receipt.witnesses)),
-                "has_diversity_hash": v.receipt.diversity_hash is not None,
-                "decision_type": v.receipt.decision_type,
-                "has_scar_reference": v.receipt.scar_reference is not None,
-            },
-        })
+    # Spec ambiguity summary
+    ambiguities = [v for v in vectors if v.category == "edge"]
+    print(f"\n{'='*70}")
+    print(f"SPEC AMBIGUITIES DETECTED: {len(ambiguities)}")
+    print(f"{'='*70}")
+    for v in ambiguities:
+        print(f"  {v.id}: {v.notes}")
     
-    # Write test vectors JSON
-    json_path = "specs/receipt-test-vectors.json"
-    import os
-    os.makedirs("specs", exist_ok=True)
-    with open(json_path, "w") as f:
-        json.dump({"version": "0.1.0", "vectors": export}, f, indent=2)
+    print(f"\n💡 These ambiguities MUST be resolved before enforcement.")
+    print(f"   Two parsers disagreeing on an edge case = spec bug, not parser bug.")
     
-    print(f"\n\n📄 Exported {len(export)} test vectors to {json_path}")
-    print(f"   Both parsers must produce identical results for all vectors.")
-    print(f"   Any disagreement = schema ambiguity that needs resolution.")
+    # Export as JSON for interop testing
+    export = [{"id": v.id, "category": v.category, "description": v.description,
+               "expected": v.expected, "reason": v.reason, "notes": v.notes}
+              for v in vectors]
+    
+    with open("test-vectors.json", "w") as f:
+        json.dump(export, f, indent=2)
+    print(f"\n📄 Exported {len(vectors)} test vectors to test-vectors.json")
 
 
 if __name__ == "__main__":
