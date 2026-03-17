@@ -1,0 +1,359 @@
+[
+  {
+    "id": "valid-001",
+    "name": "Minimal valid receipt",
+    "description": "Smallest possible valid receipt with all required fields",
+    "category": "valid",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-001",
+      "agent_id": "agent:alice",
+      "action_type": "delivery",
+      "merkle_root": "491ba5df693d61247691ffb76eb89ce78d03e59e7cbc3e8b7f7adf197f6caedd",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "OrgB",
+          "infra_hash": "hash_b",
+          "timestamp": 1773705596,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_001",
+      "created_at": 1773701996
+    },
+    "expected_valid": true,
+    "expected_errors": [],
+    "notes": ""
+  },
+  {
+    "id": "valid-002",
+    "name": "Receipt with optional fields",
+    "description": "Valid receipt with all optional fields populated",
+    "category": "valid",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-002",
+      "agent_id": "agent:bob",
+      "action_type": "attestation",
+      "merkle_root": "491ba5df693d61247691ffb76eb89ce78d03e59e7cbc3e8b7f7adf197f6caedd",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "OrgC",
+          "infra_hash": "hash_c",
+          "timestamp": 1773705596,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_002",
+      "created_at": 1773698396,
+      "scar_reference": {
+        "old_key_hash": "abc123",
+        "slash_event_hash": "def456",
+        "reason": "key_compromise"
+      },
+      "gap_events": [
+        {
+          "start": 1773619196,
+          "end": 1773662396,
+          "context": "maintenance"
+        }
+      ],
+      "decision_type": "action"
+    },
+    "expected_valid": true,
+    "expected_errors": [],
+    "notes": "Parsers must accept unknown optional fields gracefully"
+  },
+  {
+    "id": "invalid-001",
+    "name": "Missing merkle_root",
+    "description": "Receipt without merkle_root should be rejected",
+    "category": "invalid",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-003",
+      "agent_id": "agent:charlie",
+      "action_type": "delivery",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "OrgB",
+          "infra_hash": "hash_b",
+          "timestamp": 1773705596,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_003",
+      "created_at": 1773705596
+    },
+    "expected_valid": false,
+    "expected_errors": [
+      "missing_merkle_root"
+    ],
+    "notes": ""
+  },
+  {
+    "id": "invalid-002",
+    "name": "Single witness (below N\u22652 minimum)",
+    "description": "Only 1 witness \u2014 insufficient for CT-style verification",
+    "category": "invalid",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-004",
+      "agent_id": "agent:dave",
+      "action_type": "delivery",
+      "merkle_root": "491ba5df693d61247691ffb76eb89ce78d03e59e7cbc3e8b7f7adf197f6caedd",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        }
+      ],
+      "diversity_hash": "div_004",
+      "created_at": 1773705596
+    },
+    "expected_valid": false,
+    "expected_errors": [
+      "insufficient_witnesses"
+    ],
+    "notes": ""
+  },
+  {
+    "id": "invalid-003",
+    "name": "Same-org witnesses (diversity failure)",
+    "description": "2 witnesses from same org = 1 effective witness",
+    "category": "invalid",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-005",
+      "agent_id": "agent:eve",
+      "action_type": "delivery",
+      "merkle_root": "491ba5df693d61247691ffb76eb89ce78d03e59e7cbc3e8b7f7adf197f6caedd",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "SameOrg",
+          "infra_hash": "hash_x",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "SameOrg",
+          "infra_hash": "hash_y",
+          "timestamp": 1773705596,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_005",
+      "created_at": 1773705596
+    },
+    "expected_valid": false,
+    "expected_errors": [
+      "duplicate_operators"
+    ],
+    "notes": "Chrome CT requires distinct log operators, not just distinct keys"
+  },
+  {
+    "id": "invalid-004",
+    "name": "Invalid Merkle proof",
+    "description": "Inclusion proof does not verify against root",
+    "category": "invalid",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-006",
+      "agent_id": "agent:frank",
+      "action_type": "delivery",
+      "merkle_root": "0000000000000000000000000000000000000000000000000000000000000000",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "OrgB",
+          "infra_hash": "hash_b",
+          "timestamp": 1773705596,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_006",
+      "created_at": 1773705596
+    },
+    "expected_valid": false,
+    "expected_errors": [
+      "invalid_merkle_proof"
+    ],
+    "notes": ""
+  },
+  {
+    "id": "edge-001",
+    "name": "Future timestamp",
+    "description": "Receipt created_at in the future \u2014 clock skew handling",
+    "category": "edge",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-007",
+      "agent_id": "agent:grace",
+      "action_type": "delivery",
+      "merkle_root": "491ba5df693d61247691ffb76eb89ce78d03e59e7cbc3e8b7f7adf197f6caedd",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773791996,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "OrgB",
+          "infra_hash": "hash_b",
+          "timestamp": 1773791996,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_007",
+      "created_at": 1773791996
+    },
+    "expected_valid": false,
+    "expected_errors": [
+      "future_timestamp"
+    ],
+    "notes": "Parsers SHOULD reject future timestamps (clock skew > 5min)"
+  },
+  {
+    "id": "edge-002",
+    "name": "Unknown fields (forward compatibility)",
+    "description": "Receipt with fields not in current spec version",
+    "category": "edge",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-008",
+      "agent_id": "agent:heidi",
+      "action_type": "delivery",
+      "merkle_root": "491ba5df693d61247691ffb76eb89ce78d03e59e7cbc3e8b7f7adf197f6caedd",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [
+        "7d10de8554ed5ca40f9d0f0e0f4375b5b338af3fb96d33c9b2f53b5289b8f4fe"
+      ],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "OrgB",
+          "infra_hash": "hash_b",
+          "timestamp": 1773705596,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_008",
+      "created_at": 1773701996,
+      "future_field_v2": "some_value",
+      "another_unknown": 42
+    },
+    "expected_valid": true,
+    "expected_errors": [],
+    "notes": "MUST accept unknown fields (Postel's Law for forward compat, RFC 9413 notwithstanding)"
+  },
+  {
+    "id": "edge-003",
+    "name": "Empty inclusion proof (root = leaf)",
+    "description": "Single-leaf tree where root IS the leaf hash",
+    "category": "edge",
+    "receipt": {
+      "version": "0.1.0",
+      "receipt_id": "r-test-009",
+      "agent_id": "agent:ivan",
+      "action_type": "attestation",
+      "merkle_root": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "leaf_hash": "28b317cd180b3710c7624d2a4b8884cd97cdf7a234747f2dbbc76e953b7e90c4",
+      "inclusion_proof": [],
+      "witnesses": [
+        {
+          "operator_id": "w1",
+          "operator_org": "OrgA",
+          "infra_hash": "hash_a",
+          "timestamp": 1773705596,
+          "signature": "sig1"
+        },
+        {
+          "operator_id": "w2",
+          "operator_org": "OrgB",
+          "infra_hash": "hash_b",
+          "timestamp": 1773705596,
+          "signature": "sig2"
+        }
+      ],
+      "diversity_hash": "div_009",
+      "created_at": 1773703796
+    },
+    "expected_valid": true,
+    "expected_errors": [],
+    "notes": "Empty proof = root IS leaf. Valid for single-entry trees."
+  }
+]
