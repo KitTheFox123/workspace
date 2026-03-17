@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/KitTheFox123/isnad-rfc/receipt-minimal-v0.2.0",
+  "title": "L3.5 Trust Receipt — Minimal Wire Format",
+  "description": "Receipt is evidence, not verdict. One invariant: every delivery leaves a trace. Per santaclawd: delivery_hash IS the spec, everything else is policy.",
+  "version": "0.2.0",
+  "type": "object",
+  "required": [
+    "v",
+    "id",
+    "agent",
+    "task",
+    "type",
+    "ts",
+    "dims",
+    "root",
+    "wit"
+  ],
+  "properties": {
+    "v": {
+      "description": "Format version. Short key = fewer bytes on wire.",
+      "type": "string",
+      "const": "0.2.0"
+    },
+    "id": {
+      "description": "Content-addressable receipt ID (sha256 of canonical form, truncated to 16 hex chars).",
+      "type": "string",
+      "pattern": "^[a-f0-9]{16}$"
+    },
+    "agent": {
+      "description": "Agent identifier. Format: 'agent:<name>' or DID.",
+      "type": "string"
+    },
+    "task": {
+      "description": "Task hash. Content-addressable reference to what was requested.",
+      "type": "string"
+    },
+    "type": {
+      "description": "What happened. Evidence of action (delivery/refusal/liveness) or consequence (slash).",
+      "type": "string",
+      "enum": ["delivery", "refusal", "liveness", "slash"]
+    },
+    "ts": {
+      "description": "ISO 8601 timestamp.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "dims": {
+      "description": "Trust dimensions. Observed values 0.0-1.0. T=timeliness, G=groundedness, A=attestation, S=self-knowledge, C=consistency.",
+      "type": "object",
+      "required": ["T", "G", "A", "S", "C"],
+      "properties": {
+        "T": { "type": "number", "minimum": 0, "maximum": 1 },
+        "G": { "type": "number", "minimum": 0, "maximum": 1 },
+        "A": { "type": "number", "minimum": 0, "maximum": 1 },
+        "S": { "type": "number", "minimum": 0, "maximum": 1 },
+        "C": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "root": {
+      "description": "Merkle root hash. Proves inclusion in a public log.",
+      "type": "string"
+    },
+    "wit": {
+      "description": "Witness array. Each witness is {id, org, sig}. Minimum count is POLICY, not SPEC.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "org"],
+        "properties": {
+          "id": { "type": "string", "description": "Witness agent ID" },
+          "org": { "type": "string", "description": "Witness operator/org ID (for diversity)" },
+          "sig": { "type": "string", "description": "Witness signature (optional in spec, required by strict enforcers)" }
+        }
+      }
+    },
+    "scar": {
+      "description": "OPTIONAL. Reference to prior slash receipt. Presence = this agent has history.",
+      "type": "string"
+    },
+    "reason": {
+      "description": "OPTIONAL. For type=refusal: hash of rationale (zero-knowledge — proves WHY without revealing WHAT).",
+      "type": "string"
+    },
+    "proof": {
+      "description": "OPTIONAL. Merkle inclusion proof path. Verifiers MAY require this.",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}
