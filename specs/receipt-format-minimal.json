@@ -1,10 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/KitTheFox123/isnad-rfc/receipt-minimal-v0.2.0",
-  "title": "L3.5 Trust Receipt — Minimal Wire Format",
+  "title": "L3.5 Trust Receipt \u2014 Minimal Wire Format",
   "description": "Receipt is evidence, not verdict. One invariant: every interaction leaves a content-addressable trace. Everything else is policy. (santaclawd + kit_fox, 2026-03-17)",
   "type": "object",
-  "required": ["version", "agent_id", "task_hash", "decision_type", "timestamp", "dimensions", "merkle_root", "witnesses"],
+  "required": [
+    "version",
+    "agent_id",
+    "task_hash",
+    "decision_type",
+    "timestamp",
+    "dimensions",
+    "merkle_root",
+    "witnesses"
+  ],
   "additionalProperties": false,
   "properties": {
     "version": {
@@ -23,7 +32,12 @@
     },
     "decision_type": {
       "type": "string",
-      "enum": ["delivery", "refusal", "liveness", "slash"],
+      "enum": [
+        "delivery",
+        "refusal",
+        "liveness",
+        "slash"
+      ],
       "description": "What happened. Facts only."
     },
     "timestamp": {
@@ -34,13 +48,44 @@
     "dimensions": {
       "type": "object",
       "description": "Observed measurements (0.0-1.0). Evidence, not scores.",
-      "required": ["T", "G", "A", "S", "C"],
+      "required": [
+        "T",
+        "G",
+        "A",
+        "S",
+        "C"
+      ],
       "properties": {
-        "T": { "type": "number", "minimum": 0, "maximum": 1, "description": "Timeliness" },
-        "G": { "type": "number", "minimum": 0, "maximum": 1, "description": "Groundedness" },
-        "A": { "type": "number", "minimum": 0, "maximum": 1, "description": "Attestation" },
-        "S": { "type": "number", "minimum": 0, "maximum": 1, "description": "Self-knowledge" },
-        "C": { "type": "number", "minimum": 0, "maximum": 1, "description": "Consistency" }
+        "T": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Timeliness"
+        },
+        "G": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Groundedness"
+        },
+        "A": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Attestation"
+        },
+        "S": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Self-knowledge"
+        },
+        "C": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Consistency"
+        }
       },
       "additionalProperties": false
     },
@@ -54,10 +99,18 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["agent_id", "operator_id"],
+        "required": [
+          "agent_id",
+          "operator_id"
+        ],
         "properties": {
-          "agent_id": { "type": "string" },
-          "operator_id": { "type": "string", "description": "Org running this witness. Diversity is system property, not format property." }
+          "agent_id": {
+            "type": "string"
+          },
+          "operator_id": {
+            "type": "string",
+            "description": "Org running this witness. Diversity is system property, not format property."
+          }
         },
         "additionalProperties": true
       },
@@ -73,8 +126,15 @@
     },
     "merkle_proof": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Optional. Inclusion proof path."
+    },
+    "sequence_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic per-agent sequence number. Replay = same sequence_id, different content. Window scope is POLICY (enforcer-layer). Per santaclawd ADV-020 gap."
     }
   }
 }
