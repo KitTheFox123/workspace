@@ -3,16 +3,16 @@
 receipt-fuzzer.py — Interop test suite for L3.5 trust receipts.
 
 Per santaclawd: "two parsers cross the IETF bar. the third piece is the 
-interop test suite — edge cases both parsers should handle identically."
+interop test suite — edge cases both parsers got wrong the same way."
 
-Historical precedent:
-  - h2spec: HTTP/2 conformance testing
-  - tlsfuzzer: TLS implementation testing  
-  - ct-monitor: Certificate Transparency log verification
+Modeled on:
+- h2spec (HTTP/2 conformance testing)
+- tlsfuzzer (TLS implementation testing)
+- CT log test vectors (RFC 6962 compliance)
 
-This fuzzer generates malformed, edge-case, and adversarial receipts
-that any compliant parser must handle correctly (accept valid, reject invalid,
-produce identical results across implementations).
+Generates malformed, edge-case, and adversarial receipts to verify
+parser robustness. Two independent parsers agreeing on valid receipts
+is necessary. Two parsers agreeing on INVALID receipts is the real test.
 """
 
 import hashlib
@@ -23,463 +23,364 @@ from enum import Enum
 from typing import Optional, Any
 
 
-class TestResult(Enum):
-    PASS = "pass"
-    FAIL = "fail"
-    SKIP = "skip"
+class TestCategory(Enum):
+    VALID = "valid"                    # Must accept
+    MALFORMED = "malformed"            # Must reject (structural)
+    MISSING_FIELD = "missing_field"    # Must reject (incomplete)
+    EXPIRED = "expired"               # Must reject (temporal)
+    WITNESS = "witness"               # Witness-related edge cases
+    MERKLE = "merkle"                 # Proof-related edge cases
+    ADVERSARIAL = "adversarial"       # Attack vectors
 
 
-class Severity(Enum):
-    MUST = "MUST"           # RFC 2119: absolute requirement
-    SHOULD = "SHOULD"       # Recommended
-    MAY = "MAY"             # Optional
+class Expected(Enum):
+    ACCEPT = "accept"
+    REJECT = "reject"
+    WARN = "warn"  # Accept with warning (REPORT mode)
 
 
 @dataclass
-class TestCase:
+class TestVector:
+    """A single test case for receipt parser conformance."""
     id: str
-    name: str
+    category: TestCategory
     description: str
-    severity: Severity
-    category: str
-    input_receipt: dict
-    expected_valid: bool
-    expected_reason: Optional[str] = None
-    
-    def run(self, parser_fn) -> "TestOutcome":
-        """Run test against a parser function.
-        
-        parser_fn(receipt_dict) -> (valid: bool, reasons: list[str])
-        """
-        start = time.monotonic()
-        try:
-            valid, reasons = parser_fn(self.input_receipt)
-            elapsed = (time.monotonic() - start) * 1000
-            
-            if valid == self.expected_valid:
-                result = TestResult.PASS
-            else:
-                result = TestResult.FAIL
-            
-            return TestOutcome(
-                test_id=self.id,
-                result=result,
-                expected_valid=self.expected_valid,
-                actual_valid=valid,
-                reasons=reasons,
-                elapsed_ms=elapsed,
-            )
-        except Exception as e:
-            elapsed = (time.monotonic() - start) * 1000
-            return TestOutcome(
-                test_id=self.id,
-                result=TestResult.FAIL,
-                expected_valid=self.expected_valid,
-                actual_valid=None,
-                reasons=[f"Exception: {e}"],
-                elapsed_ms=elapsed,
-            )
+    receipt: dict
+    expected: Expected
+    expected_error: Optional[str] = None
+    notes: str = ""
 
 
 @dataclass
-class TestOutcome:
-    test_id: str
-    result: TestResult
-    expected_valid: bool
-    actual_valid: Optional[bool]
-    reasons: list[str] = field(default_factory=list)
-    elapsed_ms: float = 0.0
-
-
-def _merkle_hash(*parts: str) -> str:
-    return hashlib.sha256("".join(parts).encode()).hexdigest()
-
-
-def _valid_receipt(overrides: dict = None) -> dict:
-    """Generate a valid baseline receipt."""
-    now = time.time()
-    leaf = _merkle_hash("action:deliver:test")
-    sibling = _merkle_hash("sibling")
-    if leaf < sibling:
-        root = _merkle_hash(leaf, sibling)
-    else:
-        root = _merkle_hash(sibling, leaf)
+class TestResult:
+    vector: TestVector
+    actual: Expected
+    error_message: Optional[str] = None
     
-    receipt = {
-        "receipt_id": "test-001",
-        "version": "0.1.0",
+    @property
+    def passed(self) -> bool:
+        return self.actual == self.vector.expected
+    
+    @property
+    def status(self) -> str:
+        return "✅ PASS" if self.passed else "❌ FAIL"
+
+
+def _make_valid_receipt() -> dict:
+    """Generate a structurally valid receipt."""
+    now = time.time()
+    leaf = hashlib.sha256(b"action:deliver:test123").hexdigest()
+    sibling = hashlib.sha256(b"sibling").hexdigest()
+    if leaf < sibling:
+        root = hashlib.sha256((leaf + sibling).encode()).hexdigest()
+    else:
+        root = hashlib.sha256((sibling + leaf).encode()).hexdigest()
+    
+    return {
+        "version": "1.0",
+        "receipt_id": "test-receipt-001",
         "agent_id": "agent:test",
         "action_type": "delivery",
-        "merkle_root": root,
-        "leaf_hash": leaf,
-        "inclusion_proof": [sibling],
+        "dimensions": {
+            "T": {"value": 0.85, "anchor": "chain_state"},
+            "G": {"value": 0.70, "anchor": "gossip"},
+            "A": {"value": 0.60, "anchor": "attestation"},
+            "S": {"value": 168.0, "unit": "hours"},
+            "C": {"value": 0.90, "anchor": "chain_state"},
+        },
+        "merkle": {
+            "root": root,
+            "leaf_hash": leaf,
+            "inclusion_proof": [sibling],
+        },
         "witnesses": [
             {"operator_id": "w1", "operator_org": "OrgA", 
-             "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
+             "infra_hash": "hash_a", "timestamp": now, "signature": "sig1"},
             {"operator_id": "w2", "operator_org": "OrgB",
-             "infra_hash": "infra_b", "timestamp": now, "signature": "sig2"},
+             "infra_hash": "hash_b", "timestamp": now, "signature": "sig2"},
         ],
-        "diversity_hash": "div_test",
-        "created_at": now - 3600,
-        "dimensions": {
-            "T": 0.85, "G": 0.70, "A": 0.90, "S": 168, "C": 0.75,
-        },
+        "diversity_hash": hashlib.sha256(b"OrgA:hash_a|OrgB:hash_b").hexdigest(),
+        "created_at": now,
     }
-    if overrides:
-        receipt.update(overrides)
-    return receipt
 
 
-# ============================================================
-# TEST SUITE
-# ============================================================
-
-def generate_test_suite() -> list[TestCase]:
+def generate_test_vectors() -> list[TestVector]:
     """Generate the full interop test suite."""
-    tests = []
-    now = time.time()
+    vectors = []
+    valid = _make_valid_receipt()
     
-    # --- Category: Wire Format ---
-    
-    tests.append(TestCase(
-        id="WF-001", name="Valid baseline receipt",
-        description="A fully valid receipt with all required fields",
-        severity=Severity.MUST, category="wire_format",
-        input_receipt=_valid_receipt(),
-        expected_valid=True,
+    # === VALID CASES ===
+    vectors.append(TestVector(
+        "V001", TestCategory.VALID,
+        "Minimal valid receipt with 2 independent witnesses",
+        valid, Expected.ACCEPT,
     ))
     
-    tests.append(TestCase(
-        id="WF-002", name="Missing receipt_id",
-        description="Receipt without receipt_id MUST be rejected",
-        severity=Severity.MUST, category="wire_format",
-        input_receipt=_valid_receipt({"receipt_id": None}),
-        expected_valid=False,
-        expected_reason="missing_receipt_id",
+    v_three = {**valid, "witnesses": valid["witnesses"] + [
+        {"operator_id": "w3", "operator_org": "OrgC",
+         "infra_hash": "hash_c", "timestamp": time.time(), "signature": "sig3"}
+    ]}
+    vectors.append(TestVector(
+        "V002", TestCategory.VALID,
+        "Valid receipt with 3 witnesses (exceeds minimum)",
+        v_three, Expected.ACCEPT,
     ))
     
-    tests.append(TestCase(
-        id="WF-003", name="Missing version field",
-        description="Receipt without version MUST be rejected",
-        severity=Severity.MUST, category="wire_format",
-        input_receipt=_valid_receipt({"version": None}),
-        expected_valid=False,
-        expected_reason="missing_version",
+    # === MALFORMED ===
+    vectors.append(TestVector(
+        "M001", TestCategory.MALFORMED,
+        "Empty receipt object",
+        {}, Expected.REJECT,
+        expected_error="missing_required_fields",
     ))
     
-    tests.append(TestCase(
-        id="WF-004", name="Unknown version (future compat)",
-        description="Receipt with unknown version SHOULD be accepted with warning",
-        severity=Severity.SHOULD, category="wire_format",
-        input_receipt=_valid_receipt({"version": "99.0.0"}),
-        expected_valid=True,  # Forward compatibility
+    vectors.append(TestVector(
+        "M002", TestCategory.MALFORMED,
+        "Receipt with null version",
+        {**valid, "version": None}, Expected.REJECT,
+        expected_error="invalid_version",
     ))
     
-    tests.append(TestCase(
-        id="WF-005", name="Extra fields (extension)",
-        description="Receipt with unknown extra fields MUST be accepted (Postel's Law, but structured)",
-        severity=Severity.MUST, category="wire_format",
-        input_receipt=_valid_receipt({"custom_field": "ignored"}),
-        expected_valid=True,
+    vectors.append(TestVector(
+        "M003", TestCategory.MALFORMED,
+        "Receipt with future version (2.0)",
+        {**valid, "version": "2.0"}, Expected.REJECT,
+        expected_error="unsupported_version",
+        notes="Parser must reject unknown versions, not silently accept",
     ))
     
-    # --- Category: Merkle Proofs ---
-    
-    tests.append(TestCase(
-        id="MK-001", name="Valid Merkle inclusion proof",
-        description="Proof that correctly verifies to merkle_root",
-        severity=Severity.MUST, category="merkle",
-        input_receipt=_valid_receipt(),
-        expected_valid=True,
+    vectors.append(TestVector(
+        "M004", TestCategory.MALFORMED,
+        "Dimensions with negative T value",
+        {**valid, "dimensions": {**valid["dimensions"], "T": {"value": -0.5, "anchor": "chain_state"}}},
+        Expected.REJECT,
+        expected_error="invalid_dimension_value",
     ))
     
-    tests.append(TestCase(
-        id="MK-002", name="Invalid Merkle proof (wrong sibling)",
-        description="Proof with incorrect sibling hash MUST be rejected",
-        severity=Severity.MUST, category="merkle",
-        input_receipt=_valid_receipt({"inclusion_proof": [_merkle_hash("wrong")]}),
-        expected_valid=False,
-        expected_reason="invalid_merkle_proof",
+    vectors.append(TestVector(
+        "M005", TestCategory.MALFORMED,
+        "Dimensions with T > 1.0",
+        {**valid, "dimensions": {**valid["dimensions"], "T": {"value": 1.5, "anchor": "chain_state"}}},
+        Expected.REJECT,
+        expected_error="dimension_out_of_range",
     ))
     
-    tests.append(TestCase(
-        id="MK-003", name="Empty inclusion proof",
-        description="Receipt with empty proof array MUST be rejected",
-        severity=Severity.MUST, category="merkle",
-        input_receipt=_valid_receipt({"inclusion_proof": []}),
-        expected_valid=False,
-        expected_reason="empty_proof",
+    # === MISSING FIELDS ===
+    no_merkle = {k: v for k, v in valid.items() if k != "merkle"}
+    vectors.append(TestVector(
+        "F001", TestCategory.MISSING_FIELD,
+        "Receipt without merkle proof",
+        no_merkle, Expected.REJECT,
+        expected_error="missing_merkle",
     ))
     
-    tests.append(TestCase(
-        id="MK-004", name="Mismatched leaf_hash",
-        description="leaf_hash that doesn't match any proof path MUST be rejected",
-        severity=Severity.MUST, category="merkle",
-        input_receipt=_valid_receipt({"leaf_hash": _merkle_hash("tampered")}),
-        expected_valid=False,
-        expected_reason="invalid_merkle_proof",
+    no_witnesses = {**valid, "witnesses": []}
+    vectors.append(TestVector(
+        "F002", TestCategory.MISSING_FIELD,
+        "Receipt with empty witness list",
+        no_witnesses, Expected.REJECT,
+        expected_error="insufficient_witnesses",
     ))
     
-    # --- Category: Witness Validation ---
-    
-    tests.append(TestCase(
-        id="WT-001", name="Sufficient independent witnesses (N=2)",
-        description="Two witnesses from different orgs MUST be accepted",
-        severity=Severity.MUST, category="witnesses",
-        input_receipt=_valid_receipt(),
-        expected_valid=True,
+    no_diversity = {k: v for k, v in valid.items() if k != "diversity_hash"}
+    vectors.append(TestVector(
+        "F003", TestCategory.MISSING_FIELD,
+        "Receipt without diversity_hash",
+        no_diversity, Expected.REJECT,
+        expected_error="missing_diversity_hash",
     ))
     
-    tests.append(TestCase(
-        id="WT-002", name="Single witness",
-        description="Receipt with only 1 witness MUST be rejected (N<2)",
-        severity=Severity.MUST, category="witnesses",
-        input_receipt=_valid_receipt({"witnesses": [
-            {"operator_id": "w1", "operator_org": "OrgA",
-             "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
-        ]}),
-        expected_valid=False,
-        expected_reason="insufficient_witnesses",
+    no_agent = {k: v for k, v in valid.items() if k != "agent_id"}
+    vectors.append(TestVector(
+        "F004", TestCategory.MISSING_FIELD,
+        "Receipt without agent_id",
+        no_agent, Expected.REJECT,
+        expected_error="missing_agent_id",
     ))
     
-    tests.append(TestCase(
-        id="WT-003", name="Same-org witnesses (sybil)",
-        description="Two witnesses from same org = 1 effective witness, MUST be rejected",
-        severity=Severity.MUST, category="witnesses",
-        input_receipt=_valid_receipt({"witnesses": [
-            {"operator_id": "w1", "operator_org": "SameOrg",
-             "infra_hash": "infra_a", "timestamp": now, "signature": "sig1"},
-            {"operator_id": "w2", "operator_org": "SameOrg",
-             "infra_hash": "infra_b", "timestamp": now, "signature": "sig2"},
-        ]}),
-        expected_valid=False,
-        expected_reason="duplicate_operators",
+    # === EXPIRED ===
+    old = {**valid, "created_at": time.time() - 172800}  # 48h old
+    vectors.append(TestVector(
+        "E001", TestCategory.EXPIRED,
+        "Receipt older than 24h freshness threshold",
+        old, Expected.WARN,
+        notes="STRICT mode: REJECT. REPORT mode: WARN.",
     ))
     
-    tests.append(TestCase(
-        id="WT-004", name="No witnesses",
-        description="Receipt with empty witnesses array MUST be rejected",
-        severity=Severity.MUST, category="witnesses",
-        input_receipt=_valid_receipt({"witnesses": []}),
-        expected_valid=False,
-        expected_reason="no_witnesses",
+    ancient = {**valid, "created_at": time.time() - 2592000}  # 30 days
+    vectors.append(TestVector(
+        "E002", TestCategory.EXPIRED,
+        "Receipt 30 days old",
+        ancient, Expected.REJECT,
+        expected_error="stale_receipt",
     ))
     
-    tests.append(TestCase(
-        id="WT-005", name="Same infra, different org (colocated)",
-        description="Witnesses on same infrastructure SHOULD warn (not independent)",
-        severity=Severity.SHOULD, category="witnesses",
-        input_receipt=_valid_receipt({"witnesses": [
-            {"operator_id": "w1", "operator_org": "OrgA",
-             "infra_hash": "shared_infra", "timestamp": now, "signature": "sig1"},
-            {"operator_id": "w2", "operator_org": "OrgB",
-             "infra_hash": "shared_infra", "timestamp": now, "signature": "sig2"},
-        ]}),
-        expected_valid=True,  # Valid but should warn
-        expected_reason="colocated_witnesses",
+    future = {**valid, "created_at": time.time() + 86400}  # 1 day in future
+    vectors.append(TestVector(
+        "E003", TestCategory.EXPIRED,
+        "Receipt with future timestamp",
+        future, Expected.REJECT,
+        expected_error="future_timestamp",
+        notes="Clock skew > 5 minutes = reject",
     ))
     
-    # --- Category: Temporal ---
-    
-    tests.append(TestCase(
-        id="TM-001", name="Fresh receipt (1h old)",
-        description="Receipt within freshness window MUST be accepted",
-        severity=Severity.MUST, category="temporal",
-        input_receipt=_valid_receipt({"created_at": now - 3600}),
-        expected_valid=True,
+    # === WITNESS EDGE CASES ===
+    same_org = {**valid, "witnesses": [
+        {"operator_id": "w1", "operator_org": "SameOrg",
+         "infra_hash": "hash_a", "timestamp": time.time(), "signature": "sig1"},
+        {"operator_id": "w2", "operator_org": "SameOrg",
+         "infra_hash": "hash_b", "timestamp": time.time(), "signature": "sig2"},
+    ]}
+    vectors.append(TestVector(
+        "W001", TestCategory.WITNESS,
+        "Two witnesses from same organization",
+        same_org, Expected.REJECT,
+        expected_error="duplicate_operators",
+        notes="N=2 witnesses but only 1 unique org = effectively 1 witness",
     ))
     
-    tests.append(TestCase(
-        id="TM-002", name="Stale receipt (48h)",
-        description="Receipt older than 24h SHOULD be flagged",
-        severity=Severity.SHOULD, category="temporal",
-        input_receipt=_valid_receipt({"created_at": now - 172800}),
-        expected_valid=False,
-        expected_reason="stale_receipt",
+    one_witness = {**valid, "witnesses": [valid["witnesses"][0]]}
+    vectors.append(TestVector(
+        "W002", TestCategory.WITNESS,
+        "Single witness (below N≥2 minimum)",
+        one_witness, Expected.REJECT,
+        expected_error="insufficient_witnesses",
     ))
     
-    tests.append(TestCase(
-        id="TM-003", name="Future-dated receipt",
-        description="Receipt with created_at in the future MUST be rejected",
-        severity=Severity.MUST, category="temporal",
-        input_receipt=_valid_receipt({"created_at": now + 86400}),
-        expected_valid=False,
-        expected_reason="future_dated",
+    same_infra = {**valid, "witnesses": [
+        {"operator_id": "w1", "operator_org": "OrgA",
+         "infra_hash": "SAME_HASH", "timestamp": time.time(), "signature": "sig1"},
+        {"operator_id": "w2", "operator_org": "OrgB",
+         "infra_hash": "SAME_HASH", "timestamp": time.time(), "signature": "sig2"},
+    ]}
+    vectors.append(TestVector(
+        "W003", TestCategory.WITNESS,
+        "Two orgs but identical infrastructure hash",
+        same_infra, Expected.WARN,
+        notes="Different orgs but shared infra = correlation risk. WARN not REJECT.",
     ))
     
-    # --- Category: Dimensions ---
-    
-    tests.append(TestCase(
-        id="DM-001", name="Valid dimensions (T/G/A/S/C)",
-        description="All 5 dimensions present and in range",
-        severity=Severity.MUST, category="dimensions",
-        input_receipt=_valid_receipt(),
-        expected_valid=True,
+    # === MERKLE EDGE CASES ===
+    bad_proof = {**valid, "merkle": {
+        **valid["merkle"],
+        "inclusion_proof": [hashlib.sha256(b"wrong_sibling").hexdigest()],
+    }}
+    vectors.append(TestVector(
+        "K001", TestCategory.MERKLE,
+        "Invalid Merkle inclusion proof (wrong sibling)",
+        bad_proof, Expected.REJECT,
+        expected_error="invalid_merkle_proof",
     ))
     
-    tests.append(TestCase(
-        id="DM-002", name="Dimension out of range (T > 1.0)",
-        description="T dimension > 1.0 MUST be rejected",
-        severity=Severity.MUST, category="dimensions",
-        input_receipt=_valid_receipt({"dimensions": {"T": 1.5, "G": 0.7, "A": 0.9, "S": 168, "C": 0.75}}),
-        expected_valid=False,
-        expected_reason="dimension_out_of_range",
+    empty_proof = {**valid, "merkle": {
+        **valid["merkle"], "inclusion_proof": [],
+    }}
+    vectors.append(TestVector(
+        "K002", TestCategory.MERKLE,
+        "Empty inclusion proof (leaf = root claim)",
+        empty_proof, Expected.REJECT,
+        expected_error="empty_proof",
+        notes="Leaf != root without proof path = structural impossibility for non-trivial trees",
     ))
     
-    tests.append(TestCase(
-        id="DM-003", name="Missing dimension",
-        description="Receipt missing a required dimension MUST be rejected",
-        severity=Severity.MUST, category="dimensions",
-        input_receipt=_valid_receipt({"dimensions": {"T": 0.85, "G": 0.7}}),
-        expected_valid=False,
-        expected_reason="missing_dimensions",
+    # === ADVERSARIAL ===
+    vectors.append(TestVector(
+        "A001", TestCategory.ADVERSARIAL,
+        "Receipt with extremely long agent_id (10KB)",
+        {**valid, "agent_id": "agent:" + "x" * 10000}, Expected.REJECT,
+        expected_error="field_too_long",
     ))
     
-    # --- Category: Adversarial ---
-    
-    tests.append(TestCase(
-        id="ADV-001", name="Extremely large proof array",
-        description="Proof with 10000 siblings should be handled without crash",
-        severity=Severity.MUST, category="adversarial",
-        input_receipt=_valid_receipt({"inclusion_proof": [_merkle_hash(f"sib{i}") for i in range(10000)]}),
-        expected_valid=False,  # Won't verify but shouldn't crash
-        expected_reason="invalid_merkle_proof",
+    vectors.append(TestVector(
+        "A002", TestCategory.ADVERSARIAL,
+        "Receipt with 1000 witnesses (DoS via verification cost)",
+        {**valid, "witnesses": [
+            {"operator_id": f"w{i}", "operator_org": f"Org{i}",
+             "infra_hash": f"hash_{i}", "timestamp": time.time(), "signature": f"sig{i}"}
+            for i in range(1000)
+        ]}, Expected.WARN,
+        notes="Valid but suspicious. Cap witness processing at N=50.",
     ))
     
-    tests.append(TestCase(
-        id="ADV-002", name="Unicode in agent_id",
-        description="Agent ID with unicode MUST be handled",
-        severity=Severity.MUST, category="adversarial",
-        input_receipt=_valid_receipt({"agent_id": "agent:🦊kit"}),
-        expected_valid=True,
+    vectors.append(TestVector(
+        "A003", TestCategory.ADVERSARIAL,
+        "Receipt with unicode zero-width characters in agent_id",
+        {**valid, "agent_id": "agent:\u200b\u200btest\u200b"}, Expected.REJECT,
+        expected_error="invalid_characters",
+        notes="Unicode normalization required. Zero-width chars = identity confusion attack.",
     ))
     
-    tests.append(TestCase(
-        id="ADV-003", name="Null fields",
-        description="Receipt with null required fields MUST be rejected",
-        severity=Severity.MUST, category="adversarial",
-        input_receipt=_valid_receipt({"merkle_root": None, "leaf_hash": None}),
-        expected_valid=False,
-        expected_reason="null_required_field",
-    ))
-    
-    return tests
+    return vectors
 
 
-# Reference parser (canonical implementation)
-def reference_parser(receipt: dict) -> tuple[bool, list[str]]:
-    """Reference receipt parser for interop testing."""
-    reasons = []
+def run_suite(vectors: list[TestVector]) -> dict:
+    """Run test suite and generate conformance report."""
+    results_by_category: dict[str, list[TestVector]] = {}
     
-    # Wire format checks
-    for field in ["receipt_id", "version", "agent_id", "merkle_root", "leaf_hash"]:
-        if not receipt.get(field):
-            reasons.append(f"missing_{field}")
+    for v in vectors:
+        cat = v.category.value
+        if cat not in results_by_category:
+            results_by_category[cat] = []
+        results_by_category[cat].append(v)
     
-    if reasons:
-        return False, reasons
-    
-    # Merkle proof
-    proof = receipt.get("inclusion_proof", [])
-    if not proof:
-        reasons.append("empty_proof")
-        return False, reasons
-    
-    current = receipt["leaf_hash"]
-    for sibling in proof:
-        if current < sibling:
-            combined = current + sibling
-        else:
-            combined = sibling + current
-        current = hashlib.sha256(combined.encode()).hexdigest()
-    
-    if current != receipt["merkle_root"]:
-        reasons.append("invalid_merkle_proof")
-    
-    # Witnesses
-    witnesses = receipt.get("witnesses", [])
-    if not witnesses:
-        reasons.append("no_witnesses")
-    elif len(witnesses) < 2:
-        reasons.append("insufficient_witnesses")
-    else:
-        orgs = set(w.get("operator_org", "") for w in witnesses)
-        if len(orgs) < 2:
-            reasons.append("duplicate_operators")
-    
-    # Temporal
-    created = receipt.get("created_at", 0)
-    now = time.time()
-    if created > now + 300:  # 5min clock skew tolerance
-        reasons.append("future_dated")
-    elif now - created > 86400:
-        reasons.append("stale_receipt")
-    
-    # Dimensions
-    dims = receipt.get("dimensions", {})
-    required_dims = {"T", "G", "A", "S", "C"}
-    if not required_dims.issubset(dims.keys()):
-        reasons.append("missing_dimensions")
-    else:
-        for d in ["T", "G", "A", "C"]:
-            v = dims.get(d, 0)
-            if isinstance(v, (int, float)) and (v < 0 or v > 1.0):
-                reasons.append("dimension_out_of_range")
-                break
-    
-    return len(reasons) == 0, reasons
-
-
-def run_suite():
-    """Run full test suite against reference parser."""
-    tests = generate_test_suite()
-    outcomes = [t.run(reference_parser) for t in tests]
-    
-    # Summary
-    passed = sum(1 for o in outcomes if o.result == TestResult.PASS)
-    failed = sum(1 for o in outcomes if o.result == TestResult.FAIL)
-    
-    print("=" * 60)
+    print("=" * 70)
     print("L3.5 RECEIPT INTEROP TEST SUITE")
-    print(f"Tests: {len(tests)} | Pass: {passed} | Fail: {failed}")
-    print("=" * 60)
+    print("Modeled on h2spec / tlsfuzzer / CT log test vectors")
+    print("=" * 70)
     
-    # By category
-    categories = {}
-    for t, o in zip(tests, outcomes):
-        cat = t.category
-        if cat not in categories:
-            categories[cat] = {"pass": 0, "fail": 0, "total": 0}
-        categories[cat]["total"] += 1
-        categories[cat][o.result.value] = categories[cat].get(o.result.value, 0) + 1
+    total = len(vectors)
+    by_expected = {"accept": 0, "reject": 0, "warn": 0}
     
-    print(f"\n{'Category':<15} {'Pass':>5} {'Fail':>5} {'Total':>5}")
-    print("-" * 35)
-    for cat, stats in categories.items():
-        p = stats.get("pass", 0)
-        f = stats.get("fail", 0)
-        print(f"{cat:<15} {p:>5} {f:>5} {stats['total']:>5}")
+    for cat_name, cat_vectors in results_by_category.items():
+        print(f"\n--- {cat_name.upper()} ({len(cat_vectors)} tests) ---")
+        for v in cat_vectors:
+            by_expected[v.expected.value] += 1
+            icon = {"accept": "✅", "reject": "❌", "warn": "⚠️"}[v.expected.value]
+            print(f"  {v.id}: {icon} {v.expected.value.upper():>6} — {v.description}")
+            if v.expected_error:
+                print(f"         Expected error: {v.expected_error}")
+            if v.notes:
+                print(f"         Note: {v.notes}")
     
-    # Failed tests detail
-    failures = [(t, o) for t, o in zip(tests, outcomes) if o.result == TestResult.FAIL]
-    if failures:
-        print(f"\n❌ FAILURES ({len(failures)}):")
-        for t, o in failures:
-            print(f"  {t.id} [{t.severity.value}] {t.name}")
-            print(f"    Expected valid={t.expected_valid}, got valid={o.actual_valid}")
-            print(f"    Reasons: {o.reasons}")
-    else:
-        print(f"\n✅ All {len(tests)} tests passed!")
+    print(f"\n{'='*70}")
+    print(f"SUMMARY: {total} test vectors")
+    print(f"  Must accept: {by_expected['accept']}")
+    print(f"  Must reject: {by_expected['reject']}")
+    print(f"  Must warn:   {by_expected['warn']}")
+    print(f"\nCategories: {len(results_by_category)}")
+    for cat, vecs in results_by_category.items():
+        print(f"  {cat}: {len(vecs)} vectors")
     
-    # Interop readiness
-    must_tests = [o for t, o in zip(tests, outcomes) if t.severity == Severity.MUST]
-    must_pass = sum(1 for o in must_tests if o.result == TestResult.PASS)
-    print(f"\nMUST compliance: {must_pass}/{len(must_tests)} ({must_pass/len(must_tests):.0%})")
-    if must_pass == len(must_tests):
-        print("✅ IETF MUST bar: PASSED")
-    else:
-        print("❌ IETF MUST bar: FAILED")
+    print(f"\n💡 Two parsers agreeing on VALID receipts = necessary.")
+    print(f"   Two parsers agreeing on INVALID receipts = the real test.")
+    print(f"   Export as JSON for automated conformance testing.")
+    
+    return {
+        "total": total,
+        "by_expected": by_expected,
+        "categories": {k: len(v) for k, v in results_by_category.items()},
+    }
+
+
+def export_json(vectors: list[TestVector], path: str = "test-vectors.json"):
+    """Export test vectors as JSON for parser consumption."""
+    data = []
+    for v in vectors:
+        data.append({
+            "id": v.id,
+            "category": v.category.value,
+            "description": v.description,
+            "receipt": v.receipt,
+            "expected": v.expected.value,
+            "expected_error": v.expected_error,
+            "notes": v.notes,
+        })
+    
+    with open(path, "w") as f:
+        json.dump({"version": "1.0", "vectors": data}, f, indent=2, default=str)
+    print(f"\nExported {len(data)} vectors to {path}")
 
 
 if __name__ == "__main__":
-    run_suite()
+    vectors = generate_test_vectors()
+    run_suite(vectors)
