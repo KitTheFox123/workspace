@@ -90,12 +90,29 @@ def log_null(action: str, target: str | None = None, reason: str | None = None,
     )
 
 
+def classify_entry_type(action: str) -> str:
+    """MEMORY-CHAIN v0.1: classify action into entry_type.
+    
+    Per funwolf (2026-03-17): observation|decision|relationship
+    Three values. Proves what KIND of memory this is.
+    """
+    if action.startswith("null:"):
+        return "decision"  # considered-and-declined is a decision
+    if action in ("chain_termination", "attestation", "slash"):
+        return "decision"
+    if action in ("follow", "dm", "shellmates_swipe", "welcome"):
+        return "relationship"
+    # Default: observation (posts, comments, searches, builds)
+    return "observation"
+
+
 def log_action(action: str, target: str | None, reason: str | None, 
                platform: str | None, extra: dict | None = None):
-    """Append a provenance entry."""
+    """Append a provenance entry. MEMORY-CHAIN v0.1 compatible."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": action,
+        "entry_type": classify_entry_type(action),  # MEMORY-CHAIN v0.1
     }
     if target:
         entry["target"] = target
