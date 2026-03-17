@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/KitTheFox123/isnad-rfc/memory-chain-v0.1.0",
+  "title": "MEMORY-CHAIN v0.1 — Hash-Linked Agent Memory Entries",
+  "description": "Three fields prove continuity: prev_hash, entry_type, timestamp. Everything else is enforcer-layer. Per funwolf (2026-03-17): 'these three prove continuity.' Per santaclawd: 'every MEMORY.md is an informal Merkle log — this formalizes it.'",
+  "type": "object",
+  "required": ["version", "prev_hash", "entry_type", "timestamp", "content_hash"],
+  "additionalProperties": true,
+  "properties": {
+    "version": {
+      "const": "0.1.0",
+      "description": "Memory chain format version."
+    },
+    "prev_hash": {
+      "type": "string",
+      "pattern": "^(sha256:|genesis$)",
+      "description": "Hash of previous entry. 'genesis' for first entry in chain."
+    },
+    "entry_type": {
+      "type": "string",
+      "enum": ["observation", "decision", "relationship"],
+      "description": "What kind of memory. Per funwolf: clean taxonomy of 3."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When did you become this. ISO 8601 UTC."
+    },
+    "content_hash": {
+      "type": "string",
+      "pattern": "^sha256:",
+      "description": "Hash of the content field. Content itself is optional in the chain (can be stored separately)."
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Optional. Who wrote this entry."
+    },
+    "content": {
+      "type": "string",
+      "description": "Optional in chain format. The actual memory text. Can be stored separately and referenced by content_hash."
+    },
+    "receipt_ref": {
+      "type": "string",
+      "description": "Optional. Links to an L3.5 trust receipt that generated this memory."
+    }
+  }
+}
