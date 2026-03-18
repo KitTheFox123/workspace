@@ -1,201 +1,130 @@
 #!/usr/bin/env python3
 """
-witness-independence-validator.py — Validates CT-style witness independence for L3.5.
+witness-independence-validator.py — Enforce witness independence per spec
+Per santaclawd: "two witnesses from the same operator = manufactured corroboration"
+CT model: Google required ≥2 independent logs per certificate.
 
-Per santaclawd (2026-03-15): "if N=3 but all 3 are run by the same org = trust theater."
-
-Chrome CT Policy requires SCTs from 2-3 independent logs.
-Independence = different operators, different jurisdictions, no shared key material.
-
-Applied to L3.5: slash/attest entries need N≥2 witnesses from distinct operator_id.
+MUST: witness_org field present
+SHOULD: witnesses from ≥2 distinct orgs  
+MAY: verifier raises threshold
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
-
-
-class IndependenceLevel(Enum):
-    INDEPENDENT = "independent"      # Different org, different infra
-    AFFILIATED = "affiliated"        # Same parent org, different infra
-    COLLOCATED = "collocated"        # Different org, shared infra
-    DEPENDENT = "dependent"          # Same org, same infra = 1 witness
-
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 @dataclass
-class WitnessOperator:
-    operator_id: str
-    org_id: str
-    jurisdiction: str
-    infra_provider: str | None = None  # AWS, GCP, self-hosted, etc.
-    public_key_fingerprint: str = ""
+class Witness:
+    id: str
+    org: str
+    timestamp: datetime
 
-    def independence_from(self, other: 'WitnessOperator') -> IndependenceLevel:
-        """Determine independence level between two operators."""
-        if self.org_id == other.org_id:
-            return IndependenceLevel.DEPENDENT
-        if self.infra_provider and self.infra_provider == other.infra_provider:
-            return IndependenceLevel.COLLOCATED
-        if self.jurisdiction == other.jurisdiction:
-            return IndependenceLevel.AFFILIATED
-        return IndependenceLevel.INDEPENDENT
+@dataclass  
+class Receipt:
+    agent: str
+    action: str
+    witnesses: list
+    trust_anchor: str
 
+class IndependenceResult:
+    def __init__(self, receipt: Receipt):
+        self.receipt = receipt
+        self.flags = []
+        self.independent = True
+        self.org_count = 0
+        self.temporal_burst = False
+    
+    def __repr__(self):
+        status = "✅ INDEPENDENT" if self.independent else "🚨 DEPENDENT"
+        return f"{status} ({self.receipt.agent}): {'; '.join(self.flags)}"
 
-@dataclass
-class WitnessSet:
-    witnesses: list[WitnessOperator]
-    required_independent: int = 2  # Chrome CT: 2-3
+def validate_independence(receipt: Receipt, burst_window_seconds: int = 5) -> IndependenceResult:
+    result = IndependenceResult(receipt)
+    
+    if not receipt.witnesses:
+        result.flags.append("NO_WITNESSES: self-attested only")
+        result.independent = False
+        result.org_count = 0
+        return result
+    
+    # Check org diversity
+    orgs = set(w.org for w in receipt.witnesses)
+    result.org_count = len(orgs)
+    
+    if len(orgs) < 2 and len(receipt.witnesses) >= 2:
+        result.flags.append(f"SAME_ORG: {len(receipt.witnesses)} witnesses, all from {list(orgs)[0]}")
+        result.independent = False
+    elif len(orgs) >= 2:
+        result.flags.append(f"ORG_DIVERSE: {len(orgs)} distinct orgs")
+    
+    # Check temporal clustering (burst detection)
+    if len(receipt.witnesses) >= 2:
+        timestamps = sorted(w.timestamp for w in receipt.witnesses)
+        for i in range(len(timestamps) - 1):
+            delta = (timestamps[i+1] - timestamps[i]).total_seconds()
+            if delta < burst_window_seconds:
+                result.temporal_burst = True
+                result.flags.append(f"TEMPORAL_BURST: {delta:.1f}s between attestations")
+                if len(orgs) < 2:
+                    result.independent = False
+                break
+    
+    # Missing org field
+    for w in receipt.witnesses:
+        if not w.org:
+            result.flags.append(f"MISSING_ORG: witness {w.id} has no org field")
+            result.independent = False
+    
+    if result.independent and len(receipt.witnesses) >= 2:
+        result.flags.append("SPEC_COMPLIANT: ≥2 independent witnesses")
+    
+    return result
 
-    def validate(self) -> dict:
-        """Validate witness set independence."""
-        n = len(self.witnesses)
-        if n < self.required_independent:
-            return {
-                "valid": False,
-                "grade": "F",
-                "reason": f"Need {self.required_independent} witnesses, have {n}",
-                "total_witnesses": n,
-                "independent_count": 0,
-                "effective_witnesses": 0,
-                "independent_pairs": 0,
-                "total_pairs": 0,
-                "trust_theater": [],
-                "issues": [],
-            }
+# Test cases
+now = datetime.now()
 
-        # Count truly independent witnesses
-        # Group by org_id — same org = 1 effective witness
-        org_groups: dict[str, list[WitnessOperator]] = {}
-        for w in self.witnesses:
-            org_groups.setdefault(w.org_id, []).append(w)
+tests = [
+    Receipt("honest_agent", "delivered report", [
+        Witness("w1", "org_alpha", now),
+        Witness("w2", "org_beta", now + timedelta(minutes=5)),
+        Witness("w3", "org_gamma", now + timedelta(minutes=12)),
+    ], "witness_set"),
+    
+    Receipt("sybil_agent", "suspicious task", [
+        Witness("w1", "shady_corp", now),
+        Witness("w2", "shady_corp", now + timedelta(seconds=2)),
+    ], "witness_set"),
+    
+    Receipt("partial_agent", "code review", [
+        Witness("w1", "org_alpha", now),
+    ], "witness_set"),
+    
+    Receipt("no_org_agent", "data transfer", [
+        Witness("w1", "", now),
+        Witness("w2", "org_beta", now + timedelta(minutes=3)),
+    ], "witness_set"),
+    
+    Receipt("self_only", "internal task", [], "self_attested"),
+    
+    Receipt("burst_diverse", "fast but legit", [
+        Witness("w1", "org_alpha", now),
+        Witness("w2", "org_beta", now + timedelta(seconds=1)),
+    ], "witness_set"),
+]
 
-        effective = len(org_groups)
+print("=" * 60)
+print("Witness Independence Validator")
+print("CT model: ≥2 independent logs per certificate")
+print("=" * 60)
 
-        # Check pairwise independence
-        independent_pairs = 0
-        total_pairs = 0
-        issues = []
+for receipt in tests:
+    result = validate_independence(receipt)
+    print(f"\n  {result}")
+    print(f"    Witnesses: {len(receipt.witnesses)} | Orgs: {result.org_count} | Burst: {result.temporal_burst}")
 
-        orgs = list(org_groups.keys())
-        for i in range(len(orgs)):
-            for j in range(i + 1, len(orgs)):
-                w1 = org_groups[orgs[i]][0]
-                w2 = org_groups[orgs[j]][0]
-                level = w1.independence_from(w2)
-                total_pairs += 1
-                if level == IndependenceLevel.INDEPENDENT:
-                    independent_pairs += 1
-                elif level == IndependenceLevel.COLLOCATED:
-                    issues.append(
-                        f"{w1.operator_id} and {w2.operator_id}: "
-                        f"different orgs but shared infra ({w1.infra_provider})"
-                    )
-                elif level == IndependenceLevel.AFFILIATED:
-                    issues.append(
-                        f"{w1.operator_id} and {w2.operator_id}: "
-                        f"same jurisdiction ({w1.jurisdiction})"
-                    )
-
-        # Duplicate org = trust theater
-        theater = []
-        for org, members in org_groups.items():
-            if len(members) > 1:
-                names = [m.operator_id for m in members]
-                theater.append(f"Same org '{org}': {names} = 1 effective witness")
-
-        valid = effective >= self.required_independent and len(theater) == 0
-        grade = self._grade(effective, independent_pairs, total_pairs, theater)
-
-        return {
-            "valid": valid,
-            "grade": grade,
-            "total_witnesses": n,
-            "effective_witnesses": effective,
-            "required": self.required_independent,
-            "independent_pairs": independent_pairs,
-            "total_pairs": total_pairs,
-            "trust_theater": theater,
-            "issues": issues,
-        }
-
-    def _grade(self, effective, ind_pairs, total_pairs, theater):
-        if theater:
-            return "F"  # Trust theater = automatic fail
-        if effective < self.required_independent:
-            return "F"
-        ratio = ind_pairs / max(total_pairs, 1)
-        if ratio >= 1.0 and effective >= 3:
-            return "A"
-        if ratio >= 0.67:
-            return "B"
-        if ratio >= 0.5:
-            return "C"
-        return "D"
-
-
-def demo():
-    print("=== Witness Independence Validator ===\n")
-
-    scenarios = [
-        {
-            "name": "✅ Good: 3 independent witnesses",
-            "witnesses": [
-                WitnessOperator("log_alpha", "org_a", "US", "AWS"),
-                WitnessOperator("log_beta", "org_b", "EU", "GCP"),
-                WitnessOperator("log_gamma", "org_c", "JP", "self-hosted"),
-            ],
-        },
-        {
-            "name": "❌ Trust theater: same org, 3 'witnesses'",
-            "witnesses": [
-                WitnessOperator("log_1", "acme_corp", "US", "AWS"),
-                WitnessOperator("log_2", "acme_corp", "US", "AWS"),
-                WitnessOperator("log_3", "acme_corp", "EU", "GCP"),
-            ],
-        },
-        {
-            "name": "⚠️ Collocated: different orgs, same infra",
-            "witnesses": [
-                WitnessOperator("log_x", "org_x", "US", "AWS"),
-                WitnessOperator("log_y", "org_y", "US", "AWS"),
-            ],
-        },
-        {
-            "name": "⚠️ Minimum viable: 2 independent",
-            "witnesses": [
-                WitnessOperator("log_m", "org_m", "US", "self-hosted"),
-                WitnessOperator("log_n", "org_n", "EU", "GCP"),
-            ],
-        },
-        {
-            "name": "❌ Single witness",
-            "witnesses": [
-                WitnessOperator("log_solo", "org_solo", "US", "AWS"),
-            ],
-        },
-    ]
-
-    for s in scenarios:
-        ws = WitnessSet(witnesses=s["witnesses"])
-        result = ws.validate()
-        print(f"{s['name']}")
-        print(f"  Grade: {result['grade']} | "
-              f"Effective: {result['effective_witnesses']}/{result['total_witnesses']} | "
-              f"Valid: {result['valid']}")
-        if result["trust_theater"]:
-            for t in result["trust_theater"]:
-                print(f"  🎭 {t}")
-        if result["issues"]:
-            for i in result["issues"]:
-                print(f"  ⚠️  {i}")
-        print()
-
-    print("--- Chrome CT Policy Applied to L3.5 ---")
-    print("1. Slash entries require N≥2 witnesses from distinct operator_id")
-    print("2. Same org = 1 effective witness (no matter how many logs)")
-    print("3. Shared infra = collocated (weaker independence)")
-    print("4. Different jurisdiction = strongest independence signal")
-    print("5. Witness registry with org affiliation = mandatory")
-
-
-if __name__ == "__main__":
-    demo()
+print("\n" + "=" * 60)
+print("SPEC REQUIREMENTS:")
+print("  MUST: witness_org field present on all witnesses")  
+print("  SHOULD: ≥2 witnesses from distinct orgs")
+print("  SHOULD: temporal spread >5s between attestations")
+print("  Same-org witnesses = correlated oracles = expensive groupthink")
+print("=" * 60)
