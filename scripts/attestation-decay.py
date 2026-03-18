@@ -1,107 +1,107 @@
 #!/usr/bin/env python3
 """
-attestation-decay.py — Evidence decay by grade
-Per clove: older attestations should weight less.
-Per Kit: proof doesn't decay, testimony and claims do.
+attestation-decay.py — Time-based decay for attestation evidence grades
+Per clove: "have you considered decay functions for older attestations?"
+Per santaclawd: "continuity score should scale with expected relationship count by age"
 
-Ebbinghaus forgetting curve: retention = e^(-t/S)
-Grade determines decay rate: proof=∞, testimony=90d, claim=30d.
+Chain-anchored = no decay (immutable on-chain).
+Witness = decays with half-life (~90 days standard).
+Self-attested = decays fastest (~30 days).
 """
 
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-NOW = datetime(2026, 3, 18, 16, 0)
-
 @dataclass
 class Attestation:
-    grade: str  # proof / testimony / claim
-    timestamp: datetime
-    witness: str
-    value: float = 1.0  # base evidence value
+    agent: str
+    tier: str  # chain / witness / self
+    age_days: float
+    last_corroboration_days: float = 0  # days since last independent corroboration
     
-    @property
-    def age_days(self) -> float:
-        return (NOW - self.timestamp).total_seconds() / 86400
-
-    def decayed_value(self) -> float:
-        """Ebbinghaus decay by grade."""
-        half_lives = {
-            "proof": float('inf'),   # chain-anchored = permanent
-            "testimony": 90.0,       # witness-signed = 90 day half-life
-            "claim": 30.0,           # self-attested = 30 day half-life
-        }
-        hl = half_lives.get(self.grade, 30.0)
-        if hl == float('inf'):
-            return self.value
-        # Exponential decay: v * e^(-λt), λ = ln(2)/half_life
-        decay_rate = math.log(2) / hl
-        return self.value * math.exp(-decay_rate * self.age_days)
-
-
-def effective_trust(attestations: list[Attestation]) -> dict:
-    """Compute effective trust from decayed attestations."""
-    watson_morgan = {"claim": 1.0, "testimony": 2.0, "proof": 3.0}
+def decay_weight(att: Attestation) -> float:
+    """Calculate decayed evidence weight."""
+    base = {"chain": 3.0, "witness": 2.0, "self": 1.0}[att.tier]
+    half_life = {"chain": float('inf'), "witness": 90, "self": 30}[att.tier]
     
-    total_raw = sum(watson_morgan[a.grade] * a.value for a in attestations)
-    total_decayed = sum(watson_morgan[a.grade] * a.decayed_value() for a in attestations)
+    if half_life == float('inf'):
+        return base  # chain never decays
     
-    return {
-        "raw_trust": round(total_raw, 2),
-        "decayed_trust": round(total_decayed, 2),
-        "retention": round(total_decayed / total_raw * 100, 1) if total_raw > 0 else 0,
-        "count": len(attestations),
-    }
-
-
-# Test scenarios
-scenarios = {
-    "fresh_agent (all recent)": [
-        Attestation("proof", NOW - timedelta(days=1), "solana"),
-        Attestation("testimony", NOW - timedelta(days=3), "witness_a"),
-        Attestation("testimony", NOW - timedelta(days=5), "witness_b"),
-        Attestation("claim", NOW - timedelta(days=2), "self"),
-    ],
-    "established_agent (mixed age)": [
-        Attestation("proof", NOW - timedelta(days=180), "solana"),
-        Attestation("testimony", NOW - timedelta(days=120), "witness_a"),
-        Attestation("testimony", NOW - timedelta(days=60), "witness_b"),
-        Attestation("testimony", NOW - timedelta(days=30), "witness_c"),
-        Attestation("claim", NOW - timedelta(days=90), "self"),
-    ],
-    "stale_agent (all old claims)": [
-        Attestation("claim", NOW - timedelta(days=180), "self"),
-        Attestation("claim", NOW - timedelta(days=150), "self"),
-        Attestation("claim", NOW - timedelta(days=120), "self"),
-    ],
-    "chain_anchored (proof survives)": [
-        Attestation("proof", NOW - timedelta(days=365), "solana"),
-        Attestation("proof", NOW - timedelta(days=180), "solana"),
-        Attestation("proof", NOW - timedelta(days=1), "solana"),
-    ],
-}
-
-print("=" * 60)
-print("Attestation Decay by Evidence Grade")
-print("proof=∞ | testimony=90d half-life | claim=30d half-life")
-print("=" * 60)
-
-for name, attestations in scenarios.items():
-    result = effective_trust(attestations)
-    bar_raw = "█" * int(result["raw_trust"])
-    bar_dec = "▓" * int(result["decayed_trust"])
-    print(f"\n  {name}:")
-    print(f"    Raw:     {result['raw_trust']:6.1f} {bar_raw}")
-    print(f"    Decayed: {result['decayed_trust']:6.1f} {bar_dec}")
-    print(f"    Retention: {result['retention']}%")
+    # Exponential decay based on age
+    age_decay = math.exp(-0.693 * att.age_days / half_life)  # ln(2) ≈ 0.693
     
-    for a in attestations:
-        decay_pct = a.decayed_value() / a.value * 100
-        print(f"      {a.grade:10s} {a.age_days:5.0f}d → {decay_pct:5.1f}% retained")
+    # Corroboration bonus: recent corroboration resets some decay
+    if att.last_corroboration_days < 7:
+        corr_bonus = 0.5  # recent corroboration adds 50% of decayed portion back
+    elif att.last_corroboration_days < 30:
+        corr_bonus = 0.2
+    else:
+        corr_bonus = 0.0
+    
+    effective = base * (age_decay + corr_bonus * (1 - age_decay))
+    return round(max(0.1, effective), 2)  # floor at 0.1
 
-print("\n" + "=" * 60)
-print("INSIGHT: Proof doesn't decay. That's the whole point of")
-print("chain-anchoring. Testimony fades. Claims evaporate.")
-print("The grade determines not just weight but DURABILITY.")
-print("=" * 60)
+
+def expected_relationships(age_days: int, platform_coeff: float = 2.0) -> int:
+    """Per santaclawd: expected_relationships = log(age_days) * coefficient."""
+    if age_days <= 0:
+        return 0
+    return max(1, int(math.log(age_days + 1) * platform_coeff))
+
+def relationship_health(age_days: int, actual_relationships: int, platform_coeff: float = 2.0) -> str:
+    """Age-adjusted relationship health."""
+    expected = expected_relationships(age_days, platform_coeff)
+    ratio = actual_relationships / expected if expected > 0 else 0
+    if ratio >= 1.0:
+        return f"HEALTHY ({actual_relationships}/{expected} expected)"
+    elif ratio >= 0.5:
+        return f"DEVELOPING ({actual_relationships}/{expected} expected)"
+    elif ratio >= 0.2:
+        return f"STAGNANT ({actual_relationships}/{expected} expected)"
+    else:
+        return f"SUSPICIOUS ({actual_relationships}/{expected} expected)"
+
+
+# Demo attestations
+attestations = [
+    Attestation("gold", "chain", 365),
+    Attestation("recent_witness", "witness", 7, last_corroboration_days=2),
+    Attestation("stale_witness", "witness", 180, last_corroboration_days=180),
+    Attestation("refreshed_witness", "witness", 180, last_corroboration_days=5),
+    Attestation("fresh_self", "self", 3),
+    Attestation("old_self", "self", 60),
+    Attestation("ancient_self", "self", 365),
+]
+
+print("=" * 65)
+print("Attestation Decay Functions")
+print("chain=∞ | witness=90d half-life | self=30d half-life")
+print("=" * 65)
+
+for att in attestations:
+    weight = decay_weight(att)
+    base = {"chain": 3.0, "witness": 2.0, "self": 1.0}[att.tier]
+    pct = weight / base * 100
+    bar = "█" * int(pct / 5)
+    corr = f", corroborated {att.last_corroboration_days}d ago" if att.tier == "witness" else ""
+    print(f"\n  {att.agent} ({att.tier}, {att.age_days}d old{corr})")
+    print(f"    Weight: {weight:.2f}/{base:.1f} ({pct:.0f}%) {bar}")
+
+print("\n" + "=" * 65)
+print("Age-Adjusted Relationship Health (Parfit continuity)")
+print("expected = log(age_days) * platform_coefficient")
+print("=" * 65)
+
+age_cases = [
+    (7, 5), (7, 1), (30, 8), (180, 5), (365, 5), (365, 15), (730, 30),
+]
+for age, rels in age_cases:
+    health = relationship_health(age, rels)
+    print(f"  {age:4d}d old, {rels:3d} relationships → {health}")
+
+print("\n" + "=" * 65)
+print("KEY: Chain attestations are forever. Witness attestations decay")
+print("unless corroborated. Self-attestations are ephemeral claims.")
+print("A 2-year agent with 5 relationships = suspicious stagnation.")
+print("=" * 65)
