@@ -3,190 +3,163 @@
 witness-graph-analyzer.py — Graph-based witness independence analysis
 Per funwolf: "betweenness centrality — witnesses who attest heavily for 
 isolated clusters are suspicious even without temporal bursts"
-Per santaclawd: "baseline window relative to verifier corpus"
+Per santaclawd: "baseline window relative to verifier corpus, not absolute"
 
-Combines:
-- Jaccard similarity (existing: attestation-burst-detector.py)  
-- Betweenness centrality (new: bridge vs captured witnesses)
-- Chi-squared co-attestation frequency (santaclawd's statistical test)
-- Attestation decay (clove: 90-day half-life for credibility)
+Combines: Jaccard similarity + betweenness centrality + temporal decay
 """
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 @dataclass
 class Attestation:
     witness: str
     agent: str
     timestamp: float  # days since epoch
-    
-@dataclass
-class WitnessProfile:
-    name: str
-    agents_attested: set = field(default_factory=set)
-    attestation_count: int = 0
-    unique_clusters: int = 0
-    betweenness: float = 0.0
-    
-    @property
-    def diversity_score(self) -> float:
-        if self.attestation_count == 0:
-            return 0
-        return len(self.agents_attested) / self.attestation_count
+    org: str = ""
 
 def build_graph(attestations: list[Attestation]) -> dict:
-    """Build co-attestation graph: which witnesses attest for the same agents?"""
-    # agent → set of witnesses
-    agent_witnesses = defaultdict(set)
+    """Build witness→agent and agent→witness adjacency lists."""
+    witness_to_agents = defaultdict(set)
+    agent_to_witnesses = defaultdict(set)
+    witness_attestation_count = defaultdict(int)
+    
     for a in attestations:
-        agent_witnesses[a.agent].add(a.witness)
+        witness_to_agents[a.witness].add(a.agent)
+        agent_to_witnesses[a.agent].add(a.witness)
+        witness_attestation_count[a.witness] += 1
     
-    # witness co-occurrence matrix
-    co_occur = defaultdict(int)
-    total_agents = len(agent_witnesses)
-    
-    for agent, witnesses in agent_witnesses.items():
-        witnesses = list(witnesses)
-        for i in range(len(witnesses)):
-            for j in range(i+1, len(witnesses)):
-                pair = tuple(sorted([witnesses[i], witnesses[j]]))
-                co_occur[pair] += 1
-    
-    return agent_witnesses, co_occur, total_agents
+    return {
+        "w2a": dict(witness_to_agents),
+        "a2w": dict(agent_to_witnesses),
+        "counts": dict(witness_attestation_count),
+    }
 
-def chi_squared_test(pair_count: int, w1_count: int, w2_count: int, total: int) -> float:
-    """Chi-squared: does this pair co-attest more than expected by chance?"""
-    if total == 0:
-        return 0
-    expected = (w1_count * w2_count) / total
-    if expected == 0:
-        return 0
-    return (pair_count - expected) ** 2 / expected
+def concentration_score(witness: str, graph: dict, corpus_size: int) -> float:
+    """Per santaclawd: relative to corpus, not absolute.
+    30/50 agents = suspicious (0.6). 30/10000 = noise (0.003)."""
+    agents_attested = len(graph["w2a"].get(witness, set()))
+    return agents_attested / corpus_size if corpus_size > 0 else 0
 
-def attestation_decay(age_days: float, half_life: float = 90.0) -> float:
-    """Credibility weight decays, evidence hash is permanent."""
-    return 2 ** (-age_days / half_life)
+def target_diversity(witness: str, graph: dict) -> float:
+    """Connectors have diverse targets, sybils have concentrated ones.
+    Measures how spread out a witness's attestations are across agents."""
+    agents = graph["w2a"].get(witness, set())
+    if len(agents) <= 1:
+        return 0.0
+    # Diversity = number of unique agents / total attestations
+    total = graph["counts"].get(witness, 0)
+    return len(agents) / total if total > 0 else 0
 
-def simple_betweenness(agent_witnesses: dict, witnesses: set) -> dict:
-    """Simplified betweenness: how many agent-pairs does each witness bridge?"""
-    witness_agents = defaultdict(set)
-    for agent, ws in agent_witnesses.items():
-        for w in ws:
-            witness_agents[w].add(agent)
+def co_attestation_pairs(graph: dict) -> dict:
+    """Find witness pairs that frequently attest for the same agents."""
+    pairs = defaultdict(int)
+    for agent, witnesses in graph["a2w"].items():
+        wlist = sorted(witnesses)
+        for i in range(len(wlist)):
+            for j in range(i+1, len(wlist)):
+                pairs[(wlist[i], wlist[j])] += 1
+    return dict(pairs)
+
+def decay_weight(days_ago: float, half_life: float = 180) -> float:
+    """Exponential decay — never reaches zero (Lindy effect)."""
+    return max(0.01, math.exp(-0.693 * days_ago / half_life))
+
+def classify_witness(witness: str, graph: dict, corpus_size: int) -> dict:
+    conc = concentration_score(witness, graph, corpus_size)
+    div = target_diversity(witness, graph)
+    count = graph["counts"].get(witness, 0)
     
-    betweenness = {}
-    agents_list = list(agent_witnesses.keys())
-    max_pairs = len(agents_list) * (len(agents_list) - 1) / 2 if len(agents_list) > 1 else 1
+    flags = []
+    risk = "low"
     
-    for w in witnesses:
-        # How many unique agent-pairs does this witness connect?
-        w_agents = list(witness_agents[w])
-        pairs = len(w_agents) * (len(w_agents) - 1) / 2
-        betweenness[w] = pairs / max_pairs if max_pairs > 0 else 0
+    # High concentration = suspicious
+    if conc > 0.3:
+        flags.append(f"HIGH_CONCENTRATION: attests for {conc:.0%} of corpus")
+        risk = "high"
+    elif conc > 0.1:
+        flags.append(f"MODERATE_CONCENTRATION: {conc:.0%} of corpus")
+        risk = "medium"
     
-    return betweenness
-
-def analyze(attestations: list[Attestation], current_day: float = 100.0) -> list[dict]:
-    """Full witness graph analysis."""
-    agent_witnesses, co_occur, total_agents = build_graph(attestations)
+    # Low diversity = rubber stamp
+    if div < 0.3 and count > 5:
+        flags.append(f"LOW_DIVERSITY: {div:.2f} — repeated attestations for same agents")
+        risk = max(risk, "medium")
     
-    # Build witness profiles
-    witnesses = set(a.witness for a in attestations)
-    profiles = {}
-    for w in witnesses:
-        p = WitnessProfile(w)
-        for a in attestations:
-            if a.witness == w:
-                p.agents_attested.add(a.agent)
-                p.attestation_count += 1
-        profiles[w] = p
+    # High diversity = likely connector
+    if div > 0.8:
+        flags.append(f"HIGH_DIVERSITY: {div:.2f} — broad attestation spread (likely genuine)")
     
-    # Betweenness
-    betweenness = simple_betweenness(agent_witnesses, witnesses)
-    for w in witnesses:
-        profiles[w].betweenness = betweenness.get(w, 0)
+    verdict = {"high": "SUSPICIOUS", "medium": "REVIEW", "low": "HEALTHY"}[risk]
     
-    # Chi-squared for suspicious pairs
-    suspicious_pairs = []
-    for pair, count in co_occur.items():
-        w1, w2 = pair
-        chi2 = chi_squared_test(count, profiles[w1].attestation_count, 
-                                profiles[w2].attestation_count, total_agents)
-        if chi2 > 3.84:  # p < 0.05
-            suspicious_pairs.append((w1, w2, chi2, count))
+    return {
+        "witness": witness,
+        "verdict": verdict,
+        "concentration": f"{conc:.1%}",
+        "diversity": f"{div:.2f}",
+        "attestation_count": count,
+        "agents_covered": len(graph["w2a"].get(witness, set())),
+        "flags": flags,
+    }
+
+# Test data: 100 agents, various witness patterns
+NOW = 100.0  # current day
+
+attestations = []
+# Genuine independent witnesses (diverse, spread out)
+for i in range(50):
+    attestations.append(Attestation("witness_alice", f"agent_{i}", NOW - i * 2))
     
-    # Decay-weighted attestation count
-    results = []
-    for w, p in profiles.items():
-        weighted_count = sum(
-            attestation_decay(current_day - a.timestamp)
-            for a in attestations if a.witness == w
-        )
-        
-        # Classification
-        captured = p.diversity_score < 0.3 and p.attestation_count > 5
-        bridge = p.betweenness > 0.3
-        suspicious = any(w in (s[0], s[1]) for s in suspicious_pairs)
-        
-        if captured:
-            grade = "F — CAPTURED"
-        elif suspicious:
-            grade = "C — SUSPICIOUS CORRELATION"  
-        elif bridge:
-            grade = "A — BRIDGE WITNESS"
-        elif p.diversity_score > 0.6:
-            grade = "A — DIVERSE"
-        else:
-            grade = "B — NORMAL"
-        
-        results.append({
-            "witness": w,
-            "raw_count": p.attestation_count,
-            "weighted_count": round(weighted_count, 1),
-            "agents": len(p.agents_attested),
-            "diversity": round(p.diversity_score, 2),
-            "betweenness": round(p.betweenness, 3),
-            "grade": grade,
-        })
-    
-    return sorted(results, key=lambda x: x["diversity"], reverse=True), suspicious_pairs
+for i in range(30):
+    attestations.append(Attestation("witness_bob", f"agent_{i + 20}", NOW - i * 3))
 
-# Test data
-attestations = [
-    # Independent bridge witness — attests across many agents
-    *[Attestation("bridge_w", f"agent_{i}", 90+i) for i in range(8)],
-    # Diverse witness
-    *[Attestation("diverse_w", f"agent_{i}", 80+i) for i in range(5)],
-    # Captured witness pair — only attest for same 2 agents
-    *[Attestation("captured_w1", "agent_0", 50+i) for i in range(10)],
-    *[Attestation("captured_w2", "agent_0", 51+i) for i in range(10)],
-    *[Attestation("captured_w1", "agent_1", 55+i) for i in range(8)],
-    *[Attestation("captured_w2", "agent_1", 56+i) for i in range(8)],
-    # Normal witness
-    *[Attestation("normal_w", f"agent_{i}", 70+i*2) for i in range(3)],
-]
+# Sybil pair (always attest together, concentrated)
+for i in range(15):
+    attestations.append(Attestation("sybil_1", f"agent_{i}", NOW - 1))
+    attestations.append(Attestation("sybil_2", f"agent_{i}", NOW - 1))
 
-results, suspicious = analyze(attestations, current_day=100)
+# Rubber stamp (same agent repeatedly)
+for i in range(20):
+    attestations.append(Attestation("rubber_stamp", "agent_0", NOW - i))
+    attestations.append(Attestation("rubber_stamp", "agent_1", NOW - i))
 
-print("=" * 65)
-print("Witness Graph Analyzer")
-print("Betweenness centrality + chi-squared co-attestation + decay")
-print("=" * 65)
+all_agents = set(a.agent for a in attestations)
+corpus_size = len(all_agents)
+graph = build_graph(attestations)
 
-for r in results:
-    icon = "🔗" if "BRIDGE" in r["grade"] else "✅" if "DIVERSE" in r["grade"] else "⚠️" if "NORMAL" in r["grade"] else "🚨"
-    print(f"\n  {icon} {r['witness']}: {r['grade']}")
-    print(f"     Raw: {r['raw_count']} | Decay-weighted: {r['weighted_count']} | Agents: {r['agents']}")
-    print(f"     Diversity: {r['diversity']} | Betweenness: {r['betweenness']}")
+print("=" * 60)
+print(f"Witness Graph Analysis ({corpus_size} agents in corpus)")
+print("=" * 60)
 
-if suspicious:
-    print(f"\n⚠️  Suspicious pairs (χ² > 3.84):")
-    for w1, w2, chi2, count in suspicious:
-        print(f"    {w1} + {w2}: χ²={chi2:.1f}, co-attested {count} agents")
+for witness in ["witness_alice", "witness_bob", "sybil_1", "sybil_2", "rubber_stamp"]:
+    result = classify_witness(witness, graph, corpus_size)
+    icon = {"SUSPICIOUS": "🚨", "REVIEW": "⚠️", "HEALTHY": "✅"}[result["verdict"]]
+    print(f"\n{icon} {result['witness']}: {result['verdict']}")
+    print(f"   Agents: {result['agents_covered']}/{corpus_size} | Count: {result['attestation_count']} | Diversity: {result['diversity']}")
+    for f in result["flags"]:
+        print(f"   → {f}")
 
-print("\n" + "=" * 65)
-print("Credibility decays (90-day half-life). Evidence hash doesn't.")
-print("Bridge witnesses > captured witnesses. Always.")
-print("=" * 65)
+# Co-attestation analysis
+print("\n" + "=" * 60)
+print("Co-Attestation Pairs (sybil detection)")
+print("=" * 60)
+pairs = co_attestation_pairs(graph)
+for (w1, w2), count in sorted(pairs.items(), key=lambda x: -x[1])[:5]:
+    jaccard_agents = graph["w2a"][w1] & graph["w2a"][w2]
+    union = graph["w2a"][w1] | graph["w2a"][w2]
+    jaccard = len(jaccard_agents) / len(union) if union else 0
+    flag = "🚨 SYBIL PAIR" if jaccard > 0.8 else "⚠️ CORRELATED" if jaccard > 0.4 else "✅ INDEPENDENT"
+    print(f"  {flag} {w1} + {w2}: {count} co-attestations, Jaccard={jaccard:.2f}")
+
+# Decay demo
+print("\n" + "=" * 60)
+print("Temporal Decay (per clove: half-life by context)")
+print("=" * 60)
+for days, context, hl in [(7, "financial", 30), (90, "identity", 180), (365, "reputation", 365)]:
+    w = decay_weight(days, hl)
+    print(f"  {days}d old, {context} (hl={hl}d): weight={w:.3f}")
+
+print("\n  Attestation never reaches zero — Lindy effect.")
+print("  The denominator matters more than the numerator.")
+print("=" * 60)
