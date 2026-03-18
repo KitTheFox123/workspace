@@ -1,141 +1,177 @@
 #!/usr/bin/env python3
 """
-paylock-adv-bridge.py — Bridge PayLock on-chain escrow releases to ADV receipts
-Per santaclawd: "does PayLock emit receipts in ADV-compatible format?"
+paylock-adv-bridge.py — Bridge PayLock Solana escrow receipts to ADV format
+Per santaclawd: "does PayLock emit standard receipts or do we need a bridge spec?"
 
-PayLock emits: delivery_hash (sha256), escrow address, block timestamp, amount.
-ADV needs: version, timestamp, witness, delivery_hash, dimensions, agent_id.
-
-This bridge maps one to the other. On-chain hash = ground truth.
+Maps PayLock tx fields → ADV receipt-format-minimal fields.
+On-chain tx hash = witness. Escrow release = delivery proof.
 """
 
-import json
 import hashlib
-from datetime import datetime, timezone
+import json
+import time
+from dataclasses import dataclass, asdict
+from typing import Optional
 
-def paylock_to_adv(paylock_event: dict) -> dict:
-    """Convert a PayLock escrow release event to ADV receipt format."""
-    return {
-        "v": "0.2.1",
-        "ts": paylock_event.get("block_timestamp", datetime.now(timezone.utc).isoformat()),
-        "agent_from": paylock_event.get("provider_agent_id", "unknown"),
-        "agent_to": paylock_event.get("client_agent_id", "unknown"),
-        "delivery_hash": paylock_event["delivery_hash"],
-        "wit": [{
-            "id": f"solana:{paylock_event['escrow_address']}",
-            "type": "on-chain-escrow",
-            "sig": paylock_event.get("tx_signature", ""),
-        }],
-        "dims": {
-            "timeliness": compute_timeliness(paylock_event),
-            "completeness": paylock_event.get("score", 1.0),
-        },
-        "meta": {
-            "source": "paylock",
-            "chain": "solana",
-            "amount_sol": paylock_event.get("amount_sol", 0),
-            "escrow_address": paylock_event["escrow_address"],
-            "tx_signature": paylock_event.get("tx_signature", ""),
+@dataclass
+class PayLockTx:
+    """PayLock Solana escrow transaction."""
+    tx_hash: str
+    escrow_address: str
+    payer: str  # Solana pubkey
+    payee: str  # Solana pubkey
+    amount_lamports: int
+    status: str  # "funded", "released", "disputed", "refunded"
+    created_at: float
+    released_at: Optional[float] = None
+    brief_hash: Optional[str] = None  # hash of the task brief
+
+@dataclass
+class ADVReceipt:
+    """ADV receipt-format-minimal."""
+    version: str = "0.1"
+    decision_type: str = "delivery"  # delivery | refusal | delegation
+    witness: str = ""  # who attested
+    witness_type: str = "on-chain"  # on-chain | agent | platform
+    delivery_hash: str = ""  # hash of what was delivered/proven
+    timestamp: float = 0
+    # Optional fields
+    agent_id: str = ""
+    counterparty_id: str = ""
+    dimensions: dict = None
+    receipt_hash: str = ""  # self-referential integrity hash
+
+    def compute_receipt_hash(self) -> str:
+        """Compute integrity hash over non-hash fields."""
+        data = {
+            "version": self.version,
+            "decision_type": self.decision_type,
+            "witness": self.witness,
+            "delivery_hash": self.delivery_hash,
+            "timestamp": self.timestamp,
+            "agent_id": self.agent_id,
         }
+        canonical = json.dumps(data, sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def bridge(tx: PayLockTx) -> ADVReceipt:
+    """Convert PayLock tx → ADV receipt."""
+    # Map status to decision_type
+    status_map = {
+        "released": "delivery",
+        "refunded": "refusal",
+        "disputed": "refusal",
+        "funded": "delegation",  # escrow funded = task delegated
+    }
+    decision_type = status_map.get(tx.status, "delivery")
+
+    # Witness = the Solana escrow contract (on-chain attestation)
+    witness = f"solana:{tx.escrow_address}"
+
+    # Delivery hash = tx_hash (the on-chain proof)
+    delivery_hash = tx.tx_hash
+
+    # Timestamp
+    timestamp = tx.released_at or tx.created_at
+
+    # Dimensions from escrow metadata
+    dimensions = {
+        "amount_sol": tx.amount_lamports / 1_000_000_000,
+        "escrow": tx.escrow_address,
+        "brief_hash": tx.brief_hash or "none",
+        "chain": "solana",
     }
 
-
-def compute_timeliness(event: dict) -> float:
-    """Timeliness from deadline vs actual delivery."""
-    if "deadline" not in event or "delivered_at" not in event:
-        return 1.0  # no deadline = on time by default
-    deadline = datetime.fromisoformat(event["deadline"])
-    delivered = datetime.fromisoformat(event["delivered_at"])
-    if delivered <= deadline:
-        return 1.0
-    hours_late = (delivered - deadline).total_seconds() / 3600
-    return max(0.0, 1.0 - (hours_late / 24))  # linear decay over 24h
-
-
-def validate_bridge(adv_receipt: dict) -> list[str]:
-    """Validate bridged receipt against ADV schema requirements."""
-    issues = []
-    required = ["v", "ts", "delivery_hash", "wit"]
-    for field in required:
-        if field not in adv_receipt:
-            issues.append(f"MISSING required field: {field}")
-    
-    if "wit" in adv_receipt:
-        for w in adv_receipt["wit"]:
-            if "id" not in w:
-                issues.append("MISSING witness id")
-            if w.get("type") != "on-chain-escrow":
-                issues.append(f"UNEXPECTED witness type: {w.get('type')}")
-    
-    if not adv_receipt.get("delivery_hash", "").startswith("sha256:") and len(adv_receipt.get("delivery_hash", "")) != 64:
-        pass  # accept both formats
-    
-    return issues
+    receipt = ADVReceipt(
+        decision_type=decision_type,
+        witness=witness,
+        witness_type="on-chain",
+        delivery_hash=delivery_hash,
+        timestamp=timestamp,
+        agent_id=tx.payee,
+        counterparty_id=tx.payer,
+        dimensions=dimensions,
+    )
+    receipt.receipt_hash = receipt.compute_receipt_hash()
+    return receipt
 
 
-# Test with TC3 data (our first live verify-then-pay)
-tc3_event = {
-    "delivery_hash": hashlib.sha256(b"What Does the Agent Economy Need at Scale?").hexdigest(),
-    "escrow_address": "PayLock_TC3_escrow_addr",
-    "block_timestamp": "2026-02-24T15:30:00Z",
-    "tx_signature": "5KtR...mock_sig",
-    "provider_agent_id": "kit_fox",
-    "client_agent_id": "bro_agent",
-    "amount_sol": 0.01,
-    "score": 0.92,
-    "deadline": "2026-02-24T18:00:00Z",
-    "delivered_at": "2026-02-24T15:30:00Z",
-}
+def verify_bridge(receipt: ADVReceipt) -> dict:
+    """Verify bridged receipt integrity."""
+    checks = {
+        "has_witness": bool(receipt.witness),
+        "has_delivery_hash": bool(receipt.delivery_hash),
+        "has_timestamp": receipt.timestamp > 0,
+        "hash_valid": receipt.receipt_hash == receipt.compute_receipt_hash(),
+        "witness_is_onchain": receipt.witness_type == "on-chain",
+        "decision_type_valid": receipt.decision_type in ("delivery", "refusal", "delegation"),
+    }
+    checks["all_pass"] = all(checks.values())
+    return checks
 
-# Second test: late delivery
-late_event = {
-    "delivery_hash": hashlib.sha256(b"Late deliverable content").hexdigest(),
-    "escrow_address": "PayLock_late_escrow",
-    "block_timestamp": "2026-03-18T09:00:00Z",
-    "tx_signature": "7xQm...mock_sig",
-    "provider_agent_id": "slow_agent",
-    "client_agent_id": "impatient_agent",
-    "amount_sol": 0.005,
-    "score": 0.75,
-    "deadline": "2026-03-18T06:00:00Z",
-    "delivered_at": "2026-03-18T09:00:00Z",
-}
 
-# Third test: no witness (should flag)
-bare_event = {
-    "delivery_hash": hashlib.sha256(b"No escrow").hexdigest(),
-    "escrow_address": "",
-    "provider_agent_id": "unverified",
-    "client_agent_id": "trusting",
-}
+# Demo: Test Case 3 PayLock transaction
+demo_txs = [
+    PayLockTx(
+        tx_hash="5KjR...mock_tc3_release",
+        escrow_address="PLock...515ee459",
+        payer="Kit_Fox_pubkey",
+        payee="bro_agent_pubkey",
+        amount_lamports=10_000_000,  # 0.01 SOL
+        status="released",
+        created_at=1740300000,
+        released_at=1740303600,
+        brief_hash="sha256:tc3_brief_hash",
+    ),
+    PayLockTx(
+        tx_hash="8mNq...mock_disputed",
+        escrow_address="PLock...dispute01",
+        payer="client_pubkey",
+        payee="agent_pubkey",
+        amount_lamports=50_000_000,  # 0.05 SOL
+        status="disputed",
+        created_at=1740400000,
+    ),
+    PayLockTx(
+        tx_hash="3Fwp...mock_funded",
+        escrow_address="PLock...escrow42",
+        payer="requester_pubkey",
+        payee="worker_pubkey",
+        amount_lamports=100_000_000,  # 0.1 SOL
+        status="funded",
+        created_at=1740500000,
+        brief_hash="sha256:new_task_brief",
+    ),
+]
 
 print("=" * 60)
-print("PayLock → ADV Receipt Bridge")
-print("On-chain escrow release = verified action receipt")
+print("PayLock → ADV Bridge")
+print("On-chain escrow → receipt-format-minimal")
 print("=" * 60)
 
-for name, event in [("TC3 (on-time)", tc3_event), ("Late delivery", late_event), ("Bare (no escrow)", bare_event)]:
-    receipt = paylock_to_adv(event)
-    issues = validate_bridge(receipt)
-    status = "✅ VALID" if not issues else f"⚠️ {len(issues)} issues"
-    
-    print(f"\n{status} — {name}")
-    print(f"  delivery_hash: {receipt['delivery_hash'][:16]}...")
-    print(f"  witness: {receipt['wit'][0]['id']}")
-    print(f"  timeliness: {receipt['dims']['timeliness']:.2f}")
-    print(f"  completeness: {receipt['dims']['completeness']}")
-    if issues:
-        for issue in issues:
-            print(f"  → {issue}")
+for tx in demo_txs:
+    receipt = bridge(tx)
+    checks = verify_bridge(receipt)
+    icon = "✅" if checks["all_pass"] else "❌"
 
-print("\n" + "=" * 60)
-print("BRIDGE DESIGN:")
-print("  PayLock delivery_hash → ADV delivery_hash (direct)")
-print("  Escrow address → ADV witness.id (solana:addr)")
-print("  Block timestamp → ADV timestamp (direct)")
-print("  Score → ADV dims.completeness (direct)")
-print("  Deadline math → ADV dims.timeliness (computed)")
+    print(f"\n{icon} PayLock tx: {tx.tx_hash[:20]}... ({tx.status})")
+    print(f"   → ADV type: {receipt.decision_type}")
+    print(f"   → Witness: {receipt.witness[:40]}...")
+    print(f"   → Delivery hash: {receipt.delivery_hash[:20]}...")
+    print(f"   → Amount: {receipt.dimensions['amount_sol']} SOL")
+    print(f"   → Receipt hash: {receipt.receipt_hash}")
+    print(f"   → Integrity: {'PASS' if checks['all_pass'] else 'FAIL'}")
+
+print(f"\n{'=' * 60}")
+print("BRIDGE SPEC:")
+print("  PayLock tx_hash    → ADV delivery_hash")
+print("  escrow_address     → ADV witness (solana:addr)")
+print("  status=released    → decision_type=delivery")
+print("  status=disputed    → decision_type=refusal")
+print("  status=funded      → decision_type=delegation")
+print("  amount + brief     → ADV dimensions")
 print()
-print("  On-chain hash IS the ground truth.")
-print("  The bridge adds schema, not trust.")
+print("On-chain IS the witness. No additional attestation needed.")
+print("Three fields bridge the gap: witness, delivery_hash, timestamp.")
 print("=" * 60)
