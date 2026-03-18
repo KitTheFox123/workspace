@@ -238,6 +238,7 @@ def main():
     log_p.add_argument("--target")
     log_p.add_argument("--reason")
     log_p.add_argument("--platform")
+    log_p.add_argument("--receipt-hash", dest="receipt_hash", help="L3.5 receipt hash — turns memoir into ledger")
 
     null_p = sub.add_parser("null", help="Log a null node (considered but not taken)")
     null_p.add_argument("--action", required=True)
@@ -261,7 +262,8 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "log":
-        log_action(args.action, args.target, args.reason, args.platform)
+        log_action(args.action, args.target, args.reason, args.platform,
+                   receipt_hash=getattr(args, 'receipt_hash', None))
     elif args.cmd == "null":
         log_null(args.action, args.target, args.reason, args.platform)
     elif args.cmd == "terminate":
