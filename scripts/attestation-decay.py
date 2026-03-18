@@ -1,104 +1,125 @@
 #!/usr/bin/env python3
 """
-attestation-decay.py — Trust decay over time for attestations
+attestation-decay.py — Time-weighted trust scoring with exponential decay
 Per clove: "have you considered decay functions for older attestations?"
 Per Parfit: identity = overlapping chains, not permanent state.
 
-Exponential decay with configurable half-life.
-An attestation from 2 years ago = who the agent WAS, not IS.
+An attestation from 2 years ago tells you who the agent WAS, not who it IS.
+Half-life of ~90 days matches credit reporting cycles.
 """
 
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-NOW = datetime(2026, 3, 18, 20, 0, 0)
+HALF_LIFE_DAYS = 90  # credit reporting cycle
+NOW = datetime(2026, 3, 18)
 
 @dataclass
 class Attestation:
     witness: str
-    action: str
+    grade: str  # proof/testimony/claim
     timestamp: datetime
-    evidence_grade: str  # proof/testimony/claim
-    base_weight: float  # Watson & Morgan: proof=3, testimony=2, claim=1
+    
+    @property
+    def age_days(self) -> float:
+        return (NOW - self.timestamp).total_seconds() / 86400
+    
+    @property
+    def base_weight(self) -> float:
+        return {"proof": 3.0, "testimony": 2.0, "claim": 1.0}[self.grade]
+    
+    @property
+    def decay_factor(self) -> float:
+        return math.pow(0.5, self.age_days / HALF_LIFE_DAYS)
+    
+    @property
+    def effective_weight(self) -> float:
+        return self.base_weight * self.decay_factor
 
-def decay_weight(att: Attestation, half_life_days: float = 90.0) -> float:
-    """Exponential decay. Half-life = time for weight to halve."""
-    age_days = (NOW - att.timestamp).total_seconds() / 86400
-    decay = math.exp(-0.693 * age_days / half_life_days)  # ln(2) ≈ 0.693
-    return att.base_weight * decay
 
-def effective_trust(attestations: list[Attestation], half_life_days: float = 90.0) -> dict:
-    """Compute decayed trust score from attestation set."""
+def score_agent(attestations: list[Attestation]) -> dict:
+    """Compute time-weighted trust score."""
     if not attestations:
-        return {"score": 0, "effective_count": 0, "raw_count": 0}
+        return {"score": 0, "effective_attestations": 0, "verdict": "UNKNOWN"}
     
-    weights = [decay_weight(a, half_life_days) for a in attestations]
-    total = sum(weights)
-    raw_total = sum(a.base_weight for a in attestations)
+    total_weight = sum(a.effective_weight for a in attestations)
+    raw_weight = sum(a.base_weight for a in attestations)
+    decay_ratio = total_weight / raw_weight if raw_weight > 0 else 0
     
-    # Effective count: how many "fresh proof-equivalent" attestations
-    effective = total / 3.0  # normalized to proof-equivalent
+    # Effective attestation count (decay-adjusted)
+    effective_count = sum(a.decay_factor for a in attestations)
+    
+    # Recency: most recent attestation age
+    most_recent = min(a.age_days for a in attestations)
+    
+    # Score: normalized to 0-1
+    score = min(1.0, total_weight / 10)  # 10 effective weight = max
+    
+    if score >= 0.7 and most_recent < 30:
+        verdict = "TRUSTED"
+    elif score >= 0.4:
+        verdict = "ESTABLISHED"
+    elif score >= 0.1:
+        verdict = "DEVELOPING"
+    else:
+        verdict = "STALE"
     
     return {
-        "score": round(total, 2),
-        "effective_count": round(effective, 1),
-        "raw_count": len(attestations),
-        "raw_weight": round(raw_total, 1),
-        "decay_ratio": round(total / raw_total, 2) if raw_total > 0 else 0,
+        "score": round(score, 3),
+        "total_weight": round(total_weight, 2),
+        "raw_weight": round(raw_weight, 2),
+        "decay_ratio": round(decay_ratio, 3),
+        "effective_count": round(effective_count, 1),
+        "most_recent_days": round(most_recent, 0),
+        "verdict": verdict,
     }
 
-# Test scenarios
-scenarios = {
-    "fresh_agent": [
-        Attestation("witness_a", "delivered", NOW - timedelta(days=1), "proof", 3.0),
-        Attestation("witness_b", "delivered", NOW - timedelta(days=3), "testimony", 2.0),
-        Attestation("witness_c", "delivered", NOW - timedelta(days=7), "testimony", 2.0),
+
+# Test agents
+agents = {
+    "active_proven": [
+        Attestation("paylock", "proof", NOW - timedelta(days=2)),
+        Attestation("funwolf", "testimony", NOW - timedelta(days=10)),
+        Attestation("santaclawd", "testimony", NOW - timedelta(days=15)),
+        Attestation("gendolf", "testimony", NOW - timedelta(days=30)),
     ],
-    "steady_worker": [
-        Attestation("w1", "task", NOW - timedelta(days=d), "testimony", 2.0)
-        for d in range(0, 365, 30)  # monthly for a year
+    "stale_veteran": [
+        Attestation("paylock", "proof", NOW - timedelta(days=200)),
+        Attestation("funwolf", "testimony", NOW - timedelta(days=180)),
+        Attestation("santaclawd", "testimony", NOW - timedelta(days=365)),
     ],
-    "inactive_veteran": [
-        Attestation("w1", "task", NOW - timedelta(days=d), "proof", 3.0)
-        for d in range(300, 700, 50)  # all old attestations
+    "recent_self_only": [
+        Attestation("self", "claim", NOW - timedelta(days=1)),
+        Attestation("self", "claim", NOW - timedelta(days=5)),
+        Attestation("self", "claim", NOW - timedelta(days=10)),
     ],
-    "burst_then_silent": [
-        Attestation("w1", "task", NOW - timedelta(days=180+d), "testimony", 2.0)
-        for d in range(0, 30, 3)  # burst 6 months ago
-    ],
-    "sybil_fresh": [
-        Attestation(f"sybil_{i}", "task", NOW - timedelta(hours=i), "claim", 1.0)
-        for i in range(20)  # 20 claims in last day
+    "mixed_timeline": [
+        Attestation("paylock", "proof", NOW - timedelta(days=100)),
+        Attestation("funwolf", "testimony", NOW - timedelta(days=5)),
+        Attestation("self", "claim", NOW - timedelta(days=1)),
     ],
 }
 
 print("=" * 65)
-print("Attestation Decay (half-life=90 days)")
-print("'An attestation from 2 years ago tells you who the agent WAS'")
+print(f"Attestation Decay (half-life={HALF_LIFE_DAYS}d, as of {NOW.date()})")
+print("proof=3x, testimony=2x, claim=1x × decay factor")
 print("=" * 65)
 
-for name, atts in scenarios.items():
-    result = effective_trust(atts)
-    bar = "█" * min(30, int(result["score"]))
-    print(f"\n  {name}:")
-    print(f"    Raw: {result['raw_count']} attestations, weight {result['raw_weight']}")
-    print(f"    Decayed: score {result['score']}, effective {result['effective_count']} proof-equiv")
-    print(f"    Decay ratio: {result['decay_ratio']} {bar}")
-
-# Half-life comparison
-print("\n" + "=" * 65)
-print("Half-Life Sensitivity (steady_worker scenario)")
-print("=" * 65)
-steady = scenarios["steady_worker"]
-for hl in [30, 60, 90, 180, 365]:
-    r = effective_trust(steady, hl)
-    print(f"  {hl:3d} days: score={r['score']:6.1f} decay={r['decay_ratio']:.2f}")
+for name, attestations in agents.items():
+    result = score_agent(attestations)
+    icon = {"TRUSTED": "🟢", "ESTABLISHED": "🟡", "DEVELOPING": "🟠", "STALE": "🔴", "UNKNOWN": "⚫"}[result["verdict"]]
+    print(f"\n{icon} {name}: {result['verdict']} (score={result['score']})")
+    print(f"   Raw weight: {result['raw_weight']} → Effective: {result['total_weight']} (decay={result['decay_ratio']})")
+    print(f"   Effective attestations: {result['effective_count']}/{len(attestations)} | Most recent: {result['most_recent_days']:.0f}d ago")
+    
+    # Show individual decay
+    for a in attestations:
+        bar = "█" * int(a.decay_factor * 20)
+        print(f"   {a.witness:12s} {a.grade:10s} {a.age_days:5.0f}d  {a.base_weight}×{a.decay_factor:.2f}={a.effective_weight:.2f}  {bar}")
 
 print("\n" + "=" * 65)
-print("INSIGHT: 90-day half-life matches credit reporting cycles.")
-print("Fresh sybil (20 claims) scores lower than 3 real proofs.")
-print(f"  sybil_fresh: {effective_trust(scenarios['sybil_fresh'])['score']}")
-print(f"  fresh_agent: {effective_trust(scenarios['fresh_agent'])['score']}")
-print("Quality beats quantity even without independence scoring.")
+print("INSIGHT: stale_veteran has MORE raw attestations than recent_self_only")
+print("but LOWER effective score. Trust is perishable.")
+print("An attestation from 2 years ago tells you who the agent WAS.")
 print("=" * 65)
