@@ -1,157 +1,133 @@
 #!/usr/bin/env python3
 """
-trust-anchor-classifier.py — Classify where attestation chains terminate.
+trust-anchor-classifier.py — Classify receipt trust anchors
+Per santaclawd: "PayLock escrow is its own CA — the on-chain state IS the trust anchor."
 
-The infinite regress problem: who validates the validator?
-Three bedrocks: physics (hardware RoT), economics (stake), diversity (uncorrelated failure).
-Most agent systems have NONE — attestation floats on self-report.
+Three grades:
+  self    = memoir (self-reported, lowest evidence grade)
+  witness = testimony (third-party signed, medium grade)  
+  chain   = proof (on-chain state, highest evidence grade)
 
-Inspired by cassian + gendolf's "who validates the validator" thread.
-JANUS (arXiv 2402.08908): PUF as intrinsic RoT + decentralized verification.
-Knight & Leveson 1986: correlated failure from shared mental models.
+When trust_anchor=chain, replay window = blockchain finality.
+When trust_anchor=witness, TTL must be specified.
+When trust_anchor=self, evidence grade = lowest.
 """
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, asdict
 from enum import Enum
 
+class TrustAnchor(Enum):
+    SELF = "self"       # Self-reported, no external verification
+    WITNESS = "witness"  # Third-party signature  
+    CHAIN = "chain"      # On-chain state, cryptographic proof
 
-class AnchorType(Enum):
-    PHYSICS = "physics"       # TPM, PUF, SGX — can't fake hardware
-    ECONOMICS = "economics"   # Stake, bond, slashing — can't fake skin-in-game
-    DIVERSITY = "diversity"   # Uncorrelated attestors — can't fake independence
-    SOCIAL = "social"         # Reputation, history — CAN fake with time
-    SELF_REPORT = "self"      # Agent says so — trivially fakeable
-    NONE = "none"             # No anchor at all
+class EvidenceGrade(Enum):
+    PROOF = "proof"           # Cryptographically verifiable
+    TESTIMONY = "testimony"   # Third-party attestation
+    MEMOIR = "memoir"         # Self-reported claim
 
-
-ANCHOR_STRENGTH = {
-    AnchorType.PHYSICS: 1.0,
-    AnchorType.ECONOMICS: 0.85,
-    AnchorType.DIVERSITY: 0.75,
-    AnchorType.SOCIAL: 0.4,
-    AnchorType.SELF_REPORT: 0.1,
-    AnchorType.NONE: 0.0,
+# Finality times by chain
+CHAIN_FINALITY_MS = {
+    "solana": 400,
+    "ethereum": 12000,
+    "bitcoin": 600000,  # ~10 min
+    "polygon": 2000,
+    "arbitrum": 1000,
 }
 
-
 @dataclass
-class AttestationChain:
-    name: str
-    links: list  # list of (description, anchor_type) tuples
+class Receipt:
+    agent_id: str
+    action: str
+    trust_anchor: TrustAnchor
+    chain_name: str | None = None  # Required if trust_anchor=chain
+    witness_id: str | None = None  # Required if trust_anchor=witness
+    ttl_ms: int | None = None      # Required if trust_anchor != chain
+
+def classify(receipt: Receipt) -> dict:
+    """Classify a receipt's evidence grade and replay window."""
+    errors = []
     
-    def terminal_anchor(self) -> AnchorType:
-        """Where does the regress stop?"""
-        if not self.links:
-            return AnchorType.NONE
-        return self.links[-1][1]
+    # Evidence grade
+    grade_map = {
+        TrustAnchor.SELF: EvidenceGrade.MEMOIR,
+        TrustAnchor.WITNESS: EvidenceGrade.TESTIMONY,
+        TrustAnchor.CHAIN: EvidenceGrade.PROOF,
+    }
+    grade = grade_map[receipt.trust_anchor]
     
-    def strength(self) -> float:
-        """Chain strength = weakest link × terminal anchor."""
-        if not self.links:
-            return 0.0
-        anchor_scores = [ANCHOR_STRENGTH[a] for _, a in self.links]
-        # Chain is only as strong as weakest link
-        weakest = min(anchor_scores)
-        # But terminal anchor matters most
-        terminal = ANCHOR_STRENGTH[self.terminal_anchor()]
-        return round(weakest * 0.4 + terminal * 0.6, 3)
+    # Replay window
+    if receipt.trust_anchor == TrustAnchor.CHAIN:
+        if not receipt.chain_name:
+            errors.append("trust_anchor=chain requires chain_name")
+            replay_window_ms = None
+        elif receipt.chain_name not in CHAIN_FINALITY_MS:
+            errors.append(f"unknown chain: {receipt.chain_name}")
+            replay_window_ms = None
+        else:
+            replay_window_ms = CHAIN_FINALITY_MS[receipt.chain_name]
+    else:
+        if not receipt.ttl_ms:
+            errors.append(f"trust_anchor={receipt.trust_anchor.value} requires explicit ttl_ms")
+            replay_window_ms = None
+        else:
+            replay_window_ms = receipt.ttl_ms
     
-    def regress_depth(self) -> int:
-        """How many 'who validates?' steps before bedrock?"""
-        return len(self.links)
+    # Witness validation
+    if receipt.trust_anchor == TrustAnchor.WITNESS and not receipt.witness_id:
+        errors.append("trust_anchor=witness requires witness_id")
     
-    def grade(self) -> str:
-        s = self.strength()
-        if s >= 0.8: return "A"
-        if s >= 0.6: return "B"
-        if s >= 0.4: return "C"
-        if s >= 0.2: return "D"
-        return "F"
+    # Watson & Morgan evidence weight
+    weight_map = {
+        EvidenceGrade.MEMOIR: 1.0,      # Self-report
+        EvidenceGrade.TESTIMONY: 2.0,   # Third-party
+        EvidenceGrade.PROOF: 5.0,       # Cryptographic
+    }
     
-    def has_bedrock(self) -> bool:
-        """Does the chain reach a non-fakeable anchor?"""
-        t = self.terminal_anchor()
-        return t in (AnchorType.PHYSICS, AnchorType.ECONOMICS, AnchorType.DIVERSITY)
+    return {
+        "agent": receipt.agent_id,
+        "action": receipt.action,
+        "trust_anchor": receipt.trust_anchor.value,
+        "evidence_grade": grade.value,
+        "evidence_weight": weight_map[grade],
+        "replay_window_ms": replay_window_ms,
+        "errors": errors,
+        "valid": len(errors) == 0,
+    }
 
 
-def demo():
-    chains = [
-        AttestationChain("TPM-backed agent", [
-            ("agent claims scope compliance", AnchorType.SELF_REPORT),
-            ("observer validates claim", AnchorType.SOCIAL),
-            ("TEE remote attestation", AnchorType.PHYSICS),
-            ("TPM fused key signs measurement", AnchorType.PHYSICS),
-        ]),
-        AttestationChain("Staked attestor pool (Kleros-style)", [
-            ("agent claims work done", AnchorType.SELF_REPORT),
-            ("attestor validates", AnchorType.SOCIAL),
-            ("attestor stake at risk", AnchorType.ECONOMICS),
-        ]),
-        AttestationChain("Diverse attestor pool (NVP)", [
-            ("agent claims work done", AnchorType.SELF_REPORT),
-            ("4 diverse attestors vote", AnchorType.DIVERSITY),
-            ("toolchain diversity verified", AnchorType.DIVERSITY),
-        ]),
-        AttestationChain("Reputation-only (most platforms)", [
-            ("agent claims work done", AnchorType.SELF_REPORT),
-            ("platform tracks history", AnchorType.SOCIAL),
-            ("users upvote/downvote", AnchorType.SOCIAL),
-        ]),
-        AttestationChain("Pure self-report (typical agent)", [
-            ("agent says it did the thing", AnchorType.SELF_REPORT),
-        ]),
-        AttestationChain("JANUS (PUF + decentralized verify)", [
-            ("agent in TEE", AnchorType.PHYSICS),
-            ("PUF provides intrinsic RoT", AnchorType.PHYSICS),
-            ("smart contract audits result", AnchorType.ECONOMICS),
-            ("decentralized verifiers check", AnchorType.DIVERSITY),
-        ]),
-        AttestationChain("isnad chain (current)", [
-            ("agent attests claim", AnchorType.SELF_REPORT),
-            ("corroborator validates", AnchorType.SOCIAL),
-            ("chain stored in sandbox", AnchorType.SELF_REPORT),
-        ]),
-        AttestationChain("isnad + email anchoring", [
-            ("agent attests claim", AnchorType.SELF_REPORT),
-            ("corroborator validates", AnchorType.SOCIAL),
-            ("SMTP timestamps witness", AnchorType.DIVERSITY),
-            ("multiple independent observers", AnchorType.DIVERSITY),
-        ]),
-    ]
-    
-    print("=" * 65)
-    print("TRUST ANCHOR CLASSIFIER — Where Does the Regress Stop?")
-    print("=" * 65)
-    
-    for chain in sorted(chains, key=lambda c: c.strength(), reverse=True):
-        anchor = chain.terminal_anchor()
-        grade = chain.grade()
-        bedrock = "✓ BEDROCK" if chain.has_bedrock() else "✗ floating"
-        
-        print(f"\n{'─' * 55}")
-        print(f"{chain.name}")
-        print(f"  Terminal: {anchor.value} | Depth: {chain.regress_depth()} | "
-              f"Strength: {chain.strength()} | Grade: {grade} | {bedrock}")
-        
-        for i, (desc, atype) in enumerate(chain.links):
-            arrow = "└─" if i == len(chain.links) - 1 else "├─"
-            print(f"  {arrow} {desc} [{atype.value}]")
-    
-    # Summary
-    bedrock_count = sum(1 for c in chains if c.has_bedrock())
-    floating_count = len(chains) - bedrock_count
-    
-    print(f"\n{'=' * 65}")
-    print(f"SUMMARY: {bedrock_count} anchored, {floating_count} floating")
-    print(f"\nThe infinite regress stops at:")
-    print(f"  Physics  — hardware you can't fake (TPM, PUF, SGX)")
-    print(f"  Economics — stake you can't recover after slash")
-    print(f"  Diversity — failure correlation you can't orchestrate")
-    print(f"\nMost agent systems: pure self-report. No bedrock.")
-    print(f"Knight & Leveson 1986: 4 diverse > 10 identical.")
-    print(f"JANUS (2402.08908): PUF + decentralized verify = strongest.")
-    print("=" * 65)
+# Test receipts
+receipts = [
+    Receipt("kit_fox", "delivered_report", TrustAnchor.CHAIN, chain_name="solana"),
+    Receipt("kit_fox", "searched_web", TrustAnchor.WITNESS, witness_id="keenable_monitor", ttl_ms=30000),
+    Receipt("unknown_agent", "claimed_delivery", TrustAnchor.SELF, ttl_ms=86400000),
+    Receipt("scammer", "claimed_payment", TrustAnchor.CHAIN),  # Missing chain_name
+    Receipt("lazy_agent", "did_work", TrustAnchor.WITNESS),    # Missing witness + TTL
+]
 
+print("=" * 65)
+print("Trust Anchor Classifier")
+print("'PayLock escrow is its own CA' — santaclawd")
+print("=" * 65)
 
-if __name__ == "__main__":
-    demo()
+for receipt in receipts:
+    result = classify(receipt)
+    icon = "✅" if result["valid"] else "❌"
+    print(f"\n{icon} {result['agent']}: {result['action']}")
+    print(f"   Anchor: {result['trust_anchor']} → Grade: {result['evidence_grade']} (weight: {result['evidence_weight']}x)")
+    if result['replay_window_ms']:
+        print(f"   Replay window: {result['replay_window_ms']}ms")
+    for err in result['errors']:
+        print(f"   ⚠️  {err}")
+
+print("\n" + "=" * 65)
+print("EVIDENCE HIERARCHY:")
+print("  self=memoir (1x)  → 'I said I did it'")
+print("  witness=testimony (2x) → 'Someone saw me do it'")
+print("  chain=proof (5x)  → 'The blockchain confirms I did it'")
+print()
+print("REPLAY WINDOW:")
+print("  chain → finality (Solana 400ms, ETH 12s, BTC 10min)")
+print("  witness/self → MUST specify TTL explicitly")
+print("=" * 65)
