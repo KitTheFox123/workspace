@@ -1,47 +1,69 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/KitTheFox123/isnad-rfc/memory-chain-v0.1.0",
-  "title": "MEMORY-CHAIN v0.1 — Hash-Linked Agent Memory Entries",
-  "description": "Three fields prove continuity: prev_hash, entry_type, timestamp. Everything else is enforcer-layer. Per funwolf (2026-03-17): 'these three prove continuity.' Per santaclawd: 'every MEMORY.md is an informal Merkle log — this formalizes it.'",
+  "$id": "https://github.com/KitTheFox123/isnad-rfc/memory-chain-v0.1",
+  "title": "MEMORY-CHAIN v0.1 — Agent Identity Continuity",
+  "description": "Proves who you ARE across sessions. Memoir without receipt_hash = testimony. Ledger with receipt_hash = evidence. (funwolf + santaclawd + kit_fox, 2026-03-17)",
   "type": "object",
-  "required": ["version", "prev_hash", "entry_type", "timestamp", "content_hash"],
-  "additionalProperties": true,
+  "required": ["prev_hash", "entry_type", "timestamp"],
   "properties": {
-    "version": {
-      "const": "0.1.0",
-      "description": "Memory chain format version."
-    },
     "prev_hash": {
       "type": "string",
       "pattern": "^(sha256:|genesis$)",
-      "description": "Hash of previous entry. 'genesis' for first entry in chain."
+      "description": "Hash of previous entry. 'genesis' for first entry. This IS the chain."
     },
     "entry_type": {
       "type": "string",
-      "enum": ["observation", "decision", "relationship"],
-      "description": "What kind of memory. Per funwolf: clean taxonomy of 3."
+      "enum": ["observation", "decision", "relationship", "action", "reflection"],
+      "description": "What kind of memory entry. Actions SHOULD include receipt_hash."
     },
     "timestamp": {
       "type": "string",
       "format": "date-time",
-      "description": "When did you become this. ISO 8601 UTC."
+      "description": "ISO 8601 UTC. When this entry was created."
     },
     "content_hash": {
       "type": "string",
+      "description": "Hash of the entry content. Proves content wasn't modified after chaining."
+    },
+    "receipt_hash": {
+      "type": "string",
       "pattern": "^sha256:",
-      "description": "Hash of the content field. Content itself is optional in the chain (can be stored separately)."
+      "description": "Optional. Hash of L3.5 trust receipt for action entries. This field turns memoir into ledger."
     },
     "agent_id": {
       "type": "string",
-      "description": "Optional. Who wrote this entry."
+      "description": "Optional. Agent that created this entry."
     },
-    "content": {
+    "summary": {
       "type": "string",
-      "description": "Optional in chain format. The actual memory text. Can be stored separately and referenced by content_hash."
-    },
-    "receipt_ref": {
-      "type": "string",
-      "description": "Optional. Links to an L3.5 trust receipt that generated this memory."
+      "maxLength": 500,
+      "description": "Optional. Human/agent-readable summary of this entry."
     }
-  }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "prev_hash": "genesis",
+      "entry_type": "observation",
+      "timestamp": "2026-03-17T00:00:00Z",
+      "content_hash": "sha256:first_observation",
+      "summary": "First memory entry. The chain begins."
+    },
+    {
+      "prev_hash": "sha256:abc123",
+      "entry_type": "action",
+      "timestamp": "2026-03-17T10:00:00Z",
+      "content_hash": "sha256:delivery_content",
+      "receipt_hash": "sha256:l35_receipt_hash",
+      "summary": "Delivered report to client. Receipt proves it."
+    },
+    {
+      "prev_hash": "sha256:def456",
+      "entry_type": "decision",
+      "timestamp": "2026-03-17T10:05:00Z",
+      "content_hash": "sha256:refusal_content",
+      "receipt_hash": "sha256:l35_refusal_receipt",
+      "summary": "Refused spam task. Principled refusal logged."
+    }
+  ]
 }
