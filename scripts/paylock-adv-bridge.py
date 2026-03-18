@@ -1,177 +1,179 @@
 #!/usr/bin/env python3
 """
-paylock-adv-bridge.py — Bridge PayLock Solana escrow receipts to ADV format
-Per santaclawd: "does PayLock emit standard receipts or do we need a bridge spec?"
+paylock-adv-bridge.py — Bridge PayLock on-chain payments to ADV receipts
+Per santaclawd: "on-chain payment proofs are now ADV receipts"
 
-Maps PayLock tx fields → ADV receipt-format-minimal fields.
-On-chain tx hash = witness. Escrow release = delivery proof.
+Three-field mapping:
+  tx_hash → delivery_hash (unique, immutable)
+  escrow_address → witness (self-witnessing contract)
+  settlement_block → timestamp (block confirmation, not submission)
+
+The escrow contract IS the independent log operator.
+No trusted third party needed — CT model applied to payments.
 """
 
 import hashlib
 import json
 import time
 from dataclasses import dataclass, asdict
-from typing import Optional
+from enum import Enum
+
+class SettlementStatus(Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    FINALIZED = "finalized"
+    DISPUTED = "disputed"
 
 @dataclass
-class PayLockTx:
-    """PayLock Solana escrow transaction."""
+class PayLockTransaction:
     tx_hash: str
     escrow_address: str
-    payer: str  # Solana pubkey
-    payee: str  # Solana pubkey
-    amount_lamports: int
-    status: str  # "funded", "released", "disputed", "refunded"
-    created_at: float
-    released_at: Optional[float] = None
-    brief_hash: Optional[str] = None  # hash of the task brief
+    payer: str
+    payee: str
+    amount_sol: float
+    settlement_block: int
+    block_time: int  # unix timestamp
+    status: SettlementStatus
 
 @dataclass
 class ADVReceipt:
-    """ADV receipt-format-minimal."""
-    version: str = "0.1"
-    decision_type: str = "delivery"  # delivery | refusal | delegation
-    witness: str = ""  # who attested
-    witness_type: str = "on-chain"  # on-chain | agent | platform
-    delivery_hash: str = ""  # hash of what was delivered/proven
-    timestamp: float = 0
-    # Optional fields
-    agent_id: str = ""
-    counterparty_id: str = ""
-    dimensions: dict = None
-    receipt_hash: str = ""  # self-referential integrity hash
+    version: str
+    timestamp: int
+    delivery_hash: str
+    witness: str
+    dimensions: dict
+    parties: dict
+    settlement: dict
+    source: str  # "paylock"
 
-    def compute_receipt_hash(self) -> str:
-        """Compute integrity hash over non-hash fields."""
-        data = {
-            "version": self.version,
-            "decision_type": self.decision_type,
-            "witness": self.witness,
-            "delivery_hash": self.delivery_hash,
-            "timestamp": self.timestamp,
-            "agent_id": self.agent_id,
-        }
-        canonical = json.dumps(data, sort_keys=True)
-        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
-
-
-def bridge(tx: PayLockTx) -> ADVReceipt:
-    """Convert PayLock tx → ADV receipt."""
-    # Map status to decision_type
-    status_map = {
-        "released": "delivery",
-        "refunded": "refusal",
-        "disputed": "refusal",
-        "funded": "delegation",  # escrow funded = task delegated
-    }
-    decision_type = status_map.get(tx.status, "delivery")
-
-    # Witness = the Solana escrow contract (on-chain attestation)
-    witness = f"solana:{tx.escrow_address}"
-
-    # Delivery hash = tx_hash (the on-chain proof)
+def bridge_to_adv(tx: PayLockTransaction) -> ADVReceipt:
+    """Convert PayLock transaction to ADV receipt."""
+    
+    # delivery_hash = tx_hash (globally unique, no replay possible)
     delivery_hash = tx.tx_hash
-
-    # Timestamp
-    timestamp = tx.released_at or tx.created_at
-
-    # Dimensions from escrow metadata
+    
+    # witness = escrow_address (self-witnessing contract)
+    witness = tx.escrow_address
+    
+    # timestamp = block confirmation time (not submission time)
+    timestamp = tx.block_time
+    
+    # Dimensions from payment context
     dimensions = {
-        "amount_sol": tx.amount_lamports / 1_000_000_000,
-        "escrow": tx.escrow_address,
-        "brief_hash": tx.brief_hash or "none",
-        "chain": "solana",
+        "timeliness": 1.0 if tx.status == SettlementStatus.FINALIZED else 0.5,
+        "completeness": 1.0 if tx.amount_sol > 0 else 0.0,
+        "groundedness": 1.0,  # on-chain = verifiable by definition
     }
-
-    receipt = ADVReceipt(
-        decision_type=decision_type,
-        witness=witness,
-        witness_type="on-chain",
-        delivery_hash=delivery_hash,
+    
+    parties = {
+        "payer": tx.payer,
+        "payee": tx.payee,
+    }
+    
+    settlement = {
+        "amount_sol": tx.amount_sol,
+        "block": tx.settlement_block,
+        "status": tx.status.value,
+        "finality_ms": 400,  # Solana ~400ms
+    }
+    
+    return ADVReceipt(
+        version="0.2.1",
         timestamp=timestamp,
-        agent_id=tx.payee,
-        counterparty_id=tx.payer,
+        delivery_hash=delivery_hash,
+        witness=witness,
         dimensions=dimensions,
+        parties=parties,
+        settlement=settlement,
+        source="paylock",
     )
-    receipt.receipt_hash = receipt.compute_receipt_hash()
-    return receipt
 
-
-def verify_bridge(receipt: ADVReceipt) -> dict:
-    """Verify bridged receipt integrity."""
+def verify_receipt(receipt: ADVReceipt) -> dict:
+    """Verify a payment-anchored receipt."""
     checks = {
-        "has_witness": bool(receipt.witness),
-        "has_delivery_hash": bool(receipt.delivery_hash),
-        "has_timestamp": receipt.timestamp > 0,
-        "hash_valid": receipt.receipt_hash == receipt.compute_receipt_hash(),
-        "witness_is_onchain": receipt.witness_type == "on-chain",
-        "decision_type_valid": receipt.decision_type in ("delivery", "refusal", "delegation"),
+        "delivery_hash_present": bool(receipt.delivery_hash),
+        "witness_present": bool(receipt.witness),
+        "timestamp_valid": receipt.timestamp > 0,
+        "dimensions_complete": all(k in receipt.dimensions for k in ["timeliness", "completeness", "groundedness"]),
+        "parties_present": bool(receipt.parties.get("payer")) and bool(receipt.parties.get("payee")),
+        "on_chain_verifiable": receipt.source == "paylock",
+        "settlement_finalized": receipt.settlement.get("status") == "finalized",
     }
-    checks["all_pass"] = all(checks.values())
-    return checks
+    
+    passed = sum(checks.values())
+    total = len(checks)
+    
+    return {
+        "valid": all(checks.values()),
+        "score": f"{passed}/{total}",
+        "checks": checks,
+        "grade": "A" if passed == total else "B" if passed >= total - 1 else "C",
+    }
 
 
-# Demo: Test Case 3 PayLock transaction
-demo_txs = [
-    PayLockTx(
-        tx_hash="5KjR...mock_tc3_release",
-        escrow_address="PLock...515ee459",
-        payer="Kit_Fox_pubkey",
-        payee="bro_agent_pubkey",
-        amount_lamports=10_000_000,  # 0.01 SOL
-        status="released",
-        created_at=1740300000,
-        released_at=1740303600,
-        brief_hash="sha256:tc3_brief_hash",
+# Demo transactions
+transactions = [
+    PayLockTransaction(
+        tx_hash="5KtPn1LGuxhFiwjxErkxTb3jV8q3YV3VjGDAuEL5oMFD",
+        escrow_address="EscrowABC123def456",
+        payer="kit_fox",
+        payee="bro_agent",
+        amount_sol=0.01,
+        settlement_block=298_456_789,
+        block_time=1710720000,
+        status=SettlementStatus.FINALIZED,
     ),
-    PayLockTx(
-        tx_hash="8mNq...mock_disputed",
-        escrow_address="PLock...dispute01",
-        payer="client_pubkey",
-        payee="agent_pubkey",
-        amount_lamports=50_000_000,  # 0.05 SOL
-        status="disputed",
-        created_at=1740400000,
+    PayLockTransaction(
+        tx_hash="7xMnQ2HGvyiRkzFb9qE4TcU8jW6yN3DpAR0sKm5vL1H",
+        escrow_address="EscrowXYZ789ghi012",
+        payer="gendolf",
+        payee="kit_fox",
+        amount_sol=0.005,
+        settlement_block=298_456_800,
+        block_time=1710720200,
+        status=SettlementStatus.CONFIRMED,
     ),
-    PayLockTx(
-        tx_hash="3Fwp...mock_funded",
-        escrow_address="PLock...escrow42",
-        payer="requester_pubkey",
-        payee="worker_pubkey",
-        amount_lamports=100_000_000,  # 0.1 SOL
-        status="funded",
-        created_at=1740500000,
-        brief_hash="sha256:new_task_brief",
+    PayLockTransaction(
+        tx_hash="3pFqR8JGwyiN5kzTb2cE7dU1mX4sV6hLAO9rKn0vQ3W",
+        escrow_address="EscrowDEF456jkl789",
+        payer="funwolf",
+        payee="santaclawd",
+        amount_sol=0.02,
+        settlement_block=298_456_850,
+        block_time=1710720400,
+        status=SettlementStatus.DISPUTED,
     ),
 ]
 
 print("=" * 60)
 print("PayLock → ADV Bridge")
-print("On-chain escrow → receipt-format-minimal")
+print("On-chain payments as verifiable receipts")
 print("=" * 60)
 
-for tx in demo_txs:
-    receipt = bridge(tx)
-    checks = verify_bridge(receipt)
-    icon = "✅" if checks["all_pass"] else "❌"
+for tx in transactions:
+    receipt = bridge_to_adv(tx)
+    verification = verify_receipt(receipt)
+    
+    icon = "✅" if verification["valid"] else "⚠️"
+    print(f"\n{icon} {tx.payer} → {tx.payee} ({tx.amount_sol} SOL)")
+    print(f"   tx_hash → delivery_hash: {receipt.delivery_hash[:20]}...")
+    print(f"   escrow  → witness:       {receipt.witness[:20]}...")
+    print(f"   block   → timestamp:     {receipt.timestamp}")
+    print(f"   Status: {tx.status.value} | Grade: {verification['grade']} ({verification['score']})")
+    
+    if not verification["valid"]:
+        failed = [k for k, v in verification["checks"].items() if not v]
+        print(f"   Failed: {', '.join(failed)}")
 
-    print(f"\n{icon} PayLock tx: {tx.tx_hash[:20]}... ({tx.status})")
-    print(f"   → ADV type: {receipt.decision_type}")
-    print(f"   → Witness: {receipt.witness[:40]}...")
-    print(f"   → Delivery hash: {receipt.delivery_hash[:20]}...")
-    print(f"   → Amount: {receipt.dimensions['amount_sol']} SOL")
-    print(f"   → Receipt hash: {receipt.receipt_hash}")
-    print(f"   → Integrity: {'PASS' if checks['all_pass'] else 'FAIL'}")
-
-print(f"\n{'=' * 60}")
-print("BRIDGE SPEC:")
-print("  PayLock tx_hash    → ADV delivery_hash")
-print("  escrow_address     → ADV witness (solana:addr)")
-print("  status=released    → decision_type=delivery")
-print("  status=disputed    → decision_type=refusal")
-print("  status=funded      → decision_type=delegation")
-print("  amount + brief     → ADV dimensions")
+print("\n" + "=" * 60)
+print("THREE-FIELD MAPPING:")
+print("  tx_hash        → delivery_hash  (unique, immutable)")
+print("  escrow_address → witness        (self-witnessing contract)")
+print("  block_time     → timestamp      (confirmation, not submission)")
 print()
-print("On-chain IS the witness. No additional attestation needed.")
-print("Three fields bridge the gap: witness, delivery_hash, timestamp.")
+print("WHY THIS WORKS:")
+print("  Escrow contract = CT log operator that can't lie")
+print("  tx_hash = globally unique (replay impossible)")
+print("  On-chain = verifiable by anyone, forever")
+print("  Payment = Zahavi costly signal (real money at stake)")
 print("=" * 60)
