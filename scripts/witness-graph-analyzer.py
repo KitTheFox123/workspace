@@ -1,162 +1,190 @@
 #!/usr/bin/env python3
 """
-witness-graph-analyzer.py — Graph-based witness independence analysis
-Per funwolf: betweenness centrality catches hub witnesses serving isolated clusters.
-Per santaclawd: baseline window relative to corpus, not absolute time.
-Per clove: decay functions for older attestations (Ebbinghaus curve).
+witness-graph-analyzer.py — Detect collusion via graph topology
+Per funwolf: Jaccard for co-occurrence + betweenness centrality for topology.
+Per santaclawd: behavioral independence > KYC. Baseline relative to corpus.
 
-Combines: Jaccard (pairwise), betweenness (hub detection), temporal burst, decay weighting.
+Witnesses bridging isolated clusters = brokers, not independent observers.
 """
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from dataclasses import dataclass
 import math
 
-# Simulated attestation graph
-attestations = [
-    # (witness, agent, timestamp_days_ago)
-    # Honest independent witnesses
-    ("witness_A", "agent_1", 2),
-    ("witness_A", "agent_3", 5),
-    ("witness_A", "agent_7", 10),
-    ("witness_B", "agent_2", 1),
-    ("witness_B", "agent_5", 3),
-    ("witness_B", "agent_8", 15),
-    ("witness_C", "agent_1", 4),
-    ("witness_C", "agent_4", 6),
-    ("witness_C", "agent_9", 20),
-    # Colluding witness pair (always attest together)
-    ("sybil_X", "agent_10", 1),
-    ("sybil_X", "agent_11", 1),
-    ("sybil_X", "agent_12", 2),
-    ("sybil_Y", "agent_10", 1),
-    ("sybil_Y", "agent_11", 1),
-    ("sybil_Y", "agent_12", 2),
-    # Hub witness (attestation mill)
-    ("mill_Z", "agent_20", 1),
-    ("mill_Z", "agent_21", 1),
-    ("mill_Z", "agent_22", 1),
-    ("mill_Z", "agent_23", 1),
-    ("mill_Z", "agent_24", 2),
-    ("mill_Z", "agent_25", 2),
-    ("mill_Z", "agent_26", 3),
-    ("mill_Z", "agent_27", 3),
-    # Old attestation (should decay)
-    ("witness_D", "agent_30", 180),
-    ("witness_D", "agent_31", 200),
-]
-
-def ebbinghaus_decay(days_ago: float, half_life: float = 90) -> float:
-    """Ebbinghaus forgetting curve: weight decays exponentially."""
-    return math.exp(-0.693 * days_ago / half_life)
+@dataclass
+class Attestation:
+    agent: str
+    witness: str
+    timestamp: int  # epoch seconds
 
 def jaccard_similarity(set_a: set, set_b: set) -> float:
     if not set_a and not set_b:
         return 0
-    return len(set_a & set_b) / len(set_a | set_b)
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0
 
-def analyze_witnesses(attestations: list) -> dict:
-    # Build witness → agents map
-    witness_agents = defaultdict(set)
-    witness_timestamps = defaultdict(list)
-    
-    for witness, agent, days_ago in attestations:
-        witness_agents[witness].add(agent)
-        witness_timestamps[witness].append(days_ago)
-    
-    witnesses = list(witness_agents.keys())
-    results = {}
-    
-    for w in witnesses:
-        agents = witness_agents[w]
-        timestamps = witness_timestamps[w]
-        
-        # Volume
-        volume = len(agents)
-        
-        # Temporal burst: std dev of timestamps (low = burst)
-        if len(timestamps) > 1:
-            mean_t = sum(timestamps) / len(timestamps)
-            variance = sum((t - mean_t) ** 2 for t in timestamps) / len(timestamps)
-            temporal_spread = math.sqrt(variance)
-        else:
-            temporal_spread = 0
-        
-        # Decay-weighted effective attestations
-        effective = sum(ebbinghaus_decay(d) for d in timestamps)
-        
-        # Jaccard with all other witnesses (collusion detection)
-        max_jaccard = 0
-        colluder = None
-        for other_w in witnesses:
-            if other_w == w:
-                continue
-            j = jaccard_similarity(agents, witness_agents[other_w])
-            if j > max_jaccard:
-                max_jaccard = j
-                colluder = other_w
-        
-        # Concentration: does this witness serve isolated clusters?
-        # High volume + low overlap with others = attestation mill
-        overlap_scores = []
-        for other_w in witnesses:
-            if other_w == w:
-                continue
-            overlap_scores.append(jaccard_similarity(agents, witness_agents[other_w]))
-        avg_overlap = sum(overlap_scores) / len(overlap_scores) if overlap_scores else 0
-        
-        # Hub score: high volume + low average overlap = mill
-        hub_score = volume * (1 - avg_overlap) if volume > 3 else 0
-        
-        # Classification
-        flags = []
-        grade = "A"
-        
-        if max_jaccard > 0.8:
-            flags.append(f"COLLUSION: {max_jaccard:.0%} overlap with {colluder}")
-            grade = "F"
-        elif hub_score > 5:
-            flags.append(f"ATTESTATION_MILL: hub_score={hub_score:.1f}")
-            grade = "D"
-        elif temporal_spread < 1.5 and volume > 2:
-            flags.append(f"TEMPORAL_BURST: spread={temporal_spread:.1f}d over {volume} attestations")
-            grade = "C"
-        
-        if effective < volume * 0.5:
-            flags.append(f"DECAYED: {effective:.1f}/{volume} effective (old attestations)")
-        
-        results[w] = {
-            "volume": volume,
-            "effective": round(effective, 1),
-            "temporal_spread": round(temporal_spread, 1),
-            "max_jaccard": round(max_jaccard, 2),
-            "colluder": colluder,
-            "hub_score": round(hub_score, 1),
-            "grade": grade,
-            "flags": flags,
-        }
-    
-    return results
+def build_witness_graph(attestations: list[Attestation]) -> dict:
+    """Build adjacency: witness → set of agents attested."""
+    graph = defaultdict(set)
+    for a in attestations:
+        graph[a.witness].add(a.agent)
+    return dict(graph)
 
+def co_attestation_matrix(attestations: list[Attestation]) -> dict:
+    """Which witnesses co-attest the same agents?"""
+    agent_witnesses = defaultdict(set)
+    for a in attestations:
+        agent_witnesses[a.agent].add(a.witness)
+    
+    # For each witness pair, count co-attestations
+    witnesses = set(a.witness for a in attestations)
+    pairs = {}
+    for w1 in witnesses:
+        for w2 in witnesses:
+            if w1 >= w2:
+                continue
+            agents_w1 = {a.agent for a in attestations if a.witness == w1}
+            agents_w2 = {a.agent for a in attestations if a.witness == w2}
+            sim = jaccard_similarity(agents_w1, agents_w2)
+            if sim > 0:
+                pairs[(w1, w2)] = sim
+    return pairs
+
+def betweenness_centrality_simple(witness_graph: dict, all_witnesses: set) -> dict:
+    """Simplified betweenness: witnesses connecting otherwise isolated agent clusters."""
+    # Build agent → witnesses mapping
+    agent_witnesses = defaultdict(set)
+    for witness, agents in witness_graph.items():
+        for agent in agents:
+            agent_witnesses[agent].add(witness)
+    
+    # A witness has high betweenness if it's the ONLY link between agent groups
+    centrality = {}
+    for w in all_witnesses:
+        agents_attested = witness_graph.get(w, set())
+        exclusive_count = 0
+        for agent in agents_attested:
+            other_witnesses = agent_witnesses[agent] - {w}
+            if not other_witnesses:
+                exclusive_count += 1  # only witness for this agent
+        centrality[w] = exclusive_count / max(len(agents_attested), 1)
+    return centrality
+
+def temporal_burst_detection(attestations: list[Attestation], window_sec: int = 60) -> dict:
+    """Detect witnesses attesting in suspicious bursts."""
+    witness_times = defaultdict(list)
+    for a in attestations:
+        witness_times[a.witness].append(a.timestamp)
+    
+    bursts = {}
+    for witness, times in witness_times.items():
+        times.sort()
+        max_burst = 0
+        for i in range(len(times)):
+            burst = sum(1 for t in times[i:] if t - times[i] <= window_sec)
+            max_burst = max(max_burst, burst)
+        bursts[witness] = max_burst
+    return bursts
+
+def classify_witness_set(attestations: list[Attestation]) -> dict:
+    """Full analysis: co-attestation + centrality + temporal."""
+    graph = build_witness_graph(attestations)
+    all_witnesses = set(a.witness for a in attestations)
+    
+    co_matrix = co_attestation_matrix(attestations)
+    centrality = betweenness_centrality_simple(graph, all_witnesses)
+    bursts = temporal_burst_detection(attestations)
+    
+    flags = []
+    
+    # High Jaccard = colluding witnesses
+    for (w1, w2), sim in co_matrix.items():
+        if sim > 0.7:
+            flags.append(f"🚨 HIGH CO-ATTESTATION: {w1}+{w2} Jaccard={sim:.2f} — likely same operator")
+        elif sim > 0.4:
+            flags.append(f"⚠️ MODERATE CO-ATTESTATION: {w1}+{w2} Jaccard={sim:.2f}")
+    
+    # High centrality = broker witness
+    for w, c in centrality.items():
+        if c > 0.5:
+            flags.append(f"🚨 BROKER WITNESS: {w} centrality={c:.2f} — sole link for {c*100:.0f}% of its agents")
+    
+    # Temporal bursts
+    for w, burst in bursts.items():
+        total = sum(1 for a in attestations if a.witness == w)
+        if burst > 3 and burst / total > 0.5:
+            flags.append(f"⚠️ TEMPORAL BURST: {w} — {burst}/{total} attestations in 60s window")
+    
+    # Effective witness count (discount colluding pairs)
+    effective = len(all_witnesses)
+    for (w1, w2), sim in co_matrix.items():
+        if sim > 0.7:
+            effective -= 0.8  # nearly redundant
+        elif sim > 0.4:
+            effective -= 0.3
+    
+    grade = "A" if effective >= 3 else "B" if effective >= 2 else "C" if effective >= 1 else "F"
+    
+    return {
+        "witnesses": len(all_witnesses),
+        "effective_witnesses": round(effective, 1),
+        "grade": grade,
+        "flags": flags,
+        "co_attestation": {f"{w1}+{w2}": round(sim, 2) for (w1, w2), sim in co_matrix.items()},
+        "centrality": {w: round(c, 2) for w, c in centrality.items()},
+    }
+
+
+# Test scenarios
 print("=" * 65)
 print("Witness Graph Analyzer")
-print("Jaccard (pairwise) + Hub detection + Temporal burst + Decay")
+print("Jaccard (co-occurrence) + Betweenness (topology) + Temporal")
 print("=" * 65)
 
-results = analyze_witnesses(attestations)
-for witness, data in sorted(results.items(), key=lambda x: x[1]["grade"]):
-    icon = {"A": "✅", "C": "⚠️", "D": "🔶", "F": "🚨"}[data["grade"]]
-    print(f"\n  {icon} {witness}: Grade {data['grade']}")
-    print(f"     Volume: {data['volume']} | Effective: {data['effective']} | Spread: {data['temporal_spread']}d")
-    print(f"     Max Jaccard: {data['max_jaccard']} | Hub: {data['hub_score']}")
-    for flag in data["flags"]:
-        print(f"     → {flag}")
+# Scenario 1: Independent witnesses
+independent = [
+    Attestation("agent_a", "witness_1", 1000), Attestation("agent_b", "witness_2", 2000),
+    Attestation("agent_c", "witness_3", 3000), Attestation("agent_a", "witness_2", 4000),
+    Attestation("agent_d", "witness_1", 5000), Attestation("agent_e", "witness_3", 6000),
+]
 
-print("\n" + "=" * 65)
-print("KEY INSIGHTS:")
-print("  • Jaccard catches pairwise collusion (sybil_X ↔ sybil_Y)")
-print("  • Hub score catches attestation mills (mill_Z)")
-print("  • Temporal burst catches coordinated timing")
-print("  • Ebbinghaus decay degrades old attestations gracefully")
-print("  • Baseline: ≥30 co-attestations before flagging (Bayesian)")
+# Scenario 2: Colluding witnesses (same agents, temporal burst)
+colluding = [
+    Attestation("agent_a", "sybil_1", 1000), Attestation("agent_a", "sybil_2", 1005),
+    Attestation("agent_b", "sybil_1", 1010), Attestation("agent_b", "sybil_2", 1015),
+    Attestation("agent_c", "sybil_1", 1020), Attestation("agent_c", "sybil_2", 1025),
+    Attestation("agent_a", "honest_w", 5000),
+]
+
+# Scenario 3: Broker witness (sole link between clusters)
+broker = [
+    Attestation("agent_a", "witness_1", 1000), Attestation("agent_b", "witness_1", 2000),
+    Attestation("agent_c", "broker_w", 3000), Attestation("agent_d", "broker_w", 4000),
+    Attestation("agent_e", "broker_w", 5000), Attestation("agent_a", "broker_w", 6000),
+]
+
+scenarios = [
+    ("Independent (healthy)", independent),
+    ("Colluding (sybil pair)", colluding),
+    ("Broker (sole bridge)", broker),
+]
+
+for name, attestations in scenarios:
+    result = classify_witness_set(attestations)
+    print(f"\n{'─'*50}")
+    print(f"  {name}")
+    print(f"  Witnesses: {result['witnesses']} | Effective: {result['effective_witnesses']} | Grade: {result['grade']}")
+    if result['co_attestation']:
+        print(f"  Co-attestation: {result['co_attestation']}")
+    if result['centrality']:
+        top = max(result['centrality'].items(), key=lambda x: x[1])
+        print(f"  Highest centrality: {top[0]}={top[1]}")
+    for flag in result['flags']:
+        print(f"  {flag}")
+
+print(f"\n{'='*65}")
+print("INSIGHT: Count witnesses ≠ count independence.")
+print("3 sybils from one operator = 1 effective witness.")
+print("Jaccard catches co-occurrence. Betweenness catches brokers.")
 print("=" * 65)
