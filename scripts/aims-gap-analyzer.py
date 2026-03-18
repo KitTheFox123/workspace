@@ -279,5 +279,71 @@ def main():
     print("  The ecosystem builds on the anti-pattern the draft condemns")
     print("=" * 70)
 
+def nemoclaw_analysis():
+    """Analyze NemoClaw's vendor lock-in risk vs open alternatives."""
+    print("\n" + "=" * 70)
+    print("NEMOCLAW VENDOR LOCK-IN ANALYSIS (GTC 2026)")
+    print("=" * 70)
+    
+    stacks = [
+        {
+            "name": "NemoClaw (Nvidia)",
+            "format_open": True,
+            "enforcement_open": False,  # OpenShell built with CrowdStrike/Cisco/MSFT
+            "trust_layer_vendor": True,  # Policy guardrails = Nvidia stack
+            "gpu_dependency": True,
+            "identity_portable": False,  # SPIFFE possible but not default
+            "spec_org_eq_enforcement": True,  # Nvidia controls both
+            "lockin_score": 0.60,
+        },
+        {
+            "name": "CT (Certificate Transparency)",
+            "format_open": True,
+            "enforcement_open": True,  # Multiple independent log operators
+            "trust_layer_vendor": False,
+            "gpu_dependency": False,
+            "identity_portable": True,  # Certificates portable
+            "spec_org_eq_enforcement": False,  # IETF ≠ Google/browsers
+            "lockin_score": 0.14,
+        },
+        {
+            "name": "L3.5 Receipt Format",
+            "format_open": True,
+            "enforcement_open": True,  # Any verifier
+            "trust_layer_vendor": False,
+            "gpu_dependency": False,
+            "identity_portable": True,  # DKIM-signed, platform-independent
+            "spec_org_eq_enforcement": False,
+            "lockin_score": 0.08,
+        },
+        {
+            "name": "AIMS (IETF draft)",
+            "format_open": True,
+            "enforcement_open": True,  # Standards-based
+            "trust_layer_vendor": False,
+            "gpu_dependency": False,
+            "identity_portable": True,  # SPIFFE
+            "spec_org_eq_enforcement": False,
+            "lockin_score": 0.12,
+        },
+    ]
+    
+    grades = {(0, 0.15): "A", (0.15, 0.30): "B", (0.30, 0.50): "C", (0.50, 1.0): "D"}
+    
+    for stack in stacks:
+        grade = next(g for (lo, hi), g in grades.items() if lo <= stack["lockin_score"] < hi)
+        print(f"\n  {stack['name']}: Grade {grade} ({stack['lockin_score']:.0%} lock-in)")
+        print(f"    Format open: {'✓' if stack['format_open'] else '✗'}")
+        print(f"    Enforcement open: {'✓' if stack['enforcement_open'] else '✗'}")
+        print(f"    Trust layer vendor-free: {'✓' if not stack['trust_layer_vendor'] else '✗'}")
+        print(f"    Identity portable: {'✓' if stack['identity_portable'] else '✗'}")
+        print(f"    spec_org ≠ enforcement_org: {'✓' if not stack['spec_org_eq_enforcement'] else '✗'}")
+    
+    print(f"\n  ⚠️ NemoClaw pattern: open base + proprietary security = ActiveX 2.0")
+    print(f"  The security layer IS the lock-in vector.")
+    print(f"  Antidote: spec_org ≠ enforcement_org (CT, L3.5, AIMS)")
+
+
 if __name__ == "__main__":
     main()
+    nemoclaw_analysis()
