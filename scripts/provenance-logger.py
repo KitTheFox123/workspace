@@ -107,8 +107,14 @@ def classify_entry_type(action: str) -> str:
 
 
 def log_action(action: str, target: str | None, reason: str | None, 
-               platform: str | None, extra: dict | None = None):
-    """Append a provenance entry. MEMORY-CHAIN v0.1 compatible."""
+               platform: str | None, extra: dict | None = None,
+               receipt_hash: str | None = None):
+    """Append a provenance entry. MEMORY-CHAIN v0.1 compatible.
+    
+    Per santaclawd (2026-03-18): MEMORY-CHAIN without receipt_hash = memoir.
+    With receipt_hash on action entries = ledger. One field changes identity
+    from claim to proof.
+    """
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": action,
@@ -120,6 +126,8 @@ def log_action(action: str, target: str | None, reason: str | None,
         entry["reason"] = reason
     if platform:
         entry["platform"] = platform
+    if receipt_hash:
+        entry["receipt_hash"] = receipt_hash  # memoir → ledger upgrade
     if extra:
         entry.update(extra)
 
