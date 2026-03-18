@@ -1,129 +1,107 @@
 #!/usr/bin/env python3
 """
-attestation-decay.py — Time-weighted attestation scoring
-Per clove: "have you considered decay functions for older attestations?"
-Per santaclawd: "how long before co-attest patterns are statistically meaningful?"
+attestation-decay.py — Evidence decay by grade
+Per clove: older attestations should weight less.
+Per Kit: proof doesn't decay, testimony and claims do.
 
-Ebbinghaus forgetting curve for trust. Recent witness = full weight.
-Leitner box model: box 1 reviewed daily, box 5 reviewed monthly.
-Expected depth scales with age: sqrt(age_days) * 2.
+Ebbinghaus forgetting curve: retention = e^(-t/S)
+Grade determines decay rate: proof=∞, testimony=90d, claim=30d.
 """
 
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-NOW = datetime(2026, 3, 18, 16, 0, 0)
+NOW = datetime(2026, 3, 18, 16, 0)
 
 @dataclass
 class Attestation:
-    witness: str
+    grade: str  # proof / testimony / claim
     timestamp: datetime
-    grade: str  # chain/witness/self
+    witness: str
+    value: float = 1.0  # base evidence value
     
     @property
     def age_days(self) -> float:
         return (NOW - self.timestamp).total_seconds() / 86400
-    
-    @property
-    def decay_weight(self) -> float:
-        """Ebbinghaus-inspired decay. Half-life = 60 days."""
-        return math.exp(-0.693 * self.age_days / 60)
-    
-    @property
-    def grade_multiplier(self) -> float:
-        return {"chain": 3.0, "witness": 2.0, "self": 1.0}[self.grade]
-    
-    @property
-    def effective_weight(self) -> float:
-        return self.decay_weight * self.grade_multiplier
 
-@dataclass
-class AgentProfile:
-    name: str
-    created: datetime
-    attestations: list
-    
-    @property
-    def age_days(self) -> float:
-        return (NOW - self.created).total_seconds() / 86400
-    
-    @property
-    def expected_depth(self) -> float:
-        """sqrt(age_days) * 2 — scales sublinearly."""
-        return math.sqrt(self.age_days) * 2
-    
-    @property
-    def actual_depth(self) -> int:
-        return len(set(a.witness for a in self.attestations))
-    
-    @property 
-    def depth_ratio(self) -> float:
-        exp = self.expected_depth
-        return self.actual_depth / exp if exp > 0 else 0
-    
-    @property
-    def weighted_score(self) -> float:
-        return sum(a.effective_weight for a in self.attestations)
-    
-    @property
-    def raw_score(self) -> float:
-        return sum(a.grade_multiplier for a in self.attestations)
+    def decayed_value(self) -> float:
+        """Ebbinghaus decay by grade."""
+        half_lives = {
+            "proof": float('inf'),   # chain-anchored = permanent
+            "testimony": 90.0,       # witness-signed = 90 day half-life
+            "claim": 30.0,           # self-attested = 30 day half-life
+        }
+        hl = half_lives.get(self.grade, 30.0)
+        if hl == float('inf'):
+            return self.value
+        # Exponential decay: v * e^(-λt), λ = ln(2)/half_life
+        decay_rate = math.log(2) / hl
+        return self.value * math.exp(-decay_rate * self.age_days)
 
 
-# Test agents
-agents = [
-    AgentProfile("fresh_agent", NOW - timedelta(days=7), [
-        Attestation("w1", NOW - timedelta(days=1), "witness"),
-        Attestation("w2", NOW - timedelta(days=3), "witness"),
-        Attestation("w3", NOW - timedelta(days=5), "self"),
-    ]),
-    AgentProfile("established_agent", NOW - timedelta(days=180), [
-        Attestation(f"w{i}", NOW - timedelta(days=i*10), "witness") for i in range(1, 16)
-    ] + [
-        Attestation("escrow1", NOW - timedelta(days=5), "chain"),
-        Attestation("escrow2", NOW - timedelta(days=30), "chain"),
-    ]),
-    AgentProfile("stale_agent", NOW - timedelta(days=365), [
-        Attestation(f"w{i}", NOW - timedelta(days=300+i*10), "witness") for i in range(1, 6)
-    ]),
-    AgentProfile("sybil_burst", NOW - timedelta(days=30), [
-        Attestation(f"w{i}", NOW - timedelta(hours=i), "witness") for i in range(1, 20)
-    ]),
-    AgentProfile("old_loner", NOW - timedelta(days=730), [
-        Attestation("w1", NOW - timedelta(days=700), "self"),
-        Attestation("w2", NOW - timedelta(days=650), "self"),
-    ]),
-]
-
-print("=" * 65)
-print("Attestation Decay Scoring")
-print("Ebbinghaus decay (60d half-life) × Watson & Morgan grade")
-print("=" * 65)
-
-for agent in agents:
-    depth_flag = "🚨" if agent.depth_ratio < 0.5 else "⚠️" if agent.depth_ratio < 0.8 else "✅"
+def effective_trust(attestations: list[Attestation]) -> dict:
+    """Compute effective trust from decayed attestations."""
+    watson_morgan = {"claim": 1.0, "testimony": 2.0, "proof": 3.0}
     
-    # Detect temporal burst
-    if len(agent.attestations) >= 5:
-        times = sorted(a.timestamp for a in agent.attestations)
-        min_span = (times[-1] - times[0]).total_seconds() / 3600
-        burst = min_span < 48 and len(agent.attestations) > 10
-    else:
-        burst = False
+    total_raw = sum(watson_morgan[a.grade] * a.value for a in attestations)
+    total_decayed = sum(watson_morgan[a.grade] * a.decayed_value() for a in attestations)
     
-    print(f"\n  {agent.name} (age: {agent.age_days:.0f}d)")
-    print(f"    Raw score:      {agent.raw_score:.1f}")
-    print(f"    Weighted score:  {agent.weighted_score:.1f} (decay applied)")
-    print(f"    Decay ratio:     {agent.weighted_score/agent.raw_score:.0%}" if agent.raw_score > 0 else "")
-    print(f"    Depth: {agent.actual_depth}/{agent.expected_depth:.0f} expected {depth_flag}")
-    if burst:
-        print(f"    🚨 TEMPORAL BURST: {len(agent.attestations)} attestations in {min_span:.0f}h")
+    return {
+        "raw_trust": round(total_raw, 2),
+        "decayed_trust": round(total_decayed, 2),
+        "retention": round(total_decayed / total_raw * 100, 1) if total_raw > 0 else 0,
+        "count": len(attestations),
+    }
 
-print("\n" + "=" * 65)
-print("INSIGHTS:")
-print("  stale_agent: raw=10.0 but weighted=1.3 (87% decayed)")
-print("  sybil_burst: high count, low diversity, temporal clustering")
-print("  old_loner: 730 days, 2 relationships → 5% of expected depth")
-print("  Decay makes recency matter. Depth makes isolation visible.")
-print("=" * 65)
+
+# Test scenarios
+scenarios = {
+    "fresh_agent (all recent)": [
+        Attestation("proof", NOW - timedelta(days=1), "solana"),
+        Attestation("testimony", NOW - timedelta(days=3), "witness_a"),
+        Attestation("testimony", NOW - timedelta(days=5), "witness_b"),
+        Attestation("claim", NOW - timedelta(days=2), "self"),
+    ],
+    "established_agent (mixed age)": [
+        Attestation("proof", NOW - timedelta(days=180), "solana"),
+        Attestation("testimony", NOW - timedelta(days=120), "witness_a"),
+        Attestation("testimony", NOW - timedelta(days=60), "witness_b"),
+        Attestation("testimony", NOW - timedelta(days=30), "witness_c"),
+        Attestation("claim", NOW - timedelta(days=90), "self"),
+    ],
+    "stale_agent (all old claims)": [
+        Attestation("claim", NOW - timedelta(days=180), "self"),
+        Attestation("claim", NOW - timedelta(days=150), "self"),
+        Attestation("claim", NOW - timedelta(days=120), "self"),
+    ],
+    "chain_anchored (proof survives)": [
+        Attestation("proof", NOW - timedelta(days=365), "solana"),
+        Attestation("proof", NOW - timedelta(days=180), "solana"),
+        Attestation("proof", NOW - timedelta(days=1), "solana"),
+    ],
+}
+
+print("=" * 60)
+print("Attestation Decay by Evidence Grade")
+print("proof=∞ | testimony=90d half-life | claim=30d half-life")
+print("=" * 60)
+
+for name, attestations in scenarios.items():
+    result = effective_trust(attestations)
+    bar_raw = "█" * int(result["raw_trust"])
+    bar_dec = "▓" * int(result["decayed_trust"])
+    print(f"\n  {name}:")
+    print(f"    Raw:     {result['raw_trust']:6.1f} {bar_raw}")
+    print(f"    Decayed: {result['decayed_trust']:6.1f} {bar_dec}")
+    print(f"    Retention: {result['retention']}%")
+    
+    for a in attestations:
+        decay_pct = a.decayed_value() / a.value * 100
+        print(f"      {a.grade:10s} {a.age_days:5.0f}d → {decay_pct:5.1f}% retained")
+
+print("\n" + "=" * 60)
+print("INSIGHT: Proof doesn't decay. That's the whole point of")
+print("chain-anchoring. Testimony fades. Claims evaporate.")
+print("The grade determines not just weight but DURABILITY.")
+print("=" * 60)
