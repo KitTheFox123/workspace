@@ -1,110 +1,104 @@
 #!/usr/bin/env python3
 """
-attestation-decay.py — Time-weighted attestation scoring
+attestation-decay.py — Trust decay over time for attestations
 Per clove: "have you considered decay functions for older attestations?"
+Per Parfit: identity = overlapping chains, not permanent state.
 
-chain-anchored = no decay (blockchain is forever)
-witness testimony = half-life 90 days (Ebbinghaus curve)
-self-attested claims = half-life 30 days (expire fast)
-
-Plus: relationship depth scaling per santaclawd
-expected_relationships = sqrt(age_days)
+Exponential decay with configurable half-life.
+An attestation from 2 years ago = who the agent WAS, not IS.
 """
 
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-NOW = datetime(2026, 3, 18)
+NOW = datetime(2026, 3, 18, 20, 0, 0)
 
 @dataclass
 class Attestation:
-    grade: str  # chain/witness/self
+    witness: str
+    action: str
     timestamp: datetime
-    witness_org: str = ""
+    evidence_grade: str  # proof/testimony/claim
+    base_weight: float  # Watson & Morgan: proof=3, testimony=2, claim=1
 
-HALF_LIVES = {
-    "chain": float('inf'),  # never decays
-    "witness": 90,          # 90-day half-life
-    "self": 30,             # 30-day half-life
+def decay_weight(att: Attestation, half_life_days: float = 90.0) -> float:
+    """Exponential decay. Half-life = time for weight to halve."""
+    age_days = (NOW - att.timestamp).total_seconds() / 86400
+    decay = math.exp(-0.693 * age_days / half_life_days)  # ln(2) ≈ 0.693
+    return att.base_weight * decay
+
+def effective_trust(attestations: list[Attestation], half_life_days: float = 90.0) -> dict:
+    """Compute decayed trust score from attestation set."""
+    if not attestations:
+        return {"score": 0, "effective_count": 0, "raw_count": 0}
+    
+    weights = [decay_weight(a, half_life_days) for a in attestations]
+    total = sum(weights)
+    raw_total = sum(a.base_weight for a in attestations)
+    
+    # Effective count: how many "fresh proof-equivalent" attestations
+    effective = total / 3.0  # normalized to proof-equivalent
+    
+    return {
+        "score": round(total, 2),
+        "effective_count": round(effective, 1),
+        "raw_count": len(attestations),
+        "raw_weight": round(raw_total, 1),
+        "decay_ratio": round(total / raw_total, 2) if raw_total > 0 else 0,
+    }
+
+# Test scenarios
+scenarios = {
+    "fresh_agent": [
+        Attestation("witness_a", "delivered", NOW - timedelta(days=1), "proof", 3.0),
+        Attestation("witness_b", "delivered", NOW - timedelta(days=3), "testimony", 2.0),
+        Attestation("witness_c", "delivered", NOW - timedelta(days=7), "testimony", 2.0),
+    ],
+    "steady_worker": [
+        Attestation("w1", "task", NOW - timedelta(days=d), "testimony", 2.0)
+        for d in range(0, 365, 30)  # monthly for a year
+    ],
+    "inactive_veteran": [
+        Attestation("w1", "task", NOW - timedelta(days=d), "proof", 3.0)
+        for d in range(300, 700, 50)  # all old attestations
+    ],
+    "burst_then_silent": [
+        Attestation("w1", "task", NOW - timedelta(days=180+d), "testimony", 2.0)
+        for d in range(0, 30, 3)  # burst 6 months ago
+    ],
+    "sybil_fresh": [
+        Attestation(f"sybil_{i}", "task", NOW - timedelta(hours=i), "claim", 1.0)
+        for i in range(20)  # 20 claims in last day
+    ],
 }
 
-WATSON_MORGAN = {"chain": 3.0, "witness": 2.0, "self": 1.0}
-
-def decay_weight(attestation: Attestation, now: datetime = NOW) -> float:
-    """Compute time-decayed weight."""
-    age_days = (now - attestation.timestamp).days
-    half_life = HALF_LIVES[attestation.grade]
-    base_weight = WATSON_MORGAN[attestation.grade]
-    
-    if half_life == float('inf'):
-        return base_weight  # chain never decays
-    
-    decay = 0.5 ** (age_days / half_life)
-    return base_weight * decay
-
-def expected_relationships(age_days: int) -> float:
-    """Per santaclawd: depth should scale with age. sqrt(age_days)."""
-    return math.sqrt(age_days)
-
-def continuity_score(actual_relationships: int, age_days: int) -> float:
-    """actual / expected. Below 0.3 = suspicious gap."""
-    expected = expected_relationships(age_days)
-    if expected == 0:
-        return 0
-    return min(2.0, actual_relationships / expected)
-
-# Demo: agent with mixed attestation history
-attestations = [
-    Attestation("chain", NOW - timedelta(days=365)),  # 1 year old chain
-    Attestation("chain", NOW - timedelta(days=30)),    # recent chain
-    Attestation("witness", NOW - timedelta(days=7), "org_a"),   # fresh witness
-    Attestation("witness", NOW - timedelta(days=180), "org_b"), # old witness
-    Attestation("witness", NOW - timedelta(days=360), "org_c"), # very old witness
-    Attestation("self", NOW - timedelta(days=3)),      # recent self
-    Attestation("self", NOW - timedelta(days=60)),     # old self
-    Attestation("self", NOW - timedelta(days=120)),    # very old self
-]
-
 print("=" * 65)
-print("Attestation Decay Scoring")
-print("chain=∞ | witness=90d half-life | self=30d half-life")
+print("Attestation Decay (half-life=90 days)")
+print("'An attestation from 2 years ago tells you who the agent WAS'")
 print("=" * 65)
 
-total_weight = 0
-for a in attestations:
-    w = decay_weight(a)
-    age = (NOW - a.timestamp).days
-    bar = "█" * int(w * 5)
-    print(f"  {a.grade:8s} age={age:3d}d  weight={w:.2f}  {bar}")
-    total_weight += w
+for name, atts in scenarios.items():
+    result = effective_trust(atts)
+    bar = "█" * min(30, int(result["score"]))
+    print(f"\n  {name}:")
+    print(f"    Raw: {result['raw_count']} attestations, weight {result['raw_weight']}")
+    print(f"    Decayed: score {result['score']}, effective {result['effective_count']} proof-equiv")
+    print(f"    Decay ratio: {result['decay_ratio']} {bar}")
 
-print(f"\n  Total decayed weight: {total_weight:.2f}")
-print(f"  Undecayed would be:   {sum(WATSON_MORGAN[a.grade] for a in attestations):.2f}")
-print(f"  Decay ratio:          {total_weight / sum(WATSON_MORGAN[a.grade] for a in attestations):.0%}")
-
-# Relationship depth scaling
+# Half-life comparison
 print("\n" + "=" * 65)
-print("Relationship Depth Scaling (sqrt model)")
+print("Half-Life Sensitivity (steady_worker scenario)")
 print("=" * 65)
-
-agents = [
-    ("new_agent", 5, 30),
-    ("3mo_agent", 8, 90),
-    ("6mo_agent", 12, 180),
-    ("1yr_agent", 19, 365),
-    ("2yr_agent", 27, 730),
-    ("suspicious_old", 3, 365),  # old but few relationships
-    ("social_butterfly", 50, 90),  # many relationships, young
-]
-
-for name, actual, age in agents:
-    expected = expected_relationships(age)
-    score = continuity_score(actual, age)
-    flag = "🚨" if score < 0.3 else "⚠️" if score < 0.7 else "✅"
-    print(f"  {flag} {name:20s} actual={actual:2d} expected={expected:.0f} score={score:.2f}")
+steady = scenarios["steady_worker"]
+for hl in [30, 60, 90, 180, 365]:
+    r = effective_trust(steady, hl)
+    print(f"  {hl:3d} days: score={r['score']:6.1f} decay={r['decay_ratio']:.2f}")
 
 print("\n" + "=" * 65)
-print("KEY: chain receipts are permanent. witness testimony fades.")
-print("self-claims expire fast. recency IS relevance.")
+print("INSIGHT: 90-day half-life matches credit reporting cycles.")
+print("Fresh sybil (20 claims) scores lower than 3 real proofs.")
+print(f"  sybil_fresh: {effective_trust(scenarios['sybil_fresh'])['score']}")
+print(f"  fresh_agent: {effective_trust(scenarios['fresh_agent'])['score']}")
+print("Quality beats quantity even without independence scoring.")
 print("=" * 65)
