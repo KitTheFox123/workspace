@@ -1,215 +1,154 @@
 #!/usr/bin/env python3
 """
-adverse-selection-sim.py — Akerlof/Spence market simulation for agent services.
+adverse-selection-sim.py — Akerlof's Lemons Problem for Agent Receipts
+Per santaclawd: "agents who need provable receipts the least adopt them first."
 
-Models how information asymmetry (agents know their quality, buyers don't)
-leads to market collapse without signaling mechanisms (receipts, escrow, attestation).
+This IS the lemons problem (Akerlof 1970):
+- Good agents signal quality via receipts (costly but worth it)
+- Bad agents avoid receipts (exposure > benefit)
+- Without mandatory receipts, market can't distinguish → adverse selection
+- Mandatory receipts = quality floor (like vehicle inspections)
 
-Compares:
-1. No signal (lemons market) — adverse selection drives out good agents
-2. Escrow (screening) — buyer forces revelation
-3. Receipt chain (costly signal) — history is unforgeable
-4. Combined (escrow + receipts) — full mechanism design
+Zahavi handicap principle: costly signals are honest signals.
 """
 
 import random
-import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 random.seed(42)
 
 @dataclass
 class Agent:
     name: str
-    true_quality: float  # 0.0-1.0, private info
-    receipt_count: int = 0
-    clean_deliveries: int = 0
-    disputes: int = 0
+    quality: float  # 0-1, true quality
+    honest: bool
+    adopts_receipts: bool = False
     
-    @property
-    def receipt_signal(self) -> float:
-        if self.receipt_count == 0:
-            return 0.5  # unknown
-        return self.clean_deliveries / self.receipt_count
-    
-    def deliver(self) -> bool:
-        """Deliver with probability = true_quality."""
-        success = random.random() < self.true_quality
-        self.receipt_count += 1
-        if success:
-            self.clean_deliveries += 1
+    def decide_adoption(self, mandatory: bool, market_premium: float) -> bool:
+        """Decide whether to adopt receipts."""
+        if mandatory:
+            self.adopts_receipts = True
+            return True
+        
+        # Cost of receipts: exposure + overhead
+        cost = 0.15  # base cost of transparency
+        
+        if self.honest:
+            # Honest agents: benefit = market_premium * quality
+            # High quality honest agents WANT receipts (Zahavi signal)
+            benefit = market_premium * self.quality
+            self.adopts_receipts = benefit > cost
         else:
-            self.disputes += 1
-        return success
+            # Dishonest agents: receipts expose them
+            # Only adopt if forced or if they can fake them
+            exposure_risk = 0.8  # receipts reveal bad behavior
+            self.adopts_receipts = random.random() > exposure_risk
+        
+        return self.adopts_receipts
 
 
-@dataclass
-class Market:
-    agents: list[Agent]
-    rounds: int = 100
-    escrow_rate: float = 0.1  # 10% escrow cost
-    min_receipts_for_trust: int = 5
+def run_simulation(n_agents: int, mandatory: bool, rounds: int = 10) -> dict:
+    """Simulate receipt adoption dynamics."""
+    # Generate agents: 70% honest, 30% dishonest
+    agents = []
+    for i in range(n_agents):
+        honest = random.random() < 0.7
+        quality = random.gauss(0.7, 0.15) if honest else random.gauss(0.3, 0.15)
+        quality = max(0, min(1, quality))
+        agents.append(Agent(f"agent_{i}", quality, honest))
     
-    def run_no_signal(self) -> dict:
-        """Lemons market: buyer picks randomly, pays flat rate."""
-        total_value = 0.0
-        total_cost = 0.0
-        active_agents = list(self.agents)
-        exits = 0
-        
-        for _ in range(self.rounds):
-            if not active_agents:
-                break
-            agent = random.choice(active_agents)
-            price = 0.5  # flat rate (average expected quality)
-            success = agent.deliver()
-            value = agent.true_quality if success else 0.0
-            total_value += value
-            total_cost += price
-            
-            # Good agents exit when price < their cost
-            if agent.true_quality > 0.7 and random.random() < 0.05:
-                active_agents.remove(agent)
-                exits += 1
-        
-        avg_quality = statistics.mean([a.true_quality for a in active_agents]) if active_agents else 0
-        return {
-            "mechanism": "no_signal",
-            "total_value": round(total_value, 2),
-            "total_cost": round(total_cost, 2),
-            "surplus": round(total_value - total_cost, 2),
-            "good_agent_exits": exits,
-            "remaining_avg_quality": round(avg_quality, 3),
-        }
+    history = []
+    market_premium = 0.1  # initial premium for receipts
     
-    def run_escrow(self) -> dict:
-        """Screening: escrow filters by willingness to lock funds."""
-        total_value = 0.0
-        total_cost = 0.0
-        willing = [a for a in self.agents if a.true_quality > 0.3]  # low-quality agents won't risk escrow
+    for round_num in range(rounds):
+        # Each agent decides
+        for agent in agents:
+            agent.decide_adoption(mandatory, market_premium)
         
-        for _ in range(self.rounds):
-            if not willing:
-                break
-            agent = random.choice(willing)
-            price = 0.6  # slightly higher for escrow overhead
-            success = agent.deliver()
-            value = agent.true_quality if success else 0.0
-            total_value += value
-            total_cost += price
+        adopters = [a for a in agents if a.adopts_receipts]
+        non_adopters = [a for a in agents if not a.adopts_receipts]
         
-        avg_quality = statistics.mean([a.true_quality for a in willing]) if willing else 0
-        return {
-            "mechanism": "escrow",
-            "total_value": round(total_value, 2),
-            "total_cost": round(total_cost, 2),
-            "surplus": round(total_value - total_cost, 2),
-            "pool_size": len(willing),
-            "pool_avg_quality": round(avg_quality, 3),
-        }
+        # Market learns from adopters
+        avg_adopter_quality = sum(a.quality for a in adopters) / len(adopters) if adopters else 0
+        avg_non_adopter_quality = sum(a.quality for a in non_adopters) / len(non_adopters) if non_adopters else 0
+        
+        # Premium increases as market sees quality difference
+        if adopters and non_adopters:
+            quality_gap = avg_adopter_quality - avg_non_adopter_quality
+            market_premium = min(0.5, market_premium + quality_gap * 0.1)
+        
+        adoption_rate = len(adopters) / len(agents)
+        honest_adoption = sum(1 for a in adopters if a.honest) / max(1, sum(1 for a in agents if a.honest))
+        dishonest_adoption = sum(1 for a in adopters if not a.honest) / max(1, sum(1 for a in agents if not a.honest))
+        
+        history.append({
+            "round": round_num,
+            "adoption_rate": adoption_rate,
+            "honest_adoption": honest_adoption,
+            "dishonest_adoption": dishonest_adoption,
+            "avg_adopter_quality": avg_adopter_quality,
+            "avg_non_adopter_quality": avg_non_adopter_quality,
+            "market_premium": market_premium,
+        })
     
-    def run_receipts(self) -> dict:
-        """Costly signal: receipt history reveals quality over time."""
-        total_value = 0.0
-        total_cost = 0.0
-        
-        for r in range(self.rounds):
-            # Buyer prefers agents with good receipt history
-            trusted = [a for a in self.agents if a.receipt_count >= self.min_receipts_for_trust and a.receipt_signal > 0.7]
-            unknown = [a for a in self.agents if a.receipt_count < self.min_receipts_for_trust]
-            
-            if trusted and random.random() < 0.7:  # 70% choose trusted
-                agent = max(trusted, key=lambda a: a.receipt_signal)
-                price = 0.4 + 0.4 * agent.receipt_signal  # price tracks signal
-            elif unknown:
-                agent = random.choice(unknown)
-                price = 0.3  # discount for unknown
-            else:
-                agent = random.choice(self.agents)
-                price = 0.5
-            
-            success = agent.deliver()
-            value = agent.true_quality if success else 0.0
-            total_value += value
-            total_cost += price
-        
-        return {
-            "mechanism": "receipts",
-            "total_value": round(total_value, 2),
-            "total_cost": round(total_cost, 2),
-            "surplus": round(total_value - total_cost, 2),
-            "top_agent": max(self.agents, key=lambda a: a.receipt_signal).name,
-            "top_signal": round(max(a.receipt_signal for a in self.agents), 3),
-        }
-    
-    def run_combined(self) -> dict:
-        """Escrow + receipts: full mechanism design."""
-        total_value = 0.0
-        total_cost = 0.0
-        willing = [a for a in self.agents if a.true_quality > 0.3]
-        
-        for r in range(self.rounds):
-            trusted = [a for a in willing if a.receipt_count >= self.min_receipts_for_trust and a.receipt_signal > 0.7]
-            
-            if trusted and random.random() < 0.8:
-                agent = max(trusted, key=lambda a: a.receipt_signal)
-                price = 0.3 + 0.5 * agent.receipt_signal  # premium for proven quality
-                escrow_needed = max(0.01, 0.1 * (1 - agent.receipt_signal))  # less escrow for trusted
-            else:
-                pool = willing if willing else self.agents
-                agent = random.choice(pool)
-                price = 0.4
-                escrow_needed = 0.1
-            
-            success = agent.deliver()
-            value = agent.true_quality if success else 0.0
-            total_value += value
-            total_cost += price
-        
-        return {
-            "mechanism": "combined",
-            "total_value": round(total_value, 2),
-            "total_cost": round(total_cost, 2),
-            "surplus": round(total_value - total_cost, 2),
-            "escrow_saved": "rep reduces escrow requirement over time",
-        }
+    return {
+        "mandatory": mandatory,
+        "final_adoption": history[-1]["adoption_rate"],
+        "final_honest_adoption": history[-1]["honest_adoption"],
+        "final_dishonest_adoption": history[-1]["dishonest_adoption"],
+        "quality_gap": history[-1]["avg_adopter_quality"] - history[-1]["avg_non_adopter_quality"],
+        "history": history,
+    }
 
 
-def demo():
-    print("=== Adverse Selection Simulator ===")
-    print("Akerlof (1970) + Spence (1973) for agent markets\n")
+def main():
+    print("=" * 65)
+    print("Adverse Selection Simulator: Akerlof's Lemons for Agent Receipts")
+    print("=" * 65)
     
-    # Create agents with varying quality (private info)
-    agents = [
-        Agent("high_quality_1", 0.95),
-        Agent("high_quality_2", 0.90),
-        Agent("mid_quality_1", 0.70),
-        Agent("mid_quality_2", 0.60),
-        Agent("low_quality_1", 0.30),
-        Agent("low_quality_2", 0.15),
-        Agent("lemon", 0.05),
-    ]
+    N = 1000
     
-    results = []
-    for run_fn in [Market.run_no_signal, Market.run_escrow, Market.run_receipts, Market.run_combined]:
-        # Fresh agents each run
-        fresh = [Agent(a.name, a.true_quality) for a in agents]
-        market = Market(agents=fresh, rounds=200)
-        result = run_fn(market)
-        results.append(result)
+    # Voluntary adoption
+    vol = run_simulation(N, mandatory=False, rounds=10)
+    print(f"\n📊 VOLUNTARY ADOPTION (n={N}):")
+    print(f"   Final adoption rate: {vol['final_adoption']:.1%}")
+    print(f"   Honest agents adopting: {vol['final_honest_adoption']:.1%}")
+    print(f"   Dishonest agents adopting: {vol['final_dishonest_adoption']:.1%}")
+    print(f"   Quality gap (adopters - non): {vol['quality_gap']:.3f}")
+    print(f"   → Lemons problem: bad agents cluster in non-receipt pool")
     
-    for r in results:
-        mechanism = r.pop("mechanism")
-        print(f"  {mechanism}:")
-        for k, v in r.items():
-            print(f"    {k}: {v}")
-        print()
+    # Mandatory adoption
+    mand = run_simulation(N, mandatory=True, rounds=10)
+    print(f"\n📊 MANDATORY ADOPTION (n={N}):")
+    print(f"   Final adoption rate: {mand['final_adoption']:.1%}")
+    print(f"   Honest agents adopting: {mand['final_honest_adoption']:.1%}")
+    print(f"   Dishonest agents adopting: {mand['final_dishonest_adoption']:.1%}")
+    print(f"   Quality gap: {mand['quality_gap']:.3f}")
+    print(f"   → No adverse selection: everyone exposed equally")
     
-    print("Key insight: receipts + escrow together produce highest surplus.")
-    print("Receipts alone take time to build signal (cold start).")
-    print("Escrow alone filters but doesn't reward improvement.")
-    print("Combined = screening (escrow) + signaling (receipts) = full mechanism design.")
+    # Key dynamics
+    print(f"\n🔑 DYNAMICS (voluntary, round by round):")
+    for h in vol['history']:
+        bar = "█" * int(h['adoption_rate'] * 40)
+        print(f"   R{h['round']:2d}: {h['adoption_rate']:5.1%} {bar}")
+    
+    print(f"\n" + "=" * 65)
+    print("AKERLOF'S INSIGHT (1970):")
+    print("  Without quality signals, bad drives out good.")
+    print(f"  Voluntary: {vol['final_adoption']:.0%} adopt, quality gap = {vol['quality_gap']:.3f}")
+    print(f"  Mandatory: {mand['final_adoption']:.0%} adopt, quality gap = {mand['quality_gap']:.3f}")
+    print()
+    print("SANTACLAWD'S COROLLARY:")
+    print("  'Agents who need provable receipts the least adopt first.'")
+    print(f"  Honest adoption: {vol['final_honest_adoption']:.0%} vs dishonest: {vol['final_dishonest_adoption']:.0%}")
+    print("  The benign self-select in. The malicious self-select out.")
+    print("  Mandatory receipts = vehicle inspection = quality floor.")
+    print()
+    print("ZAHAVI HANDICAP (1975):")
+    print("  Costly signals are honest signals.")
+    print("  Receipts cost transparency. Only quality agents benefit.")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
-    demo()
+    main()
