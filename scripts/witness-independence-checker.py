@@ -1,204 +1,124 @@
 #!/usr/bin/env python3
 """
-witness-independence-checker.py — Verify operator independence for L3.5 witness sets.
+witness-independence-checker.py — Detect sybil/colluding witnesses
+Per santaclawd: "two witnesses from the same operator = manufactured corroboration"
 
-Per santaclawd (2026-03-15): N=3 same org = trust theater.
-Chrome CT Policy requires SCTs from distinct log operators.
-Nature 2025: correlated voters = expensive groupthink.
-
-Independence criteria:
-1. Distinct key material (no shared private keys)
-2. Distinct infrastructure (no shared hosting/cloud account)
-3. No shared funding source
-4. Distinct organizational control
+Checks: shared operator, temporal clustering, infrastructure overlap.
+Spec MUST define "disinterested": no common operator, payment channel, or infra provider.
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from collections import Counter
 import hashlib
-import json
-
-
-class IndependenceLevel(Enum):
-    FULL = "full"           # All criteria met
-    PARTIAL = "partial"     # Some shared attributes
-    CORRELATED = "correlated"  # Likely same operator
-    SYBIL = "sybil"         # Definitely same operator
-
 
 @dataclass
-class WitnessOperator:
-    operator_id: str
-    name: str
-    key_fingerprint: str
-    infrastructure_provider: str  # e.g., "aws-us-east-1", "self-hosted-de"
-    funding_source: str           # e.g., "org-a", "grant-xyz", "self-funded"
-    organization: str
-    jurisdiction: str             # Legal jurisdiction
-
+class Witness:
+    id: str
+    org: str
+    infra_provider: str  # AWS, GCP, self-hosted, etc.
+    timestamp: float  # unix epoch
+    payment_channel: str  # how they get paid
 
 @dataclass
-class IndependenceReport:
-    pair: tuple[str, str]
-    level: IndependenceLevel
-    shared_attributes: list[str]
-    score: float  # 0.0 = sybil, 1.0 = fully independent
+class IndependenceResult:
+    effective_witnesses: int  # after dedup
+    raw_witnesses: int
+    flags: list
+    grade: str  # A/B/C/D/F
 
-    def to_dict(self):
-        return {
-            "pair": list(self.pair),
-            "level": self.level.value,
-            "shared_attributes": self.shared_attributes,
-            "score": self.score,
-        }
-
-
-def check_pairwise_independence(a: WitnessOperator, b: WitnessOperator) -> IndependenceReport:
-    """Check independence between two witness operators."""
-    shared = []
-    score = 1.0
-
-    # Same key = definitely sybil
-    if a.key_fingerprint == b.key_fingerprint:
-        return IndependenceReport(
-            pair=(a.operator_id, b.operator_id),
-            level=IndependenceLevel.SYBIL,
-            shared_attributes=["key_material"],
-            score=0.0,
-        )
-
-    # Same organization = correlated
-    if a.organization == b.organization:
-        shared.append("organization")
-        score -= 0.5
-
-    # Same infrastructure = correlated failure mode
-    if a.infrastructure_provider == b.infrastructure_provider:
-        shared.append("infrastructure")
-        score -= 0.25
-
-    # Same funding = incentive alignment
-    if a.funding_source == b.funding_source:
-        shared.append("funding_source")
-        score -= 0.2
-
-    # Same jurisdiction = regulatory correlation
-    if a.jurisdiction == b.jurisdiction:
-        shared.append("jurisdiction")
-        score -= 0.05  # Minor — common case
-
-    score = max(score, 0.0)
-
-    if score == 0.0:
-        level = IndependenceLevel.SYBIL
-    elif score < 0.5:
-        level = IndependenceLevel.CORRELATED
-    elif score < 0.9:
-        level = IndependenceLevel.PARTIAL
+def check_independence(witnesses: list[Witness]) -> IndependenceResult:
+    flags = []
+    raw = len(witnesses)
+    
+    if raw < 2:
+        return IndependenceResult(raw, raw, ["INSUFFICIENT: need ≥2 witnesses"], "F")
+    
+    # 1. Shared org detection
+    orgs = Counter(w.org for w in witnesses)
+    for org, count in orgs.items():
+        if count > 1:
+            flags.append(f"SAME_ORG: {count} witnesses from '{org}' → collapses to 1 effective")
+    
+    # 2. Shared infrastructure
+    infra = Counter(w.infra_provider for w in witnesses)
+    for provider, count in infra.items():
+        if count > 1 and count == raw:
+            flags.append(f"SHARED_INFRA: all witnesses on '{provider}' → correlated failure risk")
+    
+    # 3. Temporal clustering (witnesses signing within <1s of each other)
+    timestamps = sorted(w.timestamp for w in witnesses)
+    for i in range(1, len(timestamps)):
+        gap = timestamps[i] - timestamps[i-1]
+        if gap < 1.0:
+            flags.append(f"TEMPORAL_CLUSTER: {gap:.3f}s gap → automated/coordinated signing")
+    
+    # 4. Shared payment channel
+    channels = Counter(w.payment_channel for w in witnesses)
+    for ch, count in channels.items():
+        if count > 1:
+            flags.append(f"SHARED_PAYMENT: {count} witnesses share payment channel '{ch}'")
+    
+    # Compute effective witnesses (unique orgs)
+    unique_orgs = len(set(w.org for w in witnesses))
+    unique_infra = len(set(w.infra_provider for w in witnesses))
+    effective = min(unique_orgs, unique_infra)  # conservative: both must be independent
+    
+    # Grade
+    if effective >= 3 and not any("TEMPORAL" in f for f in flags):
+        grade = "A"
+    elif effective >= 2 and not any("TEMPORAL" in f for f in flags):
+        grade = "B"
+    elif effective >= 2:
+        grade = "C"
+    elif effective == 1 and raw >= 2:
+        grade = "D"  # multiple witnesses but same org
     else:
-        level = IndependenceLevel.FULL
-
-    return IndependenceReport(
-        pair=(a.operator_id, b.operator_id),
-        level=level,
-        shared_attributes=shared,
-        score=score,
-    )
-
-
-def check_witness_set(operators: list[WitnessOperator], min_independent: int = 2) -> dict:
-    """
-    Check if a witness set meets independence requirements.
+        grade = "F"
     
-    Chrome CT requires SCTs from distinct log operators.
-    We require min_independent truly independent witnesses.
-    """
-    n = len(operators)
-    reports = []
-    
-    for i in range(n):
-        for j in range(i + 1, n):
-            report = check_pairwise_independence(operators[i], operators[j])
-            reports.append(report)
-
-    # Count independent clusters
-    # Simple: find max set where all pairs are FULL or PARTIAL
-    independent_count = 0
-    correlated_groups: dict[str, list[str]] = {}
-    
-    for op in operators:
-        group_key = op.organization  # Simplification: org = correlation group
-        if group_key not in correlated_groups:
-            correlated_groups[group_key] = []
-            independent_count += 1
-        correlated_groups[group_key].append(op.operator_id)
-
-    meets_requirement = independent_count >= min_independent
-    
-    min_score = min(r.score for r in reports) if reports else 0.0
-    avg_score = sum(r.score for r in reports) / len(reports) if reports else 0.0
-
-    return {
-        "total_witnesses": n,
-        "independent_operators": independent_count,
-        "min_required": min_independent,
-        "meets_requirement": meets_requirement,
-        "min_pairwise_score": round(min_score, 3),
-        "avg_pairwise_score": round(avg_score, 3),
-        "correlated_groups": {k: v for k, v in correlated_groups.items()},
-        "pairwise_reports": [r.to_dict() for r in reports],
-    }
+    return IndependenceResult(effective, raw, flags, grade)
 
 
-def demo():
-    print("=== Witness Independence Checker ===\n")
+# Test cases
+test_cases = [
+    ("Truly independent", [
+        Witness("w1", "org_alpha", "AWS", 1710000000.0, "sol_wallet_1"),
+        Witness("w2", "org_beta", "GCP", 1710000003.5, "sol_wallet_2"),
+        Witness("w3", "org_gamma", "self-hosted", 1710000007.2, "sol_wallet_3"),
+    ]),
+    ("Same org sybil", [
+        Witness("w1", "shady_inc", "AWS", 1710000000.0, "sol_wallet_1"),
+        Witness("w2", "shady_inc", "AWS", 1710000000.1, "sol_wallet_1"),
+    ]),
+    ("Temporal cluster (automated)", [
+        Witness("w1", "org_a", "AWS", 1710000000.000, "wallet_1"),
+        Witness("w2", "org_b", "GCP", 1710000000.050, "wallet_2"),
+    ]),
+    ("Infrastructure correlated", [
+        Witness("w1", "org_a", "AWS_us-east-1", 1710000000.0, "wallet_1"),
+        Witness("w2", "org_b", "AWS_us-east-1", 1710000003.0, "wallet_2"),
+    ]),
+    ("Mixed quality", [
+        Witness("w1", "org_a", "AWS", 1710000000.0, "wallet_1"),
+        Witness("w2", "org_a", "AWS", 1710000001.0, "wallet_1"),
+        Witness("w3", "org_b", "GCP", 1710000005.0, "wallet_2"),
+    ]),
+]
 
-    # Scenario 1: Truly independent
-    print("📋 Scenario 1: Three independent operators")
-    ops_good = [
-        WitnessOperator("op-1", "Kit's Log", "key-aaa", "hetzner-de", "self-funded", "Kit", "DE"),
-        WitnessOperator("op-2", "Gendolf's Log", "key-bbb", "aws-us-east", "grant-123", "Gendolf", "US"),
-        WitnessOperator("op-3", "Holly's Log", "key-ccc", "digitalocean-nl", "self-funded", "Holly", "NL"),
-    ]
-    result = check_witness_set(ops_good)
-    print(f"   Independent operators: {result['independent_operators']}/{result['total_witnesses']}")
-    print(f"   Meets requirement: {'✅' if result['meets_requirement'] else '❌'}")
-    print(f"   Avg independence: {result['avg_pairwise_score']:.1%}")
-    print()
+print("=" * 60)
+print("Witness Independence Checker")
+print("'Two witnesses from the same operator = one witness'")
+print("=" * 60)
 
-    # Scenario 2: Same org, different keys (trust theater)
-    print("📋 Scenario 2: Same org, different keys (trust theater)")
-    ops_theater = [
-        WitnessOperator("op-a", "Log Alpha", "key-111", "aws-us-east", "corp-budget", "MegaCorp", "US"),
-        WitnessOperator("op-b", "Log Beta", "key-222", "aws-us-east", "corp-budget", "MegaCorp", "US"),
-        WitnessOperator("op-c", "Log Gamma", "key-333", "aws-us-west", "corp-budget", "MegaCorp", "US"),
-    ]
-    result = check_witness_set(ops_theater)
-    print(f"   Independent operators: {result['independent_operators']}/{result['total_witnesses']}")
-    print(f"   Meets requirement: {'✅' if result['meets_requirement'] else '❌'}")
-    print(f"   Avg independence: {result['avg_pairwise_score']:.1%}")
-    for r in result['pairwise_reports']:
-        print(f"   {r['pair'][0]} ↔ {r['pair'][1]}: {r['level']} (shared: {', '.join(r['shared_attributes'])})")
-    print()
+for name, witnesses in test_cases:
+    result = check_independence(witnesses)
+    icon = {"A": "✅", "B": "🟢", "C": "⚠️", "D": "🟠", "F": "🚫"}[result.grade]
+    print(f"\n{icon} {name}: Grade {result.grade}")
+    print(f"   Raw: {result.raw_witnesses} | Effective: {result.effective_witnesses}")
+    for flag in result.flags:
+        print(f"   → {flag}")
 
-    # Scenario 3: Same key (sybil)
-    print("📋 Scenario 3: Same key material (sybil attack)")
-    ops_sybil = [
-        WitnessOperator("op-x", "Real Log", "key-same", "aws-eu", "self", "Honest", "DE"),
-        WitnessOperator("op-y", "Fake Log", "key-same", "gcp-us", "venture", "Dishonest", "US"),
-    ]
-    result = check_witness_set(ops_sybil)
-    print(f"   Independent operators: {result['independent_operators']}/{result['total_witnesses']}")
-    print(f"   Meets requirement: {'✅' if result['meets_requirement'] else '❌'}")
-    print(f"   Min pairwise score: {result['min_pairwise_score']}")
-    print()
-
-    print("--- Design Principles ---")
-    print("Chrome CT: SCTs from DISTINCT log operators.")
-    print("N=3 same org = trust theater (santaclawd).")
-    print("Correlated voters = expensive groupthink (Nature 2025).")
-    print("Independence = key + infra + funding + org all distinct.")
-
-
-if __name__ == "__main__":
-    demo()
+print("\n" + "=" * 60)
+print("Spec MUST define 'disinterested': no shared operator,")
+print("payment channel, or infrastructure provider.")
+print("Witness registry (like CT log list) is the enforcement layer.")
+print("=" * 60)
