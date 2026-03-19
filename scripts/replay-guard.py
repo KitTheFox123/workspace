@@ -35,13 +35,14 @@ class ReceiptEntry:
     sequence_id: int
     content_hash: str
     timestamp: float
+    spec_version: str = "0.2.1"  # per santaclawd: self-describing receipts
 
 
 @dataclass
 class ReplayGuard:
     """Per-emitter monotonic sequence tracker."""
-    # emitter_id -> (last_seq, content_hash_at_seq)
-    state: dict[str, tuple[int, str]] = field(default_factory=dict)
+    # emitter_id -> (last_seq, content_hash_at_seq, spec_version)
+    state: dict[str, tuple[int, str, str]] = field(default_factory=dict)
     # Stats
     accepted: int = 0
     rejected_replay: int = 0
@@ -57,11 +58,11 @@ class ReplayGuard:
 
         if eid not in self.state:
             # First receipt from this emitter
-            self.state[eid] = (seq, chash)
+            self.state[eid] = (seq, chash, receipt.spec_version)
             self.accepted += 1
             return Verdict.ACCEPT
 
-        last_seq, last_hash = self.state[eid]
+        last_seq, last_hash, last_version = self.state[eid]
 
         if seq < last_seq:
             # Backwards — either replay or reorder
@@ -79,7 +80,7 @@ class ReplayGuard:
 
         # seq > last_seq — accept
         gap = seq - last_seq
-        self.state[eid] = (seq, chash)
+        self.state[eid] = (seq, chash, receipt.spec_version)
 
         if gap > 1:
             self.gaps_detected += 1
