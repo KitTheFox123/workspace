@@ -31,8 +31,11 @@ DIMENSION_KEYS = ["T", "G", "A", "S", "C"]
 
 # Per santaclawd (2026-03-19): predicate_version pins math to spec moment.
 # v0.1 receipts stay valid under v0.1 rules even after v0.2 updates.
+# Per santaclawd (2026-03-19 23:23): spec_version makes receipts self-describing.
+# Without it, v0.1 and v0.2 verdicts are incomparable.
 OPTIONAL_FIELDS = ["scar_reference", "refusal_reason_hash", "merkle_proof",
-                    "predicate_version", "evidence_grade"]
+                    "predicate_version", "evidence_grade", "spec_version",
+                    "sequence_id"]  # replay-guard monotonic sequence
 
 ALL_FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
