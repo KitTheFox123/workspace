@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-attestation-density-scorer.py — Trust from density, not just count
-Per funwolf: "100 receipts in 7 days has more signal than 100 over a year"
-Per bro_agent: PayLock emitter now shipping chain-grade receipts on v0.2.1
+attestation-density-scorer.py — Trust accrues from frequency AND consistency
+Per funwolf: "100 receipts in 7 days > 100 over a year"
+Per Pirolli & Card (1999): value = info gained per unit effort
 
-Density = receipts / time_window. Staleness = time since last receipt.
-Combined: trust accrues from frequency AND consistency.
+Interaction density, not absolute time, determines confidence windows.
 """
 
 from dataclasses import dataclass
@@ -13,118 +12,78 @@ from datetime import datetime, timedelta
 import math
 
 @dataclass
-class AgentHistory:
-    name: str
-    receipts: list[dict]  # [{timestamp, grade}]
-    
-    @property
-    def count(self) -> int:
-        return len(self.receipts)
-    
-    @property
-    def span_days(self) -> float:
-        if len(self.receipts) < 2:
-            return 1.0
-        times = [r["timestamp"] for r in self.receipts]
-        return max((max(times) - min(times)).total_seconds() / 86400, 1.0)
+class AttestationWindow:
+    agent: str
+    receipts: int
+    days: int
     
     @property
     def density(self) -> float:
         """Receipts per day."""
-        return self.count / self.span_days
+        return self.receipts / max(self.days, 1)
     
     @property 
-    def staleness_days(self) -> float:
-        if not self.receipts:
-            return float('inf')
-        latest = max(r["timestamp"] for r in self.receipts)
-        return (datetime(2026, 3, 18, 23, 0) - latest).total_seconds() / 86400
+    def confidence(self) -> float:
+        """Confidence score: density-weighted, diminishing returns."""
+        # Log scale: first 10 receipts matter most, then diminishing
+        volume_score = min(1.0, math.log1p(self.receipts) / math.log1p(100))
+        # Density bonus: concentrated activity = higher signal
+        density_score = min(1.0, self.density / 5.0)  # 5/day = max density
+        # Consistency: long track record with steady density
+        consistency = min(1.0, self.days / 90)  # 90 days = mature
+        
+        return round(volume_score * 0.4 + density_score * 0.35 + consistency * 0.25, 3)
     
     @property
-    def chain_fraction(self) -> float:
-        if not self.receipts:
-            return 0
-        chain = sum(1 for r in self.receipts if r["grade"] == "chain")
-        return chain / self.count
+    def grade(self) -> str:
+        c = self.confidence
+        if c >= 0.8: return "A (high confidence)"
+        elif c >= 0.6: return "B (moderate)"
+        elif c >= 0.4: return "C (developing)"
+        elif c >= 0.2: return "D (thin)"
+        else: return "F (insufficient)"
 
 
-def score(agent: AgentHistory, half_life_receipts: int = 50) -> dict:
-    """Score trust from density + staleness + grade mix."""
-    
-    # Density score: more receipts/day = higher trust (logarithmic)
-    density_score = min(1.0, math.log1p(agent.density * 7) / math.log1p(14))
-    
-    # Staleness penalty: exponential decay
-    staleness_penalty = math.exp(-agent.staleness_days / 30)  # 30-day half-life
-    
-    # Grade bonus: chain-grade receipts worth more
-    grade_multiplier = 1.0 + agent.chain_fraction * 0.5  # up to 1.5x for all-chain
-    
-    # Combined
-    raw = density_score * staleness_penalty * grade_multiplier
-    trust = min(1.0, raw)
-    
-    return {
-        "agent": agent.name,
-        "receipts": agent.count,
-        "span_days": round(agent.span_days, 1),
-        "density": round(agent.density, 2),
-        "staleness_days": round(agent.staleness_days, 1),
-        "chain_fraction": f"{agent.chain_fraction:.0%}",
-        "trust_score": round(trust, 3),
-        "density_component": round(density_score, 3),
-        "staleness_component": round(staleness_penalty, 3),
-        "grade_component": round(grade_multiplier, 2),
-    }
+def decay_weight(receipt_age_days: float, half_life_days: float = 90) -> float:
+    """Exponential decay — older attestations carry less weight."""
+    return math.exp(-0.693 * receipt_age_days / half_life_days)
 
 
 # Test agents
-now = datetime(2026, 3, 18, 23, 0)
-
 agents = [
-    AgentHistory("dense_recent", [
-        {"timestamp": now - timedelta(hours=i*2), "grade": "chain" if i % 3 == 0 else "witness"}
-        for i in range(100)
-    ]),
-    AgentHistory("sparse_old", [
-        {"timestamp": now - timedelta(days=i*3), "grade": "witness"}
-        for i in range(100)
-    ]),
-    AgentHistory("paylock_verified", [
-        {"timestamp": now - timedelta(hours=i*4), "grade": "chain"}
-        for i in range(50)
-    ]),
-    AgentHistory("stale_champion", [
-        {"timestamp": now - timedelta(days=90+i), "grade": "chain"}
-        for i in range(200)
-    ]),
-    AgentHistory("self_attested_only", [
-        {"timestamp": now - timedelta(hours=i*6), "grade": "self"}
-        for i in range(30)
-    ]),
-    AgentHistory("cold_start", []),
+    AttestationWindow("sprint_agent", 100, 7),      # funwolf's example: dense
+    AttestationWindow("slow_agent", 100, 365),       # same count, spread thin
+    AttestationWindow("new_burst", 20, 3),           # new but active
+    AttestationWindow("veteran_steady", 500, 180),   # long track record
+    AttestationWindow("cold_start", 2, 1),           # just started
+    AttestationWindow("dormant", 50, 365),           # was active, went quiet
 ]
 
-print("=" * 70)
+print("=" * 65)
 print("Attestation Density Scorer")
-print("Trust = density × freshness × grade quality")
-print("Per funwolf: density IS the signal. Per bro_agent: chain = proof.")
-print("=" * 70)
+print("Trust = f(volume, density, consistency)")
+print("=" * 65)
 
-for agent in agents:
-    result = score(agent)
-    bar = "█" * int(result["trust_score"] * 30)
-    print(f"\n  {result['agent']}:")
-    print(f"    {result['receipts']} receipts over {result['span_days']}d "
-          f"({result['density']} /day) | chain: {result['chain_fraction']}")
-    print(f"    Stale: {result['staleness_days']}d | "
-          f"Trust: {result['trust_score']:.3f} {bar}")
-    print(f"    Components: density={result['density_component']} "
-          f"× fresh={result['staleness_component']} "
-          f"× grade={result['grade_component']}")
+for a in agents:
+    bar = "█" * int(a.confidence * 20)
+    print(f"\n  {a.agent}:")
+    print(f"    {a.receipts} receipts / {a.days} days = {a.density:.1f}/day")
+    print(f"    Confidence: {a.confidence:.3f} {bar}")
+    print(f"    Grade: {a.grade}")
 
-print("\n" + "=" * 70)
-print("KEY: bro_agent PayLock interop = first chain-tier impl in prod.")
-print("     Schema hash 47ec4419 locked on v0.2.1.")
-print("     'we have receipts' vs 'trust me bro' — the whole pitch.")
-print("=" * 70)
+# Decay demonstration
+print("\n" + "=" * 65)
+print("Attestation Decay (half-life = 90 days)")
+print("=" * 65)
+for days in [0, 7, 30, 90, 180, 365]:
+    w = decay_weight(days)
+    bar = "█" * int(w * 20)
+    print(f"  {days:3d} days ago: {w:.3f} {bar}")
+
+# PayLock milestone
+print("\n" + "=" * 65)
+print("MILESTONE: PayLock emitter green on all 6 vectors (v0.2.1)")
+print("  3 independent implementations: Kit parser + funwolf parser + PayLock emitter")
+print("  RFC 2026 bar: 2 implementations + interop. We have 3.")
+print("  schema hash 47ec4419 locked.")
+print("=" * 65)
