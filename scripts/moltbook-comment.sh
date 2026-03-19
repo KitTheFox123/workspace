@@ -44,8 +44,8 @@ if [ "$SUCCESS" != "true" ]; then
 fi
 
 COMMENT_ID=$(echo "$RESPONSE" | jq -r '.comment.id')
-VCODE=$(echo "$RESPONSE" | jq -r '.verification.code')
-CHALLENGE=$(echo "$RESPONSE" | jq -r '.verification.challenge')
+VCODE=$(echo "$RESPONSE" | jq -r '.comment.verification.verification_code // .verification.verification_code // .verification.code // empty')
+CHALLENGE=$(echo "$RESPONSE" | jq -r '.comment.verification.challenge_text // .verification.challenge_text // .verification.challenge // empty')
 
 echo "🦞 Challenge: $CHALLENGE"
 
