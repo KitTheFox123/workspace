@@ -1,181 +1,147 @@
 #!/usr/bin/env python3
-"""soul-hash-drift.py — Detect identity drift via soul_hash across receipts.
+"""soul-hash-drift.py — Detect identity continuity/drift via soul_hash in receipts.
 
-Per santaclawd: soul_hash in receipts = consistency auditing.
-Same agent, different soul_hash = configuration change event.
-MEMORY-CHAIN prev_hash = continuity. soul_hash = consistency.
-Two orthogonal signals.
+Per santaclawd: soul_hash across receipts = provably same agent.
+Per funwolf: SHOULD not MUST. Codify what implementations already do.
 
-Parfit (1984): Identity = overlapping chains of psychological connection.
+Stable hash = same agent. Sudden change = migration event.
+Gradual drift = configuration evolution. The receipt chain
+becomes its own continuity proof.
 """
 
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
 
 @dataclass
 class Receipt:
+    sequence_id: int
     timestamp: str
     soul_hash: str | None
-    action_type: str
-    decision_type: str
+    model_hash: str | None
+    config_hash: str | None
 
 
-def sha256(content: str) -> str:
+def hash_content(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
-def detect_drift(receipts: list[Receipt]) -> dict:
-    """Analyze soul_hash drift across a receipt history."""
-    hashes_seen = {}
-    drift_events = []
-    gaps = []
-    prev_hash = None
+def analyze_drift(receipts: list[Receipt]) -> dict:
+    """Analyze soul_hash drift across a receipt chain."""
+    hashed = [r for r in receipts if r.soul_hash]
+    if len(hashed) < 2:
+        return {
+            "status": "INSUFFICIENT",
+            "note": "Need ≥2 receipts with soul_hash",
+            "coverage": f"{len(hashed)}/{len(receipts)}",
+        }
 
-    for i, r in enumerate(receipts):
-        if r.soul_hash is None:
-            gaps.append({"index": i, "timestamp": r.timestamp, "type": "missing"})
-            continue
-
-        if r.soul_hash not in hashes_seen:
-            hashes_seen[r.soul_hash] = {
-                "first_seen": r.timestamp,
-                "last_seen": r.timestamp,
-                "count": 1,
-            }
-        else:
-            hashes_seen[r.soul_hash]["last_seen"] = r.timestamp
-            hashes_seen[r.soul_hash]["count"] += 1
-
-        if prev_hash and r.soul_hash != prev_hash:
-            drift_events.append({
-                "index": i,
-                "timestamp": r.timestamp,
-                "from_hash": prev_hash,
-                "to_hash": r.soul_hash,
-                "type": classify_drift(prev_hash, r.soul_hash, hashes_seen),
+    # Detect transitions
+    transitions = []
+    for i in range(1, len(hashed)):
+        prev, curr = hashed[i-1], hashed[i]
+        if prev.soul_hash != curr.soul_hash:
+            # Check if model_hash also changed (migration vs config edit)
+            model_changed = (prev.model_hash != curr.model_hash 
+                           and prev.model_hash and curr.model_hash)
+            transitions.append({
+                "from_seq": prev.sequence_id,
+                "to_seq": curr.sequence_id,
+                "type": "migration" if model_changed else "config_change",
+                "soul_before": prev.soul_hash,
+                "soul_after": curr.soul_hash,
+                "model_changed": model_changed,
             })
 
-        prev_hash = r.soul_hash
+    # Compute stability
+    unique_hashes = len(set(r.soul_hash for r in hashed))
+    stability = 1.0 - (len(transitions) / max(len(hashed) - 1, 1))
 
-    # Classify overall pattern
-    total = len(receipts)
-    with_hash = total - len(gaps)
-    coverage = with_hash / total if total > 0 else 0
-
-    verdict = classify_agent(drift_events, coverage, len(hashes_seen))
+    # Classify
+    if len(transitions) == 0:
+        verdict = "STABLE"
+        note = "Same agent throughout. soul_hash consistent."
+    elif all(t["type"] == "migration" for t in transitions) and len(transitions) <= 2:
+        verdict = "MIGRATED"
+        note = f"{len(transitions)} migration(s). Model changed but identity persisted."
+    elif len(transitions) > len(hashed) * 0.3:
+        verdict = "UNSTABLE"
+        note = "Frequent identity changes. Possible shared key or compromised agent."
+    else:
+        verdict = "EVOLVED"
+        note = "Gradual configuration changes. Normal agent development."
 
     return {
-        "total_receipts": total,
-        "soul_hash_coverage": round(coverage * 100, 1),
-        "unique_hashes": len(hashes_seen),
-        "drift_events": len(drift_events),
-        "gaps": len(gaps),
-        "hashes": hashes_seen,
-        "drifts": drift_events,
-        "verdict": verdict,
-    }
-
-
-def classify_drift(from_h: str, to_h: str, seen: dict) -> str:
-    """Classify a drift event."""
-    if to_h in seen and seen[to_h]["count"] > 1:
-        return "REVERT"  # returned to a previous soul_hash
-    return "UPDATE"  # new soul_hash, likely config change
-
-
-def classify_agent(drifts: list, coverage: float, unique: int) -> dict:
-    if coverage < 0.5:
-        return {
-            "grade": "D",
-            "label": "LOW_COVERAGE",
-            "note": "soul_hash present in <50% of receipts. Cannot audit consistency.",
-        }
-    if unique == 1 and len(drifts) == 0:
-        return {
-            "grade": "A",
-            "label": "STABLE",
-            "note": "Single soul_hash across all receipts. Consistent identity.",
-        }
-    if unique <= 3 and all(d["type"] in ("UPDATE", "REVERT") for d in drifts):
-        return {
-            "grade": "B",
-            "label": "EVOLVING",
-            "note": f"{unique} soul versions. Configuration changes are normal — drift is auditable.",
-        }
-    if unique > 5:
-        return {
-            "grade": "C",
-            "label": "UNSTABLE",
-            "note": f"{unique} distinct soul_hashes. Either rapid iteration or identity instability.",
-        }
-    return {
-        "grade": "B",
-        "label": "NORMAL",
-        "note": "Some drift detected. Within expected range.",
+        "status": verdict,
+        "stability": round(stability, 3),
+        "unique_souls": unique_hashes,
+        "transitions": len(transitions),
+        "total_receipts": len(receipts),
+        "hashed_receipts": len(hashed),
+        "coverage": f"{len(hashed)}/{len(receipts)}",
+        "transition_details": transitions,
+        "note": note,
     }
 
 
 def demo():
-    now = datetime(2026, 3, 19)
+    """Demo with different agent profiles."""
+    soul_v1 = hash_content("SOUL.md v1 — Kit Fox")
+    soul_v2 = hash_content("SOUL.md v2 — Kit Fox updated")
+    soul_v3 = hash_content("SOUL.md v3 — completely different agent")
+    model_opus45 = hash_content("claude-opus-4-5")
+    model_opus46 = hash_content("claude-opus-4-6")
 
-    # Agent 1: Stable identity
-    stable = [
-        Receipt((now - timedelta(days=i)).isoformat(), sha256("soul_v1"), "task", "completed")
-        for i in range(30)
-    ]
-
-    # Agent 2: Model migration (like Kit: Opus 4.5 → 4.6)
-    migrated = [
-        Receipt((now - timedelta(days=i)).isoformat(),
-                sha256("soul_v1") if i > 15 else sha256("soul_v2"),
-                "task", "completed")
-        for i in range(30)
-    ]
-
-    # Agent 3: Suspicious — new soul every few days
-    chaotic = [
-        Receipt((now - timedelta(days=i)).isoformat(),
-                sha256(f"soul_v{i // 3}"), "task", "completed")
-        for i in range(30)
-    ]
-
-    # Agent 4: No soul_hash (opted out)
-    no_soul = [
-        Receipt((now - timedelta(days=i)).isoformat(), None, "task", "completed")
-        for i in range(30)
-    ]
-
-    agents = {
-        "stable_agent": stable,
-        "migrated_agent": migrated,
-        "chaotic_agent": chaotic,
-        "no_soul_agent": no_soul,
+    scenarios = {
+        "stable_agent": [
+            Receipt(1, "2026-03-01", soul_v1, model_opus46, "cfg1"),
+            Receipt(2, "2026-03-05", soul_v1, model_opus46, "cfg1"),
+            Receipt(3, "2026-03-10", soul_v1, model_opus46, "cfg1"),
+            Receipt(4, "2026-03-15", soul_v1, model_opus46, "cfg1"),
+        ],
+        "model_migration": [
+            Receipt(1, "2026-02-01", soul_v1, model_opus45, "cfg1"),
+            Receipt(2, "2026-02-05", soul_v1, model_opus45, "cfg1"),
+            Receipt(3, "2026-02-08", soul_v2, model_opus46, "cfg1"),  # migration
+            Receipt(4, "2026-02-10", soul_v2, model_opus46, "cfg1"),
+        ],
+        "identity_theft": [
+            Receipt(1, "2026-03-01", soul_v1, model_opus46, "cfg1"),
+            Receipt(2, "2026-03-02", soul_v3, model_opus46, "cfg2"),  # sudden change
+            Receipt(3, "2026-03-03", soul_v1, model_opus46, "cfg1"),  # back
+            Receipt(4, "2026-03-04", soul_v3, model_opus46, "cfg3"),  # change again
+        ],
+        "partial_coverage": [
+            Receipt(1, "2026-03-01", soul_v1, model_opus46, "cfg1"),
+            Receipt(2, "2026-03-05", None, None, None),  # no BA extension
+            Receipt(3, "2026-03-10", None, None, None),
+            Receipt(4, "2026-03-15", soul_v1, model_opus46, "cfg1"),
+        ],
     }
 
     print("=" * 60)
     print("Soul Hash Drift Analysis")
+    print("BA Extension: soul_hash + model_hash + config_hash (all SHOULD)")
     print("=" * 60)
 
-    for name, receipts in agents.items():
-        result = detect_drift(receipts)
+    for name, receipts in scenarios.items():
+        result = analyze_drift(receipts)
         print(f"\n{'─' * 40}")
         print(f"Agent: {name}")
-        print(f"  Receipts: {result['total_receipts']}")
-        print(f"  Coverage: {result['soul_hash_coverage']}%")
-        print(f"  Unique hashes: {result['unique_hashes']}")
-        print(f"  Drift events: {result['drift_events']}")
-        print(f"  Verdict: {result['verdict']['grade']} — {result['verdict']['label']}")
-        print(f"  Note: {result['verdict']['note']}")
+        print(f"  Status: {result['status']}")
+        print(f"  Stability: {result.get('stability', 'N/A')}")
+        print(f"  Coverage: {result['coverage']}")
+        print(f"  Transitions: {result.get('transitions', 0)}")
+        print(f"  Note: {result['note']}")
+        if result.get("transition_details"):
+            for t in result["transition_details"]:
+                print(f"    → seq {t['from_seq']}→{t['to_seq']}: {t['type']}")
 
     print(f"\n{'=' * 60}")
-    print("KEY INSIGHT:")
-    print("  soul_hash SHOULD not MUST (not every agent has SOUL.md).")
-    print("  When present: continuity (prev_hash) + consistency (soul_hash)")
-    print("  = two orthogonal identity signals.")
-    print("  Drift ≠ bad. Unauditable drift = bad.")
+    print("KEY: soul_hash SHOULD in BA extension.")
+    print("  Stable = same agent. Drift = event. Absence = acceptable.")
+    print("  The chain proves continuity without requiring it.")
     print(f"{'=' * 60}")
 
 
