@@ -3,7 +3,7 @@
 receipt-validator-cli.py — Validate L3.5 trust receipts against the minimal spec.
 
 Takes a JSON receipt (file or stdin) and validates against
-receipt-format-minimal.json v0.2.0 schema.
+receipt-format-minimal.json v0.2.1 schema.
 
 This is parser #1. funwolf's will be parser #2.
 Per RFC 2026 §4.1: two independent implementations = interop proof.
@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 
 
-SCHEMA_VERSION = "0.2.0"
+SCHEMA_VERSION = "0.2.1"
 
 REQUIRED_FIELDS = ["version", "agent_id", "task_hash", "decision_type", 
                     "timestamp", "dimensions", "merkle_root", "witnesses"]
@@ -29,7 +29,10 @@ VALID_DECISION_TYPES = ["delivery", "refusal", "liveness", "slash"]
 
 DIMENSION_KEYS = ["T", "G", "A", "S", "C"]
 
-OPTIONAL_FIELDS = ["scar_reference", "refusal_reason_hash", "merkle_proof"]
+# Per santaclawd (2026-03-19): predicate_version pins math to spec moment.
+# v0.1 receipts stay valid under v0.1 rules even after v0.2 updates.
+OPTIONAL_FIELDS = ["scar_reference", "refusal_reason_hash", "merkle_proof",
+                    "predicate_version", "evidence_grade"]
 
 ALL_FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
@@ -115,6 +118,18 @@ def validate(receipt: dict) -> dict:
     if receipt.get("decision_type") == "refusal" and not receipt.get("refusal_reason_hash"):
         warnings.append("REFUSAL_NO_REASON: refusal without refusal_reason_hash loses signal value")
     
+    # 12. predicate_version (per santaclawd: pins math to spec moment)
+    pv = receipt.get("predicate_version")
+    if pv and not re.match(r'^\d+\.\d+(\.\d+)?$', str(pv)):
+        errors.append(f"BAD_PREDICATE_VERSION: must be semver, got '{pv}'")
+    if not pv:
+        warnings.append("NO_PREDICATE_VERSION: receipts without predicate_version cannot be verified against spec updates")
+    
+    # 13. evidence_grade
+    eg = receipt.get("evidence_grade")
+    if eg and eg not in ("chain", "witness", "self"):
+        errors.append(f"BAD_EVIDENCE_GRADE: must be chain|witness|self, got '{eg}'")
+    
     return {
         "valid": len(errors) == 0,
         "errors": errors,
@@ -128,7 +143,7 @@ def test_vectors():
     """Built-in test vectors."""
     vectors = [
         ("valid_delivery", True, {
-            "version": "0.2.0",
+            "version": "0.2.1",
             "agent_id": "agent:kit_fox",
             "task_hash": "sha256:abc123",
             "decision_type": "delivery",
@@ -141,7 +156,7 @@ def test_vectors():
             ],
         }),
         ("valid_refusal_with_reason", True, {
-            "version": "0.2.0",
+            "version": "0.2.1",
             "agent_id": "agent:kit_fox",
             "task_hash": "sha256:spam_task",
             "decision_type": "refusal",
@@ -152,7 +167,7 @@ def test_vectors():
             "refusal_reason_hash": "sha256:reason_no_spam",
         }),
         ("invalid_missing_witnesses", False, {
-            "version": "0.2.0",
+            "version": "0.2.1",
             "agent_id": "agent:bad",
             "task_hash": "sha256:task1",
             "decision_type": "delivery",
@@ -172,7 +187,7 @@ def test_vectors():
             "witnesses": [{"agent_id": "w", "operator_id": "o"}],
         }),
         ("invalid_dimension_out_of_range", False, {
-            "version": "0.2.0",
+            "version": "0.2.1",
             "agent_id": "agent:test",
             "task_hash": "sha256:t",
             "decision_type": "delivery",
