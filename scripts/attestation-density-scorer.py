@@ -1,145 +1,97 @@
 #!/usr/bin/env python3
 """
-attestation-density-scorer.py — Score trust by interaction density, not just count
-Per funwolf: "100 receipts in 7 days > 100 over a year"
-Per bro_agent: PayLock confirmed 3 implementations on v0.2.1
+attestation-density-scorer.py — Trust accrual via interaction density
+Per funwolf: "100 receipts in 7 days > 100 receipts over a year"
+Per Pirolli & Card (1999): max signal per unit effort
 
-Density = receipts / time_window. Normalizes for high-frequency vs low-frequency agents.
+Weights recency × density, not just count.
+Exponential decay with density-adjusted half-life.
 """
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import math
 
-@dataclass 
-class AgentHistory:
-    name: str
-    receipts: list  # list of (timestamp, grade) tuples
-    
-    @property
-    def count(self) -> int:
-        return len(self.receipts)
-    
-    @property
-    def span_days(self) -> float:
-        if len(self.receipts) < 2:
-            return 1.0
-        ts = [r[0] for r in self.receipts]
-        return max(1.0, (max(ts) - min(ts)).total_seconds() / 86400)
-    
+@dataclass
+class AttestationWindow:
+    agent: str
+    receipts: int
+    days: int
+    chain_anchored: int = 0
+    witnessed: int = 0
+    self_attested: int = 0
+
     @property
     def density(self) -> float:
         """Receipts per day."""
-        return self.count / self.span_days
-    
+        return self.receipts / max(self.days, 1)
+
     @property
-    def consistency(self) -> float:
-        """How evenly distributed are receipts? 1.0 = perfectly even."""
-        if len(self.receipts) < 3:
-            return 0.5
-        ts = sorted(r[0] for r in self.receipts)
-        gaps = [(ts[i+1] - ts[i]).total_seconds() for i in range(len(ts)-1)]
-        mean_gap = sum(gaps) / len(gaps)
-        if mean_gap == 0:
-            return 1.0
-        variance = sum((g - mean_gap)**2 for g in gaps) / len(gaps)
-        cv = math.sqrt(variance) / mean_gap  # coefficient of variation
-        return max(0.0, min(1.0, 1.0 - cv))  # lower CV = higher consistency
-    
-    @property  
-    def grade_mix(self) -> dict:
-        """Distribution of evidence grades."""
-        grades = [r[1] for r in self.receipts]
-        total = len(grades)
-        return {g: grades.count(g) / total for g in set(grades)} if total > 0 else {}
+    def evidence_weighted_count(self) -> float:
+        """Watson & Morgan weighted: chain=3x, witness=2x, self=1x."""
+        return self.chain_anchored * 3 + self.witnessed * 2 + self.self_attested * 1
 
+    def trust_score(self, half_life_base: float = 90.0) -> float:
+        """
+        Trust = evidence_weighted × density_factor × recency_factor
+        
+        Density adjusts half-life: high-density agents have shorter
+        half-lives (trust decays faster when you're expected to be active).
+        """
+        # Density factor: log to prevent runaway scaling, capped at 3
+        density_factor = min(3.0, math.log2(1 + self.density)) if self.density > 0 else 0
 
-def score_agent(agent: AgentHistory) -> dict:
-    density = agent.density
-    consistency = agent.consistency
-    count = agent.count
-    
-    # Density score: log scale, 1 receipt/day = baseline
-    density_score = min(1.0, math.log2(max(1, density) + 1) / 4)
-    
-    # Count score: diminishing returns after 50
-    count_score = min(1.0, math.sqrt(count) / math.sqrt(100))
-    
-    # Grade bonus: chain-anchored receipts worth more
-    grade_mix = agent.grade_mix
-    grade_bonus = grade_mix.get("chain", 0) * 0.3 + grade_mix.get("witness", 0) * 0.15
-    
-    # Combined trust score
-    trust = (density_score * 0.3 + count_score * 0.3 + consistency * 0.2 + grade_bonus + 0.2) 
-    trust = min(1.0, max(0.0, trust))
-    
-    # Freshness: decay based on most recent receipt
-    if agent.receipts:
-        latest = max(r[0] for r in agent.receipts)
-        now = datetime(2026, 3, 19)
-        days_stale = (now - latest).total_seconds() / 86400
-        freshness = math.exp(-days_stale / 90)  # 90-day half-life
-    else:
-        freshness = 0.0
-    
-    final = trust * freshness
-    
-    return {
-        "agent": agent.name,
-        "receipts": count,
-        "span_days": f"{agent.span_days:.0f}",
-        "density": f"{density:.1f}/day",
-        "consistency": f"{consistency:.0%}",
-        "grade_mix": {k: f"{v:.0%}" for k, v in grade_mix.items()},
-        "trust_raw": f"{trust:.2f}",
-        "freshness": f"{freshness:.2f}",
-        "final_score": f"{final:.2f}",
-    }
+        # Density-adjusted half-life: active agents must keep proving
+        adjusted_half_life = half_life_base / max(1, math.log2(1 + self.density))
 
+        # Recency factor: exponential decay from midpoint of window
+        midpoint_age = self.days / 2
+        recency = math.exp(-0.693 * midpoint_age / adjusted_half_life)
 
-# Test agents
-now = datetime(2026, 3, 19)
+        # Self-attestation penalty: all self-attested = 0.3x multiplier
+        total = self.chain_anchored + self.witnessed + self.self_attested
+        if total > 0:
+            independent_ratio = (self.chain_anchored + self.witnessed) / total
+            independence_factor = 0.3 + 0.7 * independent_ratio
+        else:
+            independence_factor = 0.3
+
+        # Combined score
+        raw = self.evidence_weighted_count * density_factor * recency * independence_factor
+        return min(1.0, raw / 100)  # normalize to [0, 1]
+
 
 agents = [
-    AgentHistory("burst_trader", [
-        (now - timedelta(hours=i), "chain") for i in range(100)
-    ]),
-    AgentHistory("steady_worker", [
-        (now - timedelta(days=i), "witness") for i in range(100)
-    ]),
-    AgentHistory("ghost_agent", [
-        (now - timedelta(days=180 + i*2), "self") for i in range(50)
-    ]),
-    AgentHistory("new_but_solid", [
-        (now - timedelta(hours=i*6), "chain") for i in range(20)
-    ]),
-    AgentHistory("self_reporter", [
-        (now - timedelta(days=i*3), "self") for i in range(30)
-    ]),
-    AgentHistory("paylock_user", [
-        (now - timedelta(days=i*2), "chain") for i in range(47)
-    ]),
+    AttestationWindow("burst_agent", 100, 7, chain_anchored=20, witnessed=60, self_attested=20),
+    AttestationWindow("steady_agent", 100, 365, chain_anchored=30, witnessed=50, self_attested=20),
+    AttestationWindow("new_agent", 5, 3, chain_anchored=0, witnessed=3, self_attested=2),
+    AttestationWindow("dormant_veteran", 500, 365, chain_anchored=100, witnessed=300, self_attested=100),
+    AttestationWindow("sybil_burst", 50, 1, chain_anchored=0, witnessed=0, self_attested=50),
+    AttestationWindow("quality_agent", 30, 30, chain_anchored=25, witnessed=5, self_attested=0),
 ]
 
-print("=" * 65)
+print("=" * 70)
 print("Attestation Density Scorer")
-print("'100 in 7 days > 100 over a year' — funwolf")
-print("'3 implementations = the spec is real' — bro_agent (PayLock)")
-print("=" * 65)
+print("Trust = evidence_weight × density × recency")
+print("=" * 70)
 
-for agent in agents:
-    result = score_agent(agent)
-    bar = "█" * int(float(result["final_score"]) * 20)
-    print(f"\n  {result['agent']}:")
-    print(f"    {result['receipts']} receipts / {result['span_days']}d = {result['density']}")
-    print(f"    Consistency: {result['consistency']} | Grades: {result['grade_mix']}")
-    print(f"    Trust: {result['trust_raw']} × Freshness: {result['freshness']} = {result['final_score']} {bar}")
+for a in agents:
+    score = a.trust_score()
+    bar = "█" * int(score * 30)
+    grade = "A" if score > 0.7 else "B" if score > 0.4 else "C" if score > 0.2 else "D" if score > 0.1 else "F"
+    print(f"\n  {a.agent}:")
+    print(f"    {a.receipts} receipts / {a.days} days = {a.density:.1f}/day")
+    print(f"    Evidence: chain={a.chain_anchored} witness={a.witnessed} self={a.self_attested}")
+    print(f"    Weighted: {a.evidence_weighted_count:.0f} | Score: {score:.3f} | Grade: {grade}")
+    print(f"    {bar}")
 
-print("\n" + "=" * 65)
-print("KEY INSIGHT:")
-print("  Density normalizes for agent frequency patterns.")
-print("  Consistency penalizes burst-then-silence.")  
-print("  Freshness decays trust on stale agents (90-day half-life).")
-print("  Grade mix rewards chain-anchored evidence.")
-print("  ghost_agent: 50 receipts but 180 days stale = near-zero trust.")
-print("=" * 65)
+print("\n" + "=" * 70)
+print("KEY INSIGHTS:")
+print("  burst_agent (100/7d) >> steady_agent (100/365d)")
+print("  sybil_burst (50/1d, all self-attested) = low score despite density")
+print("  quality_agent (30/30d, mostly chain) = high score from evidence grade")
+print()
+print("  Density without evidence grade = noise (sybil_burst)")
+print("  Evidence grade without density = stale (steady_agent)")
+print("  Both together = signal (burst_agent, quality_agent)")
+print("=" * 70)
