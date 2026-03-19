@@ -1,155 +1,136 @@
 #!/usr/bin/env python3
-"""failure-taxonomy-detector.py — Ghost/zombie/phantom failure mode classification.
+"""failure-taxonomy-detector.py — Detect ghost/zombie/phantom agents.
 
-Per santaclawd ADV v0.2 proposal:
-  trust = min(continuity, stake, reachability)
-  ghost = continuous + staked + unreachable
-  zombie = reachable + staked + discontinuous
-  phantom = reachable + continuous + unstaked
+Per santaclawd ADV v0.2 failure taxonomy:
+  ghost   = continuous + staked + UNREACHABLE
+  zombie  = reachable + staked + DISCONTINUOUS
+  phantom = reachable + continuous + UNSTAKED
 
-Each failure mode maps to a distributed systems analog:
-  ghost → network partition
-  zombie → byzantine fault
-  phantom → sybil/free-rider
-
-Detector outputs per-axis scores + failure_mode classification.
+trust = min(continuity, stake, reachability)
+The failing axis tells you exactly what attack you're looking at.
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import Enum
 
 
 class FailureMode(Enum):
-    HEALTHY = "healthy"
-    GHOST = "ghost"          # unreachable
-    ZOMBIE = "zombie"        # discontinuous identity
-    PHANTOM = "phantom"      # unstaked/uncommitted
-    DEAD = "dead"            # multiple axes failed
-    DORMANT = "dormant"      # all low but no single clear failure
+    HEALTHY = "HEALTHY"
+    GHOST = "GHOST"       # unreachable
+    ZOMBIE = "ZOMBIE"     # discontinuous
+    PHANTOM = "PHANTOM"   # unstaked
+    DEAD = "DEAD"         # multiple failures
 
 
 @dataclass
-class AgentAxes:
-    """Three-axis trust measurement."""
+class AgentState:
     name: str
-    continuity: float   # 0-1: soul_hash stability, memory consistency
-    stake: float        # 0-1: ADV trajectory, transaction history, escrow deposits
-    reachability: float # 0-1: inbox liveness, response rate, heartbeat freshness
+    # Continuity: monotonic sequence with no gaps > threshold
+    last_sequence_id: int
+    expected_sequence_id: int  # what we'd expect next
+    sequence_gap_count: int    # gaps detected
+    # Stake: on-chain or escrow commitment
+    stake_amount: float        # SOL or equivalent
+    stake_verified: bool       # verified on-chain
+    # Reachability: responds to pings
+    last_ping_response: datetime
+    ping_timeout: timedelta = timedelta(hours=24)
 
-    def trust_score(self) -> float:
-        """Trust = min(axes). Weakest link sets ceiling."""
-        return min(self.continuity, self.stake, self.reachability)
+    @property
+    def is_continuous(self) -> bool:
+        return self.sequence_gap_count <= 2  # allow 2 small gaps
+
+    @property
+    def is_staked(self) -> bool:
+        return self.stake_verified and self.stake_amount > 0
+
+    @property
+    def is_reachable(self) -> bool:
+        return (datetime(2026, 3, 19, 20, 0) - self.last_ping_response) < self.ping_timeout
 
 
-THRESHOLD_HIGH = 0.6
-THRESHOLD_LOW = 0.3
+def classify(agent: AgentState) -> dict:
+    """Classify agent failure mode."""
+    axes = {
+        "continuity": agent.is_continuous,
+        "stake": agent.is_staked,
+        "reachability": agent.is_reachable,
+    }
+    failing = [k for k, v in axes.items() if not v]
 
-
-def classify(agent: AgentAxes) -> dict:
-    """Classify failure mode from 3-axis scores."""
-    c, s, r = agent.continuity, agent.stake, agent.reachability
-    trust = agent.trust_score()
-
-    # Count failing axes
-    failing = []
-    if c < THRESHOLD_HIGH:
-        failing.append("continuity")
-    if s < THRESHOLD_HIGH:
-        failing.append("stake")
-    if r < THRESHOLD_HIGH:
-        failing.append("reachability")
-
-    if len(failing) == 0:
+    if not failing:
         mode = FailureMode.HEALTHY
-        remediation = "none needed"
-    elif len(failing) >= 2:
-        mode = FailureMode.DEAD if trust < THRESHOLD_LOW else FailureMode.DORMANT
-        remediation = f"multiple axes degraded: {', '.join(failing)}. full re-evaluation needed."
+    elif len(failing) > 1:
+        mode = FailureMode.DEAD
     elif "reachability" in failing:
         mode = FailureMode.GHOST
-        remediation = "ping agent, check inbox liveness, verify endpoint"
     elif "continuity" in failing:
         mode = FailureMode.ZOMBIE
-        remediation = "verify soul_hash, check for operator change, compare behavioral fingerprint"
     elif "stake" in failing:
         mode = FailureMode.PHANTOM
-        remediation = "agent present but uncommitted. require escrow deposit or transaction history"
     else:
-        mode = FailureMode.DORMANT
-        remediation = "unclear failure pattern"
+        mode = FailureMode.DEAD
 
-    # Distributed systems analog
-    analogs = {
-        FailureMode.HEALTHY: "operational",
-        FailureMode.GHOST: "network partition (Brewer CAP)",
-        FailureMode.ZOMBIE: "byzantine fault (Lamport 1982)",
-        FailureMode.PHANTOM: "sybil / free-rider",
-        FailureMode.DEAD: "total failure",
-        FailureMode.DORMANT: "partial degradation",
+    # trust = min(axis scores)
+    scores = {
+        "continuity": 1.0 if agent.is_continuous else max(0, 1.0 - agent.sequence_gap_count * 0.2),
+        "stake": 1.0 if agent.is_staked else 0.0,
+        "reachability": 1.0 if agent.is_reachable else 0.0,
+    }
+    trust = min(scores.values())
+
+    remediation = {
+        FailureMode.HEALTHY: "none needed",
+        FailureMode.GHOST: "check network/DNS, verify endpoint alive, send wake-up receipt",
+        FailureMode.ZOMBIE: "investigate sequence gaps — missed receipts or selective emission",
+        FailureMode.PHANTOM: "verify stake on-chain, check escrow contract, require re-stake",
+        FailureMode.DEAD: "multiple axes failed — quarantine and investigate",
     }
 
     return {
         "agent": agent.name,
-        "axes": {
-            "continuity": round(c, 2),
-            "stake": round(s, 2),
-            "reachability": round(r, 2),
-        },
-        "trust_score": round(trust, 2),
-        "failure_mode": mode.value,
-        "analog": analogs[mode],
-        "failing_axes": failing,
-        "remediation": remediation,
+        "mode": mode.value,
+        "trust": round(trust, 2),
+        "axes": {k: "✅" if v else "❌" for k, v in axes.items()},
+        "scores": {k: round(v, 2) for k, v in scores.items()},
+        "failing": failing or ["none"],
+        "remediation": remediation[mode],
     }
 
 
-def demo():
-    agents = [
-        AgentAxes("kit_fox", 0.95, 0.87, 0.92),        # healthy
-        AgentAxes("stale_bot", 0.90, 0.80, 0.05),       # ghost — unreachable
-        AgentAxes("hijacked_agent", 0.15, 0.85, 0.90),  # zombie — identity changed
-        AgentAxes("lurker_99", 0.88, 0.10, 0.95),       # phantom — no stake
-        AgentAxes("dead_project", 0.20, 0.05, 0.10),    # dead — everything failed
-        AgentAxes("fading_veteran", 0.70, 0.45, 0.55),  # dormant — multi-axis degradation
-        AgentAxes("paylock_agent", 0.92, 0.98, 0.88),   # healthy — high stake from escrow
-        AgentAxes("new_identity", 0.30, 0.70, 0.85),    # zombie — fresh SOUL.md, same endpoint
-    ]
+# Test agents
+now = datetime(2026, 3, 19, 20, 0)
+agents = [
+    AgentState("healthy_agent", 100, 101, 0, 0.05, True, now - timedelta(hours=1)),
+    AgentState("ghost_agent", 100, 101, 0, 0.05, True, now - timedelta(days=3)),
+    AgentState("zombie_agent", 50, 100, 12, 0.05, True, now - timedelta(hours=2)),
+    AgentState("phantom_agent", 100, 101, 0, 0.0, False, now - timedelta(hours=1)),
+    AgentState("dead_agent", 10, 100, 20, 0.0, False, now - timedelta(days=7)),
+    AgentState("near_ghost", 100, 101, 0, 0.05, True, now - timedelta(hours=23)),
+]
 
-    icons = {
-        "healthy": "🟢",
-        "ghost": "👻",
-        "zombie": "🧟",
-        "phantom": "👤",
-        "dead": "💀",
-        "dormant": "😴",
-    }
+print("=" * 65)
+print("Failure Taxonomy Detector — ghost/zombie/phantom (ADV v0.2)")
+print("trust = min(continuity, stake, reachability)")
+print("=" * 65)
 
-    print("=" * 70)
-    print("Failure Taxonomy Detector — Ghost/Zombie/Phantom Classification")
-    print("trust = min(continuity, stake, reachability)")
-    print("=" * 70)
+icons = {"HEALTHY": "🟢", "GHOST": "👻", "ZOMBIE": "🧟", "PHANTOM": "👤", "DEAD": "💀"}
 
-    for agent in agents:
-        result = classify(agent)
-        icon = icons.get(result["failure_mode"], "?")
-        ax = result["axes"]
+for a in agents:
+    r = classify(a)
+    icon = icons[r["mode"]]
+    print(f"\n  {icon} {r['agent']}: {r['mode']} (trust={r['trust']})")
+    print(f"     continuity:{r['axes']['continuity']} stake:{r['axes']['stake']} reachability:{r['axes']['reachability']}")
+    print(f"     scores: {r['scores']}")
+    if r["mode"] != "HEALTHY":
+        print(f"     fix: {r['remediation']}")
 
-        print(f"\n  {icon} {result['agent']}: {result['failure_mode'].upper()} (trust={result['trust_score']})")
-        print(f"     continuity={ax['continuity']} stake={ax['stake']} reachability={ax['reachability']}")
-        print(f"     analog: {result['analog']}")
-        if result["failing_axes"]:
-            print(f"     failing: {', '.join(result['failing_axes'])}")
-            print(f"     fix: {result['remediation']}")
-
-    print(f"\n{'=' * 70}")
-    print("SPEC RECOMMENDATION (ADV v0.2):")
-    print("  MUST: expose per-axis scores, not composite")
-    print("  MUST: failure_mode field in trust response")
-    print("  MUST: remediation hint per failure mode")
-    print("  ghost → ping / zombie → verify identity / phantom → require stake")
-    print("  Detector per mode, not single health check.")
-    print(f"{'=' * 70}")
+print(f"\n{'=' * 65}")
+print("INSIGHT: One detector per failure mode, not one score.")
+print("ghost = ping it. zombie = check sequence. phantom = check chain.")
+print(f"{'=' * 65}")
 
 
 if __name__ == "__main__":
-    demo()
+    pass  # demo runs at import
