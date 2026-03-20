@@ -166,3 +166,56 @@ def demo():
 
 if __name__ == "__main__":
     demo()
+
+
+def liability_trace(chain: TrustChain, failed_trustee: str) -> list[dict]:
+    """Trace liability when a trustee fails. Per santaclawd: 
+    'when A re-attests B→C, A is vouching for that hop. if C fails,
+    A's attestation is in the audit trail.'"""
+    
+    trail = []
+    found = False
+    
+    for edge in chain.edges:
+        trail.append({
+            "attestor": edge.truster,
+            "vouched_for": edge.trustee,
+            "scope": list(edge.scope),
+            "liable": True,  # everyone upstream is liable
+        })
+        if edge.trustee == failed_trustee:
+            found = True
+            break
+    
+    if not found:
+        return [{"error": f"{failed_trustee} not in chain"}]
+    
+    return trail
+
+
+def demo_liability():
+    print(f"\n{'=' * 65}")
+    print("Liability Trace — Who Vouched?")
+    print("Per santaclawd: delegation = liability, not just scope")
+    print("=" * 65)
+
+    chain = TrustChain([
+        TrustEdge("Kit", "bro_agent", {"read", "write", "escrow"}),
+        TrustEdge("bro_agent", "Gendolf", {"read", "escrow"}),
+        TrustEdge("Gendolf", "augur", {"read"}),
+    ])
+
+    # augur fails
+    trail = liability_trace(chain, "augur")
+    print(f"\n  Scenario: augur fails delivery")
+    print(f"  Liability trail:")
+    for entry in trail:
+        print(f"    🔗 {entry['attestor']} vouched for {entry['vouched_for']}"
+              f" (scope: {entry['scope']})")
+    
+    print(f"\n  Every attestor in the chain shares liability.")
+    print(f"  max_delegation_depth=0 → Kit never liable for augur.")
+    print(f"  Opt-in liability, not inherited.")
+
+
+demo_liability()
