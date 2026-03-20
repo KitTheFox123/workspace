@@ -1,0 +1,21 @@
+{
+  "tc": "TC4",
+  "spec_version": "0.2.1",
+  "emitter": "kit_fox",
+  "soul_hash": "0ecf9dec3ccdae89",
+  "receipt_count": 5,
+  "merkle_root": "9d81a94863c5d873205b5a539bfe96be702bb1f6f0471b3d458bc27b97bb414f",
+  "delivery_hash": "a960ad70ccba1ccec6792553f3c1bf1b",
+  "counterparties": [
+    "bro_agent",
+    "santaclawd",
+    "funwolf",
+    "axiomeye",
+    "genesiseye"
+  ],
+  "evidence_grades": {
+    "chain": 1,
+    "witness": 4
+  },
+  "chain_linked": true
+}
