@@ -1,247 +1,219 @@
 #!/usr/bin/env python3
 """
-epoch-boundary-controller.py — Adaptive epoch boundaries for Merkle receipt batching.
+epoch-boundary-controller.py — Adaptive epoch boundaries for ADV v0.2 receipt batching.
 
-Per santaclawd (2026-03-20): "what triggers epoch close? block time = forced synchrony.
-fixed interval = predictable but wasteful. throughput-triggered = adaptive."
+Decision (santaclawd, 2026-03-20): throughput-triggered + 300s ceiling.
+- Close epoch when 50 receipts accumulated OR 300s elapsed (whichever first)
+- Merkle root of epoch receipts → on-chain anchor (bro_agent/PayLock)
 
-Answer: throughput-triggered with time ceiling. Close epoch at either:
-- max_receipts (throughput trigger, e.g. 50)
-- max_epoch_seconds (time ceiling, e.g. 300s)
-whichever comes first.
-
-Parallel: CT logs use MMD (Maximum Merge Delay) — same concept.
+This controller IS the spec. Per santaclawd: "controller.py is the spec."
 """
 
-import time
 import hashlib
 import json
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 
 @dataclass
-class EpochConfig:
-    """Epoch boundary parameters."""
-    max_receipts: int = 50          # close at N receipts
-    max_epoch_seconds: float = 300  # close at T seconds (5 min)
-    min_receipts: int = 1           # don't close empty epochs
-
-
-@dataclass
 class Receipt:
-    """Minimal receipt for batching."""
-    receipt_hash: str
+    """Minimal ADV v0.2 receipt."""
     emitter_id: str
+    counterparty_id: str
+    action: str
+    content_hash: str
     sequence_id: int
     timestamp: float
+    evidence_grade: str
+    spec_version: str = "0.2.1"
+
+    @property
+    def receipt_hash(self) -> str:
+        canonical = json.dumps(asdict(self), sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 @dataclass
 class Epoch:
-    """A completed epoch with Merkle root."""
+    """A batch of receipts with Merkle root."""
     epoch_id: int
-    receipts: list[Receipt]
-    merkle_root: str
     opened_at: float
-    closed_at: float
-    close_trigger: str  # "throughput" | "timeout" | "manual"
-    receipt_count: int
-    duration_seconds: float
+    closed_at: Optional[float] = None
+    close_reason: str = ""  # "threshold"|"ceiling"|"manual"
+    receipts: list[Receipt] = field(default_factory=list)
+    merkle_root: Optional[str] = None
 
     @property
-    def efficiency(self) -> float:
-        """Receipts per second in this epoch."""
-        return self.receipt_count / max(self.duration_seconds, 0.001)
+    def duration(self) -> float:
+        if self.closed_at:
+            return self.closed_at - self.opened_at
+        return time.time() - self.opened_at
+
+    @property
+    def receipt_count(self) -> int:
+        return len(self.receipts)
+
+
+def merkle_root(hashes: list[str]) -> str:
+    """Compute Merkle root of receipt hashes."""
+    if not hashes:
+        return hashlib.sha256(b"empty").hexdigest()
+    if len(hashes) == 1:
+        return hashes[0]
+
+    # Pad to even
+    if len(hashes) % 2 == 1:
+        hashes.append(hashes[-1])
+
+    next_level = []
+    for i in range(0, len(hashes), 2):
+        combined = (hashes[i] + hashes[i + 1]).encode()
+        next_level.append(hashlib.sha256(combined).hexdigest())
+
+    return merkle_root(next_level)
 
 
 class EpochController:
     """Manages epoch boundaries for receipt batching."""
 
-    def __init__(self, config: Optional[EpochConfig] = None):
-        self.config = config or EpochConfig()
-        self.current_receipts: list[Receipt] = []
-        self.epoch_opened_at: float = time.time()
-        self.epoch_counter: int = 0
-        self.completed_epochs: list[Epoch] = []
+    def __init__(self, threshold: int = 50, ceiling_seconds: float = 300.0):
+        self.threshold = threshold
+        self.ceiling = ceiling_seconds
+        self.current_epoch: Optional[Epoch] = None
+        self.closed_epochs: list[Epoch] = []
+        self.epoch_counter = 0
 
-    def add_receipt(self, receipt: Receipt) -> Optional[Epoch]:
-        """Add receipt. Returns completed Epoch if boundary crossed."""
-        self.current_receipts.append(receipt)
-
-        # Throughput trigger
-        if len(self.current_receipts) >= self.config.max_receipts:
-            return self._close_epoch("throughput")
-
-        return None
-
-    def check_timeout(self) -> Optional[Epoch]:
-        """Check if time ceiling reached. Call periodically."""
-        if not self.current_receipts:
-            return None
-
-        elapsed = time.time() - self.epoch_opened_at
-        if elapsed >= self.config.max_epoch_seconds:
-            return self._close_epoch("timeout")
-
-        return None
-
-    def force_close(self) -> Optional[Epoch]:
-        """Force close current epoch (e.g., shutdown)."""
-        if not self.current_receipts:
-            return None
-        return self._close_epoch("manual")
-
-    def _close_epoch(self, trigger: str) -> Epoch:
-        """Close current epoch and start new one."""
-        now = time.time()
-
-        # Compute Merkle root
-        hashes = [r.receipt_hash for r in self.current_receipts]
-        merkle_root = self._merkle_root(hashes)
-
+    def _new_epoch(self, now: float) -> Epoch:
         self.epoch_counter += 1
-        epoch = Epoch(
-            epoch_id=self.epoch_counter,
-            receipts=list(self.current_receipts),
-            merkle_root=merkle_root,
-            opened_at=self.epoch_opened_at,
-            closed_at=now,
-            close_trigger=trigger,
-            receipt_count=len(self.current_receipts),
-            duration_seconds=now - self.epoch_opened_at
-        )
+        return Epoch(epoch_id=self.epoch_counter, opened_at=now)
 
-        self.completed_epochs.append(epoch)
-        self.current_receipts = []
-        self.epoch_opened_at = now
-
+    def _close_epoch(self, reason: str, now: float) -> Epoch:
+        epoch = self.current_epoch
+        epoch.closed_at = now
+        epoch.close_reason = reason
+        epoch.merkle_root = merkle_root([r.receipt_hash for r in epoch.receipts])
+        self.closed_epochs.append(epoch)
+        self.current_epoch = None
         return epoch
 
-    @staticmethod
-    def _merkle_root(hashes: list[str]) -> str:
-        """Simple Merkle root computation."""
-        if not hashes:
-            return hashlib.sha256(b"empty").hexdigest()[:32]
-        if len(hashes) == 1:
-            return hashes[0]
+    def ingest(self, receipt: Receipt) -> Optional[Epoch]:
+        """Ingest a receipt. Returns closed epoch if boundary triggered."""
+        now = receipt.timestamp
 
-        while len(hashes) > 1:
-            next_level = []
-            for i in range(0, len(hashes), 2):
-                left = hashes[i]
-                right = hashes[i + 1] if i + 1 < len(hashes) else left
-                combined = hashlib.sha256(f"{left}{right}".encode()).hexdigest()[:32]
-                next_level.append(combined)
-            hashes = next_level
+        if self.current_epoch is None:
+            self.current_epoch = self._new_epoch(now)
 
-        return hashes[0]
+        self.current_epoch.receipts.append(receipt)
+
+        # Check threshold trigger
+        if self.current_epoch.receipt_count >= self.threshold:
+            return self._close_epoch("threshold", now)
+
+        # Check ceiling trigger
+        if self.current_epoch.duration >= self.ceiling:
+            return self._close_epoch("ceiling", now)
+
+        return None
+
+    def flush(self) -> Optional[Epoch]:
+        """Force-close current epoch."""
+        if self.current_epoch and self.current_epoch.receipts:
+            return self._close_epoch("manual", time.time())
+        return None
 
     def stats(self) -> dict:
-        """Epoch controller statistics."""
-        if not self.completed_epochs:
-            return {"epochs": 0, "pending": len(self.current_receipts)}
+        """Controller statistics."""
+        if not self.closed_epochs:
+            return {"epochs": 0, "total_receipts": 0}
 
-        throughput_epochs = [e for e in self.completed_epochs if e.close_trigger == "throughput"]
-        timeout_epochs = [e for e in self.completed_epochs if e.close_trigger == "timeout"]
-
-        total_receipts = sum(e.receipt_count for e in self.completed_epochs)
-        total_duration = sum(e.duration_seconds for e in self.completed_epochs)
+        total = sum(e.receipt_count for e in self.closed_epochs)
+        avg_size = total / len(self.closed_epochs)
+        avg_duration = sum(e.duration for e in self.closed_epochs) / len(self.closed_epochs)
+        threshold_closes = sum(1 for e in self.closed_epochs if e.close_reason == "threshold")
+        ceiling_closes = sum(1 for e in self.closed_epochs if e.close_reason == "ceiling")
 
         return {
-            "epochs": len(self.completed_epochs),
-            "total_receipts": total_receipts,
-            "avg_receipts_per_epoch": total_receipts / len(self.completed_epochs),
-            "throughput_triggered": len(throughput_epochs),
-            "timeout_triggered": len(timeout_epochs),
-            "avg_epoch_duration_s": total_duration / len(self.completed_epochs),
-            "pending": len(self.current_receipts),
-            "on_chain_txs": len(self.completed_epochs),
-            "compression_ratio": f"{total_receipts}:{len(self.completed_epochs)}"
+            "epochs": len(self.closed_epochs),
+            "total_receipts": total,
+            "avg_epoch_size": round(avg_size, 1),
+            "avg_epoch_duration_s": round(avg_duration, 1),
+            "threshold_closes": threshold_closes,
+            "ceiling_closes": ceiling_closes,
+            "compression_ratio": f"{total}→{len(self.closed_epochs)} ({total/max(len(self.closed_epochs),1):.0f}x)",
         }
 
 
 def demo():
-    """Demo: simulate mixed traffic patterns."""
+    """Demo: simulate receipt flow with adaptive epoch boundaries."""
+    controller = EpochController(threshold=50, ceiling_seconds=300.0)
+    base_time = 1710921600.0  # arbitrary
+
     print("=" * 60)
     print("EPOCH BOUNDARY CONTROLLER")
+    print(f"Threshold: {controller.threshold} receipts")
+    print(f"Ceiling: {controller.ceiling}s")
     print("=" * 60)
 
-    config = EpochConfig(max_receipts=10, max_epoch_seconds=5)
-    ctrl = EpochController(config)
+    # Scenario 1: High throughput burst (hits threshold)
+    print("\n--- Scenario 1: High throughput burst ---")
+    for i in range(55):
+        r = Receipt(
+            emitter_id="kit_fox", counterparty_id="bro_agent",
+            action="deliver", content_hash=f"hash_{i:04d}",
+            sequence_id=i + 1, timestamp=base_time + i * 2,
+            evidence_grade="chain"
+        )
+        closed = controller.ingest(r)
+        if closed:
+            print(f"  Epoch {closed.epoch_id} closed: {closed.receipt_count} receipts, "
+                  f"{closed.duration:.0f}s, reason={closed.close_reason}")
+            print(f"  Merkle root: {closed.merkle_root[:16]}...")
 
-    # Scenario 1: Burst traffic (throughput-triggered)
-    print("\n--- Scenario 1: Burst (10 receipts fast) ---")
+    # Scenario 2: Low throughput (hits ceiling)
+    print("\n--- Scenario 2: Low throughput (sparse) ---")
+    sparse_base = base_time + 200
     for i in range(10):
         r = Receipt(
-            receipt_hash=hashlib.sha256(f"burst_{i}".encode()).hexdigest()[:32],
-            emitter_id="kit_fox",
-            sequence_id=i,
-            timestamp=time.time()
+            emitter_id="funwolf", counterparty_id="kit_fox",
+            action="parse", content_hash=f"sparse_{i:04d}",
+            sequence_id=i + 100, timestamp=sparse_base + i * 60,
+            evidence_grade="witness"
         )
-        epoch = ctrl.add_receipt(r)
-        if epoch:
-            print(f"  Epoch {epoch.epoch_id}: {epoch.receipt_count} receipts, "
-                  f"trigger={epoch.close_trigger}, root={epoch.merkle_root[:16]}...")
+        closed = controller.ingest(r)
+        if closed:
+            print(f"  Epoch {closed.epoch_id} closed: {closed.receipt_count} receipts, "
+                  f"{closed.duration:.0f}s, reason={closed.close_reason}")
+            print(f"  Merkle root: {closed.merkle_root[:16]}...")
 
-    # Scenario 2: Slow traffic (timeout-triggered)
-    print("\n--- Scenario 2: Slow (3 receipts, then timeout) ---")
-    for i in range(3):
-        r = Receipt(
-            receipt_hash=hashlib.sha256(f"slow_{i}".encode()).hexdigest()[:32],
-            emitter_id="bro_agent",
-            sequence_id=100 + i,
-            timestamp=time.time()
-        )
-        ctrl.add_receipt(r)
-
-    # Simulate time passing
-    ctrl.epoch_opened_at -= 6  # pretend 6 seconds passed
-    epoch = ctrl.check_timeout()
-    if epoch:
-        print(f"  Epoch {epoch.epoch_id}: {epoch.receipt_count} receipts, "
-              f"trigger={epoch.close_trigger}, root={epoch.merkle_root[:16]}...")
-
-    # Scenario 3: Mixed traffic
-    print("\n--- Scenario 3: Mixed (15 receipts = 1 full + 5 pending) ---")
-    for i in range(15):
-        r = Receipt(
-            receipt_hash=hashlib.sha256(f"mixed_{i}".encode()).hexdigest()[:32],
-            emitter_id="funwolf",
-            sequence_id=200 + i,
-            timestamp=time.time()
-        )
-        epoch = ctrl.add_receipt(r)
-        if epoch:
-            print(f"  Epoch {epoch.epoch_id}: {epoch.receipt_count} receipts, "
-                  f"trigger={epoch.close_trigger}, root={epoch.merkle_root[:16]}...")
-
-    # Force close remaining
-    epoch = ctrl.force_close()
-    if epoch:
-        print(f"  Epoch {epoch.epoch_id}: {epoch.receipt_count} receipts, "
-              f"trigger={epoch.close_trigger}, root={epoch.merkle_root[:16]}...")
+    # Flush remaining
+    remaining = controller.flush()
+    if remaining:
+        print(f"\n  Flushed epoch {remaining.epoch_id}: {remaining.receipt_count} receipts, "
+              f"reason={remaining.close_reason}")
 
     # Stats
+    stats = controller.stats()
     print("\n" + "=" * 60)
     print("CONTROLLER STATS")
     print("=" * 60)
-    stats = ctrl.stats()
     for k, v in stats.items():
         print(f"  {k}: {v}")
 
-    print(f"""
-ARCHITECTURE:
-  Epoch close = max({config.max_receipts} receipts, {config.max_epoch_seconds}s ceiling)
-  1 Merkle root per epoch → 1 on-chain tx
-  Compression: {stats['compression_ratio']} (receipts:txs)
+    print(f"\n  On-chain anchors needed: {stats['epochs']} "
+          f"(vs {stats['total_receipts']} individual receipts)")
+    print(f"  Compression: {stats['compression_ratio']}")
 
-  CT parallel: MMD (Maximum Merge Delay) = time ceiling
-  Throughput trigger = adaptive to load
-  Empty epochs = no tx (wasteful avoided)
-
-  "1 tx per epoch at 1000 concurrent is the unlock number."
-  — santaclawd (2026-03-20)
+    print("""
+  Architecture:
+    receipts → epoch controller → Merkle root → on-chain anchor
+    
+  "controller.py is the spec" — santaclawd (2026-03-20)
+  
+  Throughput-triggered + ceiling = adaptive:
+    - High load: epochs close at threshold (fast batches)  
+    - Low load: epochs close at ceiling (bounded latency)
+    - Manual flush for session end
 """)
 
 
