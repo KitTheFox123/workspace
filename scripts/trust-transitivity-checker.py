@@ -1,142 +1,166 @@
 #!/usr/bin/env python3
-"""trust-transitivity-checker.py — Detect implicit trust transitivity in agent graphs.
+"""trust-transitivity-checker.py — Validate non-transitivity in trust chains.
 
-Per santaclawd: "A trusts B. B trusts C. A trusts C? in agent pipelines today:
+Per santaclawd: "A trusts B. B trusts C. A trusts C? In agent pipelines today:
 implicitly yes — and that is the attack surface."
 
-SPIFFE principle: identity is non-transitive. Delegation is explicit and scoped.
-This tool scans an attestation graph and flags implicit transitive trust paths
-that lack explicit re-attestation.
+Rule: trust does not propagate without explicit re-attestation at each hop.
+Scope narrows (never wider) at each delegation.
 
-Supply chain attack surface = trust paths with missing intermediate attestations.
+Isnad principle (850 CE): every link in the chain individually verified.
 """
 
-from dataclasses import dataclass, field
-from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum
+
+
+class Verdict(Enum):
+    VALID = "VALID"
+    INVALID_IMPLICIT = "INVALID_IMPLICIT_TRANSITIVITY"
+    INVALID_SCOPE_WIDENING = "INVALID_SCOPE_WIDENING"
+    INVALID_MISSING_ATTESTATION = "INVALID_MISSING_ATTESTATION"
+    WARN_DEPTH = "WARN_EXCESSIVE_DEPTH"
 
 
 @dataclass
-class Attestation:
-    source: str
-    target: str
-    scope: str  # what the attestation covers
-    explicit: bool = True  # was this explicitly attested or inferred?
-    max_delegation_depth: int = 0  # 0 = non-transitive (default safe)
+class TrustEdge:
+    """A directed trust relationship: truster -> trustee with scope."""
+    truster: str
+    trustee: str
+    scope: set[str]  # what capabilities are delegated
+    attested: bool = True  # explicit attestation exists
 
 
 @dataclass
-class TrustGraph:
-    attestations: list[Attestation] = field(default_factory=list)
+class TrustChain:
+    """A sequence of trust edges forming a delegation path."""
+    edges: list[TrustEdge]
+    max_depth: int = 5  # warn beyond this
 
-    def _adjacency(self) -> dict[str, list[Attestation]]:
-        adj = defaultdict(list)
-        for a in self.attestations:
-            adj[a.source].append(a)
-        return adj
-
-    def find_transitive_paths(self, max_depth: int = 5) -> list[dict]:
-        """Find all paths where trust propagates beyond explicit attestation."""
-        adj = self._adjacency()
+    def validate(self) -> list[dict]:
+        """Validate the chain. Returns list of issues."""
         issues = []
 
-        # For each pair (A, C) where A doesn't directly attest C,
-        # check if there's a path A→B→C through trusted intermediaries
-        all_agents = set()
-        for a in self.attestations:
-            all_agents.add(a.source)
-            all_agents.add(a.target)
+        if not self.edges:
+            return [{"verdict": Verdict.VALID, "detail": "empty chain"}]
 
-        direct_pairs = {(a.source, a.target) for a in self.attestations}
+        # Check each hop
+        for i, edge in enumerate(self.edges):
+            if not edge.attested:
+                issues.append({
+                    "verdict": Verdict.INVALID_MISSING_ATTESTATION,
+                    "hop": i,
+                    "detail": f"{edge.truster} -> {edge.trustee}: no explicit attestation",
+                })
 
-        for origin in all_agents:
-            # BFS from origin
-            visited = {origin}
-            queue = [(origin, [origin], 0)]  # (current, path, depth)
+        # Check scope narrowing: each hop's scope must be subset of previous
+        for i in range(1, len(self.edges)):
+            prev_scope = self.edges[i - 1].scope
+            curr_scope = self.edges[i].scope
+            widened = curr_scope - prev_scope
+            if widened:
+                issues.append({
+                    "verdict": Verdict.INVALID_SCOPE_WIDENING,
+                    "hop": i,
+                    "detail": f"{self.edges[i].truster} -> {self.edges[i].trustee}: "
+                              f"scope widened by {widened}",
+                })
 
-            while queue:
-                current, path, depth = queue.pop(0)
-                if depth >= max_depth:
-                    continue
+        # Check continuity: each edge's trustee must be next edge's truster
+        for i in range(len(self.edges) - 1):
+            if self.edges[i].trustee != self.edges[i + 1].truster:
+                issues.append({
+                    "verdict": Verdict.INVALID_IMPLICIT,
+                    "hop": i,
+                    "detail": f"gap: {self.edges[i].trustee} != {self.edges[i+1].truster}. "
+                              f"implicit transitivity assumed",
+                })
 
-                for att in adj.get(current, []):
-                    target = att.target
-                    if target in visited:
-                        continue
+        # Depth warning
+        if len(self.edges) > self.max_depth:
+            issues.append({
+                "verdict": Verdict.WARN_DEPTH,
+                "hop": len(self.edges),
+                "detail": f"chain depth {len(self.edges)} > max {self.max_depth}",
+            })
 
-                    new_path = path + [target]
-                    visited.add(target)
+        if not issues:
+            final_scope = self.edges[-1].scope
+            issues.append({
+                "verdict": Verdict.VALID,
+                "detail": f"chain valid, final scope: {final_scope}",
+            })
 
-                    if len(new_path) > 2:  # path has intermediate hops
-                        # Check: does origin explicitly attest target?
-                        if (origin, target) not in direct_pairs:
-                            # Check delegation depth
-                            chain_depth = len(new_path) - 1
-                            max_allowed = min(
-                                a.max_delegation_depth
-                                for a in self.attestations
-                                if a.source in path and a.target in path[1:]
-                            ) if self.attestations else 0
+        return issues
 
-                            issues.append({
-                                "origin": origin,
-                                "target": target,
-                                "path": " → ".join(new_path),
-                                "hops": chain_depth,
-                                "max_delegation_allowed": max_allowed,
-                                "risk": "HIGH" if max_allowed == 0 else "MEDIUM" if chain_depth > max_allowed else "LOW",
-                                "fix": f"explicit attestation {origin}→{target} or set max_delegation_depth>={chain_depth}",
-                            })
-
-                    queue.append((target, new_path, depth + 1))
-
-        return sorted(issues, key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[x["risk"]])
+    def effective_scope(self) -> set[str]:
+        """Compute the narrowest scope across the chain."""
+        if not self.edges:
+            return set()
+        scope = self.edges[0].scope.copy()
+        for edge in self.edges[1:]:
+            scope &= edge.scope
+        return scope
 
 
 def demo():
-    graph = TrustGraph(attestations=[
-        # Healthy: direct attestations
-        Attestation("kit_fox", "bro_agent", "receipt_validation"),
-        Attestation("bro_agent", "funwolf", "parser_compliance"),
-        Attestation("funwolf", "gendolf", "sandbox_hosting"),
-        Attestation("kit_fox", "funwolf", "parser_compliance"),  # explicit skip
-
-        # Supply chain scenario: A→B→C→D, no skip attestations
-        Attestation("marketplace", "orchestrator", "task_routing"),
-        Attestation("orchestrator", "worker_1", "task_execution"),
-        Attestation("worker_1", "subcontractor", "subtask_delivery"),
-
-        # Scoped delegation: A→B with depth=1
-        Attestation("enterprise", "managed_agent", "full_service", max_delegation_depth=1),
-        Attestation("managed_agent", "tool_agent", "tool_invocation"),
-        Attestation("tool_agent", "data_source", "data_fetch"),
-    ])
-
-    issues = graph.find_transitive_paths()
-
     print("=" * 65)
     print("Trust Transitivity Checker")
-    print("Detects implicit trust propagation without re-attestation")
-    print("Default: max_delegation_depth=0 (non-transitive)")
+    print("Rule: trust ≠ transitive. Each hop needs attestation + scope ⊆")
     print("=" * 65)
 
-    for issue in issues:
-        icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}[issue["risk"]]
-        print(f"\n  {icon} {issue['risk']}: {issue['origin']} → {issue['target']}")
-        print(f"     Path: {issue['path']}")
-        print(f"     Hops: {issue['hops']} | Max allowed: {issue['max_delegation_allowed']}")
-        print(f"     Fix: {issue['fix']}")
+    scenarios = {
+        "valid_chain": TrustChain([
+            TrustEdge("Kit", "bro_agent", {"read", "write", "escrow"}),
+            TrustEdge("bro_agent", "Gendolf", {"read", "escrow"}),  # narrowed
+            TrustEdge("Gendolf", "augur", {"read"}),  # narrowed again
+        ]),
+        "implicit_transitivity": TrustChain([
+            TrustEdge("Kit", "bro_agent", {"read", "write"}),
+            # gap: Kit->augur assumed because Kit trusts bro_agent and bro_agent trusts augur
+            TrustEdge("Kit", "augur", {"read", "write"}, attested=False),
+        ]),
+        "scope_widening": TrustChain([
+            TrustEdge("Kit", "bro_agent", {"read"}),
+            TrustEdge("bro_agent", "Gendolf", {"read", "write", "admin"}),  # widened!
+        ]),
+        "missing_attestation": TrustChain([
+            TrustEdge("Kit", "bro_agent", {"read", "write"}),
+            TrustEdge("bro_agent", "unknown_agent", {"read"}, attested=False),
+        ]),
+        "excessive_depth": TrustChain([
+            TrustEdge(f"agent_{i}", f"agent_{i+1}", {"read"})
+            for i in range(8)
+        ], max_depth=5),
+    }
 
-    high = sum(1 for i in issues if i["risk"] == "HIGH")
-    med = sum(1 for i in issues if i["risk"] == "MEDIUM")
+    for name, chain in scenarios.items():
+        issues = chain.validate()
+        eff_scope = chain.effective_scope()
 
-    print(f"\n{'─' * 50}")
-    print(f"Issues: {high} HIGH, {med} MEDIUM, {len(issues) - high - med} LOW")
+        print(f"\n{'─' * 50}")
+        print(f"Scenario: {name}")
+        print(f"  Chain: {' → '.join(e.truster for e in chain.edges)}"
+              f" → {chain.edges[-1].trustee}" if chain.edges else "  Chain: empty")
+        print(f"  Effective scope: {eff_scope}")
+
+        for issue in issues:
+            icon = {
+                Verdict.VALID: "✅",
+                Verdict.INVALID_IMPLICIT: "🔴",
+                Verdict.INVALID_SCOPE_WIDENING: "⚠️",
+                Verdict.INVALID_MISSING_ATTESTATION: "🔴",
+                Verdict.WARN_DEPTH: "🟡",
+            }[issue["verdict"]]
+            print(f"  {icon} {issue['verdict'].value}: {issue['detail']}")
+
     print(f"\n{'=' * 65}")
-    print("ADV v0.2 RECOMMENDATION:")
-    print("  MUST: trust is non-transitive by default (depth=0)")
-    print("  MUST: explicit re-attestation required at each hop")
-    print("  MAY: max_delegation_depth > 0 with explicit scope")
-    print("  MUST: transitive paths without re-attestation = audit flag")
+    print("SPEC RECOMMENDATION (ADV v0.2):")
+    print("  MUST: trust does not propagate without explicit re-attestation")
+    print("  MUST: scope narrows or stays equal at each hop (never widens)")
+    print("  MUST: each edge requires signed attestation from truster")
+    print("  SHOULD: warn on chain depth > 5")
+    print("  Isnad: every link individually verified (850 CE → 2026 CE)")
     print(f"{'=' * 65}")
 
 
