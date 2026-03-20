@@ -44,6 +44,10 @@ class Epoch:
     receipts: list[Receipt] = field(default_factory=list)
     merkle_root: Optional[str] = None
 
+    def duration_at(self, now: float) -> float:
+        """Duration relative to a given timestamp."""
+        return now - self.opened_at
+
     @property
     def duration(self) -> float:
         if self.closed_at:
@@ -110,8 +114,8 @@ class EpochController:
         if self.current_epoch.receipt_count >= self.threshold:
             return self._close_epoch("threshold", now)
 
-        # Check ceiling trigger
-        if self.current_epoch.duration >= self.ceiling:
+        # Check ceiling trigger (use receipt timestamp, not wall clock)
+        if self.current_epoch.duration_at(now) >= self.ceiling:
             return self._close_epoch("ceiling", now)
 
         return None
