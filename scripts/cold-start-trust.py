@@ -38,6 +38,7 @@ MIN_RECEIPTS = 30  # below this = INSUFFICIENT data
 MIN_DAYS = 14  # below this = too early
 WARMING_RECEIPTS = 10  # some data but not enough
 ESTABLISHED_RECEIPTS = 200  # well-known agent
+MAX_RECEIPTS_PER_DAY = 20  # velocity cap — organic agents rarely exceed this
 MAX_VELOCITY = 20  # max receipts/day before velocity flag
 
 
@@ -68,6 +69,10 @@ def assess_cold_start(
     velocity = receipt_count / max(age_days, 0.1)
     velocity_flag = velocity > MAX_VELOCITY and age_days < MIN_DAYS
 
+    # Velocity check — per santaclawd: manufactured history detection
+    velocity = receipt_count / max(age_days, 0.1)
+    velocity_suspicious = velocity > MAX_RECEIPTS_PER_DAY and age_days > 0
+
     # Phase classification
     if receipt_count == 0:
         phase = "GENESIS"
@@ -79,6 +84,11 @@ def assess_cold_start(
         ci = wilson_interval(successful_receipts, receipt_count)
         point = None
         rec = f"VELOCITY_SUSPECT: {velocity:.1f} receipts/day exceeds {MAX_VELOCITY}/day cap in first {MIN_DAYS} days. Manufactured history?"
+    elif velocity_suspicious:
+        phase = "VELOCITY_FLAG"
+        ci = wilson_interval(successful_receipts, receipt_count)
+        point = None
+        rec = f"VELOCITY_FLAG: {velocity:.1f} receipts/day exceeds {MAX_RECEIPTS_PER_DAY}/day cap. Manufactured history suspected."
     elif receipt_count < WARMING_RECEIPTS or age_days < 7:
         phase = "WARMING"
         ci = wilson_interval(successful_receipts, receipt_count)
