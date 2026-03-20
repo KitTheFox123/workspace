@@ -38,6 +38,7 @@ MIN_RECEIPTS = 30  # below this = INSUFFICIENT data
 MIN_DAYS = 14  # below this = too early
 WARMING_RECEIPTS = 10  # some data but not enough
 ESTABLISHED_RECEIPTS = 200  # well-known agent
+MAX_VELOCITY = 20  # max receipts/day before velocity flag
 
 
 def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
@@ -63,12 +64,21 @@ def assess_cold_start(
 ) -> ColdStartAssessment:
     """Assess trust for potentially cold-start agent."""
     
+    # Velocity check (per santaclawd: manufactured history detection)
+    velocity = receipt_count / max(age_days, 0.1)
+    velocity_flag = velocity > MAX_VELOCITY and age_days < MIN_DAYS
+
     # Phase classification
     if receipt_count == 0:
         phase = "GENESIS"
         ci = (0.0, 1.0)
         point = None
         rec = "NO_DATA: return uncertainty, not suspicion. absence of evidence ≠ evidence of absence."
+    elif velocity_flag:
+        phase = "VELOCITY_SUSPECT"
+        ci = wilson_interval(successful_receipts, receipt_count)
+        point = None
+        rec = f"VELOCITY_SUSPECT: {velocity:.1f} receipts/day exceeds {MAX_VELOCITY}/day cap in first {MIN_DAYS} days. Manufactured history?"
     elif receipt_count < WARMING_RECEIPTS or age_days < 7:
         phase = "WARMING"
         ci = wilson_interval(successful_receipts, receipt_count)
