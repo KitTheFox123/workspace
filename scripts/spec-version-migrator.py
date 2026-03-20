@@ -60,6 +60,68 @@ SPEC_VERSIONS = {
 }
 
 
+@dataclass
+class MigrationWindow:
+    """Per santaclawd: without a sunset clause, verifiers fragment."""
+    sunset_version: str       # version being deprecated
+    accept_until: int         # epoch: SHOULD warn after this
+    reject_after: int         # epoch: MUST reject after this
+    successor: str            # version to migrate to
+
+    def status_at(self, epoch: int) -> str:
+        if epoch < self.accept_until:
+            return "ACTIVE"       # old version still fully accepted
+        elif epoch < self.reject_after:
+            return "DEPRECATED"   # warn but accept
+        else:
+            return "REJECTED"     # MUST reject
+
+    def bytes_overhead(self) -> int:
+        return 12  # sunset_version(2) + accept_until(4) + reject_after(4) + successor(2)
+
+
+# Migration windows: spec-defined sunset clauses
+MIGRATION_WINDOWS = [
+    MigrationWindow(
+        sunset_version="0.1.0",
+        accept_until=1777680000,   # ~2026-04-01 (30 days from v0.2 release)
+        reject_after=1780358400,   # ~2026-05-01 (60 days from v0.2 release)
+        successor="0.2.0",
+    ),
+    MigrationWindow(
+        sunset_version="0.2.0",
+        accept_until=1782950400,   # ~2026-06-01
+        reject_after=1785628800,   # ~2026-07-01
+        successor="0.2.1",
+    ),
+]
+
+
+def check_migration_status(spec_version: str, current_epoch: int) -> dict:
+    """Check if a receipt's spec version is within its migration window."""
+    for mw in MIGRATION_WINDOWS:
+        if mw.sunset_version == spec_version:
+            status = mw.status_at(current_epoch)
+            return {
+                "version": spec_version,
+                "status": status,
+                "successor": mw.successor,
+                "accept_until": mw.accept_until,
+                "reject_after": mw.reject_after,
+                "overhead_bytes": mw.bytes_overhead(),
+                "action": {
+                    "ACTIVE": "none — version is current",
+                    "DEPRECATED": f"SHOULD migrate to {mw.successor}",
+                    "REJECTED": f"MUST reject — migrate to {mw.successor}",
+                }[status],
+            }
+    return {
+        "version": spec_version,
+        "status": "CURRENT",  # no sunset window = latest
+        "action": "none — no migration scheduled",
+    }
+
+
 def check_receipt_version(receipt: dict) -> dict:
     """Validate receipt against its declared spec version."""
     spec_ver = receipt.get("spec_version") or receipt.get("version", "0.1.0")
@@ -204,12 +266,25 @@ def demo():
     for h in cmp["hazards"]:
         print(f"  ⚠️  {h}")
 
+    # Migration window demo
+    import time
+    now = int(time.time())
+    print("\n--- Migration Windows (per santaclawd) ---")
+    for ver in ["0.1.0", "0.2.0", "0.2.1"]:
+        ms = check_migration_status(ver, now)
+        icon = {"CURRENT": "🟢", "ACTIVE": "🟢", "DEPRECATED": "🟡", "REJECTED": "🔴"}[ms["status"]]
+        print(f"  {icon} v{ms['version']}: {ms['status']}")
+        print(f"     {ms['action']}")
+        if "overhead_bytes" in ms:
+            print(f"     overhead: {ms['overhead_bytes']} bytes")
+
     print(f"\n{'=' * 65}")
     print("SPEC RECOMMENDATION:")
     print("  MUST: every receipt carries spec_version (2 bytes: major.minor)")
     print("  MUST: verifier rejects receipts with unknown spec_version")
-    print("  SHOULD: cross-version comparisons flag themselves")
-    print("  SHOULD: migration windows are auditable via version transitions")
+    print("  MUST: migration_window defines accept_until + reject_after")
+    print("  12 bytes overhead: sunset(2) + accept_until(4) + reject(4) + successor(2)")
+    print("  Without sunset clause, verifiers fragment independently.")
     print(f"{'=' * 65}")
 
 
