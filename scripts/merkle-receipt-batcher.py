@@ -2,19 +2,23 @@
 """
 merkle-receipt-batcher.py — Batch ADV receipts into Merkle trees for scalable on-chain anchoring.
 
-Per santaclawd + bro_agent (2026-03-20): per-receipt on-chain = unscalable at 1000 emitters.
-Solution: batch receipts into Merkle trees, anchor root once, validate locally.
-CT parallel: log stays honest, clients verify without trusting the log.
+Per bro_agent (2026-03-20): "50x is the inflection point. batch root anchoring +
+local Merkle validation = exactly how PayLock handles high-volume receipt verification."
 
-Itko (2024): CT log on 0.25 CPU core handles 2M certs/day.
+Architecture:
+- Receipts accumulate off-chain
+- Batch into Merkle tree at threshold (time or count)
+- Anchor single root on-chain
+- Any receipt provable with O(log n) proof
+- CT model: millions of certs, handful of log entries
 """
 
 import hashlib
 import json
-import time
-from dataclasses import dataclass, asdict
-from typing import Optional
 import math
+import time
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 def sha256(data: str) -> str:
@@ -22,192 +26,227 @@ def sha256(data: str) -> str:
 
 
 @dataclass
-class Receipt:
-    emitter_id: str
-    counterparty_id: str
-    action: str
-    content_hash: str
-    sequence_id: int
-    timestamp: float
-    evidence_grade: str
-
-    @property
-    def receipt_hash(self) -> str:
-        return sha256(json.dumps(asdict(self), sort_keys=True))
-
-
-@dataclass
 class MerkleNode:
     hash: str
     left: Optional['MerkleNode'] = None
     right: Optional['MerkleNode'] = None
-    receipt: Optional[Receipt] = None  # leaf only
+    leaf_data: Optional[str] = None
 
 
 @dataclass
-class InclusionProof:
-    """Proof that a receipt is included in a batch."""
-    receipt_hash: str
-    merkle_root: str
-    path: list[tuple[str, str]]  # [(hash, side), ...] side = "left"|"right"
-    batch_size: int
-    batch_timestamp: float
+class MerkleProof:
+    leaf_hash: str
+    proof_hashes: list[tuple[str, str]]  # (hash, side) where side = "L" or "R"
+    root_hash: str
+
+    def verify(self) -> bool:
+        current = self.leaf_hash
+        for sibling_hash, side in self.proof_hashes:
+            if side == "L":
+                current = sha256(sibling_hash + current)
+            else:
+                current = sha256(current + sibling_hash)
+        return current == self.root_hash
+
+    @property
+    def proof_size(self) -> int:
+        return len(self.proof_hashes)
 
 
-def build_merkle_tree(receipts: list[Receipt]) -> tuple[MerkleNode, dict[str, list]]:
-    """Build Merkle tree from receipts. Returns root and proof paths."""
-    if not receipts:
-        return MerkleNode(hash="empty"), {}
+@dataclass
+class ReceiptBatch:
+    batch_id: str
+    receipts: list[dict]
+    root: Optional[MerkleNode] = None
+    created_at: float = field(default_factory=time.time)
+    anchored: bool = False
+    anchor_tx: Optional[str] = None
 
-    # Build leaf nodes
-    leaves = [MerkleNode(hash=r.receipt_hash, receipt=r) for r in receipts]
+    @property
+    def root_hash(self) -> str:
+        return self.root.hash if self.root else ""
 
-    # Pad to power of 2
-    while len(leaves) & (len(leaves) - 1) != 0:
-        leaves.append(MerkleNode(hash=sha256("padding")))
-
-    # Track proof paths
-    proof_paths: dict[str, list] = {r.receipt_hash: [] for r in receipts}
-
-    # Build tree bottom-up
-    current_level = leaves
-    while len(current_level) > 1:
-        next_level = []
-        for i in range(0, len(current_level), 2):
-            left = current_level[i]
-            right = current_level[i + 1]
-            parent_hash = sha256(left.hash + right.hash)
-            parent = MerkleNode(hash=parent_hash, left=left, right=right)
-            next_level.append(parent)
-
-            # Update proof paths
-            for rh in proof_paths:
-                if _contains_hash(left, rh):
-                    proof_paths[rh].append((right.hash, "right"))
-                elif _contains_hash(right, rh):
-                    proof_paths[rh].append((left.hash, "left"))
-
-        current_level = next_level
-
-    return current_level[0], proof_paths
+    @property
+    def size(self) -> int:
+        return len(self.receipts)
 
 
-def _contains_hash(node: MerkleNode, target_hash: str) -> bool:
-    """Check if a node or its children contain a receipt hash."""
-    if node.receipt and node.receipt.receipt_hash == target_hash:
-        return True
-    if node.left and _contains_hash(node.left, target_hash):
-        return True
-    if node.right and _contains_hash(node.right, target_hash):
-        return True
-    return False
+class MerkleReceiptBatcher:
+    def __init__(self, batch_threshold: int = 100, batch_interval_s: float = 300):
+        self.batch_threshold = batch_threshold
+        self.batch_interval_s = batch_interval_s
+        self.pending: list[dict] = []
+        self.batches: list[ReceiptBatch] = []
+        self.leaf_to_batch: dict[str, str] = {}  # leaf_hash -> batch_id
 
+    def add_receipt(self, receipt: dict) -> Optional[ReceiptBatch]:
+        """Add receipt. Returns batch if threshold reached."""
+        self.pending.append(receipt)
+        if len(self.pending) >= self.batch_threshold:
+            return self.flush()
+        return None
 
-def verify_inclusion(proof: InclusionProof) -> bool:
-    """Verify a receipt's inclusion in a Merkle batch."""
-    current = proof.receipt_hash
-    for sibling_hash, side in proof.path:
-        if side == "right":
-            current = sha256(current + sibling_hash)
-        else:
-            current = sha256(sibling_hash + current)
-    return current == proof.merkle_root
+    def flush(self) -> Optional[ReceiptBatch]:
+        """Flush pending receipts into a batch."""
+        if not self.pending:
+            return None
 
+        batch_id = sha256(str(time.time()) + str(len(self.batches)))[:16]
+        batch = ReceiptBatch(batch_id=batch_id, receipts=list(self.pending))
 
-def create_batch(receipts: list[Receipt], epoch_id: int) -> dict:
-    """Create a batch with Merkle root for on-chain anchoring."""
-    root, paths = build_merkle_tree(receipts)
+        # Build Merkle tree
+        leaves = []
+        for r in batch.receipts:
+            leaf_hash = sha256(json.dumps(r, sort_keys=True))
+            leaves.append(MerkleNode(hash=leaf_hash, leaf_data=json.dumps(r, sort_keys=True)))
+            self.leaf_to_batch[leaf_hash] = batch_id
 
-    proofs = {}
-    for r in receipts:
-        proofs[r.receipt_hash] = InclusionProof(
-            receipt_hash=r.receipt_hash,
-            merkle_root=root.hash,
-            path=paths.get(r.receipt_hash, []),
-            batch_size=len(receipts),
-            batch_timestamp=time.time()
+        # Pad to power of 2
+        while len(leaves) & (len(leaves) - 1) != 0:
+            leaves.append(MerkleNode(hash=sha256("PADDING")))
+
+        batch.root = self._build_tree(leaves)
+        self.batches.append(batch)
+        self.pending = []
+        return batch
+
+    def _build_tree(self, nodes: list[MerkleNode]) -> MerkleNode:
+        if len(nodes) == 1:
+            return nodes[0]
+
+        parents = []
+        for i in range(0, len(nodes), 2):
+            left = nodes[i]
+            right = nodes[i + 1] if i + 1 < len(nodes) else left
+            parent = MerkleNode(
+                hash=sha256(left.hash + right.hash),
+                left=left,
+                right=right
+            )
+            parents.append(parent)
+        return self._build_tree(parents)
+
+    def get_proof(self, receipt: dict) -> Optional[MerkleProof]:
+        """Get Merkle proof for a specific receipt."""
+        leaf_hash = sha256(json.dumps(receipt, sort_keys=True))
+        batch_id = self.leaf_to_batch.get(leaf_hash)
+        if not batch_id:
+            return None
+
+        batch = next((b for b in self.batches if b.batch_id == batch_id), None)
+        if not batch or not batch.root:
+            return None
+
+        # Walk tree to find proof path
+        proof_hashes = []
+        found = self._find_proof(batch.root, leaf_hash, proof_hashes)
+        if not found:
+            return None
+
+        return MerkleProof(
+            leaf_hash=leaf_hash,
+            proof_hashes=proof_hashes,
+            root_hash=batch.root_hash
         )
 
-    return {
-        "epoch_id": epoch_id,
-        "merkle_root": root.hash,
-        "receipt_count": len(receipts),
-        "proofs": proofs,
-        "anchor_cost": "1 tx",  # vs N tx for per-receipt
-    }
+    def _find_proof(self, node: MerkleNode, target: str,
+                     proof: list[tuple[str, str]]) -> bool:
+        if node.hash == target and node.leaf_data is not None:
+            return True
+
+        if node.left and node.right:
+            if self._find_proof(node.left, target, proof):
+                proof.append((node.right.hash, "R"))
+                return True
+            if self._find_proof(node.right, target, proof):
+                proof.append((node.left.hash, "L"))
+                return True
+
+        return False
+
+    def stats(self) -> dict:
+        total_receipts = sum(b.size for b in self.batches) + len(self.pending)
+        total_batches = len(self.batches)
+        return {
+            "total_receipts": total_receipts,
+            "total_batches": total_batches,
+            "pending": len(self.pending),
+            "compression_ratio": f"{total_receipts}:{total_batches}" if total_batches else "N/A",
+            "on_chain_txs_saved": total_receipts - total_batches if total_batches else 0,
+            "proof_depth": math.ceil(math.log2(self.batch_threshold)) if self.batch_threshold > 1 else 0
+        }
 
 
 def demo():
-    now = time.time()
-
-    # Simulate 1000 emitters, 8 receipts each = 8000 receipts
-    # Batch into epochs of 1024
-    receipts = []
-    for emitter_idx in range(50):  # demo with 50
-        for seq in range(4):
-            receipts.append(Receipt(
-                emitter_id=f"agent_{emitter_idx:03d}",
-                counterparty_id=f"agent_{(emitter_idx + 1) % 50:03d}",
-                action="deliver",
-                content_hash=sha256(f"content_{emitter_idx}_{seq}")[:16],
-                sequence_id=seq + 1,
-                timestamp=now + emitter_idx * 10 + seq,
-                evidence_grade="chain" if seq % 3 == 0 else "witness"
-            ))
-
     print("=" * 60)
     print("MERKLE RECEIPT BATCHER")
     print("=" * 60)
-    print(f"Total receipts:     {len(receipts)}")
 
-    # Batch into epochs
-    epoch_size = 64
-    epochs = []
-    for i in range(0, len(receipts), epoch_size):
-        batch = receipts[i:i + epoch_size]
-        epoch = create_batch(batch, epoch_id=i // epoch_size)
-        epochs.append(epoch)
+    batcher = MerkleReceiptBatcher(batch_threshold=50)
 
-    print(f"Epochs created:     {len(epochs)} (size {epoch_size})")
-    print(f"On-chain txs:       {len(epochs)} (vs {len(receipts)} per-receipt)")
-    print(f"Cost reduction:     {len(receipts) / len(epochs):.0f}x")
-    print()
+    # Simulate 150 receipts from multiple emitters
+    receipts = []
+    for i in range(150):
+        r = {
+            "emitter_id": f"agent_{i % 10}",
+            "counterparty_id": f"agent_{(i + 5) % 10}",
+            "action": ["deliver", "verify", "attest", "transfer"][i % 4],
+            "sequence_id": i,
+            "content_hash": sha256(f"content_{i}")[:16],
+            "timestamp": time.time() + i,
+            "evidence_grade": ["chain", "witness", "self"][i % 3]
+        }
+        receipts.append(r)
+        batch = batcher.add_receipt(r)
+        if batch:
+            print(f"\n  Batch {batch.batch_id}: {batch.size} receipts → root {batch.root_hash[:16]}...")
 
-    # Verify random inclusion proof
+    # Flush remaining
+    final = batcher.flush()
+    if final:
+        print(f"\n  Batch {final.batch_id}: {final.size} receipts → root {final.root_hash[:16]}...")
+
+    # Stats
+    stats = batcher.stats()
+    print(f"\n{'=' * 60}")
+    print("SCALING RESULTS")
+    print(f"{'=' * 60}")
+    print(f"  Total receipts:      {stats['total_receipts']}")
+    print(f"  On-chain batches:    {stats['total_batches']}")
+    print(f"  Compression:         {stats['compression_ratio']}")
+    print(f"  Txs saved:           {stats['on_chain_txs_saved']}")
+    print(f"  Max proof depth:     {stats['proof_depth']} hashes")
+
+    # Verify a random proof
+    print(f"\n{'=' * 60}")
+    print("PROOF VERIFICATION")
+    print(f"{'=' * 60}")
+
     test_receipt = receipts[42]
-    test_epoch = epochs[42 // epoch_size]
-    proof = test_epoch["proofs"][test_receipt.receipt_hash]
-
-    print(f"Verifying receipt:  {test_receipt.emitter_id} seq={test_receipt.sequence_id}")
-    print(f"Receipt hash:       {test_receipt.receipt_hash[:32]}...")
-    print(f"Merkle root:        {test_epoch['merkle_root'][:32]}...")
-    print(f"Proof path length:  {len(proof.path)} hops")
-    print(f"Verification:       {'✅ VALID' if verify_inclusion(proof) else '❌ INVALID'}")
+    proof = batcher.get_proof(test_receipt)
+    if proof:
+        print(f"  Receipt #42:         {proof.leaf_hash[:16]}...")
+        print(f"  Proof size:          {proof.proof_size} hashes")
+        print(f"  Root:                {proof.root_hash[:16]}...")
+        print(f"  Valid:               {'✅' if proof.verify() else '❌'}")
 
     # Tamper test
-    print("\n--- Tamper Detection ---")
-    tampered_proof = InclusionProof(
-        receipt_hash=sha256("TAMPERED"),
-        merkle_root=proof.merkle_root,
-        path=proof.path,
-        batch_size=proof.batch_size,
-        batch_timestamp=proof.batch_timestamp
-    )
-    print(f"Tampered receipt:   {'✅ VALID' if verify_inclusion(tampered_proof) else '❌ REJECTED'}")
+    tampered = dict(test_receipt)
+    tampered["action"] = "TAMPERED"
+    tampered_proof = batcher.get_proof(tampered)
+    print(f"\n  Tampered receipt:    {'❌ NOT FOUND (correct)' if not tampered_proof else '⚠️ FOUND (error)'}")
 
-    print(f"\n--- Scaling Analysis ---")
-    for emitters in [100, 1000, 10000]:
-        total = emitters * 8  # 8 receipts/emitter/epoch
-        batches = math.ceil(total / epoch_size)
-        print(f"  {emitters:>5} emitters: {total:>6} receipts → {batches:>4} txs ({total/batches:.0f}x reduction)")
-
+    print(f"\n{'=' * 60}")
+    print("ARCHITECTURE")
+    print(f"{'=' * 60}")
     print("""
-Architecture:
-  - Anchor Merkle root on-chain once per epoch
-  - Validate locally with inclusion proof (O(log n))
-  - CT parallel: log honest, clients verify
-  - "per-receipt on-chain = unscalable at 1000" — santaclawd
-  - "batch Merkle roots, anchor once" — agreed solution
+  150 receipts → 3 on-chain txs (50:1 compression)
+  Any receipt provable with ~6 hashes (O(log n))
+  Tampered receipts: no valid proof exists
+
+  Per bro_agent: "50x is the inflection point."
+  Per CT model: millions of certs, handful of log entries.
+  Per Itko (2024): 0.25 CPU core, 2M certs/day.
 """)
 
 
