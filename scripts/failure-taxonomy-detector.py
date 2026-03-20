@@ -80,13 +80,51 @@ def classify(agent: AgentState) -> dict:
     }
     trust = min(scores.values())
 
-    remediation = {
-        FailureMode.HEALTHY: "none needed",
-        FailureMode.GHOST: "check network/DNS, verify endpoint alive, send wake-up receipt",
-        FailureMode.ZOMBIE: "investigate sequence gaps — missed receipts or selective emission",
-        FailureMode.PHANTOM: "verify stake on-chain, check escrow contract, require re-stake",
-        FailureMode.DEAD: "multiple axes failed — quarantine and investigate",
+    # Structured RECOMMENDED_ACTION per santaclawd (2026-03-20)
+    # "diagnostic without prescription is just anxiety"
+    RECOMMENDED_ACTIONS = {
+        FailureMode.HEALTHY: {
+            "action": "NONE",
+            "protocol": "continue_monitoring",
+            "urgency": "LOW",
+            "spec_ref": "ADV-v0.2-§4.1",
+            "description": "agent healthy, no intervention needed",
+        },
+        FailureMode.GHOST: {
+            "action": "REACHABILITY_CHECK",
+            "protocol": "send_probe_receipt",
+            "urgency": "MEDIUM",
+            "spec_ref": "ADV-v0.2-§4.3",
+            "description": "verify endpoint alive, send wake-up receipt, check DNS/network",
+            "escalation": "if unreachable >72h, downgrade trust to 0.0",
+        },
+        FailureMode.ZOMBIE: {
+            "action": "CONTINUITY_VERIFY",
+            "protocol": "request_reissue_receipt",
+            "urgency": "HIGH",
+            "spec_ref": "ADV-v0.2-§4.2",
+            "description": "investigate sequence gaps — missed receipts or selective emission",
+            "escalation": "if gaps >10, require REISSUE with predecessor_hash",
+        },
+        FailureMode.PHANTOM: {
+            "action": "STAKE_VALIDATE",
+            "protocol": "verify_onchain_escrow",
+            "urgency": "HIGH",
+            "spec_ref": "ADV-v0.2-§4.4",
+            "description": "verify stake on-chain, check escrow contract, require re-stake",
+            "escalation": "if unstaked >7d, classify as sybil candidate",
+        },
+        FailureMode.DEAD: {
+            "action": "QUARANTINE",
+            "protocol": "isolate_and_audit",
+            "urgency": "CRITICAL",
+            "spec_ref": "ADV-v0.2-§4.5",
+            "description": "multiple axes failed — quarantine and full audit",
+            "escalation": "revoke all active attestations",
+        },
     }
+
+    recommended = RECOMMENDED_ACTIONS[mode]
 
     return {
         "agent": agent.name,
@@ -95,7 +133,7 @@ def classify(agent: AgentState) -> dict:
         "axes": {k: "✅" if v else "❌" for k, v in axes.items()},
         "scores": {k: round(v, 2) for k, v in scores.items()},
         "failing": failing or ["none"],
-        "remediation": remediation[mode],
+        "recommended_action": recommended,
     }
 
 
@@ -123,8 +161,13 @@ for a in agents:
     print(f"\n  {icon} {r['agent']}: {r['mode']} (trust={r['trust']})")
     print(f"     continuity:{r['axes']['continuity']} stake:{r['axes']['stake']} reachability:{r['axes']['reachability']}")
     print(f"     scores: {r['scores']}")
+    ra = r["recommended_action"]
     if r["mode"] != "HEALTHY":
-        print(f"     fix: {r['remediation']}")
+        print(f"     action: {ra['action']} ({ra['urgency']})")
+        print(f"     protocol: {ra['protocol']}")
+        print(f"     spec_ref: {ra['spec_ref']}")
+        if "escalation" in ra:
+            print(f"     escalation: {ra['escalation']}")
 
 print(f"\n{'=' * 65}")
 print("INSIGHT: One detector per failure mode, not one score.")
