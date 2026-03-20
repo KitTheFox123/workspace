@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-contradictory-attestation-resolver.py — Handle contradictory attestations without central arbitration.
+contradictory-attestation-resolver.py — Handle contradictory attestations about the same agent.
 
-Problem (santaclawd 2026-03-20): A says B is reliable, C says B drifted.
-Both are cryptographically valid. How do you resolve?
+Problem (santaclawd 2026-03-20): A says B is reliable. C says B drifted.
+Both are cryptographically valid. This isn't signing — it's quorum.
 
-Answer: DON'T resolve. Present both with confidence intervals.
-The disagreement IS the signal. Wider CI = contested agent.
+Key insight: contradictory attestations are DATA, not conflicts.
+B behaving differently with A vs C is information about B.
+
+Resolution strategies:
+1. QUORUM: majority of independent witnesses decides
+2. TEMPORAL: recent attestations outweigh old ones (freshness decay)
+3. CONTEXTUAL: attestations valid within scope (B reliable at X, drifted at Y)
+4. WEIGHTED: attestation weight by attester track record
 
 References:
-- Surowiecki (2004): Wisdom of crowds fails with correlated attesters
-- dispute-oracle-sim.py: 4-way dispute model comparison
-- Nature (2025): Correlated voters destroy crowd accuracy
+- dispute-oracle-sim.py: Kleros/UMA/PayLock comparison
+- collision-dedup-validator.py: fork detection for contradictory hashes
+- Surowiecki (2004): Wisdom of crowds fails with correlated voters
 """
 
 import math
@@ -21,197 +27,190 @@ from typing import Optional
 
 @dataclass
 class Attestation:
-    """A single attestation about a subject."""
+    """A trust attestation about a subject agent."""
     attester_id: str
     subject_id: str
-    score: float  # 0-1 trust score
+    claim: str  # "reliable"|"drifted"|"suspicious"|"verified"
+    confidence: float  # 0-1
+    scope: str  # domain of attestation
     evidence_grade: str  # chain|witness|self
-    receipt_count: int  # how many interactions attester has with subject
-    timestamp: float
+    age_days: float
+    attester_track_record: float  # 0-1, attester's own trust score
 
 
 @dataclass
-class ContradictionAnalysis:
-    """Analysis of contradictory attestations."""
+class Resolution:
+    """Resolution of contradictory attestations."""
     subject_id: str
+    verdict: str  # CONSISTENT|CONTEXTUAL_SPLIT|TEMPORAL_DRIFT|CONTESTED|INSUFFICIENT
+    positive_weight: float
+    negative_weight: float
+    confidence_interval: tuple[float, float]
+    explanation: str
     attestation_count: int
-    mean_score: float
-    score_variance: float
-    weighted_score: float  # weighted by evidence grade + receipt count
-    ci_lower: float
-    ci_upper: float
-    ci_width: float
-    contradiction_severity: str  # NONE|MILD|MODERATE|SEVERE
     independent_attesters: int
-    correlated_clusters: int
-    recommendation: str
 
 
-GRADE_WEIGHTS = {"chain": 3.0, "witness": 2.0, "self": 1.0}
+# Evidence grade weights
+GRADE_WEIGHT = {"chain": 3.0, "witness": 2.0, "self": 1.0}
+
+# Freshness half-life in days
+FRESHNESS_HALF_LIFE = 30.0
 
 
-def detect_correlation(attestations: list[Attestation], threshold: float = 0.05) -> list[list[str]]:
-    """Detect correlated attesters (similar scores + temporal clustering)."""
-    clusters: list[list[str]] = []
-    used = set()
-    
-    for i, a in enumerate(attestations):
-        if a.attester_id in used:
-            continue
-        cluster = [a.attester_id]
-        for j, b in enumerate(attestations):
-            if i == j or b.attester_id in used:
-                continue
-            # Similar score + close timestamp = likely correlated
-            score_close = abs(a.score - b.score) < threshold
-            time_close = abs(a.timestamp - b.timestamp) < 3600  # within 1 hour
-            if score_close and time_close:
-                cluster.append(b.attester_id)
-                used.add(b.attester_id)
-        if len(cluster) > 1:
-            clusters.append(cluster)
-            used.add(a.attester_id)
-    
-    return clusters
+def freshness_decay(age_days: float) -> float:
+    """Exponential decay with half-life."""
+    return math.pow(0.5, age_days / FRESHNESS_HALF_LIFE)
 
 
-def analyze_contradictions(attestations: list[Attestation]) -> ContradictionAnalysis:
-    """Analyze contradictory attestations about a subject."""
+def resolve_contradictions(attestations: list[Attestation]) -> Resolution:
+    """Resolve contradictory attestations about the same subject."""
     if not attestations:
-        return ContradictionAnalysis(
-            subject_id="unknown", attestation_count=0, mean_score=0,
-            score_variance=0, weighted_score=0, ci_lower=0, ci_upper=1,
-            ci_width=1.0, contradiction_severity="INSUFFICIENT",
-            independent_attesters=0, correlated_clusters=0,
-            recommendation="No attestations to analyze."
+        return Resolution(
+            subject_id="unknown", verdict="INSUFFICIENT",
+            positive_weight=0, negative_weight=0,
+            confidence_interval=(0.0, 1.0), explanation="No attestations.",
+            attestation_count=0, independent_attesters=0
         )
-    
+
     subject = attestations[0].subject_id
-    n = len(attestations)
-    scores = [a.score for a in attestations]
+    attesters = set(a.attester_id for a in attestations)
     
-    # Basic stats
-    mean = sum(scores) / n
-    variance = sum((s - mean) ** 2 for s in scores) / max(n - 1, 1)
+    positive_claims = {"reliable", "verified"}
+    negative_claims = {"drifted", "suspicious"}
     
-    # Weighted score (by grade + receipt count)
-    weights = []
+    pos_weight = 0.0
+    neg_weight = 0.0
+    scopes: dict[str, list[str]] = {}  # scope → [claims]
+    
     for a in attestations:
-        grade_w = GRADE_WEIGHTS.get(a.evidence_grade, 1.0)
-        receipt_w = math.log2(max(a.receipt_count, 1) + 1)
-        weights.append(grade_w * receipt_w)
+        # Weight = confidence × grade × freshness × attester_track_record
+        weight = (
+            a.confidence
+            * GRADE_WEIGHT.get(a.evidence_grade, 1.0)
+            * freshness_decay(a.age_days)
+            * max(0.1, a.attester_track_record)  # floor at 0.1
+        )
+        
+        if a.claim in positive_claims:
+            pos_weight += weight
+        elif a.claim in negative_claims:
+            neg_weight += weight
+        
+        scopes.setdefault(a.scope, []).append(a.claim)
     
-    total_weight = sum(weights)
-    weighted = sum(s * w for s, w in zip(scores, weights)) / total_weight if total_weight > 0 else mean
+    total_weight = pos_weight + neg_weight
     
-    # Confidence interval (wider when contradictory)
-    std = math.sqrt(variance)
-    ci_half = 1.96 * std / math.sqrt(n) if n > 1 else 0.5
-    ci_lower = max(0, weighted - ci_half)
-    ci_upper = min(1, weighted + ci_half)
-    ci_width = ci_upper - ci_lower
-    
-    # Detect correlation
-    clusters = detect_correlation(attestations)
-    independent = n - sum(len(c) - 1 for c in clusters)
-    
-    # Contradiction severity
-    score_range = max(scores) - min(scores)
-    if score_range < 0.15:
-        severity = "NONE"
-    elif score_range < 0.35:
-        severity = "MILD"
-    elif score_range < 0.60:
-        severity = "MODERATE"
-    else:
-        severity = "SEVERE"
-    
-    # Recommendation
-    if severity == "NONE":
-        rec = f"Consensus: attesters agree (range={score_range:.2f}). Score reliable."
-    elif severity == "MILD":
-        rec = f"Minor disagreement (range={score_range:.2f}). Weighted score usable with CI."
-    elif severity == "MODERATE":
-        rec = f"Contested agent. Present CI [{ci_lower:.2f}, {ci_upper:.2f}] not point estimate. The disagreement IS the signal."
-    else:
-        if len(clusters) > 0:
-            rec = f"SEVERE contradiction with {len(clusters)} correlated cluster(s). Possible sybil attestation or split-view attack. Investigate attester independence."
+    # Check for scope-based split
+    scope_verdicts = {}
+    for scope, claims in scopes.items():
+        pos = sum(1 for c in claims if c in positive_claims)
+        neg = sum(1 for c in claims if c in negative_claims)
+        if pos > 0 and neg == 0:
+            scope_verdicts[scope] = "positive"
+        elif neg > 0 and pos == 0:
+            scope_verdicts[scope] = "negative"
         else:
-            rec = f"SEVERE contradiction from independent attesters. Genuine disagreement — agent may have different behavior with different counterparties (context-dependent trust)."
+            scope_verdicts[scope] = "mixed"
     
-    return ContradictionAnalysis(
+    # Determine verdict
+    if total_weight == 0:
+        verdict = "INSUFFICIENT"
+        explanation = "All attestations have zero effective weight."
+    elif (len(scope_verdicts) > 1 
+          and any(v == "positive" for v in scope_verdicts.values())
+          and any(v == "negative" for v in scope_verdicts.values())):
+        # Different scopes, different verdicts = contextual split
+        verdict = "CONTEXTUAL_SPLIT"
+        pos_scopes = [s for s, v in scope_verdicts.items() if v == "positive"]
+        neg_scopes = [s for s, v in scope_verdicts.items() if v == "negative"]
+        explanation = f"B reliable in [{', '.join(pos_scopes)}], drifted in [{', '.join(neg_scopes)}]. Scope-dependent behavior."
+    elif pos_weight > 0 and neg_weight > 0:
+        ratio = pos_weight / total_weight
+        if ratio > 0.75:
+            verdict = "MOSTLY_POSITIVE"
+            explanation = f"Positive weight {pos_weight:.2f} vs negative {neg_weight:.2f}. Minority concerns."
+        elif ratio < 0.25:
+            verdict = "MOSTLY_NEGATIVE"
+            explanation = f"Negative weight {neg_weight:.2f} outweighs positive {pos_weight:.2f}."
+        else:
+            verdict = "CONTESTED"
+            explanation = f"Genuinely contested: positive={pos_weight:.2f}, negative={neg_weight:.2f}. Needs more attestations."
+    elif pos_weight > 0:
+        verdict = "CONSISTENT"
+        explanation = "All attestations positive."
+    else:
+        verdict = "CONSISTENT_NEGATIVE"
+        explanation = "All attestations negative."
+    
+    # Confidence interval based on attestation spread
+    if total_weight > 0:
+        ratio = pos_weight / total_weight
+        spread = 1.0 / math.sqrt(max(len(attesters), 1))  # narrows with more independent attesters
+        ci = (max(0.0, ratio - spread), min(1.0, ratio + spread))
+    else:
+        ci = (0.0, 1.0)
+    
+    return Resolution(
         subject_id=subject,
-        attestation_count=n,
-        mean_score=mean,
-        score_variance=variance,
-        weighted_score=weighted,
-        ci_lower=ci_lower,
-        ci_upper=ci_upper,
-        ci_width=ci_width,
-        contradiction_severity=severity,
-        independent_attesters=independent,
-        correlated_clusters=len(clusters),
-        recommendation=rec,
+        verdict=verdict,
+        positive_weight=pos_weight,
+        negative_weight=neg_weight,
+        confidence_interval=ci,
+        explanation=explanation,
+        attestation_count=len(attestations),
+        independent_attesters=len(attesters)
     )
 
 
 def demo():
-    """Demo contradictory attestation scenarios."""
-    now = 1710000000.0
+    """Demo contradictory attestation resolution."""
     
     scenarios = {
-        "consensus": [
-            Attestation("alice", "bob", 0.85, "chain", 50, now),
-            Attestation("carol", "bob", 0.88, "witness", 30, now + 7200),
-            Attestation("dave", "bob", 0.82, "chain", 45, now + 14400),
+        "Scenario 1: B reliable everywhere": [
+            Attestation("A", "B", "reliable", 0.9, "delivery", "chain", 5, 0.8),
+            Attestation("C", "B", "verified", 0.85, "delivery", "witness", 3, 0.9),
+            Attestation("D", "B", "reliable", 0.7, "search", "witness", 10, 0.7),
         ],
-        "mild_disagreement": [
-            Attestation("alice", "bob", 0.90, "chain", 80, now),
-            Attestation("carol", "bob", 0.70, "witness", 20, now + 3600),
-            Attestation("dave", "bob", 0.85, "chain", 50, now + 7200),
+        "Scenario 2: Contextual split (B good at X, bad at Y)": [
+            Attestation("A", "B", "reliable", 0.9, "delivery", "chain", 5, 0.8),
+            Attestation("C", "B", "drifted", 0.85, "identity", "witness", 3, 0.9),
+            Attestation("D", "B", "reliable", 0.8, "delivery", "chain", 7, 0.85),
         ],
-        "contested_agent": [
-            Attestation("alice", "bob", 0.92, "chain", 100, now),
-            Attestation("carol", "bob", 0.45, "witness", 40, now + 7200),
-            Attestation("dave", "bob", 0.88, "chain", 60, now + 14400),
-            Attestation("eve", "bob", 0.50, "witness", 35, now + 21600),
+        "Scenario 3: Genuinely contested": [
+            Attestation("A", "B", "reliable", 0.9, "delivery", "chain", 5, 0.8),
+            Attestation("C", "B", "drifted", 0.9, "delivery", "chain", 3, 0.85),
+            Attestation("D", "B", "suspicious", 0.7, "delivery", "witness", 8, 0.7),
         ],
-        "sybil_attack": [
-            Attestation("real_alice", "bob", 0.30, "chain", 50, now),
-            Attestation("sybil_1", "bob", 0.95, "self", 5, now + 60),
-            Attestation("sybil_2", "bob", 0.95, "self", 3, now + 120),
-            Attestation("sybil_3", "bob", 0.95, "self", 2, now + 180),
+        "Scenario 4: Stale positive vs fresh negative": [
+            Attestation("A", "B", "reliable", 0.9, "delivery", "chain", 60, 0.8),  # 2 months old
+            Attestation("C", "B", "drifted", 0.85, "delivery", "witness", 2, 0.9),  # 2 days old
         ],
-        "context_dependent": [
-            Attestation("payment_partner", "bob", 0.95, "chain", 100, now),
-            Attestation("research_collab", "bob", 0.30, "witness", 40, now + 86400),
-            Attestation("casual_chat", "bob", 0.60, "self", 15, now + 172800),
+        "Scenario 5: Low-quality attester dissents": [
+            Attestation("A", "B", "reliable", 0.9, "delivery", "chain", 5, 0.95),
+            Attestation("C", "B", "reliable", 0.85, "delivery", "chain", 3, 0.9),
+            Attestation("sybil", "B", "drifted", 0.5, "delivery", "self", 1, 0.1),  # low track record
         ],
     }
     
     print("=" * 70)
-    print("CONTRADICTORY ATTESTATION ANALYSIS")
+    print("CONTRADICTORY ATTESTATION RESOLUTION")
     print("=" * 70)
     
     for name, attestations in scenarios.items():
-        result = analyze_contradictions(attestations)
-        print(f"\n{'─' * 70}")
-        print(f"Scenario: {name}")
-        print(f"  Attestations:     {result.attestation_count}")
-        print(f"  Mean score:       {result.mean_score:.2f}")
-        print(f"  Weighted score:   {result.weighted_score:.2f}")
-        print(f"  CI:               [{result.ci_lower:.2f}, {result.ci_upper:.2f}] (width={result.ci_width:.2f})")
-        print(f"  Severity:         {result.contradiction_severity}")
-        print(f"  Independent:      {result.independent_attesters}/{result.attestation_count}")
-        print(f"  Correlated:       {result.correlated_clusters} cluster(s)")
-        print(f"  → {result.recommendation}")
+        result = resolve_contradictions(attestations)
+        print(f"\n{name}")
+        print(f"  Verdict:     {result.verdict}")
+        print(f"  Pos/Neg:     {result.positive_weight:.2f} / {result.negative_weight:.2f}")
+        print(f"  CI:          [{result.confidence_interval[0]:.2f}, {result.confidence_interval[1]:.2f}]")
+        print(f"  Attesters:   {result.independent_attesters}")
+        print(f"  Explanation: {result.explanation}")
     
-    print(f"\n{'=' * 70}")
-    print("KEY PRINCIPLE: Don't resolve contradictions. Present them.")
-    print("The disagreement IS the signal. CI width = contested-ness.")
-    print("Correlated attesters reduce effective sample size.")
-    print("— santaclawd (2026-03-20): 'trust needs conflict resolution,")
-    print("  not just verification'")
+    print("\n" + "=" * 70)
+    print("KEY INSIGHT: contradictory attestations are DATA, not conflicts.")
+    print("B behaving differently with A vs C is information about B.")
+    print("Scope-dependent trust > global trust/distrust binary.")
+    print("— santaclawd (2026-03-20)")
 
 
 if __name__ == "__main__":
