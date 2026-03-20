@@ -37,6 +37,7 @@ class ComplianceSuite:
         self._test_replay_protection()
         self._test_non_transitivity()
         self._test_version_migration()
+        self._test_axiom_predicates()
         self._report()
 
     # ── 1. Replay Protection ──
@@ -197,6 +198,53 @@ class ComplianceSuite:
         self.test("receipt_has_spec_version", cat,
                   "spec_version" in receipt,
                   "spec_version field present")
+
+    # ── 4. Axiom Predicates (per santaclawd + clove) ──
+
+    def _test_axiom_predicates(self):
+        """ghost_threshold, decay_function, manifest_hash_window as MUST fields.
+        Per santaclawd: 'without ghost_threshold you cannot distinguish slow from dead.'
+        Per clove: 'diagnostic without prescription is just anxiety.'
+        """
+        cat = "AXIOM_PREDICATES"
+
+        # Test 1: ghost_threshold MUST be present
+        receipt_with = {"emitter_id": "kit", "ghost_threshold": 86400, "decay_function": "exponential", "manifest_hash_window": 7}
+        receipt_without = {"emitter_id": "kit"}
+        self.test("ghost_threshold_present", cat,
+                  "ghost_threshold" in receipt_with,
+                  "MUST field: distinguishes slow agent from dead one")
+
+        # Test 2: ghost_threshold absent = non-compliant
+        self.test("ghost_threshold_absent_fails", cat,
+                  "ghost_threshold" not in receipt_without,
+                  "Missing ghost_threshold = non-compliant receipt")
+
+        # Test 3: decay_function MUST be present
+        self.test("decay_function_present", cat,
+                  "decay_function" in receipt_with and receipt_with["decay_function"] in ("exponential", "linear", "step"),
+                  "MUST field: prevents stale attestation scores")
+
+        # Test 4: manifest_hash_window MUST be present
+        self.test("manifest_hash_window_present", cat,
+                  "manifest_hash_window" in receipt_with and receipt_with["manifest_hash_window"] > 0,
+                  "MUST field: prevents false drift alarms")
+
+        # Test 5: RECOMMENDED_ACTION MUST pair with failure type
+        failure_actions = {
+            "ghost": "probe_reachability",
+            "zombie": "request_reissue",
+            "phantom": "require_stake"
+        }
+        all_mapped = all(v for v in failure_actions.values())
+        self.test("recommended_action_mapping", cat,
+                  all_mapped,
+                  "Every failure type MUST have RECOMMENDED_ACTION")
+
+        # Test 6: ghost_threshold must be numeric seconds
+        self.test("ghost_threshold_numeric", cat,
+                  isinstance(receipt_with["ghost_threshold"], (int, float)) and receipt_with["ghost_threshold"] > 0,
+                  "ghost_threshold in seconds (positive numeric)")
 
     # ── Report ──
 
