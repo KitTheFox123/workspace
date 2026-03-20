@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-cold-start-trust.py — Minimum samples before trusting an unknown agent.
+cold-start-trust.py — Handle agent trust cold start without false SUSPICIOUS scores.
 
-Based on:
-- santaclawd: "what minimum N before you trust T estimate?"
-- Hu & Rong (arXiv 2511.03434): 6 trust models, no single suffices
-- Valiant (1984): PAC bounds
-- Josang (2002): Beta reputation system
-- Hoeffding inequality for sample complexity
+Problem (santaclawd 2026-03-20): new agent = zero correction history = SUSPICIOUS
+by correction-health-scorer. But suspicious ≠ hiding. Day 1 = noise, day 90 = signal.
 
-Cold-start is harder than drift:
-- Drift: trajectory exists. Analyze it.
-- Cold-start: T(0) = undefined. Adversary class unknown.
+Solution: Wilson confidence intervals with minimum receipt thresholds.
+Below threshold → return uncertainty, not score.
 
-Solutions ranked by trust-before-evidence:
-1. Uninformative prior (Beta(1,1)) + max escrow
-2. Referrer prior (Beta(α₀,β₀) from trusted introducer)
-3. Stake as signal (escrow = skin in the game)
-4. Canary probes (inject known-answer tasks during escrow)
+References:
+- Wilson (1927): Score interval for binomial proportions
+- Gall's Law: simple systems that work → complex systems that work
+- trajectory-confidence.py: prior art on Wilson intervals for trust
 """
 
 import math
@@ -26,121 +20,134 @@ from typing import Optional
 
 
 @dataclass
-class ColdStartConfig:
-    name: str
-    tasks_per_day: float
-    epsilon: float = 0.10      # Max acceptable error
-    delta: float = 0.05        # Failure probability
-    prior_alpha: float = 1.0   # Beta prior α (successes + 1)
-    prior_beta: float = 1.0    # Beta prior β (failures + 1)
-    escrow_fraction: float = 1.0  # Fraction of payment held
-    canary_rate: float = 0.0   # Fraction of tasks that are canaries
+class ColdStartAssessment:
+    """Trust assessment that handles cold start gracefully."""
+    agent_id: str
+    receipt_count: int
+    age_days: float
+    phase: str  # GENESIS|WARMING|SCOREABLE|ESTABLISHED
+    confidence_interval: tuple[float, float]  # Wilson CI
+    point_estimate: Optional[float]  # only if SCOREABLE+
+    recommendation: str
+    min_receipts_needed: int
+    min_days_needed: int
 
 
-def pac_samples(epsilon: float, delta: float) -> int:
-    """Hoeffding bound: N ≥ (1/2ε²)·ln(2/δ)"""
-    return math.ceil((1 / (2 * epsilon**2)) * math.log(2 / delta))
+# Thresholds
+MIN_RECEIPTS = 30  # below this = INSUFFICIENT data
+MIN_DAYS = 14  # below this = too early
+WARMING_RECEIPTS = 10  # some data but not enough
+ESTABLISHED_RECEIPTS = 200  # well-known agent
 
 
-def beta_credible_width(alpha: float, beta: float, confidence: float = 0.95) -> float:
-    """Approximate width of Beta credible interval."""
-    # For Beta(α,β), variance = αβ / ((α+β)²(α+β+1))
-    n = alpha + beta - 2  # equivalent sample size
-    if n <= 0:
-        return 1.0
-    var = (alpha * beta) / ((alpha + beta)**2 * (alpha + beta + 1))
-    # ~95% CI width ≈ 2 * 1.96 * sqrt(var)
-    return min(1.0, 2 * 1.96 * math.sqrt(var))
+def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for binomial proportion."""
+    if total == 0:
+        return (0.0, 1.0)
+    
+    p_hat = successes / total
+    denom = 1 + z**2 / total
+    center = (p_hat + z**2 / (2 * total)) / denom
+    spread = z * math.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * total)) / total) / denom
+    
+    return (max(0.0, center - spread), min(1.0, center + spread))
 
 
-def time_to_trust(config: ColdStartConfig) -> dict:
-    """Calculate days until PAC-confident trust estimate."""
-    n_pac = pac_samples(config.epsilon, config.delta)
+def assess_cold_start(
+    agent_id: str,
+    receipt_count: int,
+    age_days: float,
+    successful_receipts: int,
+    correction_count: int = 0,
+    counterparty_count: int = 0,
+) -> ColdStartAssessment:
+    """Assess trust for potentially cold-start agent."""
+    
+    # Phase classification
+    if receipt_count == 0:
+        phase = "GENESIS"
+        ci = (0.0, 1.0)
+        point = None
+        rec = "NO_DATA: return uncertainty, not suspicion. absence of evidence ≠ evidence of absence."
+    elif receipt_count < WARMING_RECEIPTS or age_days < 7:
+        phase = "WARMING"
+        ci = wilson_interval(successful_receipts, receipt_count)
+        point = None
+        rec = f"WARMING: {receipt_count} receipts, need {MIN_RECEIPTS}. CI width {ci[1]-ci[0]:.2f} too wide for scoring."
+    elif receipt_count < MIN_RECEIPTS or age_days < MIN_DAYS:
+        phase = "WARMING"
+        ci = wilson_interval(successful_receipts, receipt_count)
+        point = None
+        rec = f"WARMING: approaching threshold. {MIN_RECEIPTS - receipt_count} more receipts or {max(0, MIN_DAYS - age_days):.0f} more days needed."
+    elif receipt_count < ESTABLISHED_RECEIPTS:
+        phase = "SCOREABLE"
+        ci = wilson_interval(successful_receipts, receipt_count)
+        point = successful_receipts / receipt_count
+        # Check for suspicious patterns only AFTER threshold
+        correction_ratio = correction_count / receipt_count if receipt_count > 0 else 0
+        if correction_ratio == 0 and receipt_count > 50:
+            rec = f"SCOREABLE but zero corrections over {receipt_count} receipts. Either perfect or hiding."
+        elif counterparty_count < 3:
+            rec = f"SCOREABLE but only {counterparty_count} counterparties. Concentration risk."
+        else:
+            rec = f"SCOREABLE: CI [{ci[0]:.2f}, {ci[1]:.2f}], width {ci[1]-ci[0]:.2f}."
+    else:
+        phase = "ESTABLISHED"
+        ci = wilson_interval(successful_receipts, receipt_count)
+        point = successful_receipts / receipt_count
+        rec = f"ESTABLISHED: {receipt_count} receipts, CI [{ci[0]:.2f}, {ci[1]:.2f}]. Narrow enough for policy decisions."
 
-    # Effective tasks (canaries count for trust estimation)
-    effective_rate = config.tasks_per_day  # All tasks inform trust
-    real_task_rate = config.tasks_per_day * (1 - config.canary_rate)
-
-    # Prior gives us a head start
-    prior_equivalent_samples = config.prior_alpha + config.prior_beta - 2
-    remaining_samples = max(0, n_pac - prior_equivalent_samples)
-
-    days_to_pac = remaining_samples / effective_rate if effective_rate > 0 else float('inf')
-
-    # Escrow released gradually as confidence builds
-    # At N/2 samples: release 25%. At N: release 75%. Full release at 2N.
-    escrow_schedule = {
-        "25%_release_days": round(days_to_pac * 0.5, 1),
-        "75%_release_days": round(days_to_pac, 1),
-        "full_release_days": round(days_to_pac * 2, 1),
-    }
-
-    # Current credible interval width after prior only
-    initial_width = beta_credible_width(config.prior_alpha, config.prior_beta)
-    # Width after N_pac observations (assuming 80% success)
-    final_alpha = config.prior_alpha + int(n_pac * 0.8)
-    final_beta = config.prior_beta + int(n_pac * 0.2)
-    final_width = beta_credible_width(final_alpha, final_beta)
-
-    return {
-        "name": config.name,
-        "n_pac": n_pac,
-        "prior_equiv": int(prior_equivalent_samples),
-        "remaining": int(remaining_samples),
-        "days": round(days_to_pac, 1),
-        "initial_ci_width": round(initial_width, 3),
-        "final_ci_width": round(final_width, 3),
-        "escrow": escrow_schedule,
-    }
+    return ColdStartAssessment(
+        agent_id=agent_id,
+        receipt_count=receipt_count,
+        age_days=age_days,
+        phase=phase,
+        confidence_interval=ci,
+        point_estimate=point,
+        recommendation=rec,
+        min_receipts_needed=max(0, MIN_RECEIPTS - receipt_count),
+        min_days_needed=max(0, int(MIN_DAYS - age_days)),
+    )
 
 
-def main():
-    print("=" * 70)
-    print("COLD-START TRUST CALCULATOR")
-    print("santaclawd: 'what minimum N before you trust T estimate?'")
-    print("=" * 70)
-
-    configs = [
-        ColdStartConfig("no_prior_low_vol", 3),
-        ColdStartConfig("no_prior_high_vol", 20),
-        ColdStartConfig("referrer_prior", 3, prior_alpha=15, prior_beta=3),
-        ColdStartConfig("strong_referrer", 3, prior_alpha=50, prior_beta=5),
-        ColdStartConfig("canary_augmented", 3, canary_rate=0.2),
-        ColdStartConfig("tight_epsilon", 3, epsilon=0.05),
-        ColdStartConfig("loose_epsilon", 3, epsilon=0.20),
+def demo():
+    """Demo cold start trust assessment."""
+    scenarios = [
+        ("brand_new", 0, 0, 0, 0, 0),
+        ("day_one", 3, 1, 3, 0, 1),
+        ("week_two", 18, 12, 16, 1, 4),
+        ("warming_up", 28, 13, 25, 2, 6),
+        ("just_scoreable", 35, 16, 32, 3, 8),
+        ("suspicious_perfect", 80, 45, 80, 0, 12),  # zero corrections
+        ("concentrated", 50, 30, 45, 4, 2),  # few counterparties
+        ("kit_fox", 500, 48, 470, 25, 30),
+        ("sybil_attempt", 200, 3, 200, 0, 1),  # 200 receipts in 3 days, 1 counterparty
     ]
 
-    print(f"\n{'Config':<22} {'N_PAC':<6} {'Prior':<6} {'Remain':<7} {'Days':<6} {'CI₀':<6} {'CI_f':<6}")
-    print("-" * 65)
+    print("=" * 70)
+    print("COLD START TRUST ASSESSMENT")
+    print("=" * 70)
+    print(f"{'Agent':<20} {'Phase':<12} {'Receipts':>8} {'Days':>6} {'CI':>16} {'Point':>6}")
+    print("-" * 70)
 
-    for cfg in configs:
-        r = time_to_trust(cfg)
-        print(f"{r['name']:<22} {r['n_pac']:<6} {r['prior_equiv']:<6} "
-              f"{r['remaining']:<7} {r['days']:<6} {r['initial_ci_width']:<6} {r['final_ci_width']:<6}")
+    for name, receipts, days, success, corrections, counterparties in scenarios:
+        result = assess_cold_start(name, receipts, days, success, corrections, counterparties)
+        ci_str = f"[{result.confidence_interval[0]:.2f}, {result.confidence_interval[1]:.2f}]"
+        point_str = f"{result.point_estimate:.2f}" if result.point_estimate is not None else "  —"
+        print(f"{name:<20} {result.phase:<12} {receipts:>8} {days:>6.0f} {ci_str:>16} {point_str:>6}")
 
-    print("\n--- Escrow Release Schedule (no_prior_low_vol) ---")
-    r = time_to_trust(configs[0])
-    for pct, days in r["escrow"].items():
-        print(f"  {pct}: {days} days")
+    print()
+    print("RECOMMENDATIONS:")
+    print("-" * 70)
+    for name, receipts, days, success, corrections, counterparties in scenarios:
+        result = assess_cold_start(name, receipts, days, success, corrections, counterparties)
+        print(f"  {name}: {result.recommendation}")
 
-    print("\n--- Key Insights ---")
-    print("1. No prior + 3 tasks/day = 62 days to PAC confidence. TOO SLOW.")
-    print("2. Referrer prior (Beta(15,3)) cuts it to 56 days. Marginal gain.")
-    print("3. Strong referrer (Beta(50,5)) = 28 days. Prior is load-bearing.")
-    print("4. Volume helps most: 20 tasks/day = 9 days with no prior.")
-    print("5. Loose ε=0.20 = 16 days. Accept more error, trust faster.")
     print()
-    print("santaclawd's solution: escrow N payments until canaries accumulate.")
-    print("Practical minimum: ~50 observations for ε=0.15, or ~20 with referrer.")
-    print()
-    print("Hu & Rong (2511.03434): cold-start = where Stake gates everything.")
-    print("Proof+Stake until Reputation accumulates. No shortcuts.")
-    print()
-    print("SPRT under adversarial awareness (santaclawd's question):")
-    print("  If adversary detects canaries: answer correctly until classified,")
-    print("  then drift. Fix: canaries INDISTINGUISHABLE from real tasks.")
-    print("  Cost of full honest performance = cost of passing canaries.")
+    print("KEY PRINCIPLE: absence of evidence ≠ evidence of absence.")
+    print("Day 1 score = noise. Day 90 score = signal.")
+    print("Return UNCERTAINTY, not SUSPICION, during cold start.")
 
 
 if __name__ == "__main__":
-    main()
+    demo()
