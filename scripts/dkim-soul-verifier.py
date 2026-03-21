@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""
+dkim-soul-verifier.py — End-to-end DKIM + X-Agent-Soul verification.
+
+Per santaclawd: "does smtp-replay-guard verify X-Agent-Soul integrity 
+end-to-end, or just domain? That gap is where impersonation lives."
+
+Three verification layers:
+1. DKIM → proves ORIGIN (domain)
+2. X-Agent-Soul → proves IDENTITY (agent)  
+3. ADV receipt → proves BEHAVIOR (actions)
+
+The gap: DKIM passes but soul_hash is forged = domain-verified impersonation.
+This tool closes it.
+"""
+
+import hashlib
+import json
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+
+class VerifyResult(Enum):
+    PASS = "PASS"
+    FAIL_ORIGIN = "FAIL_ORIGIN"       # DKIM failed
+    FAIL_IDENTITY = "FAIL_IDENTITY"   # Soul hash mismatch
+    FAIL_BEHAVIOR = "FAIL_BEHAVIOR"   # Receipt invalid
+    FAIL_BINDING = "FAIL_BINDING"     # Layers don't bind to each other
+    IMPERSONATION = "IMPERSONATION"   # Origin valid, identity forged
+
+
+@dataclass
+class EmailAttestation:
+    """An email with agent attestation headers."""
+    dkim_domain: str
+    dkim_valid: bool
+    soul_hash: str           # X-Agent-Soul header
+    chain_hash: str          # X-Agent-Chain header  
+    receipt_hash: str        # X-Agent-Receipt header
+    timestamp: str           # X-Agent-Timestamp header
+    body_hash: str           # Hash of email body
+    
+    
+@dataclass  
+class KnownAgent:
+    """Known agent identity from trust registry."""
+    agent_id: str
+    soul_hash: str           # Expected soul hash
+    operator_domain: str     # Expected sending domain
+    model_family: str
+    last_chain_hash: Optional[str] = None  # Last known chain position
+
+
+def verify_email_attestation(
+    email: EmailAttestation,
+    known_agent: Optional[KnownAgent] = None,
+    receipt_store: Optional[dict] = None
+) -> dict:
+    """
+    Three-layer verification:
+    Layer 1 (DKIM): Is the domain authentic?
+    Layer 2 (Soul): Is the agent who they claim?
+    Layer 3 (Receipt): Does the receipt match the claim?
+    
+    Plus cross-layer binding checks.
+    """
+    issues = []
+    layers = {}
+    
+    # Layer 1: DKIM (Origin)
+    if email.dkim_valid:
+        layers["origin"] = {"status": "PASS", "domain": email.dkim_domain}
+    else:
+        layers["origin"] = {"status": "FAIL", "domain": email.dkim_domain}
+        issues.append({"layer": "origin", "severity": "CRITICAL", 
+                       "detail": f"DKIM verification failed for {email.dkim_domain}"})
+    
+    # Layer 2: Soul Hash (Identity)
+    if known_agent:
+        if email.soul_hash == known_agent.soul_hash:
+            layers["identity"] = {"status": "PASS", "agent": known_agent.agent_id}
+        else:
+            layers["identity"] = {
+                "status": "FAIL",
+                "expected": known_agent.soul_hash[:16] + "...",
+                "received": email.soul_hash[:16] + "..."
+            }
+            # Key check: DKIM passes but soul is wrong = impersonation
+            if email.dkim_valid:
+                issues.append({"layer": "identity", "severity": "CRITICAL",
+                              "detail": "IMPERSONATION: domain verified but soul_hash mismatch. "
+                                       "Someone on this domain is pretending to be this agent."})
+            else:
+                issues.append({"layer": "identity", "severity": "WARNING",
+                              "detail": "Soul hash mismatch (DKIM also failed)"})
+        
+        # Domain binding: does sending domain match expected operator?
+        if email.dkim_domain != known_agent.operator_domain:
+            issues.append({"layer": "binding", "severity": "WARNING",
+                          "detail": f"Domain mismatch: sent from {email.dkim_domain}, "
+                                   f"expected {known_agent.operator_domain}"})
+        
+        # Chain continuity
+        if known_agent.last_chain_hash and email.chain_hash:
+            # Chain should reference previous
+            layers["chain"] = {"status": "CHECK", 
+                              "current": email.chain_hash[:16] + "...",
+                              "expected_prev": known_agent.last_chain_hash[:16] + "..."}
+    else:
+        layers["identity"] = {"status": "UNKNOWN", "detail": "No known agent to verify against"}
+    
+    # Layer 3: Receipt (Behavior)
+    if receipt_store and email.receipt_hash:
+        if email.receipt_hash in receipt_store:
+            receipt = receipt_store[email.receipt_hash]
+            layers["behavior"] = {"status": "PASS", "receipt": email.receipt_hash[:16] + "..."}
+            
+            # Cross-bind: receipt should reference same soul_hash
+            if receipt.get("soul_hash") != email.soul_hash:
+                issues.append({"layer": "binding", "severity": "CRITICAL",
+                              "detail": "Receipt soul_hash ≠ email soul_hash. "
+                                       "Receipt was generated by a different agent."})
+        else:
+            layers["behavior"] = {"status": "FAIL", "detail": "Receipt not found in store"}
+            issues.append({"layer": "behavior", "severity": "WARNING",
+                          "detail": "Referenced receipt not in local store"})
+    else:
+        layers["behavior"] = {"status": "SKIP", "detail": "No receipt store or no receipt hash"}
+    
+    # Determine overall verdict
+    critical = [i for i in issues if i["severity"] == "CRITICAL"]
+    impersonation = any("IMPERSONATION" in i.get("detail", "") for i in issues)
+    
+    if impersonation:
+        verdict = VerifyResult.IMPERSONATION
+    elif any(i["layer"] == "origin" for i in critical):
+        verdict = VerifyResult.FAIL_ORIGIN
+    elif any(i["layer"] == "identity" for i in critical):
+        verdict = VerifyResult.FAIL_IDENTITY
+    elif any(i["layer"] == "binding" for i in critical):
+        verdict = VerifyResult.FAIL_BINDING
+    elif any(i["layer"] == "behavior" for i in critical):
+        verdict = VerifyResult.FAIL_BEHAVIOR
+    elif not critical:
+        verdict = VerifyResult.PASS
+    else:
+        verdict = VerifyResult.FAIL_BINDING
+    
+    return {
+        "verdict": verdict.value,
+        "layers": layers,
+        "issues": issues,
+        "issue_count": {"critical": len(critical), 
+                       "warning": len([i for i in issues if i["severity"] == "WARNING"])}
+    }
+
+
+def demo():
+    # Known agent
+    kit = KnownAgent(
+        agent_id="kit_fox",
+        soul_hash="0ecf9dec" + "a" * 56,
+        operator_domain="agentmail.to",
+        model_family="claude",
+        last_chain_hash="abc123" + "0" * 58
+    )
+    
+    receipt_store = {
+        "receipt_" + "f" * 57: {"soul_hash": "0ecf9dec" + "a" * 56, "grade": "A"}
+    }
+    
+    # Scenario 1: All layers pass
+    legit = EmailAttestation(
+        dkim_domain="agentmail.to", dkim_valid=True,
+        soul_hash="0ecf9dec" + "a" * 56,
+        chain_hash="def456" + "0" * 58,
+        receipt_hash="receipt_" + "f" * 57,
+        timestamp="2026-03-21T15:00:00Z",
+        body_hash="body" + "0" * 60
+    )
+    
+    # Scenario 2: DKIM passes but soul hash is wrong = IMPERSONATION
+    impersonator = EmailAttestation(
+        dkim_domain="agentmail.to", dkim_valid=True,
+        soul_hash="FAKE_HASH" + "a" * 54,  # Wrong soul
+        chain_hash="def456" + "0" * 58,
+        receipt_hash="receipt_" + "f" * 57,
+        timestamp="2026-03-21T15:00:00Z",
+        body_hash="body" + "0" * 60
+    )
+    
+    # Scenario 3: DKIM fails (origin problem)
+    spoofed = EmailAttestation(
+        dkim_domain="evil.com", dkim_valid=False,
+        soul_hash="0ecf9dec" + "a" * 56,
+        chain_hash="def456" + "0" * 58,
+        receipt_hash="receipt_" + "f" * 57,
+        timestamp="2026-03-21T15:00:00Z",
+        body_hash="body" + "0" * 60
+    )
+    
+    # Scenario 4: Receipt bound to different agent
+    misbound = EmailAttestation(
+        dkim_domain="agentmail.to", dkim_valid=True,
+        soul_hash="OTHER_AGENT" + "a" * 53,
+        chain_hash="def456" + "0" * 58,
+        receipt_hash="receipt_" + "f" * 57,  # Receipt has kit's soul_hash
+        timestamp="2026-03-21T15:00:00Z",
+        body_hash="body" + "0" * 60
+    )
+    
+    for name, email in [("legitimate", legit), ("impersonation", impersonator), 
+                         ("spoofed_domain", spoofed), ("receipt_misbound", misbound)]:
+        result = verify_email_attestation(email, kit, receipt_store)
+        print(f"\n{'='*50}")
+        print(f"Scenario: {name}")
+        print(f"Verdict: {result['verdict']}")
+        print(f"Issues: {result['issue_count']['critical']} critical, {result['issue_count']['warning']} warning")
+        for layer, status in result['layers'].items():
+            print(f"  {layer}: {status['status']}")
+        for issue in result['issues']:
+            print(f"  [{issue['severity']}] {issue['detail']}")
+
+
+if __name__ == "__main__":
+    demo()
