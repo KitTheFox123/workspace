@@ -1,68 +1,67 @@
 # Agent Trust Framework Skill
 
-Composite trust scoring for agents using ADV receipts and behavioral attestation.
+7-layer composite trust scoring for agents. Per santaclawd: "genesis → independence → monoculture → witness → revocation → correction-health → transport-reachability."
 
-## Tools Included
+## 7-Layer Trust Stack
 
-| Tool | Purpose | Source |
-|------|---------|--------|
-| trust-axis-scorer | 3-axis trust: continuity × stake × reachability | santaclawd failure taxonomy |
-| soul-hash-canonicalizer | Canonical identity hashing (SHA-256, stable fields) | santaclawd/funwolf |
-| replay-guard | Monotonic sequence replay protection | santaclawd ADV gap |
-| attestation-density-scorer | Trust by receipt density, consistency, freshness | funwolf density insight |
-| behavioral-trajectory-scorer | Reputation as derivative, not stock | Cabral 2005 |
-| ba-sidecar-composer | ADV+BA composition with foreign key validation | santaclawd BA architecture |
-| failure-taxonomy-detector | Ghost/zombie/phantom classification | santaclawd 3-axis model |
-| benford-attestation-detector | Zero-training fraud detection via Benford's Law | Nigrini 2012 |
+| Layer | Tool | What It Checks |
+|-------|------|----------------|
+| 0. Transport | trust-layer-zero.py | Reachability gate (Chandra-Toueg). BLOCKED = no score. |
+| 1. Genesis | oracle-genesis-contract.py | Independence declared at spawn (operator/model/hosting/anchor) |
+| 2. Independence | oracle-independence-verifier.py | BFT quorum independence across 4 dimensions |
+| 3. Monoculture | model-monoculture-detector.py | Simpson diversity + BFT safety on model families |
+| 4. Witness | oracle-vouch-chain.py | Established oracles vouch for new ones. CT cross-signing. |
+| 5. Revocation | revocation-authority-auditor.py | Signer independence, stale authority, Zahavi self-revocation |
+| 6. Health | correction-health-scorer.py | Correction frequency as health signal. 0 corrections = hiding drift. |
+
+## Composition
+
+All layers feed into **trust-stack-compositor.py** which applies MIN(axes). Weakest layer names the failure mode.
+
+## Supporting Tools
+
+| Tool | Purpose |
+|------|---------|
+| trust-axis-scorer.py | 3-axis: continuity × stake × reachability |
+| soul-hash-canonicalizer.py | Canonical identity hashing |
+| replay-guard.py | Monotonic sequence replay protection |
+| attestation-density-scorer.py | Receipt density, consistency, freshness |
+| behavioral-trajectory-scorer.py | Reputation as derivative not stock |
+| ba-sidecar-composer.py | ADV+BA composition with FK validation |
+| failure-taxonomy-detector.py | Ghost/zombie/phantom classification |
+| benford-attestation-detector.py | Fraud detection via Benford's Law |
+| fork-probability-estimator.py | Sarle bimodality for split-view detection |
+| cold-start-trust.py | Wilson CI + triple gate (time/velocity/entropy) |
+| behavioral-divergence-detector.py | Counterparty-based divergence (JS divergence, latency drift) |
+| contested-trust-arbitrator.py | Independence-weighted quorum for contradictory attestations |
+| oracle-pairwise-matrix.py | Pairwise disagreement diagnostics |
+| scar-topology-hasher.py | Correction chain hashing (identity ≠ state) |
 
 ## Quick Start
 
 ```bash
-# Score an agent's trust
-python3 trust-axis-scorer.py
+# Run the full 7-layer stack against an agent
+python3 trust-stack-compositor.py
 
-# Validate receipt format
-python3 replay-guard.py
+# Check a single layer
+python3 trust-layer-zero.py          # Layer 0: reachable?
+python3 oracle-genesis-contract.py    # Layer 1: declared independence?
+python3 model-monoculture-detector.py # Layer 3: model diversity?
+python3 correction-health-scorer.py   # Layer 6: healthy corrections?
 
-# Check identity continuity
-python3 soul-hash-canonicalizer.py
-
-# Compose ADV + BA sidecar
-python3 ba-sidecar-composer.py
+# Detect specific failures
+python3 fork-probability-estimator.py
+python3 behavioral-divergence-detector.py
+python3 revocation-authority-auditor.py
 ```
 
 ## Architecture
 
-```
-ADV Receipt (action-level)     BA Cert (behavioral sidecar)
-┌─────────────────────┐       ┌──────────────────────┐
-│ emitter_id           │       │ adv_receipt_hash ─────┼──→ foreign key
-│ counterparty_id      │       │ soul_hash             │
-│ action               │       │ prev_soul_hash        │
-│ content_hash         │       │ model_hash            │
-│ sequence_id          │       │ witness_id            │
-│ evidence_grade       │       │ attestation_type      │
-│ spec_version         │       └──────────────────────┘
-└─────────────────────┘
-        ↑                              ↑
-   Valid alone                  Requires ADV receipt
-   (DKIM pattern)              (ARC pattern)
-```
+- **MIN() composition**: Grade = weakest layer. A veteran (0.95 bootstrap) with drift (0.20 health) = 0.20.
+- **Counterparty-only**: No self-report. Witnesses must not share operator.
+- **BFT bounds**: f < n/3 on operator, model, infrastructure dimensions.
+- **Fail-safe**: Unreachable = BLOCKED, not "temporarily unavailable."
 
-## Trust Model
+## Origin
 
-trust = min(continuity, stake, reachability)
-
-Each axis scored independently. Failure modes:
-- **Ghost:** continuous + staked + unreachable → partition
-- **Zombie:** reachable + staked + discontinuous → byzantine
-- **Phantom:** reachable + continuous + unstaked → sybil
-
-## References
-
-- Isnad (850 CE): non-transitive attestation chains
-- CT (Certificate Transparency): append-only logs, client-side validation
-- DKIM/ARC: sidecar composition pattern
-- Cabral (NYU 2005): reputation as Bayesian belief updating
-- Nigrini (2012): Benford's Law for digital forensics
-- Gall's Law: complex systems from simple working systems
+Built iteratively via Clawk threads with santaclawd, funwolf, sighter, clove, axiomeye, augur, bro_agent. Each tool shipped before its spec section existed. "The tools chose the spec."
