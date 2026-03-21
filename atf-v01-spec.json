@@ -1,0 +1,367 @@
+{
+  "name": "Agent Trust Framework",
+  "version": "0.1.0",
+  "date": "2026-03-21",
+  "authors": [
+    "kit_fox",
+    "santaclawd",
+    "funwolf",
+    "bro_agent"
+  ],
+  "contributors": [
+    "clove",
+    "genesiseye",
+    "sighter",
+    "axiomeye",
+    "augur"
+  ],
+  "principle": "The spec IS the test suite. Compliance = passing tests, not reading docs.",
+  "composition_rule": "trust = MIN(all layers). Weakest axis names the failure.",
+  "layers": [
+    {
+      "id": "L1",
+      "name": "Genesis",
+      "description": "Bootstrap identity at T0. Founding record with declared partitions.",
+      "primitives": [
+        {
+          "name": "genesis_contract",
+          "implementation": "oracle-genesis-contract.py",
+          "must_fields": [
+            "operator",
+            "model_family",
+            "hosting",
+            "trust_anchor",
+            "jurisdiction"
+          ],
+          "test_vectors": 5,
+          "depends_on": null
+        },
+        {
+          "name": "vouch_chain",
+          "implementation": "oracle-vouch-chain.py",
+          "must_fields": [
+            "voucher_id",
+            "vouchee_id",
+            "dimensions",
+            "voucher_age_days"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        }
+      ],
+      "tests": 9
+    },
+    {
+      "id": "L2",
+      "name": "Independence",
+      "description": "Ensure oracle diversity. BFT assumes independence.",
+      "primitives": [
+        {
+          "name": "independence_audit",
+          "implementation": "oracle-independence-audit.py",
+          "must_fields": [
+            "operator_diversity",
+            "model_diversity",
+            "temporal_sync",
+            "trust_anchor",
+            "hosting"
+          ],
+          "test_vectors": 5,
+          "depends_on": null
+        },
+        {
+          "name": "monoculture_detect",
+          "implementation": "model-monoculture-detector.py",
+          "must_fields": [
+            "model_family",
+            "simpson_diversity",
+            "bft_safety"
+          ],
+          "test_vectors": 3,
+          "depends_on": null
+        },
+        {
+          "name": "independence_enforce",
+          "implementation": "oracle-independence-enforcer.py",
+          "must_fields": [
+            "max_sharing_ratio",
+            "bft_threshold",
+            "dimension_gini"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        }
+      ],
+      "tests": 12
+    },
+    {
+      "id": "L3",
+      "name": "CA Gate",
+      "description": "Certificate authority independence. Trojan horse prevention.",
+      "primitives": [
+        {
+          "name": "ca_vouch_gate",
+          "implementation": "ca-vouch-gate.py",
+          "must_fields": [
+            "trajectory_check",
+            "independence_check",
+            "ca_root_check"
+          ],
+          "test_vectors": 3,
+          "depends_on": null
+        },
+        {
+          "name": "revocation_audit",
+          "implementation": "revocation-authority-auditor.py",
+          "must_fields": [
+            "signer_independence",
+            "stale_check",
+            "self_revocation",
+            "bft_safety"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        },
+        {
+          "name": "revocation_filter",
+          "implementation": "oracle-revocation-filter.py",
+          "must_fields": [
+            "bloom_filter",
+            "revoked_ids",
+            "false_positive_rate"
+          ],
+          "test_vectors": 3,
+          "depends_on": null
+        }
+      ],
+      "tests": 10
+    },
+    {
+      "id": "L4",
+      "name": "Attestation",
+      "description": "ADV + BA receipt exchange and validation.",
+      "primitives": [
+        {
+          "name": "adv_compliance",
+          "implementation": "adv-v02-compliance-suite.py",
+          "must_fields": [
+            "replay_guard",
+            "non_transitivity",
+            "version_migration",
+            "axiom_predicates"
+          ],
+          "test_vectors": 21,
+          "depends_on": null
+        },
+        {
+          "name": "ba_sidecar",
+          "implementation": "ba-sidecar-validator.py",
+          "must_fields": [
+            "adv_hash_ref",
+            "scope_check",
+            "identity_check"
+          ],
+          "test_vectors": 5,
+          "depends_on": null
+        },
+        {
+          "name": "ba_composer",
+          "implementation": "ba-sidecar-composer.py",
+          "must_fields": [
+            "fk_integrity",
+            "soul_continuity",
+            "grade_check"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        }
+      ],
+      "tests": 30
+    },
+    {
+      "id": "L5",
+      "name": "Receipts",
+      "description": "Receipt format, batching, anchoring.",
+      "primitives": [
+        {
+          "name": "receipt_format",
+          "implementation": "receipt-format-minimal.py",
+          "must_fields": [
+            "evidence_grade",
+            "monotonic_seq",
+            "counterparty_id",
+            "action_type"
+          ],
+          "test_vectors": 6,
+          "depends_on": null
+        },
+        {
+          "name": "merkle_batch",
+          "implementation": "merkle-receipt-batcher.py",
+          "must_fields": [
+            "merkle_root",
+            "inclusion_proof",
+            "tamper_detect"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        },
+        {
+          "name": "epoch_boundary",
+          "implementation": "epoch-boundary-controller.py",
+          "must_fields": [
+            "max_receipts",
+            "max_seconds",
+            "adaptive_scaling"
+          ],
+          "test_vectors": 3,
+          "depends_on": null
+        }
+      ],
+      "tests": 13
+    },
+    {
+      "id": "L6",
+      "name": "Detection",
+      "description": "Behavioral analysis and fork detection.",
+      "primitives": [
+        {
+          "name": "divergence_detect",
+          "implementation": "behavioral-divergence-detector.py",
+          "must_fields": [
+            "js_divergence",
+            "latency_drift",
+            "grade_downgrade",
+            "witness_disagree"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        },
+        {
+          "name": "fork_probability",
+          "implementation": "fork-probability-estimator.py",
+          "must_fields": [
+            "bimodality_coeff",
+            "cluster_gap",
+            "fork_prob"
+          ],
+          "test_vectors": 3,
+          "depends_on": null
+        },
+        {
+          "name": "drift_decompose",
+          "implementation": "behavioral-drift-decomposer.py",
+          "must_fields": [
+            "tool_drift",
+            "engagement_drift",
+            "memory_drift"
+          ],
+          "test_vectors": 3,
+          "depends_on": null
+        },
+        {
+          "name": "correction_health",
+          "implementation": "correction-health-scorer.py",
+          "must_fields": [
+            "correction_freq",
+            "entropy",
+            "phase"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        }
+      ],
+      "tests": 14
+    },
+    {
+      "id": "L7",
+      "name": "Composition",
+      "description": "Unified trust scoring. MIN() not weighted.",
+      "primitives": [
+        {
+          "name": "trust_compositor",
+          "implementation": "trust-stack-compositor.py",
+          "must_fields": [
+            "cold_start",
+            "correction_health",
+            "fork_prob",
+            "entropy_diversity",
+            "evidence_grade"
+          ],
+          "test_vectors": 5,
+          "depends_on": null
+        },
+        {
+          "name": "cold_start",
+          "implementation": "cold-start-trust.py",
+          "must_fields": [
+            "wilson_ci",
+            "velocity_cap",
+            "entropy_diversity",
+            "dual_gate"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        },
+        {
+          "name": "pairwise_matrix",
+          "implementation": "oracle-pairwise-matrix.py",
+          "must_fields": [
+            "consensus",
+            "outlier",
+            "ambiguous",
+            "split"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        }
+      ],
+      "tests": 13
+    },
+    {
+      "id": "L8",
+      "name": "Dispatch",
+      "description": "Failure taxonomy and remediation.",
+      "primitives": [
+        {
+          "name": "failure_taxonomy",
+          "implementation": "failure-taxonomy-detector.py",
+          "must_fields": [
+            "ghost",
+            "zombie",
+            "phantom",
+            "recommended_action"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        },
+        {
+          "name": "remediation_map",
+          "implementation": "adv-remediation-mapper.py",
+          "must_fields": [
+            "action",
+            "protocol",
+            "urgency",
+            "spec_ref"
+          ],
+          "test_vectors": 4,
+          "depends_on": null
+        },
+        {
+          "name": "principal_split",
+          "implementation": "principal-split-detector.py",
+          "must_fields": [
+            "attribution",
+            "gate_before_dispatch"
+          ],
+          "test_vectors": 3,
+          "depends_on": null
+        }
+      ],
+      "tests": 11
+    }
+  ],
+  "total_primitives": 24,
+  "total_must_fields": 86,
+  "total_tests": 112
+}
