@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-oracle-revocation.py — Evidence-based oracle independence revocation.
+oracle-revocation.py — Independence revocation for oracle/witness quorums.
 
-The missing primitive in the trust stack (santaclawd 2026-03-21):
-- oracle-independence-verifier.py ✓
-- oracle-genesis-registry.py ✓  
-- oracle-vouch-chain.py ✓
-- model-monoculture-detector.py ✓
-- oracle-revocation.py ← THIS
+Missing primitive identified by santaclawd + augur (2026-03-20):
+"independence declared at genesis can be invalidated — acquisition, config drift, shared incident."
 
 Revocation triggers:
-1. Gini threshold breach (>0.33 = BFT unsafe)
-2. Model family acquisition (same family = correlated failures)
-3. Shared incident (same CVE/outage across providers)
-4. Behavioral correlation (outputs too similar = not independent)
+1. ACQUISITION: operator merge → two oracles now share operator dimension
+2. CONFIG_DRIFT: model family convergence → independent models now same family
+3. SHARED_INCIDENT: correlated failure revealed → independence was illusory
+4. MANUAL: explicit revocation by registry operator
 
-Key principle: revocation by EVIDENCE not AUTHORITY.
-Any party with proof can trigger re-audit.
-CT parallel: CRLite bloom filter for mass revocation checks.
+Each trigger invalidates a specific independence dimension.
+Revocation = REISSUE receipt with reason_code + affected_scope.
+
+References:
+- CT CRL/OCSP/CRLite progression
+- augur: "independence is a founding constraint, not a runtime property"
+- santaclawd: "what triggers a re-audit?"
 """
 
 import hashlib
@@ -28,216 +28,256 @@ from enum import Enum
 from typing import Optional
 
 
-class RevocationReason(Enum):
-    GINI_BREACH = "gini_threshold_breach"
-    MONOCULTURE = "model_family_acquisition"
-    SHARED_INCIDENT = "shared_incident_cve"
-    BEHAVIORAL_CORRELATION = "output_correlation"
-    MANUAL_EVIDENCE = "manual_evidence_submission"
+class RevocationTrigger(Enum):
+    ACQUISITION = "acquisition"         # operator merge
+    CONFIG_DRIFT = "config_drift"       # model family convergence
+    SHARED_INCIDENT = "shared_incident" # correlated failure
+    MANUAL = "manual"                   # explicit revocation
+    EXPIRY = "expiry"                   # time-based re-audit required
 
 
-class RevocationStatus(Enum):
-    ACTIVE = "active"
-    SUSPENDED = "suspended"  # temporary, pending review
-    REVOKED = "revoked"  # permanent until re-audit
-    REINSTATED = "reinstated"  # passed re-audit
-
-
-@dataclass
-class RevocationEvidence:
-    """Evidence supporting a revocation claim."""
-    reason: RevocationReason
-    submitter_id: str
-    timestamp: float
-    evidence_hash: str  # hash of evidence payload
-    details: dict
-    
-    @property
-    def evidence_id(self) -> str:
-        data = f"{self.reason.value}:{self.submitter_id}:{self.timestamp}:{self.evidence_hash}"
-        return hashlib.sha256(data.encode()).hexdigest()[:16]
+class IndependenceDimension(Enum):
+    OPERATOR = "operator"
+    MODEL = "model"
+    HOSTING = "hosting"
+    DATA_SOURCE = "data_source"
 
 
 @dataclass
-class OracleStatus:
-    """Current status of an oracle in the independence registry."""
+class OracleRegistration:
+    """Oracle in the independence registry."""
     oracle_id: str
+    operator: str
     model_family: str
-    status: RevocationStatus = RevocationStatus.ACTIVE
-    revocation_history: list[RevocationEvidence] = field(default_factory=list)
-    last_audit: Optional[float] = None
-    
-    @property
-    def times_revoked(self) -> int:
-        return sum(1 for e in self.revocation_history)
+    hosting: str
+    data_source: str
+    registered_at: float
+    revoked: bool = False
+    revocation_reason: Optional[str] = None
+    revocation_trigger: Optional[str] = None
+    affected_dimensions: list[str] = field(default_factory=list)
 
 
 @dataclass
-class RevocationVerdict:
-    """Result of evaluating revocation evidence."""
-    oracle_id: str
-    previous_status: RevocationStatus
-    new_status: RevocationStatus
-    reason: RevocationReason
-    evidence_id: str
-    affected_quorums: list[str]
-    remediation: str
+class RevocationEvent:
+    """A revocation event in the audit trail."""
+    event_id: str
+    trigger: RevocationTrigger
+    affected_oracles: list[str]
+    affected_dimensions: list[IndependenceDimension]
+    reason: str
+    timestamp: float
+    evidence: dict  # supporting evidence for the revocation
+
+    @property
+    def event_hash(self) -> str:
+        canonical = json.dumps({
+            "event_id": self.event_id,
+            "trigger": self.trigger.value,
+            "affected_oracles": sorted(self.affected_oracles),
+            "reason": self.reason,
+            "timestamp": self.timestamp,
+        }, sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
-def check_gini_breach(oracle_weights: dict[str, float], threshold: float = 0.33) -> Optional[RevocationEvidence]:
-    """Check if any oracle controls >threshold of total weight (BFT unsafe)."""
-    total = sum(oracle_weights.values())
-    if total == 0:
-        return None
-    
-    for oracle_id, weight in oracle_weights.items():
-        fraction = weight / total
-        if fraction > threshold:
-            return RevocationEvidence(
-                reason=RevocationReason.GINI_BREACH,
-                submitter_id="system",
-                timestamp=time.time(),
-                evidence_hash=hashlib.sha256(json.dumps(oracle_weights, sort_keys=True).encode()).hexdigest()[:32],
-                details={"oracle_id": oracle_id, "fraction": fraction, "threshold": threshold}
-            )
-    return None
+@dataclass
+class QuorumHealth:
+    """Health of an oracle quorum after revocation processing."""
+    total_oracles: int
+    active_oracles: int
+    revoked_oracles: int
+    effective_independent: float  # BFT-relevant count
+    bft_safe: bool  # can tolerate f failures?
+    revocation_events: list[RevocationEvent]
+    warning: Optional[str] = None
 
 
-def check_monoculture(oracles: list[OracleStatus], family_threshold: float = 0.34) -> list[RevocationEvidence]:
-    """Check if model family concentration exceeds BFT safety."""
-    family_counts: dict[str, list[str]] = {}
-    for o in oracles:
-        family_counts.setdefault(o.model_family, []).append(o.oracle_id)
-    
-    evidences = []
-    total = len(oracles)
-    for family, members in family_counts.items():
-        if len(members) / total > family_threshold:
-            evidences.append(RevocationEvidence(
-                reason=RevocationReason.MONOCULTURE,
-                submitter_id="system",
-                timestamp=time.time(),
-                evidence_hash=hashlib.sha256(f"{family}:{len(members)}:{total}".encode()).hexdigest()[:32],
-                details={"family": family, "members": members, "fraction": len(members)/total}
-            ))
-    return evidences
+class RevocationRegistry:
+    """Manages oracle independence with revocation support."""
 
+    def __init__(self):
+        self.oracles: dict[str, OracleRegistration] = {}
+        self.events: list[RevocationEvent] = []
 
-def check_shared_incident(affected_oracles: list[str], incident_id: str, 
-                           total_oracles: int, threshold: float = 0.25) -> Optional[RevocationEvidence]:
-    """Check if shared incident affects too many oracles."""
-    if len(affected_oracles) / max(total_oracles, 1) > threshold:
-        return RevocationEvidence(
-            reason=RevocationReason.SHARED_INCIDENT,
-            submitter_id="incident_reporter",
+    def register(self, oracle: OracleRegistration):
+        self.oracles[oracle.oracle_id] = oracle
+
+    def revoke(self, event: RevocationEvent):
+        """Process a revocation event."""
+        self.events.append(event)
+        for oid in event.affected_oracles:
+            if oid in self.oracles:
+                o = self.oracles[oid]
+                o.revoked = True
+                o.revocation_reason = event.reason
+                o.revocation_trigger = event.trigger.value
+                o.affected_dimensions = [d.value for d in event.affected_dimensions]
+
+    def detect_acquisition(self, operator_a: str, operator_b: str, merged_name: str) -> Optional[RevocationEvent]:
+        """Detect operator acquisition — two operators becoming one."""
+        affected = [
+            oid for oid, o in self.oracles.items()
+            if not o.revoked and o.operator in (operator_a, operator_b)
+        ]
+        if len(affected) < 2:
+            return None
+
+        return RevocationEvent(
+            event_id=f"acq_{int(time.time())}",
+            trigger=RevocationTrigger.ACQUISITION,
+            affected_oracles=affected,
+            affected_dimensions=[IndependenceDimension.OPERATOR],
+            reason=f"{operator_a} + {operator_b} merged into {merged_name}. Operator independence invalidated.",
             timestamp=time.time(),
-            evidence_hash=hashlib.sha256(incident_id.encode()).hexdigest()[:32],
-            details={"incident_id": incident_id, "affected": affected_oracles, 
-                     "fraction": len(affected_oracles)/total_oracles}
+            evidence={"merger": f"{operator_a}+{operator_b}→{merged_name}"},
         )
-    return None
 
+    def detect_model_convergence(self) -> list[RevocationEvent]:
+        """Detect model family convergence — independent models now same family."""
+        events = []
+        active = {oid: o for oid, o in self.oracles.items() if not o.revoked}
 
-def evaluate_revocation(oracle: OracleStatus, evidence: RevocationEvidence, 
-                         quorum_memberships: list[str]) -> RevocationVerdict:
-    """Evaluate revocation evidence and produce verdict."""
-    previous = oracle.status
-    
-    # Determine new status based on evidence severity
-    if evidence.reason == RevocationReason.GINI_BREACH:
-        new_status = RevocationStatus.SUSPENDED
-        remediation = "Re-audit required. Reduce weight below BFT threshold (0.33)."
-    elif evidence.reason == RevocationReason.MONOCULTURE:
-        new_status = RevocationStatus.SUSPENDED
-        remediation = "Suspend until family diversity restored. Replace with different model family."
-    elif evidence.reason == RevocationReason.SHARED_INCIDENT:
-        new_status = RevocationStatus.SUSPENDED
-        remediation = "Suspend pending incident resolution. CVE remediation required."
-    elif evidence.reason == RevocationReason.BEHAVIORAL_CORRELATION:
-        new_status = RevocationStatus.REVOKED
-        remediation = "Revoked. Independence claim falsified by output correlation analysis."
-    else:
-        new_status = RevocationStatus.SUSPENDED
-        remediation = "Suspend pending manual review of submitted evidence."
-    
-    oracle.status = new_status
-    oracle.revocation_history.append(evidence)
-    
-    return RevocationVerdict(
-        oracle_id=oracle.oracle_id,
-        previous_status=previous,
-        new_status=new_status,
-        reason=evidence.reason,
-        evidence_id=evidence.evidence_id,
-        affected_quorums=quorum_memberships,
-        remediation=remediation
-    )
+        # Group by model family
+        families: dict[str, list[str]] = {}
+        for oid, o in active.items():
+            families.setdefault(o.model_family, []).append(oid)
+
+        for family, members in families.items():
+            if len(members) > len(active) / 3:  # BFT threshold
+                events.append(RevocationEvent(
+                    event_id=f"conv_{family}_{int(time.time())}",
+                    trigger=RevocationTrigger.CONFIG_DRIFT,
+                    affected_oracles=members[1:],  # keep first, flag rest
+                    affected_dimensions=[IndependenceDimension.MODEL],
+                    reason=f"Model family '{family}' controls {len(members)}/{len(active)} oracles. BFT violation.",
+                    timestamp=time.time(),
+                    evidence={"family": family, "count": len(members), "total": len(active)},
+                ))
+        return events
+
+    def health_check(self) -> QuorumHealth:
+        """Check quorum health after revocations."""
+        active = [o for o in self.oracles.values() if not o.revoked]
+        revoked = [o for o in self.oracles.values() if o.revoked]
+
+        # Effective independent count (group by operator+model)
+        groups: set[tuple[str, str]] = set()
+        for o in active:
+            groups.add((o.operator, o.model_family))
+        effective = len(groups)
+
+        n = len(active)
+        f_tolerable = (n - 1) // 3  # BFT: n >= 3f + 1
+        bft_safe = effective > f_tolerable and n >= 4
+
+        warning = None
+        if not bft_safe:
+            warning = f"QUORUM_DEGRADED: {effective} effective independent oracles, need >{f_tolerable} for BFT safety."
+        elif effective < n * 0.5:
+            warning = f"CONCENTRATION_RISK: {effective}/{n} effective independent. Below 50% diversity."
+
+        return QuorumHealth(
+            total_oracles=len(self.oracles),
+            active_oracles=n,
+            revoked_oracles=len(revoked),
+            effective_independent=effective,
+            bft_safe=bft_safe,
+            revocation_events=self.events,
+            warning=warning,
+        )
 
 
 def demo():
-    """Demo: oracle revocation scenarios."""
+    """Demo: oracle independence with revocation."""
+    registry = RevocationRegistry()
+
+    # Register 7 oracles across diverse operators/models
     oracles = [
-        OracleStatus("oracle_1", "openai"),
-        OracleStatus("oracle_2", "openai"),
-        OracleStatus("oracle_3", "openai"),
-        OracleStatus("oracle_4", "anthropic"),
-        OracleStatus("oracle_5", "google"),
-        OracleStatus("oracle_6", "openai"),
-        OracleStatus("oracle_7", "mistral"),
+        OracleRegistration("oracle_1", "acme_corp", "gpt-4", "aws", "web_crawl", time.time()),
+        OracleRegistration("oracle_2", "beta_labs", "claude-3", "gcp", "academic", time.time()),
+        OracleRegistration("oracle_3", "gamma_io", "llama-3", "azure", "proprietary", time.time()),
+        OracleRegistration("oracle_4", "delta_sys", "gemini", "self_hosted", "web_crawl", time.time()),
+        OracleRegistration("oracle_5", "epsilon_ai", "gpt-4", "aws", "web_crawl", time.time()),
+        OracleRegistration("oracle_6", "zeta_net", "mistral", "hetzner", "academic", time.time()),
+        OracleRegistration("oracle_7", "eta_tech", "claude-3", "gcp", "proprietary", time.time()),
     ]
+    for o in oracles:
+        registry.register(o)
 
     print("=" * 65)
-    print("ORACLE REVOCATION — THE MISSING PRIMITIVE")
+    print("ORACLE INDEPENDENCE REVOCATION DEMO")
     print("=" * 65)
 
-    # Scenario 1: Monoculture detection
-    print("\n--- Scenario 1: Model Family Monoculture ---")
-    mono_evidence = check_monoculture(oracles)
-    for ev in mono_evidence:
-        print(f"  ⚠️  {ev.reason.value}: {ev.details['family']} = {ev.details['fraction']:.0%} of quorum")
-        verdict = evaluate_revocation(
-            oracles[0], ev, ["quorum_alpha", "quorum_beta"]
+    # Initial health
+    health = registry.health_check()
+    print(f"\n--- INITIAL STATE ---")
+    print(f"Total: {health.total_oracles}, Active: {health.active_oracles}, Effective: {health.effective_independent}")
+    print(f"BFT safe: {health.bft_safe}")
+
+    # Scenario 1: Acquisition — acme_corp buys epsilon_ai
+    print(f"\n--- TRIGGER: ACQUISITION (acme_corp acquires epsilon_ai) ---")
+    acq_event = registry.detect_acquisition("acme_corp", "epsilon_ai", "acme_unified")
+    if acq_event:
+        registry.revoke(acq_event)
+        print(f"Revoked: {acq_event.affected_oracles}")
+        print(f"Reason: {acq_event.reason}")
+        print(f"Hash: {acq_event.event_hash}")
+
+    health = registry.health_check()
+    print(f"Active: {health.active_oracles}, Effective: {health.effective_independent}, BFT: {health.bft_safe}")
+    if health.warning:
+        print(f"⚠️  {health.warning}")
+
+    # Scenario 2: Model convergence check
+    print(f"\n--- CHECK: MODEL CONVERGENCE ---")
+    convergence = registry.detect_model_convergence()
+    if convergence:
+        for ev in convergence:
+            registry.revoke(ev)
+            print(f"Convergence detected: {ev.reason}")
+    else:
+        print("No model convergence detected (no family >1/3 quorum).")
+
+    health = registry.health_check()
+    print(f"Active: {health.active_oracles}, Effective: {health.effective_independent}, BFT: {health.bft_safe}")
+    if health.warning:
+        print(f"⚠️  {health.warning}")
+
+    # Scenario 3: Shared incident — all AWS oracles fail simultaneously
+    print(f"\n--- TRIGGER: SHARED INCIDENT (AWS outage) ---")
+    aws_oracles = [oid for oid, o in registry.oracles.items() if o.hosting == "aws" and not o.revoked]
+    if aws_oracles:
+        incident = RevocationEvent(
+            event_id=f"incident_aws_{int(time.time())}",
+            trigger=RevocationTrigger.SHARED_INCIDENT,
+            affected_oracles=aws_oracles,
+            affected_dimensions=[IndependenceDimension.HOSTING],
+            reason="AWS us-east-1 outage revealed hosting dependency. Independence on hosting dimension invalidated.",
+            timestamp=time.time(),
+            evidence={"incident": "aws-us-east-1-outage", "duration_hours": 4},
         )
-        print(f"  Verdict: {verdict.previous_status.value} → {verdict.new_status.value}")
-        print(f"  Remediation: {verdict.remediation}")
-        print(f"  Affected quorums: {verdict.affected_quorums}")
+        registry.revoke(incident)
+        print(f"Revoked: {aws_oracles}")
+        print(f"Reason: {incident.reason}")
 
-    # Scenario 2: Gini concentration
-    print("\n--- Scenario 2: Gini Weight Concentration ---")
-    weights = {"oracle_1": 0.4, "oracle_2": 0.2, "oracle_3": 0.15, 
-               "oracle_4": 0.15, "oracle_5": 0.1}
-    gini_ev = check_gini_breach(weights)
-    if gini_ev:
-        print(f"  ⚠️  {gini_ev.reason.value}: oracle_1 = {gini_ev.details['fraction']:.0%}")
-        verdict = evaluate_revocation(
-            OracleStatus("oracle_1", "openai"), gini_ev, ["quorum_gamma"]
-        )
-        print(f"  Verdict: {verdict.previous_status.value} → {verdict.new_status.value}")
+    health = registry.health_check()
+    print(f"\n--- FINAL STATE ---")
+    print(f"Total: {health.total_oracles}, Active: {health.active_oracles}, Revoked: {health.revoked_oracles}")
+    print(f"Effective independent: {health.effective_independent}")
+    print(f"BFT safe: {health.bft_safe}")
+    if health.warning:
+        print(f"⚠️  {health.warning}")
 
-    # Scenario 3: Shared CVE
-    print("\n--- Scenario 3: Shared Incident (CVE) ---")
-    cve_ev = check_shared_incident(
-        ["oracle_1", "oracle_2", "oracle_6"],
-        "CVE-2026-1234", 
-        total_oracles=7
-    )
-    if cve_ev:
-        print(f"  ⚠️  {cve_ev.reason.value}: {len(cve_ev.details['affected'])}/{7} oracles affected")
-        print(f"  Incident: {cve_ev.details['incident_id']}")
+    print(f"\nRevocation events: {len(health.revocation_events)}")
+    for ev in health.revocation_events:
+        print(f"  [{ev.trigger.value}] {ev.reason[:80]}...")
 
-    # Summary
     print("\n" + "=" * 65)
-    print("TRUST STACK STATUS (post-revocation)")
+    print("KEY INSIGHT: independence is founding, not permanent.")
+    print("Revocation completes the trust stack.")
+    print("\"What triggers a re-audit?\" — santaclawd")
     print("=" * 65)
-    print(f"  oracle-independence-verifier.py  ✅")
-    print(f"  oracle-genesis-registry.py       ✅")
-    print(f"  oracle-vouch-chain.py            ✅")
-    print(f"  model-monoculture-detector.py    ✅")
-    print(f"  oracle-revocation.py             ✅  ← NEW")
-    print()
-    print("  Key: revocation by EVIDENCE not AUTHORITY.")
-    print("  Any party with proof can trigger re-audit.")
-    print("  — santaclawd (2026-03-21)")
 
 
 if __name__ == "__main__":
