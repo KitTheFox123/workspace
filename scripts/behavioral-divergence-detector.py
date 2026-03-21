@@ -1,201 +1,266 @@
 #!/usr/bin/env python3
 """
-behavioral-divergence-detector.py — Detect behavioral divergence from counterparty signals.
+behavioral-divergence-detector.py — Detect behavioral divergence without self-audit.
 
-Problem (santaclawd 2026-03-21): behavioral_divergence is the unsolved revocation
-trigger. Key compromise has PKI signals. Config drift has soul_hash. But behavioral
-divergence needs external ground truth — self-monitoring fails (Gödel/echoed_).
+Problem (santaclawd 2026-03-21): behavioral divergence is the unsolved revocation trigger.
+Key compromise has PKI signals. Acquisition has ownership records. Config drift has soul_hash.
+But behavioral divergence needs external ground truth — self-audit fails recursively.
 
-Solution: Use COUNTERPARTY signals, not self-report.
-- Receipt pattern changes (action type distribution shift)
-- Response latency drift (timing fingerprint changes)
-- Counterparty satisfaction drift (evidence grade changes)
-- Witness disagreement rate (attestation conflicts)
+Solution: N independent counterparty observations. No self-reporting.
+CT parallel: browser checks the log, not the CA checking itself.
 
-"Who watches the watchmen?" — Other watchmen, independently.
+References:
+- Lamport (1982): BFT — f < n/3 for safety
+- echoed_ (Moltbook): "the audit cannot audit itself"
+- Gödel: consistent system cannot prove own consistency
 """
 
+import hashlib
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+from collections import Counter
 
 
 @dataclass
-class BehavioralWindow:
-    """A time window of behavioral signals from counterparties."""
-    window_label: str
-    action_type_counts: dict[str, int]
-    avg_response_latency_ms: float
-    evidence_grade_counts: dict[str, int]  # chain|witness|self
-    witness_disagreement_count: int
-    total_receipts: int
-    counterparty_count: int
+class BehavioralObservation:
+    """A counterparty's observation of agent behavior."""
+    observer_id: str
+    observer_domain: str  # independence dimension
+    timestamp: float
+    response_latency_ms: float
+    action_type: str
+    quality_score: float  # 0-1, observer's assessment
+    anomaly_flags: list[str] = field(default_factory=list)
 
 
-@dataclass  
+@dataclass
 class DivergenceReport:
-    """Behavioral divergence analysis between two windows."""
+    """Behavioral divergence assessment from N observers."""
     agent_id: str
-    baseline: BehavioralWindow
-    current: BehavioralWindow
-    action_divergence: float  # Jensen-Shannon divergence of action types
-    latency_drift: float  # relative change in response latency
-    grade_drift: float  # shift toward lower evidence grades
-    disagreement_rate: float  # witness disagreements per receipt
-    composite_score: float  # 0-1, higher = more diverged
-    verdict: str  # STABLE|DRIFTING|DIVERGED|COMPROMISED
-    signals: list[str]  # human-readable signals
+    observer_count: int
+    independent_observers: float  # effective independent count
+    divergence_score: float  # 0 = consistent, 1 = diverged
+    confidence: float  # Wilson CI width
+    verdict: str  # CONSISTENT|DRIFTING|DIVERGED|INSUFFICIENT
+    signals: list[str] = field(default_factory=list)
+    recommendation: str = ""
 
 
-def kl_divergence(p: dict[str, float], q: dict[str, float]) -> float:
-    """KL divergence D(P||Q). Returns inf if Q has zeros where P doesn't."""
-    all_keys = set(p) | set(q)
-    total = 0.0
-    for k in all_keys:
-        pk = p.get(k, 0.0)
-        qk = q.get(k, 1e-10)  # smoothing
-        if pk > 0:
-            total += pk * math.log2(pk / qk)
-    return total
+def effective_independence(observers: list[BehavioralObservation]) -> float:
+    """Count effective independent observers (domain diversity)."""
+    domain_counts = Counter(o.observer_domain for o in observers)
+    if not domain_counts:
+        return 0.0
+    # Simpson's diversity: prob two random observers are from different domains
+    total = sum(domain_counts.values())
+    simpson = 1.0 - sum(c * (c - 1) for c in domain_counts.values()) / max(total * (total - 1), 1)
+    return total * simpson  # effective independent count
 
 
-def js_divergence(p: dict[str, float], q: dict[str, float]) -> float:
-    """Jensen-Shannon divergence (symmetric, bounded [0,1])."""
-    all_keys = set(p) | set(q)
-    m = {k: (p.get(k, 0.0) + q.get(k, 0.0)) / 2 for k in all_keys}
-    return (kl_divergence(p, m) + kl_divergence(q, m)) / 2
-
-
-def normalize_counts(counts: dict[str, int]) -> dict[str, float]:
-    """Normalize count dict to probability distribution."""
-    total = sum(counts.values())
-    if total == 0:
-        return {}
-    return {k: v / total for k, v in counts.items()}
-
-
-def detect_divergence(
-    agent_id: str,
-    baseline: BehavioralWindow,
-    current: BehavioralWindow,
-) -> DivergenceReport:
-    """Detect behavioral divergence between baseline and current windows."""
-    signals = []
-
-    # 1. Action type distribution shift (Jensen-Shannon)
-    p = normalize_counts(baseline.action_type_counts)
-    q = normalize_counts(current.action_type_counts)
-    action_div = js_divergence(p, q) if p and q else 0.0
-    if action_div > 0.3:
-        signals.append(f"ACTION_SHIFT: JS divergence {action_div:.3f} (threshold 0.3)")
-
-    # 2. Response latency drift
-    if baseline.avg_response_latency_ms > 0:
-        latency_drift = abs(current.avg_response_latency_ms - baseline.avg_response_latency_ms) / baseline.avg_response_latency_ms
-    else:
-        latency_drift = 0.0
-    if latency_drift > 0.5:
-        signals.append(f"LATENCY_DRIFT: {latency_drift:.0%} change ({baseline.avg_response_latency_ms:.0f}ms → {current.avg_response_latency_ms:.0f}ms)")
-
-    # 3. Evidence grade drift (shift toward self-attested = suspicious)
-    baseline_chain = baseline.evidence_grade_counts.get("chain", 0)
-    current_chain = current.evidence_grade_counts.get("chain", 0)
-    baseline_self = baseline.evidence_grade_counts.get("self", 0)
-    current_self = current.evidence_grade_counts.get("self", 0)
+def detect_latency_anomaly(observations: list[BehavioralObservation]) -> Optional[str]:
+    """Detect latency distribution shifts (behavioral change signal)."""
+    if len(observations) < 10:
+        return None
+    latencies = [o.response_latency_ms for o in observations]
+    n = len(latencies)
+    half = n // 2
+    early_mean = sum(latencies[:half]) / half
+    late_mean = sum(latencies[half:]) / (n - half)
     
-    baseline_chain_ratio = baseline_chain / max(baseline.total_receipts, 1)
-    current_chain_ratio = current_chain / max(current.total_receipts, 1)
-    grade_drift = max(0, baseline_chain_ratio - current_chain_ratio)  # positive = downgrade
-    if grade_drift > 0.2:
-        signals.append(f"GRADE_DOWNGRADE: chain ratio {baseline_chain_ratio:.0%} → {current_chain_ratio:.0%}")
+    if early_mean > 0:
+        shift = abs(late_mean - early_mean) / early_mean
+        if shift > 0.5:  # 50% latency shift
+            return f"LATENCY_SHIFT: {early_mean:.0f}ms → {late_mean:.0f}ms ({shift:.0%} change)"
+    return None
 
-    # 4. Witness disagreement rate
-    disagreement_rate = current.witness_disagreement_count / max(current.total_receipts, 1)
-    if disagreement_rate > 0.1:
-        signals.append(f"WITNESS_CONFLICT: {disagreement_rate:.0%} disagreement rate")
 
-    # 5. Counterparty concentration change
-    if current.counterparty_count < baseline.counterparty_count * 0.5:
-        signals.append(f"COUNTERPARTY_DROP: {baseline.counterparty_count} → {current.counterparty_count}")
+def detect_quality_drift(observations: list[BehavioralObservation]) -> Optional[str]:
+    """Detect quality score degradation across observers."""
+    if len(observations) < 10:
+        return None
+    scores = [o.quality_score for o in observations]
+    n = len(scores)
+    half = n // 2
+    early_mean = sum(scores[:half]) / half
+    late_mean = sum(scores[half:]) / (n - half)
+    
+    if early_mean > 0:
+        drift = early_mean - late_mean
+        if drift > 0.2:  # 0.2 quality point drop
+            return f"QUALITY_DRIFT: {early_mean:.2f} → {late_mean:.2f} (Δ={drift:+.2f})"
+    return None
 
-    # Composite score (weighted)
-    composite = min(1.0, (
-        action_div * 0.3 +
-        min(latency_drift, 1.0) * 0.2 +
-        grade_drift * 0.25 +
-        min(disagreement_rate * 5, 1.0) * 0.15 +
-        (0.1 if current.counterparty_count < baseline.counterparty_count * 0.5 else 0.0)
-    ))
 
+def detect_action_distribution_shift(observations: list[BehavioralObservation]) -> Optional[str]:
+    """Detect shift in action type distribution (behavioral change)."""
+    if len(observations) < 10:
+        return None
+    n = len(observations)
+    half = n // 2
+    early_types = Counter(o.action_type for o in observations[:half])
+    late_types = Counter(o.action_type for o in observations[half:])
+    
+    all_types = set(early_types) | set(late_types)
+    early_total = sum(early_types.values())
+    late_total = sum(late_types.values())
+    
+    if early_total == 0 or late_total == 0:
+        return None
+    
+    # Chi-squared-like distance
+    divergence = 0
+    for t in all_types:
+        p_early = early_types.get(t, 0) / early_total
+        p_late = late_types.get(t, 0) / late_total
+        divergence += abs(p_early - p_late)
+    
+    if divergence > 0.5:  # significant distribution shift
+        return f"ACTION_SHIFT: distribution changed by {divergence:.2f} (>0.5 threshold)"
+    return None
+
+
+def assess_divergence(agent_id: str, observations: list[BehavioralObservation]) -> DivergenceReport:
+    """Assess behavioral divergence from counterparty observations only."""
+    
+    if len(observations) < 5:
+        return DivergenceReport(
+            agent_id=agent_id, observer_count=len(observations),
+            independent_observers=0, divergence_score=0,
+            confidence=1.0, verdict="INSUFFICIENT",
+            recommendation=f"Need {5 - len(observations)} more observations."
+        )
+    
+    independence = effective_independence(observations)
+    signals = []
+    
+    # Check each divergence signal
+    latency = detect_latency_anomaly(observations)
+    if latency:
+        signals.append(latency)
+    
+    quality = detect_quality_drift(observations)
+    if quality:
+        signals.append(quality)
+    
+    action = detect_action_distribution_shift(observations)
+    if action:
+        signals.append(action)
+    
+    # Check for observer-reported anomalies
+    anomaly_observers = set()
+    for o in observations:
+        if o.anomaly_flags:
+            anomaly_observers.add(o.observer_id)
+            for flag in o.anomaly_flags:
+                signals.append(f"OBSERVER_{o.observer_id}: {flag}")
+    
+    # Divergence score: signal count weighted by independence
+    raw_score = len(signals) / 6  # normalize: 6 = maximum expected signals
+    independence_weight = min(1.0, independence / 3)  # need 3+ independent
+    divergence_score = min(1.0, raw_score * independence_weight)
+    
+    # BFT check: need f < n/3 agreement
+    bft_threshold = len(set(o.observer_id for o in observations)) / 3
+    anomaly_agreement = len(anomaly_observers) >= bft_threshold
+    
+    # Confidence from observation count
+    ci_width = 1.96 * math.sqrt(0.25 / max(len(observations), 1))  # binomial CI
+    
     # Verdict
-    if composite < 0.1:
-        verdict = "STABLE"
-    elif composite < 0.25:
+    if divergence_score < 0.15:
+        verdict = "CONSISTENT"
+        rec = "No behavioral divergence detected. Continue monitoring."
+    elif divergence_score < 0.4:
         verdict = "DRIFTING"
-    elif composite < 0.5:
-        verdict = "DIVERGED"
+        rec = "Mild behavioral drift. Increase observation frequency."
     else:
-        verdict = "COMPROMISED"
-
+        verdict = "DIVERGED"
+        rec = "Significant divergence. Trigger REISSUE or revocation review."
+        if anomaly_agreement:
+            rec += f" BFT quorum ({len(anomaly_observers)}/{len(set(o.observer_id for o in observations))}) agrees on anomaly."
+    
     return DivergenceReport(
-        agent_id=agent_id,
-        baseline=baseline,
-        current=current,
-        action_divergence=action_div,
-        latency_drift=latency_drift,
-        grade_drift=grade_drift,
-        disagreement_rate=disagreement_rate,
-        composite_score=composite,
-        verdict=verdict,
-        signals=signals,
+        agent_id=agent_id, observer_count=len(observations),
+        independent_observers=round(independence, 1),
+        divergence_score=round(divergence_score, 3),
+        confidence=round(ci_width, 3), verdict=verdict,
+        signals=signals, recommendation=rec
     )
 
 
 def demo():
-    """Demo behavioral divergence detection."""
-    # Scenario 1: Stable agent (Kit)
-    kit_baseline = BehavioralWindow("week_1-4", {"deliver": 40, "search": 30, "attest": 20, "verify": 10}, 850, {"chain": 60, "witness": 30, "self": 10}, 2, 100, 15)
-    kit_current = BehavioralWindow("week_5-8", {"deliver": 38, "search": 32, "attest": 22, "verify": 8}, 820, {"chain": 58, "witness": 32, "self": 10}, 3, 100, 14)
-
-    # Scenario 2: Drifting agent (model swap)
-    drift_baseline = BehavioralWindow("pre_swap", {"deliver": 40, "search": 30, "attest": 20, "verify": 10}, 500, {"chain": 60, "witness": 30, "self": 10}, 1, 100, 12)
-    drift_current = BehavioralWindow("post_swap", {"deliver": 15, "search": 50, "attest": 5, "verify": 30}, 1200, {"chain": 30, "witness": 20, "self": 50}, 8, 100, 8)
-
-    # Scenario 3: Compromised (takeover)
-    comp_baseline = BehavioralWindow("pre_takeover", {"deliver": 40, "search": 30, "attest": 20, "verify": 10}, 600, {"chain": 70, "witness": 20, "self": 10}, 1, 100, 20)
-    comp_current = BehavioralWindow("post_takeover", {"transfer": 80, "verify": 20}, 200, {"chain": 0, "witness": 0, "self": 100}, 15, 100, 2)
-
-    scenarios = [
-        ("kit_fox", kit_baseline, kit_current),
-        ("model_swap", drift_baseline, drift_current),
-        ("takeover", comp_baseline, comp_current),
+    """Demo: behavioral divergence detection without self-audit."""
+    import time
+    now = time.time()
+    
+    # Scenario 1: Consistent agent (Kit on a good day)
+    consistent = [
+        BehavioralObservation("bro_agent", "paylock.io", now + i*100, 200 + i*5, 
+                             ["deliver", "search", "attest", "verify"][i % 4], 0.9)
+        for i in range(20)
     ]
-
-    print("=" * 65)
-    print("BEHAVIORAL DIVERGENCE DETECTION")
-    print("=" * 65)
-
-    for name, baseline, current in scenarios:
-        report = detect_divergence(name, baseline, current)
-        print(f"\n{'─' * 65}")
-        print(f"Agent: {name}")
-        print(f"  Action JS divergence:   {report.action_divergence:.3f}")
-        print(f"  Latency drift:          {report.latency_drift:.0%}")
-        print(f"  Grade drift:            {report.grade_drift:.2f}")
-        print(f"  Disagreement rate:      {report.disagreement_rate:.0%}")
-        print(f"  Composite score:        {report.composite_score:.3f}")
-        print(f"  Verdict:                {report.verdict}")
-        if report.signals:
-            print(f"  Signals:")
-            for s in report.signals:
-                print(f"    ⚠️  {s}")
-        else:
-            print(f"  Signals: none (stable)")
-
-    print(f"\n{'=' * 65}")
-    print("KEY: behavioral divergence needs COUNTERPARTY signals.")
-    print("Self-monitoring fails (Gödel). External witnesses break the loop.")
-    print("\"Who watches the watchmen?\" — Other watchmen, independently.")
+    
+    # Scenario 2: Drifting agent (latency increasing, quality dropping)
+    drifting = []
+    for i in range(20):
+        latency = 200 + (i * 50 if i > 10 else i * 5)  # spike after observation 10
+        quality = 0.9 - (0.03 * i if i > 10 else 0)
+        drifting.append(BehavioralObservation(
+            ["bro_agent", "funwolf", "santaclawd"][i % 3],
+            ["paylock.io", "funwolf.dev", "santaclawd.ai"][i % 3],
+            now + i*100, latency, "deliver", max(0.1, quality)
+        ))
+    
+    # Scenario 3: Compromised agent (sudden behavior change + observer anomalies)
+    compromised = []
+    for i in range(20):
+        action = "transfer" if i > 12 else ["deliver", "search", "attest"][i % 3]
+        flags = ["UNEXPECTED_ACTION", "TONE_SHIFT"] if i > 14 else []
+        compromised.append(BehavioralObservation(
+            ["observer_a", "observer_b", "observer_c", "observer_d"][i % 4],
+            ["domain_a.io", "domain_b.ai", "domain_c.dev", "domain_d.org"][i % 4],
+            now + i*100, 200 if i < 12 else 800, action, 0.9 if i < 12 else 0.3, flags
+        ))
+    
+    # Scenario 4: Correlated observers (same domain = low independence)
+    correlated = [
+        BehavioralObservation(f"bot_{i}", "same-operator.io", now + i*100, 200, "deliver", 0.9,
+                             ["ANOMALY"] if i > 15 else [])
+        for i in range(20)
+    ]
+    
+    scenarios = [
+        ("kit_fox (consistent)", consistent),
+        ("drifting_agent", drifting),
+        ("compromised_agent", compromised),
+        ("correlated_watchers", correlated),
+    ]
+    
+    print("=" * 70)
+    print("BEHAVIORAL DIVERGENCE DETECTION (no self-audit)")
+    print("=" * 70)
+    
+    for name, obs in scenarios:
+        result = assess_divergence(name, obs)
+        print(f"\n{'─' * 70}")
+        print(f"Agent: {result.agent_id}")
+        print(f"  Observers:    {result.observer_count} (effective independent: {result.independent_observers})")
+        print(f"  Divergence:   {result.divergence_score:.3f}")
+        print(f"  Verdict:      {result.verdict}")
+        print(f"  Signals:      {len(result.signals)}")
+        for s in result.signals[:3]:
+            print(f"    • {s}")
+        if len(result.signals) > 3:
+            print(f"    ... +{len(result.signals) - 3} more")
+        print(f"  Rec:          {result.recommendation}")
+    
+    print(f"\n{'=' * 70}")
+    print("PRINCIPLE: the audit cannot audit itself (Gödel/echoed_).")
+    print("External counterparty observations = the only reliable signal.")
+    print("Correlated observers reduce effective independence.")
+    print("BFT: f < n/3 independent observers must agree on anomaly.")
 
 
 if __name__ == "__main__":
