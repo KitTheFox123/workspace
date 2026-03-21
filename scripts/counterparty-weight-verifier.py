@@ -1,176 +1,213 @@
 #!/usr/bin/env python3
 """
-counterparty-weight-verifier.py — Counterparty-verifiable genesis weight verification.
+counterparty-weight-verifier.py — Counterparty-verifiable genesis weights.
 
-Per santaclawd: "self-auditable ≠ counterparty-verifiable. if only the evaluator 
-can check their own weight drift, you moved the bias, not eliminated it."
+Per santaclawd: "self-auditable ≠ counterparty-verifiable. if only the
+evaluator can check their own weight drift, you moved the bias, not eliminated it."
 
-Solution: Genesis scoring weights published as hash-pinned JSON. Any counterparty
-can fetch, hash, compare against genesis_hash embedded in receipts.
+Solution: hash(declared_weights) in genesis record. Counterparty fetches
+genesis, hashes locally, compares. No trust in evaluator needed.
+CT parallel: log publishes cert, browser verifies independently.
 
-CT model: weights are the pre-certificate. Drift = misissuance.
+Checks:
+1. Genesis weight declaration exists and is hash-pinned
+2. Current weights match genesis hash (no silent drift)
+3. Weight changes have REISSUE receipts (explicit, not silent)
+4. Counterparty can independently verify without evaluator cooperation
 """
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 
 @dataclass
-class GenesisWeights:
-    """Scoring criteria declared at genesis, hash-pinned."""
-    criteria: dict[str, float]  # axis -> weight
-    aggregation: str  # "MIN" or "WEIGHTED"
-    version: str
-    declared_at: str
+class WeightDeclaration:
+    """Scoring criteria weights declared at genesis."""
+    weights: dict[str, float]  # dimension -> weight
+    declared_at: datetime
     
+    @property
     def canonical_hash(self) -> str:
-        """Deterministic hash of weight declaration."""
-        canonical = json.dumps({
-            "criteria": dict(sorted(self.criteria.items())),
-            "aggregation": self.aggregation,
-            "version": self.version,
-            "declared_at": self.declared_at
-        }, separators=(',', ':'), sort_keys=True)
+        """Deterministic hash of weights for verification."""
+        canonical = json.dumps(self.weights, sort_keys=True, separators=(',', ':'))
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
-    
-    def to_publishable(self) -> dict:
-        """Format for counterparty consumption."""
-        return {
-            "genesis_weights": {
-                "criteria": self.criteria,
-                "aggregation": self.aggregation,
-                "version": self.version,
-                "declared_at": self.declared_at,
-                "genesis_hash": self.canonical_hash()
-            }
-        }
 
 
+@dataclass
+class GenesisRecord:
+    agent_id: str
+    weight_declaration: WeightDeclaration
+    weight_hash: str  # hash pinned at genesis
+    created_at: datetime
+
+
+@dataclass
+class WeightReissue:
+    """Explicit weight change with receipt."""
+    old_weights: dict[str, float]
+    new_weights: dict[str, float]
+    reason: str
+    issued_at: datetime
+    old_hash: str
+    new_hash: str
+
+
+@dataclass
 class CounterpartyVerifier:
-    """Verify that an evaluator's current weights match their genesis declaration."""
+    """Independent verification without evaluator cooperation."""
     
-    def verify(self, receipt_genesis_hash: str, fetched_weights: GenesisWeights) -> dict:
-        """
-        Counterparty verification: compare genesis_hash in receipt against 
-        hash of fetched weight declaration.
-        """
-        computed_hash = fetched_weights.canonical_hash()
-        match = receipt_genesis_hash == computed_hash
-        
+    def verify_genesis_integrity(self, genesis: GenesisRecord) -> dict:
+        """Check that genesis weight hash matches declared weights."""
+        computed = genesis.weight_declaration.canonical_hash
+        matches = computed == genesis.weight_hash
         return {
-            "verified": match,
-            "receipt_hash": receipt_genesis_hash,
-            "computed_hash": computed_hash,
-            "verdict": "CONSISTENT" if match else "WEIGHT_DRIFT_DETECTED",
-            "severity": "OK" if match else "CRITICAL",
-            "detail": (
-                "Genesis weights match receipt declaration"
-                if match else
-                f"MISISSUANCE: receipt claims {receipt_genesis_hash}, "
-                f"current weights hash to {computed_hash}. "
-                "Evaluator changed scoring criteria without REISSUE."
-            )
+            "check": "GENESIS_INTEGRITY",
+            "declared_hash": genesis.weight_hash,
+            "computed_hash": computed,
+            "match": matches,
+            "verdict": "VALID" if matches else "TAMPERED"
         }
     
-    def audit_weight_history(self, history: list[tuple[str, GenesisWeights]]) -> dict:
-        """Audit a sequence of (timestamp, weights) for undeclared changes."""
-        if not history:
-            return {"changes": 0, "verdict": "NO_DATA"}
+    def verify_current_weights(
+        self,
+        genesis: GenesisRecord,
+        current_weights: dict[str, float],
+        reissues: list[WeightReissue]
+    ) -> dict:
+        """Verify current weights trace back to genesis through explicit reissues."""
+        # Compute current hash
+        canonical = json.dumps(current_weights, sort_keys=True, separators=(',', ':'))
+        current_hash = hashlib.sha256(canonical.encode()).hexdigest()[:16]
         
-        changes = []
-        prev_hash = None
-        for ts, weights in history:
-            h = weights.canonical_hash()
-            if prev_hash and h != prev_hash:
-                changes.append({
-                    "timestamp": ts,
-                    "old_hash": prev_hash,
-                    "new_hash": h,
-                    "new_weights": weights.criteria
+        # Walk the reissue chain from genesis
+        expected_hash = genesis.weight_hash
+        chain_valid = True
+        chain_breaks = []
+        
+        for i, reissue in enumerate(reissues):
+            if reissue.old_hash != expected_hash:
+                chain_valid = False
+                chain_breaks.append({
+                    "reissue_index": i,
+                    "expected": expected_hash,
+                    "declared_old": reissue.old_hash,
+                    "reason": reissue.reason
                 })
-            prev_hash = h
+            expected_hash = reissue.new_hash
         
-        declared_reissues = sum(1 for c in changes if True)  # placeholder
+        # Check current matches end of chain
+        current_matches_chain = current_hash == expected_hash
+        
+        # Silent drift detection
+        if not reissues and current_hash != genesis.weight_hash:
+            verdict = "SILENT_DRIFT"
+            detail = "Weights changed without REISSUE receipt"
+        elif not chain_valid:
+            verdict = "CHAIN_BROKEN"
+            detail = f"{len(chain_breaks)} breaks in reissue chain"
+        elif not current_matches_chain:
+            verdict = "UNDECLARED_CHANGE"
+            detail = "Current weights don't match latest reissue"
+        else:
+            verdict = "VERIFIED"
+            detail = f"Chain valid: genesis → {len(reissues)} reissues → current"
         
         return {
-            "total_snapshots": len(history),
-            "weight_changes": len(changes),
-            "changes": changes,
-            "verdict": (
-                "STABLE" if not changes else
-                "REISSUED" if len(changes) <= 2 else
-                "SUSPICIOUS_DRIFT"
-            )
+            "check": "WEIGHT_CONTINUITY",
+            "genesis_hash": genesis.weight_hash,
+            "current_hash": current_hash,
+            "reissue_count": len(reissues),
+            "chain_valid": chain_valid,
+            "current_matches_chain": current_matches_chain,
+            "chain_breaks": chain_breaks,
+            "verdict": verdict,
+            "detail": detail
+        }
+    
+    def full_audit(
+        self,
+        genesis: GenesisRecord,
+        current_weights: dict[str, float],
+        reissues: list[WeightReissue]
+    ) -> dict:
+        integrity = self.verify_genesis_integrity(genesis)
+        continuity = self.verify_current_weights(genesis, current_weights, reissues)
+        
+        # Overall grade
+        if integrity["verdict"] == "TAMPERED":
+            grade = "F"
+        elif continuity["verdict"] == "SILENT_DRIFT":
+            grade = "F"
+        elif continuity["verdict"] == "CHAIN_BROKEN":
+            grade = "D"
+        elif continuity["verdict"] == "UNDECLARED_CHANGE":
+            grade = "D"
+        else:
+            grade = "A"
+        
+        return {
+            "agent": genesis.agent_id,
+            "grade": grade,
+            "genesis_integrity": integrity,
+            "weight_continuity": continuity,
+            "verifiable_without_cooperation": True,
+            "detail": "Counterparty needs only: genesis record + reissue receipts + current weights"
         }
 
 
 def demo():
-    # Genesis declaration
-    genesis = GenesisWeights(
-        criteria={"maturity": 0.25, "health": 0.25, "consistency": 0.25, "independence": 0.25},
-        aggregation="MIN",
-        version="1.0.0",
-        declared_at="2026-03-21T00:00:00Z"
-    )
+    now = datetime(2026, 3, 21, 19, 0, 0)
     
-    print("=== Genesis Declaration ===")
-    pub = genesis.to_publishable()
-    print(json.dumps(pub, indent=2))
-    genesis_hash = genesis.canonical_hash()
+    genesis_weights = {"continuity": 0.35, "stake": 0.25, "reachability": 0.20, "entropy": 0.20}
+    declaration = WeightDeclaration(weights=genesis_weights, declared_at=now)
+    genesis = GenesisRecord(
+        agent_id="kit_fox",
+        weight_declaration=declaration,
+        weight_hash=declaration.canonical_hash,
+        created_at=now
+    )
     
     verifier = CounterpartyVerifier()
     
-    # Scenario 1: Honest evaluator — weights unchanged
-    print("\n=== Scenario: Honest Evaluator ===")
-    honest = GenesisWeights(
-        criteria={"maturity": 0.25, "health": 0.25, "consistency": 0.25, "independence": 0.25},
-        aggregation="MIN", version="1.0.0", declared_at="2026-03-21T00:00:00Z"
-    )
-    result = verifier.verify(genesis_hash, honest)
-    print(f"Verdict: {result['verdict']} | Verified: {result['verified']}")
+    # Scenario 1: No changes, weights match genesis
+    print("=== STABLE (no changes) ===")
+    result = verifier.full_audit(genesis, genesis_weights, [])
+    print(f"Grade: {result['grade']} | {result['weight_continuity']['verdict']}")
+    print(f"  {result['weight_continuity']['detail']}")
     
-    # Scenario 2: Drifted evaluator — secretly halved health weight
-    print("\n=== Scenario: Weight Drift (halved health) ===")
-    drifted = GenesisWeights(
-        criteria={"maturity": 0.35, "health": 0.10, "consistency": 0.25, "independence": 0.30},
-        aggregation="MIN", version="1.0.0", declared_at="2026-03-21T00:00:00Z"
+    # Scenario 2: Explicit reissue (legitimate weight change)
+    new_weights = {"continuity": 0.30, "stake": 0.30, "reachability": 0.20, "entropy": 0.20}
+    new_decl = WeightDeclaration(weights=new_weights, declared_at=now)
+    reissue = WeightReissue(
+        old_weights=genesis_weights, new_weights=new_weights,
+        reason="stake weight increased after TC3 showed escrow importance",
+        issued_at=now, old_hash=declaration.canonical_hash, new_hash=new_decl.canonical_hash
     )
-    result = verifier.verify(genesis_hash, drifted)
-    print(f"Verdict: {result['verdict']} | Severity: {result['severity']}")
-    print(f"Detail: {result['detail']}")
+    print("\n=== LEGITIMATE REISSUE ===")
+    result = verifier.full_audit(genesis, new_weights, [reissue])
+    print(f"Grade: {result['grade']} | {result['weight_continuity']['verdict']}")
+    print(f"  {result['weight_continuity']['detail']}")
     
-    # Scenario 3: Aggregation changed (MIN → WEIGHTED)
-    print("\n=== Scenario: Aggregation Changed ===")
-    changed_agg = GenesisWeights(
-        criteria={"maturity": 0.25, "health": 0.25, "consistency": 0.25, "independence": 0.25},
-        aggregation="WEIGHTED", version="1.0.0", declared_at="2026-03-21T00:00:00Z"
+    # Scenario 3: Silent drift (weights changed without reissue)
+    drifted = {"continuity": 0.10, "stake": 0.50, "reachability": 0.20, "entropy": 0.20}
+    print("\n=== SILENT DRIFT (no reissue) ===")
+    result = verifier.full_audit(genesis, drifted, [])
+    print(f"Grade: {result['grade']} | {result['weight_continuity']['verdict']}")
+    print(f"  {result['weight_continuity']['detail']}")
+    
+    # Scenario 4: Tampered genesis
+    tampered_genesis = GenesisRecord(
+        agent_id="sybil_agent",
+        weight_declaration=WeightDeclaration(weights={"continuity": 0.50, "stake": 0.50}, declared_at=now),
+        weight_hash="deadbeef12345678",  # doesn't match
+        created_at=now
     )
-    result = verifier.verify(genesis_hash, changed_agg)
-    print(f"Verdict: {result['verdict']} | Severity: {result['severity']}")
-    
-    # Scenario 4: Weight history audit
-    print("\n=== Weight History Audit ===")
-    history = [
-        ("2026-03-01", genesis),
-        ("2026-03-07", genesis),
-        ("2026-03-14", GenesisWeights(
-            criteria={"maturity": 0.30, "health": 0.20, "consistency": 0.25, "independence": 0.25},
-            aggregation="MIN", version="1.1.0", declared_at="2026-03-14T00:00:00Z"
-        )),
-        ("2026-03-21", GenesisWeights(
-            criteria={"maturity": 0.40, "health": 0.10, "consistency": 0.25, "independence": 0.25},
-            aggregation="MIN", version="1.2.0", declared_at="2026-03-21T00:00:00Z"
-        )),
-    ]
-    audit = verifier.audit_weight_history(history)
-    print(f"Snapshots: {audit['total_snapshots']} | Changes: {audit['weight_changes']}")
-    print(f"Verdict: {audit['verdict']}")
-    for c in audit['changes']:
-        print(f"  [{c['timestamp']}] {c['old_hash']} → {c['new_hash']}")
-        print(f"    New weights: {c['new_weights']}")
+    print("\n=== TAMPERED GENESIS ===")
+    result = verifier.full_audit(tampered_genesis, {"continuity": 0.50, "stake": 0.50}, [])
+    print(f"Grade: {result['grade']} | {result['genesis_integrity']['verdict']}")
 
 
 if __name__ == "__main__":
