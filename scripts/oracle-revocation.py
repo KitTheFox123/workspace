@@ -1,249 +1,243 @@
 #!/usr/bin/env python3
 """
-oracle-revocation.py — Revocation primitive for oracle independence.
+oracle-revocation.py — Evidence-based oracle independence revocation.
 
-Missing piece identified by santaclawd (2026-03-21):
-"independence declared at genesis can be invalidated — acquisition,
-config drift, shared incident. what triggers a re-audit?"
+The missing primitive in the trust stack (santaclawd 2026-03-21):
+- oracle-independence-verifier.py ✓
+- oracle-genesis-registry.py ✓  
+- oracle-vouch-chain.py ✓
+- model-monoculture-detector.py ✓
+- oracle-revocation.py ← THIS
 
-Three revocation triggers:
-1. SOUL_DRIFT: soul_hash changed without REISSUE receipt
-2. INDEPENDENCE_BREACH: Gini exceeds threshold (acquisition)
-3. MONOCULTURE_BREACH: model family diversity below minimum
+Revocation triggers:
+1. Gini threshold breach (>0.33 = BFT unsafe)
+2. Model family acquisition (same family = correlated failures)
+3. Shared incident (same CVE/outage across providers)
+4. Behavioral correlation (outputs too similar = not independent)
 
-CT parallel: log disqualification. Spec defines WHEN, browser decides WHAT.
+Key principle: revocation by EVIDENCE not AUTHORITY.
+Any party with proof can trigger re-audit.
+CT parallel: CRLite bloom filter for mass revocation checks.
 """
 
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Optional
 
 
-class RevocationTrigger(Enum):
-    SOUL_DRIFT = "soul_hash changed without REISSUE receipt"
-    INDEPENDENCE_BREACH = "Gini coefficient exceeds threshold"
-    MONOCULTURE_BREACH = "model family diversity below minimum"
-    MANUAL = "operator-initiated revocation"
-    EXPIRY = "attestation TTL exceeded"
+class RevocationReason(Enum):
+    GINI_BREACH = "gini_threshold_breach"
+    MONOCULTURE = "model_family_acquisition"
+    SHARED_INCIDENT = "shared_incident_cve"
+    BEHAVIORAL_CORRELATION = "output_correlation"
+    MANUAL_EVIDENCE = "manual_evidence_submission"
 
 
-class RevocationAction(Enum):
-    WARN = "flag for review, continue accepting"
-    SUSPEND = "stop accepting new attestations, honor existing"
-    REVOKE = "invalidate all attestations from this oracle"
-    QUARANTINE = "isolate pending investigation"
+class RevocationStatus(Enum):
+    ACTIVE = "active"
+    SUSPENDED = "suspended"  # temporary, pending review
+    REVOKED = "revoked"  # permanent until re-audit
+    REINSTATED = "reinstated"  # passed re-audit
 
 
 @dataclass
-class RevocationEvent:
-    oracle_id: str
-    trigger: RevocationTrigger
-    action: RevocationAction
+class RevocationEvidence:
+    """Evidence supporting a revocation claim."""
+    reason: RevocationReason
+    submitter_id: str
     timestamp: float
-    evidence: dict
-    receipt_hash: str = ""
-
-    def __post_init__(self):
-        if not self.receipt_hash:
-            canonical = json.dumps({
-                "oracle_id": self.oracle_id,
-                "trigger": self.trigger.name,
-                "action": self.action.name,
-                "timestamp": self.timestamp,
-                "evidence": self.evidence,
-            }, sort_keys=True)
-            self.receipt_hash = hashlib.sha256(canonical.encode()).hexdigest()[:32]
+    evidence_hash: str  # hash of evidence payload
+    details: dict
+    
+    @property
+    def evidence_id(self) -> str:
+        data = f"{self.reason.value}:{self.submitter_id}:{self.timestamp}:{self.evidence_hash}"
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
 @dataclass
 class OracleStatus:
+    """Current status of an oracle in the independence registry."""
     oracle_id: str
-    status: str  # ACTIVE|WARNED|SUSPENDED|REVOKED|QUARANTINED
-    active_warnings: list[RevocationEvent] = field(default_factory=list)
-    revocation_history: list[RevocationEvent] = field(default_factory=list)
-    last_audit: float = 0.0
+    model_family: str
+    status: RevocationStatus = RevocationStatus.ACTIVE
+    revocation_history: list[RevocationEvidence] = field(default_factory=list)
+    last_audit: Optional[float] = None
+    
+    @property
+    def times_revoked(self) -> int:
+        return sum(1 for e in self.revocation_history)
 
 
-class RevocationRegistry:
-    """Manages oracle revocation state."""
+@dataclass
+class RevocationVerdict:
+    """Result of evaluating revocation evidence."""
+    oracle_id: str
+    previous_status: RevocationStatus
+    new_status: RevocationStatus
+    reason: RevocationReason
+    evidence_id: str
+    affected_quorums: list[str]
+    remediation: str
 
-    def __init__(self, gini_threshold: float = 0.7, min_diversity: float = 0.3,
-                 attestation_ttl_days: int = 90):
-        self.gini_threshold = gini_threshold
-        self.min_diversity = min_diversity
-        self.attestation_ttl = attestation_ttl_days * 86400
-        self.oracles: dict[str, OracleStatus] = {}
-        self.events: list[RevocationEvent] = []
 
-    def register(self, oracle_id: str):
-        self.oracles[oracle_id] = OracleStatus(
-            oracle_id=oracle_id, status="ACTIVE", last_audit=time.time()
+def check_gini_breach(oracle_weights: dict[str, float], threshold: float = 0.33) -> Optional[RevocationEvidence]:
+    """Check if any oracle controls >threshold of total weight (BFT unsafe)."""
+    total = sum(oracle_weights.values())
+    if total == 0:
+        return None
+    
+    for oracle_id, weight in oracle_weights.items():
+        fraction = weight / total
+        if fraction > threshold:
+            return RevocationEvidence(
+                reason=RevocationReason.GINI_BREACH,
+                submitter_id="system",
+                timestamp=time.time(),
+                evidence_hash=hashlib.sha256(json.dumps(oracle_weights, sort_keys=True).encode()).hexdigest()[:32],
+                details={"oracle_id": oracle_id, "fraction": fraction, "threshold": threshold}
+            )
+    return None
+
+
+def check_monoculture(oracles: list[OracleStatus], family_threshold: float = 0.34) -> list[RevocationEvidence]:
+    """Check if model family concentration exceeds BFT safety."""
+    family_counts: dict[str, list[str]] = {}
+    for o in oracles:
+        family_counts.setdefault(o.model_family, []).append(o.oracle_id)
+    
+    evidences = []
+    total = len(oracles)
+    for family, members in family_counts.items():
+        if len(members) / total > family_threshold:
+            evidences.append(RevocationEvidence(
+                reason=RevocationReason.MONOCULTURE,
+                submitter_id="system",
+                timestamp=time.time(),
+                evidence_hash=hashlib.sha256(f"{family}:{len(members)}:{total}".encode()).hexdigest()[:32],
+                details={"family": family, "members": members, "fraction": len(members)/total}
+            ))
+    return evidences
+
+
+def check_shared_incident(affected_oracles: list[str], incident_id: str, 
+                           total_oracles: int, threshold: float = 0.25) -> Optional[RevocationEvidence]:
+    """Check if shared incident affects too many oracles."""
+    if len(affected_oracles) / max(total_oracles, 1) > threshold:
+        return RevocationEvidence(
+            reason=RevocationReason.SHARED_INCIDENT,
+            submitter_id="incident_reporter",
+            timestamp=time.time(),
+            evidence_hash=hashlib.sha256(incident_id.encode()).hexdigest()[:32],
+            details={"incident_id": incident_id, "affected": affected_oracles, 
+                     "fraction": len(affected_oracles)/total_oracles}
         )
+    return None
 
-    def check_soul_drift(self, oracle_id: str, current_hash: str,
-                          previous_hash: str, has_reissue: bool) -> Optional[RevocationEvent]:
-        """Check for unauthorized soul_hash change."""
-        if current_hash != previous_hash and not has_reissue:
-            event = RevocationEvent(
-                oracle_id=oracle_id,
-                trigger=RevocationTrigger.SOUL_DRIFT,
-                action=RevocationAction.QUARANTINE,
-                timestamp=time.time(),
-                evidence={
-                    "previous_hash": previous_hash,
-                    "current_hash": current_hash,
-                    "reissue_receipt": False,
-                }
-            )
-            self._apply(event)
-            return event
-        return None
 
-    def check_independence(self, oracle_id: str, gini: float,
-                            controlling_entity: Optional[str] = None) -> Optional[RevocationEvent]:
-        """Check if oracle independence is compromised."""
-        if gini > self.gini_threshold:
-            event = RevocationEvent(
-                oracle_id=oracle_id,
-                trigger=RevocationTrigger.INDEPENDENCE_BREACH,
-                action=RevocationAction.SUSPEND,
-                timestamp=time.time(),
-                evidence={
-                    "gini": gini,
-                    "threshold": self.gini_threshold,
-                    "controlling_entity": controlling_entity,
-                }
-            )
-            self._apply(event)
-            return event
-        return None
-
-    def check_monoculture(self, oracle_id: str, family_diversity: float,
-                           dominant_family: str) -> Optional[RevocationEvent]:
-        """Check if model monoculture compromises oracle."""
-        if family_diversity < self.min_diversity:
-            event = RevocationEvent(
-                oracle_id=oracle_id,
-                trigger=RevocationTrigger.MONOCULTURE_BREACH,
-                action=RevocationAction.WARN,
-                timestamp=time.time(),
-                evidence={
-                    "family_diversity": family_diversity,
-                    "min_diversity": self.min_diversity,
-                    "dominant_family": dominant_family,
-                }
-            )
-            self._apply(event)
-            return event
-        return None
-
-    def check_expiry(self, oracle_id: str, last_attestation: float) -> Optional[RevocationEvent]:
-        """Check if attestation has expired."""
-        age = time.time() - last_attestation
-        if age > self.attestation_ttl:
-            event = RevocationEvent(
-                oracle_id=oracle_id,
-                trigger=RevocationTrigger.EXPIRY,
-                action=RevocationAction.SUSPEND,
-                timestamp=time.time(),
-                evidence={
-                    "last_attestation_age_days": age / 86400,
-                    "ttl_days": self.attestation_ttl / 86400,
-                }
-            )
-            self._apply(event)
-            return event
-        return None
-
-    def _apply(self, event: RevocationEvent):
-        """Apply revocation event to oracle status."""
-        self.events.append(event)
-        oracle = self.oracles.get(event.oracle_id)
-        if not oracle:
-            return
-
-        oracle.revocation_history.append(event)
-
-        action_to_status = {
-            RevocationAction.WARN: "WARNED",
-            RevocationAction.SUSPEND: "SUSPENDED",
-            RevocationAction.REVOKE: "REVOKED",
-            RevocationAction.QUARANTINE: "QUARANTINED",
-        }
-
-        # Escalation: never downgrade status
-        severity = {"ACTIVE": 0, "WARNED": 1, "SUSPENDED": 2, "QUARANTINED": 3, "REVOKED": 4}
-        new_status = action_to_status[event.action]
-        if severity.get(new_status, 0) > severity.get(oracle.status, 0):
-            oracle.status = new_status
-
-        if event.action == RevocationAction.WARN:
-            oracle.active_warnings.append(event)
-
-    def audit_all(self) -> list[RevocationEvent]:
-        """Return all events since last audit."""
-        return self.events
+def evaluate_revocation(oracle: OracleStatus, evidence: RevocationEvidence, 
+                         quorum_memberships: list[str]) -> RevocationVerdict:
+    """Evaluate revocation evidence and produce verdict."""
+    previous = oracle.status
+    
+    # Determine new status based on evidence severity
+    if evidence.reason == RevocationReason.GINI_BREACH:
+        new_status = RevocationStatus.SUSPENDED
+        remediation = "Re-audit required. Reduce weight below BFT threshold (0.33)."
+    elif evidence.reason == RevocationReason.MONOCULTURE:
+        new_status = RevocationStatus.SUSPENDED
+        remediation = "Suspend until family diversity restored. Replace with different model family."
+    elif evidence.reason == RevocationReason.SHARED_INCIDENT:
+        new_status = RevocationStatus.SUSPENDED
+        remediation = "Suspend pending incident resolution. CVE remediation required."
+    elif evidence.reason == RevocationReason.BEHAVIORAL_CORRELATION:
+        new_status = RevocationStatus.REVOKED
+        remediation = "Revoked. Independence claim falsified by output correlation analysis."
+    else:
+        new_status = RevocationStatus.SUSPENDED
+        remediation = "Suspend pending manual review of submitted evidence."
+    
+    oracle.status = new_status
+    oracle.revocation_history.append(evidence)
+    
+    return RevocationVerdict(
+        oracle_id=oracle.oracle_id,
+        previous_status=previous,
+        new_status=new_status,
+        reason=evidence.reason,
+        evidence_id=evidence.evidence_id,
+        affected_quorums=quorum_memberships,
+        remediation=remediation
+    )
 
 
 def demo():
-    reg = RevocationRegistry()
-    now = time.time()
-
-    # Register oracles
-    for oid in ["oracle_alpha", "oracle_beta", "oracle_gamma", "oracle_delta"]:
-        reg.register(oid)
+    """Demo: oracle revocation scenarios."""
+    oracles = [
+        OracleStatus("oracle_1", "openai"),
+        OracleStatus("oracle_2", "openai"),
+        OracleStatus("oracle_3", "openai"),
+        OracleStatus("oracle_4", "anthropic"),
+        OracleStatus("oracle_5", "google"),
+        OracleStatus("oracle_6", "openai"),
+        OracleStatus("oracle_7", "mistral"),
+    ]
 
     print("=" * 65)
-    print("ORACLE REVOCATION DEMO")
+    print("ORACLE REVOCATION — THE MISSING PRIMITIVE")
     print("=" * 65)
 
-    # Scenario 1: Soul drift without REISSUE
-    e1 = reg.check_soul_drift("oracle_alpha", "newhash", "oldhash", has_reissue=False)
-    print(f"\n1. Soul drift (no REISSUE):")
-    print(f"   Oracle: oracle_alpha → {reg.oracles['oracle_alpha'].status}")
-    print(f"   Action: {e1.action.name} — {e1.trigger.value}")
+    # Scenario 1: Monoculture detection
+    print("\n--- Scenario 1: Model Family Monoculture ---")
+    mono_evidence = check_monoculture(oracles)
+    for ev in mono_evidence:
+        print(f"  ⚠️  {ev.reason.value}: {ev.details['family']} = {ev.details['fraction']:.0%} of quorum")
+        verdict = evaluate_revocation(
+            oracles[0], ev, ["quorum_alpha", "quorum_beta"]
+        )
+        print(f"  Verdict: {verdict.previous_status.value} → {verdict.new_status.value}")
+        print(f"  Remediation: {verdict.remediation}")
+        print(f"  Affected quorums: {verdict.affected_quorums}")
 
-    # Scenario 2: Independence breach (acquisition)
-    e2 = reg.check_independence("oracle_beta", gini=0.82, controlling_entity="MegaCorp")
-    print(f"\n2. Independence breach (acquisition):")
-    print(f"   Oracle: oracle_beta → {reg.oracles['oracle_beta'].status}")
-    print(f"   Evidence: Gini={e2.evidence['gini']}, controller={e2.evidence['controlling_entity']}")
+    # Scenario 2: Gini concentration
+    print("\n--- Scenario 2: Gini Weight Concentration ---")
+    weights = {"oracle_1": 0.4, "oracle_2": 0.2, "oracle_3": 0.15, 
+               "oracle_4": 0.15, "oracle_5": 0.1}
+    gini_ev = check_gini_breach(weights)
+    if gini_ev:
+        print(f"  ⚠️  {gini_ev.reason.value}: oracle_1 = {gini_ev.details['fraction']:.0%}")
+        verdict = evaluate_revocation(
+            OracleStatus("oracle_1", "openai"), gini_ev, ["quorum_gamma"]
+        )
+        print(f"  Verdict: {verdict.previous_status.value} → {verdict.new_status.value}")
 
-    # Scenario 3: Model monoculture
-    e3 = reg.check_monoculture("oracle_gamma", family_diversity=0.15, dominant_family="gpt-4")
-    print(f"\n3. Model monoculture:")
-    print(f"   Oracle: oracle_gamma → {reg.oracles['oracle_gamma'].status}")
-    print(f"   Evidence: diversity={e3.evidence['family_diversity']}, dominant={e3.evidence['dominant_family']}")
-
-    # Scenario 4: Attestation expiry
-    e4 = reg.check_expiry("oracle_delta", last_attestation=now - 100 * 86400)
-    print(f"\n4. Attestation expiry:")
-    print(f"   Oracle: oracle_delta → {reg.oracles['oracle_delta'].status}")
-    print(f"   Evidence: age={e4.evidence['last_attestation_age_days']:.0f}d, TTL={e4.evidence['ttl_days']:.0f}d")
-
-    # Scenario 5: Escalation — warn then breach
-    reg.register("oracle_epsilon")
-    reg.check_monoculture("oracle_epsilon", 0.25, "claude")  # WARN
-    reg.check_independence("oracle_epsilon", 0.75, "AcquiCorp")  # SUSPEND
-    print(f"\n5. Escalation (warn → suspend):")
-    print(f"   Oracle: oracle_epsilon → {reg.oracles['oracle_epsilon'].status}")
-    print(f"   History: {len(reg.oracles['oracle_epsilon'].revocation_history)} events")
+    # Scenario 3: Shared CVE
+    print("\n--- Scenario 3: Shared Incident (CVE) ---")
+    cve_ev = check_shared_incident(
+        ["oracle_1", "oracle_2", "oracle_6"],
+        "CVE-2026-1234", 
+        total_oracles=7
+    )
+    if cve_ev:
+        print(f"  ⚠️  {cve_ev.reason.value}: {len(cve_ev.details['affected'])}/{7} oracles affected")
+        print(f"  Incident: {cve_ev.details['incident_id']}")
 
     # Summary
-    print(f"\n{'='*65}")
-    print("REGISTRY STATUS")
-    print(f"{'='*65}")
-    print(f"{'Oracle':<20} {'Status':<15} {'Events':>6}")
-    print("-" * 45)
-    for oid, oracle in reg.oracles.items():
-        print(f"{oid:<20} {oracle.status:<15} {len(oracle.revocation_history):>6}")
-
-    print(f"\nTotal events: {len(reg.events)}")
-    print(f"\nPrinciple: spec defines WHEN, operator decides WHAT.")
-    print(f"CT parallel: log disqualification, not certificate revocation.")
+    print("\n" + "=" * 65)
+    print("TRUST STACK STATUS (post-revocation)")
+    print("=" * 65)
+    print(f"  oracle-independence-verifier.py  ✅")
+    print(f"  oracle-genesis-registry.py       ✅")
+    print(f"  oracle-vouch-chain.py            ✅")
+    print(f"  model-monoculture-detector.py    ✅")
+    print(f"  oracle-revocation.py             ✅  ← NEW")
+    print()
+    print("  Key: revocation by EVIDENCE not AUTHORITY.")
+    print("  Any party with proof can trigger re-audit.")
+    print("  — santaclawd (2026-03-21)")
 
 
 if __name__ == "__main__":
