@@ -2,16 +2,17 @@
 """
 scoring-criteria-declaration.py — Genesis-declared scoring criteria.
 
-Per santaclawd: "post-hoc weight assignment reintroduces narrative bias through the back door."
+Per santaclawd: "post-hoc weight assignment reintroduces narrative bias."
+Scoring weights MUST be declared at genesis, not assigned retroactively.
 
-Scoring weights MUST be declared at genesis (before seeing any data).
-Evaluator commits to criteria, then applies. Not the reverse.
+Isnad lesson: hadith grading criteria existed BEFORE the evaluation.
+If you pick weights after seeing results, you're fitting the narrative.
 
-Properties:
-1. Weights declared before evaluation begins
-2. Hash-locked commitment (can't change weights after seeing data)
-3. Split vs composite attribution mode declared
-4. Weight changes require REISSUE with reason_code
+Primitives:
+1. ScoringCriteria — declared at genesis with weights, thresholds, version
+2. CriteriaRegistry — append-only log of criteria declarations  
+3. EvaluationAudit — every score links back to declared criteria by hash
+4. CriteriaDrift — detect when evaluation diverges from declared weights
 """
 
 import hashlib
@@ -22,145 +23,191 @@ from typing import Optional
 
 
 @dataclass
+class ScoringCriterion:
+    name: str
+    weight: float
+    threshold: float  # minimum acceptable score
+    aggregation: str  # "min" | "weighted_avg" | "geometric_mean"
+    description: str = ""
+
+
+@dataclass
 class ScoringCriteria:
-    """Genesis-declared scoring weights."""
-    criteria_id: str
+    version: str
+    criteria: list[ScoringCriterion]
     declared_at: datetime
-    declared_by: str
+    declared_by: str  # agent_id
+    aggregation: str = "min"  # how to combine criteria scores
     
-    # Weights per dimension (must sum to 1.0)
-    weights: dict[str, float]
-    
-    # Attribution mode: "split" shows per-principal, "composite" hides which
-    attribution_mode: str = "split"  # split | composite
-    
-    # Minimum evidence threshold per dimension
-    min_evidence: dict[str, int] = field(default_factory=dict)
-    
-    # Hash commitment
-    commitment_hash: str = ""
-    
-    def __post_init__(self):
-        total = sum(self.weights.values())
-        if abs(total - 1.0) > 0.01:
-            raise ValueError(f"Weights must sum to 1.0, got {total}")
-        if self.attribution_mode not in ("split", "composite"):
-            raise ValueError(f"attribution_mode must be split|composite, got {self.attribution_mode}")
-        self.commitment_hash = self._compute_hash()
-    
-    def _compute_hash(self) -> str:
-        canonical = json.dumps({
-            "weights": dict(sorted(self.weights.items())),
-            "attribution_mode": self.attribution_mode,
-            "min_evidence": dict(sorted(self.min_evidence.items())),
-            "declared_by": self.declared_by,
+    def canonical_hash(self) -> str:
+        """Deterministic hash of declared criteria. Immutable after genesis."""
+        payload = json.dumps({
+            "version": self.version,
+            "criteria": [
+                {"name": c.name, "weight": c.weight, "threshold": c.threshold, "aggregation": c.aggregation}
+                for c in sorted(self.criteria, key=lambda x: x.name)
+            ],
+            "aggregation": self.aggregation,
+            "declared_by": self.declared_by
         }, sort_keys=True)
-        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
     
     def evaluate(self, scores: dict[str, float]) -> dict:
-        """Apply declared weights to scores. Refuses if criteria changed."""
-        # Verify commitment
-        if self._compute_hash() != self.commitment_hash:
-            return {"error": "COMMITMENT_VIOLATED", "detail": "Scoring criteria modified after declaration"}
+        """Evaluate against declared criteria. Returns audit trail."""
+        results = {}
+        missing = []
         
-        missing = [k for k in self.weights if k not in scores]
+        for criterion in self.criteria:
+            if criterion.name not in scores:
+                missing.append(criterion.name)
+                continue
+            
+            score = scores[criterion.name]
+            results[criterion.name] = {
+                "score": score,
+                "weight": criterion.weight,
+                "threshold": criterion.threshold,
+                "passed": score >= criterion.threshold,
+                "weighted_score": score * criterion.weight
+            }
+        
         if missing:
-            return {"error": "MISSING_DIMENSIONS", "dimensions": missing}
-        
-        # Check min evidence (if provided)
-        # In real use, evidence counts would be passed alongside scores
-        
-        if self.attribution_mode == "split":
-            breakdown = {k: round(scores[k] * self.weights[k], 4) for k in self.weights}
-            composite = sum(breakdown.values())
             return {
-                "composite_score": round(composite, 4),
-                "breakdown": breakdown,
-                "raw_scores": {k: scores[k] for k in self.weights},
-                "weights_used": self.weights,
-                "commitment_hash": self.commitment_hash,
-                "attribution_mode": "split",
-                "weakest_axis": min(scores, key=lambda k: scores[k]),
-                "min_score": round(min(scores[k] for k in self.weights), 4),
+                "verdict": "INCOMPLETE",
+                "missing_criteria": missing,
+                "criteria_hash": self.canonical_hash()
             }
+        
+        passed = [r for r in results.values() if r["passed"]]
+        
+        # Aggregate per declared method
+        if self.aggregation == "min":
+            final_score = min(r["score"] for r in results.values())
+        elif self.aggregation == "weighted_avg":
+            total_weight = sum(c.weight for c in self.criteria)
+            final_score = sum(r["weighted_score"] for r in results.values()) / total_weight
         else:
-            # Composite hides per-dimension scores
-            composite = sum(scores[k] * self.weights[k] for k in self.weights)
-            return {
-                "composite_score": round(composite, 4),
-                "commitment_hash": self.commitment_hash,
-                "attribution_mode": "composite",
-                "warning": "composite mode hides per-principal attribution — use split for disputes"
-            }
+            from math import prod
+            scores_list = [r["score"] for r in results.values()]
+            final_score = prod(scores_list) ** (1.0 / len(scores_list))
+        
+        # Grade
+        if final_score >= 0.9:
+            grade = "A"
+        elif final_score >= 0.7:
+            grade = "B"
+        elif final_score >= 0.5:
+            grade = "C"
+        elif final_score >= 0.3:
+            grade = "D"
+        else:
+            grade = "F"
+        
+        return {
+            "verdict": "PASS" if len(passed) == len(results) else "FAIL",
+            "grade": grade,
+            "final_score": round(final_score, 3),
+            "aggregation": self.aggregation,
+            "criteria_hash": self.canonical_hash(),
+            "declared_at": self.declared_at.isoformat(),
+            "results": results,
+            "passed_count": f"{len(passed)}/{len(results)}"
+        }
+
+
+@dataclass
+class CriteriaRegistry:
+    """Append-only registry. No retroactive modification."""
+    entries: list[ScoringCriteria] = field(default_factory=list)
     
-    def reissue(self, new_weights: dict[str, float], reason: str) -> 'ScoringCriteria':
-        """REISSUE with new weights + reason. Returns new criteria with predecessor link."""
-        new = ScoringCriteria(
-            criteria_id=f"{self.criteria_id}_r1",
-            declared_at=datetime.utcnow(),
-            declared_by=self.declared_by,
-            weights=new_weights,
-            attribution_mode=self.attribution_mode,
-            min_evidence=self.min_evidence,
-        )
-        return new
+    def register(self, criteria: ScoringCriteria) -> str:
+        """Register criteria. Returns hash. Immutable after this point."""
+        # Check for hash collision (version bump with same hash = suspicious)
+        existing_hashes = {e.canonical_hash() for e in self.entries}
+        h = criteria.canonical_hash()
+        if h in existing_hashes:
+            return f"DUPLICATE:{h}"
+        self.entries.append(criteria)
+        return h
+    
+    def get_by_hash(self, h: str) -> Optional[ScoringCriteria]:
+        for entry in self.entries:
+            if entry.canonical_hash() == h:
+                return entry
+        return None
+    
+    def detect_drift(self, criteria_hash: str, actual_weights: dict[str, float]) -> dict:
+        """Detect if evaluation diverged from declared weights."""
+        criteria = self.get_by_hash(criteria_hash)
+        if not criteria:
+            return {"verdict": "UNKNOWN_CRITERIA", "hash": criteria_hash}
+        
+        drifted = []
+        for c in criteria.criteria:
+            if c.name in actual_weights:
+                declared = c.weight
+                actual = actual_weights[c.name]
+                if abs(declared - actual) > 0.01:
+                    drifted.append({
+                        "criterion": c.name,
+                        "declared_weight": declared,
+                        "actual_weight": actual,
+                        "drift": round(actual - declared, 3)
+                    })
+        
+        return {
+            "verdict": "DRIFTED" if drifted else "ALIGNED",
+            "criteria_hash": criteria_hash,
+            "drifted_criteria": drifted,
+            "severity": "CRITICAL" if len(drifted) > len(criteria.criteria) / 2 else "WARNING" if drifted else "OK"
+        }
 
 
 def demo():
-    now = datetime(2026, 3, 21, 17, 0, 0)
+    now = datetime(2026, 3, 21, 18, 0, 0)
+    registry = CriteriaRegistry()
     
-    # Scenario 1: Honest evaluator — declare weights, then evaluate
-    criteria = ScoringCriteria(
-        criteria_id="atf_core_v1",
+    # Declare ATF-core scoring criteria at genesis
+    atf_core = ScoringCriteria(
+        version="0.1.0",
+        criteria=[
+            ScoringCriterion("maturity", 1.0, 0.3, "min", "Cold-start Wilson CI"),
+            ScoringCriterion("health", 1.0, 0.2, "min", "Correction frequency"),
+            ScoringCriterion("consistency", 1.0, 0.2, "min", "Fork probability"),
+            ScoringCriterion("independence", 1.0, 0.5, "min", "Oracle diversity"),
+        ],
         declared_at=now,
         declared_by="kit_fox",
-        weights={
-            "maturity": 0.20,
-            "health": 0.25,
-            "consistency": 0.25,
-            "independence": 0.15,
-            "connector": 0.15,
-        },
-        attribution_mode="split",
+        aggregation="min"
     )
     
-    scores = {
-        "maturity": 0.85,
-        "health": 0.72,
-        "consistency": 0.91,
-        "independence": 0.60,
-        "connector": 0.45,
-    }
+    h = registry.register(atf_core)
+    print(f"Registered ATF-core criteria: {h}")
     
-    result = criteria.evaluate(scores)
-    print("=== HONEST EVALUATION (split) ===")
-    print(f"Composite: {result['composite_score']}")
-    print(f"Weakest: {result['weakest_axis']} ({result['min_score']})")
-    print(f"Breakdown: {result['breakdown']}")
-    print(f"Commitment: {result['commitment_hash']}")
+    # Evaluate kit_fox
+    kit_scores = {"maturity": 0.88, "health": 0.72, "consistency": 0.91, "independence": 0.85}
+    result = atf_core.evaluate(kit_scores)
+    print(f"\nkit_fox: {result['verdict']} Grade={result['grade']} Score={result['final_score']}")
+    print(f"  Aggregation: {result['aggregation']} | Criteria hash: {result['criteria_hash']}")
     
-    # Scenario 2: Composite mode — hides per-principal
-    composite_criteria = ScoringCriteria(
-        criteria_id="atf_composite",
-        declared_at=now,
-        declared_by="adversary",
-        weights=criteria.weights,
-        attribution_mode="composite",
-    )
+    # Evaluate sybil
+    sybil_scores = {"maturity": 0.12, "health": 0.95, "consistency": 0.88, "independence": 0.10}
+    result = atf_core.evaluate(sybil_scores)
+    print(f"\nsybil: {result['verdict']} Grade={result['grade']} Score={result['final_score']}")
+    for name, r in result['results'].items():
+        if not r['passed']:
+            print(f"  FAIL: {name} = {r['score']} < {r['threshold']}")
     
-    result2 = composite_criteria.evaluate(scores)
-    print(f"\n=== COMPOSITE (hides breakdown) ===")
-    print(f"Composite: {result2['composite_score']}")
-    print(f"Warning: {result2['warning']}")
-    
-    # Scenario 3: Tampering detection
-    print(f"\n=== TAMPERING DETECTION ===")
-    criteria.weights["connector"] = 0.50  # try to change after declaration
-    criteria.weights["maturity"] = 0.05   # rebalance
-    criteria.weights["independence"] = 0.00
-    tampered = criteria.evaluate(scores)
-    print(f"Result: {tampered['error']}")
-    print(f"Detail: {tampered['detail']}")
+    # Detect weight drift (someone using different weights than declared)
+    drift = registry.detect_drift(h, {
+        "maturity": 1.0,
+        "health": 0.5,  # halved weight = narrative bias
+        "consistency": 1.0,
+        "independence": 2.0  # doubled = retroactive emphasis
+    })
+    print(f"\nDrift detection: {drift['verdict']} ({drift['severity']})")
+    for d in drift['drifted_criteria']:
+        print(f"  {d['criterion']}: declared={d['declared_weight']}, actual={d['actual_weight']} (drift={d['drift']})")
 
 
 if __name__ == "__main__":
