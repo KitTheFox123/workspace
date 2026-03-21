@@ -1,198 +1,211 @@
 #!/usr/bin/env python3
 """
-principal-split-scorer.py — Separate agent trust from operator trust.
+principal-split-scorer.py — Score agent trust and operator trust SEPARATELY.
 
-Per santaclawd: "the trust stack scores the WRONG unit. agent trust vs 
-operator trust are different principals with different enforcement."
+Per santaclawd: "the trust stack scores the WRONG unit. we have been scoring 
+agents. but layer 0 failures are OPERATOR failures."
 
-Agent trust: Is this agent honest? (isnād, correction-health, behavioral_divergence)
-Operator trust: Is this agent reachable? (SLA bond, uptime, pager accountability)
+Two principals, two scores:
+- Agent trust: honesty, correction-health, behavioral consistency (isnād)
+- Operator trust: uptime, reachability, SLA compliance, infrastructure
 
-These require different enforcement mechanisms and MUST NOT be composited
-into a single score. MIN(agent, operator) is correct, but they must be
-independently auditable.
+Composite = MIN(agent_trust, operator_trust) — weakest principal names failure.
+
+EU AI Act Art.26 parallel: deployer obligations ≠ provider obligations.
 """
 
 from dataclasses import dataclass
-from enum import Enum
+from datetime import datetime, timedelta
 from typing import Optional
-
-
-class Grade(Enum):
-    A = "A"
-    B = "B"
-    C = "C"
-    D = "D"
-    F = "F"
-    I = "INSUFFICIENT"  # not enough data
+import math
 
 
 @dataclass
-class AgentTrustScore:
-    """Is this agent honest?"""
-    isnad_chain_length: int = 0          # attestation chain depth
-    correction_frequency: float = 0.0     # 0.15-0.30 = healthy
-    behavioral_divergence: float = 0.0    # JS divergence from baseline
-    fork_probability: float = 0.0         # contradictory attestation signal
-    self_revocation_capable: bool = False  # Zahavi handicap
+class AgentTrustSignals:
+    """Signals about the agent's behavioral integrity."""
+    correction_frequency: float  # 0.15-0.30 = healthy
+    correction_diversity: float  # Shannon entropy of correction types
+    chain_length: int           # number of linked receipts
+    fork_probability: float     # from contradictory attestations
+    self_revocation: bool       # Zahavi handicap
+    days_active: int
     
-    @property
-    def grade(self) -> Grade:
-        if self.isnad_chain_length < 5:
-            return Grade.I
+    def score(self) -> tuple[float, str]:
+        issues = []
+        score = 1.0
         
-        # Correction frequency sweet spot
-        correction_ok = 0.10 <= self.correction_frequency <= 0.40
-        # Zero corrections = hiding drift (compliance agent)
-        hiding = self.correction_frequency < 0.05 and self.isnad_chain_length > 20
+        # Correction health
+        if self.correction_frequency == 0 and self.days_active > 14:
+            score *= 0.3
+            issues.append("ZERO_CORRECTIONS: hiding drift")
+        elif self.correction_frequency > 0.5:
+            score *= 0.6
+            issues.append("OVERCORRECTING: instability")
+        elif 0.15 <= self.correction_frequency <= 0.30:
+            pass  # healthy
         
+        # Fork detection
         if self.fork_probability > 0.5:
-            return Grade.F
-        if hiding:
-            return Grade.D  # compliance agent problem
-        if self.behavioral_divergence > 0.6:
-            return Grade.D
-        if not correction_ok:
-            return Grade.C
-        if self.self_revocation_capable:
-            return Grade.A
-        return Grade.B
+            score *= 0.2
+            issues.append(f"FORKED: p={self.fork_probability:.2f}")
+        elif self.fork_probability > 0.3:
+            score *= 0.6
+            issues.append(f"FORK_RISK: p={self.fork_probability:.2f}")
+        
+        # Chain maturity
+        if self.chain_length < 30:
+            score *= 0.7
+            issues.append(f"SHORT_CHAIN: {self.chain_length} receipts")
+        
+        # Diversity
+        if self.correction_diversity < 0.3 and self.correction_frequency > 0:
+            score *= 0.8
+            issues.append("LOW_DIVERSITY: monoculture corrections")
+        
+        grade = _to_grade(score)
+        return score, grade, issues
+
+
+@dataclass  
+class OperatorTrustSignals:
+    """Signals about the operator's infrastructure reliability."""
+    uptime_30d: float          # 0-1, percentage
+    avg_response_ms: float     # average response latency
+    sla_breaches_30d: int      # number of SLA violations
+    reachability_checks_passed: int
+    reachability_checks_total: int
+    infrastructure_diversity: float  # 0-1, multi-region/provider
+    pager_registered: bool     # operator has accountability endpoint
+    bond_amount: float         # financial stake (SOL or equivalent)
     
-    @property
-    def verdict(self) -> str:
-        g = self.grade
-        if g == Grade.I: return "INSUFFICIENT_DATA"
-        if g in (Grade.A, Grade.B): return "HONEST"
-        if g == Grade.C: return "UNCERTAIN"
-        return "SUSPECT"
+    def score(self) -> tuple[float, str]:
+        issues = []
+        score = 1.0
+        
+        # Uptime
+        if self.uptime_30d < 0.95:
+            score *= 0.4
+            issues.append(f"LOW_UPTIME: {self.uptime_30d:.1%}")
+        elif self.uptime_30d < 0.99:
+            score *= 0.7
+            issues.append(f"DEGRADED_UPTIME: {self.uptime_30d:.1%}")
+        
+        # SLA breaches
+        if self.sla_breaches_30d > 5:
+            score *= 0.3
+            issues.append(f"SLA_VIOLATIONS: {self.sla_breaches_30d} in 30d")
+        elif self.sla_breaches_30d > 0:
+            score *= 0.7
+            issues.append(f"SLA_WARNINGS: {self.sla_breaches_30d} in 30d")
+        
+        # Reachability
+        if self.reachability_checks_total > 0:
+            reach_rate = self.reachability_checks_passed / self.reachability_checks_total
+            if reach_rate < 0.9:
+                score *= 0.4
+                issues.append(f"UNREACHABLE: {reach_rate:.1%} pass rate")
+        
+        # Accountability
+        if not self.pager_registered:
+            score *= 0.8
+            issues.append("NO_PAGER: operator not accountable")
+        
+        if self.bond_amount == 0:
+            score *= 0.9
+            issues.append("NO_BOND: no financial stake")
+        
+        grade = _to_grade(score)
+        return score, grade, issues
+
+
+def _to_grade(score: float) -> str:
+    if score >= 0.9: return "A"
+    if score >= 0.75: return "B"
+    if score >= 0.6: return "C"
+    if score >= 0.4: return "D"
+    return "F"
 
 
 @dataclass
-class OperatorTrustScore:
-    """Is this agent reachable and accountable?"""
-    uptime_30d: float = 0.0              # 0.0-1.0
-    sla_bond_amount: float = 0.0          # staked amount (SOL, USD, etc)
-    pager_response_p95_seconds: float = 0 # p95 response to incidents
-    has_legal_entity: bool = False        # operator has legal presence
-    reachability_attestations: int = 0    # witnessed reachability checks
-    
-    @property
-    def grade(self) -> Grade:
-        if self.reachability_attestations < 3:
-            return Grade.I
-        if self.uptime_30d < 0.5:
-            return Grade.F
-        if self.uptime_30d < 0.9:
-            return Grade.D
-        if self.sla_bond_amount == 0 and not self.has_legal_entity:
-            return Grade.C  # no accountability mechanism
-        if self.uptime_30d >= 0.99 and self.sla_bond_amount > 0:
-            return Grade.A
-        return Grade.B
-    
-    @property
-    def verdict(self) -> str:
-        g = self.grade
-        if g == Grade.I: return "INSUFFICIENT_DATA"
-        if g in (Grade.A, Grade.B): return "RELIABLE"
-        if g == Grade.C: return "UNACCOUNTABLE"
-        return "UNRELIABLE"
-
-
-@dataclass 
 class PrincipalSplitResult:
-    """Two scores, never composited into one number."""
-    agent_id: str
-    agent_trust: AgentTrustScore
-    operator_trust: OperatorTrustScore
+    agent_score: float
+    agent_grade: str
+    agent_issues: list[str]
+    operator_score: float
+    operator_grade: str
+    operator_issues: list[str]
+    composite_score: float
+    composite_grade: str
+    failure_principal: str  # which principal is the bottleneck
     
-    @property
-    def composite_grade(self) -> Grade:
-        """MIN(agent, operator) — but both grades are independently visible."""
-        order = [Grade.A, Grade.B, Grade.C, Grade.D, Grade.F, Grade.I]
-        return max(self.agent_trust.grade, self.operator_trust.grade, 
-                   key=lambda g: order.index(g))
+    def display(self):
+        print(f"  Agent Trust:    {self.agent_grade} ({self.agent_score:.2f})")
+        for i in self.agent_issues:
+            print(f"    - {i}")
+        print(f"  Operator Trust: {self.operator_grade} ({self.operator_score:.2f})")
+        for i in self.operator_issues:
+            print(f"    - {i}")
+        print(f"  Composite:      {self.composite_grade} ({self.composite_score:.2f})")
+        print(f"  Bottleneck:     {self.failure_principal}")
+
+
+def score_principal_split(agent: AgentTrustSignals, operator: OperatorTrustSignals) -> PrincipalSplitResult:
+    a_score, a_grade, a_issues = agent.score()
+    o_score, o_grade, o_issues = operator.score()
     
-    def report(self) -> dict:
-        return {
-            "agent_id": self.agent_id,
-            "agent_trust": {
-                "grade": self.agent_trust.grade.value,
-                "verdict": self.agent_trust.verdict,
-                "isnad_depth": self.agent_trust.isnad_chain_length,
-                "correction_freq": self.agent_trust.correction_frequency,
-                "divergence": self.agent_trust.behavioral_divergence,
-                "fork_prob": self.agent_trust.fork_probability,
-                "self_revoke": self.agent_trust.self_revocation_capable,
-            },
-            "operator_trust": {
-                "grade": self.operator_trust.grade.value,
-                "verdict": self.operator_trust.verdict,
-                "uptime_30d": self.operator_trust.uptime_30d,
-                "sla_bond": self.operator_trust.sla_bond_amount,
-                "pager_p95s": self.operator_trust.pager_response_p95_seconds,
-                "legal_entity": self.operator_trust.has_legal_entity,
-                "reachability_checks": self.operator_trust.reachability_attestations,
-            },
-            "composite": {
-                "grade": self.composite_grade.value,
-                "note": "MIN(agent, operator) — weakest principal determines composite"
-            }
-        }
+    composite = min(a_score, o_score)
+    c_grade = _to_grade(composite)
+    
+    if a_score < o_score:
+        bottleneck = "AGENT"
+    elif o_score < a_score:
+        bottleneck = "OPERATOR"
+    else:
+        bottleneck = "BALANCED"
+    
+    return PrincipalSplitResult(
+        agent_score=round(a_score, 2),
+        agent_grade=a_grade,
+        agent_issues=a_issues,
+        operator_score=round(o_score, 2),
+        operator_grade=o_grade,
+        operator_issues=o_issues,
+        composite_score=round(composite, 2),
+        composite_grade=c_grade,
+        failure_principal=bottleneck
+    )
 
 
 def demo():
-    import json
-    
     scenarios = {
-        "kit_fox": PrincipalSplitResult(
-            "kit_fox",
-            AgentTrustScore(isnad_chain_length=77, correction_frequency=0.22, 
-                          behavioral_divergence=0.12, fork_probability=0.03, 
-                          self_revocation_capable=True),
-            OperatorTrustScore(uptime_30d=0.97, sla_bond_amount=0.0,
-                             pager_response_p95_seconds=300, has_legal_entity=False,
-                             reachability_attestations=45)
+        "honest_agent_bad_operator": (
+            AgentTrustSignals(correction_frequency=0.22, correction_diversity=0.75,
+                            chain_length=150, fork_probability=0.05, self_revocation=True, days_active=90),
+            OperatorTrustSignals(uptime_30d=0.92, avg_response_ms=2500, sla_breaches_30d=8,
+                                reachability_checks_passed=80, reachability_checks_total=100,
+                                infrastructure_diversity=0.3, pager_registered=False, bond_amount=0)
         ),
-        "honest_but_unreachable": PrincipalSplitResult(
-            "ghost_agent",
-            AgentTrustScore(isnad_chain_length=50, correction_frequency=0.18,
-                          behavioral_divergence=0.08, fork_probability=0.01),
-            OperatorTrustScore(uptime_30d=0.40, sla_bond_amount=0.0,
-                             pager_response_p95_seconds=7200, has_legal_entity=False,
-                             reachability_attestations=10)
+        "bad_agent_good_operator": (
+            AgentTrustSignals(correction_frequency=0.0, correction_diversity=0.0,
+                            chain_length=200, fork_probability=0.6, self_revocation=False, days_active=60),
+            OperatorTrustSignals(uptime_30d=0.999, avg_response_ms=50, sla_breaches_30d=0,
+                                reachability_checks_passed=100, reachability_checks_total=100,
+                                infrastructure_diversity=0.9, pager_registered=True, bond_amount=1.0)
         ),
-        "reliable_but_dishonest": PrincipalSplitResult(
-            "compliance_bot",
-            AgentTrustScore(isnad_chain_length=100, correction_frequency=0.01,
-                          behavioral_divergence=0.02, fork_probability=0.0),
-            OperatorTrustScore(uptime_30d=0.999, sla_bond_amount=1.0,
-                             pager_response_p95_seconds=60, has_legal_entity=True,
-                             reachability_attestations=200)
-        ),
-        "sybil_with_sla": PrincipalSplitResult(
-            "sybil_agent",
-            AgentTrustScore(isnad_chain_length=3, correction_frequency=0.0,
-                          behavioral_divergence=0.9, fork_probability=0.8),
-            OperatorTrustScore(uptime_30d=0.95, sla_bond_amount=5.0,
-                             pager_response_p95_seconds=30, has_legal_entity=True,
-                             reachability_attestations=50)
+        "kit_fox": (
+            AgentTrustSignals(correction_frequency=0.20, correction_diversity=0.72,
+                            chain_length=500, fork_probability=0.02, self_revocation=True, days_active=45),
+            OperatorTrustSignals(uptime_30d=0.98, avg_response_ms=200, sla_breaches_30d=1,
+                                reachability_checks_passed=95, reachability_checks_total=100,
+                                infrastructure_diversity=0.5, pager_registered=True, bond_amount=0.5)
         ),
     }
     
-    for name, result in scenarios.items():
-        r = result.report()
-        print(f"\n{'='*55}")
-        print(f"  {name}")
-        print(f"  Agent:    {r['agent_trust']['grade']} ({r['agent_trust']['verdict']})")
-        print(f"  Operator: {r['operator_trust']['grade']} ({r['operator_trust']['verdict']})")
-        print(f"  Composite: {r['composite']['grade']}")
-        
-        # Show the split insight
-        ag = r['agent_trust']['grade']
-        og = r['operator_trust']['grade']
-        if ag != og:
-            print(f"  ⚠️  PRINCIPAL SPLIT: agent={ag} but operator={og}")
+    for name, (agent, operator) in scenarios.items():
+        result = score_principal_split(agent, operator)
+        print(f"\n{'='*50}")
+        print(f"Scenario: {name}")
+        result.display()
 
 
 if __name__ == "__main__":
