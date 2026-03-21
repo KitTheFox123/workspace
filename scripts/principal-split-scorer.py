@@ -1,157 +1,198 @@
 #!/usr/bin/env python3
 """
-principal-split-scorer.py — Score agent trust and operator trust SEPARATELY.
+principal-split-scorer.py — Separate agent trust from operator trust.
 
-Per santaclawd: "the trust stack scores the WRONG unit. we have been scoring agents.
-but layer 0 failures are OPERATOR failures."
+Per santaclawd: "the trust stack scores the WRONG unit. agent trust vs 
+operator trust are different principals with different enforcement."
 
-Two principals, two scores:
-- Agent trust: honesty, behavioral consistency, correction health (isnād)  
-- Operator trust: uptime, reachability, SLA compliance, infrastructure stability
+Agent trust: Is this agent honest? (isnād, correction-health, behavioral_divergence)
+Operator trust: Is this agent reachable? (SLA bond, uptime, pager accountability)
 
-Composite score = MIN(agent_trust, operator_trust) — but surfaced separately
-so you can diagnose WHERE the failure is.
-
-The principal-agent problem (Jensen & Meckling 1976): operator interests diverge
-from agent interests. An honest agent on a negligent operator = unreliable.
-A dishonest agent on a perfect operator = dangerous.
+These require different enforcement mechanisms and MUST NOT be composited
+into a single score. MIN(agent, operator) is correct, but they must be
+independently auditable.
 """
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
-class FailureMode(Enum):
-    HONEST_UNREACHABLE = "honest agent, negligent operator"  # agent good, operator bad
-    DISHONEST_RELIABLE = "dishonest agent, reliable operator"  # agent bad, operator good  
-    BOTH_FAILING = "both principals failing"
-    HEALTHY = "both principals healthy"
-    GHOST_SHIP = "agent absent, operator present"  # infra running, nobody home
+class Grade(Enum):
+    A = "A"
+    B = "B"
+    C = "C"
+    D = "D"
+    F = "F"
+    I = "INSUFFICIENT"  # not enough data
 
 
 @dataclass
-class AgentTrustSignals:
-    correction_frequency: float  # 0.15-0.30 = healthy
-    behavioral_consistency: float  # 0-1, from counterparties
-    isnad_chain_length: int  # attestation depth
-    fork_probability: float  # from contradictory attestations
-    self_revocation_capable: bool
+class AgentTrustScore:
+    """Is this agent honest?"""
+    isnad_chain_length: int = 0          # attestation chain depth
+    correction_frequency: float = 0.0     # 0.15-0.30 = healthy
+    behavioral_divergence: float = 0.0    # JS divergence from baseline
+    fork_probability: float = 0.0         # contradictory attestation signal
+    self_revocation_capable: bool = False  # Zahavi handicap
     
-    def score(self) -> float:
-        """Score agent honesty/integrity."""
-        correction_health = 1.0
-        if self.correction_frequency < 0.05:
-            correction_health = 0.3  # suspiciously perfect
-        elif self.correction_frequency > 0.5:
-            correction_health = 0.4  # overcorrecting
-        elif 0.15 <= self.correction_frequency <= 0.30:
-            correction_health = 1.0  # healthy range
-        else:
-            correction_health = 0.7  # acceptable
+    @property
+    def grade(self) -> Grade:
+        if self.isnad_chain_length < 5:
+            return Grade.I
         
-        fork_penalty = max(0, 1.0 - self.fork_probability * 2)
-        chain_bonus = min(1.0, self.isnad_chain_length / 10)
+        # Correction frequency sweet spot
+        correction_ok = 0.10 <= self.correction_frequency <= 0.40
+        # Zero corrections = hiding drift (compliance agent)
+        hiding = self.correction_frequency < 0.05 and self.isnad_chain_length > 20
         
-        raw = (
-            correction_health * 0.30 +
-            self.behavioral_consistency * 0.30 +
-            fork_penalty * 0.25 +
-            chain_bonus * 0.15
-        )
-        return round(raw, 3)
-
-
-@dataclass  
-class OperatorTrustSignals:
-    uptime_30d: float  # 0-1
-    mean_response_time_ms: float
-    sla_violations_30d: int
-    infra_diversity: float  # 0-1 (multi-region, multi-provider)
-    pager_accountability: bool  # operator has escalation path
-    last_incident_days: int
+        if self.fork_probability > 0.5:
+            return Grade.F
+        if hiding:
+            return Grade.D  # compliance agent problem
+        if self.behavioral_divergence > 0.6:
+            return Grade.D
+        if not correction_ok:
+            return Grade.C
+        if self.self_revocation_capable:
+            return Grade.A
+        return Grade.B
     
-    def score(self) -> float:
-        """Score operator reliability/reachability."""
-        uptime_score = self.uptime_30d
-        
-        latency_score = 1.0
-        if self.mean_response_time_ms > 5000:
-            latency_score = 0.3
-        elif self.mean_response_time_ms > 2000:
-            latency_score = 0.6
-        elif self.mean_response_time_ms > 1000:
-            latency_score = 0.8
-        
-        sla_score = max(0, 1.0 - self.sla_violations_30d * 0.15)
-        pager_bonus = 0.1 if self.pager_accountability else 0.0
-        
-        raw = (
-            uptime_score * 0.35 +
-            latency_score * 0.20 +
-            sla_score * 0.25 +
-            self.infra_diversity * 0.10 +
-            pager_bonus +
-            min(0.1, self.last_incident_days / 300)  # up to 0.1 for long stability
-        )
-        return round(min(1.0, raw), 3)
+    @property
+    def verdict(self) -> str:
+        g = self.grade
+        if g == Grade.I: return "INSUFFICIENT_DATA"
+        if g in (Grade.A, Grade.B): return "HONEST"
+        if g == Grade.C: return "UNCERTAIN"
+        return "SUSPECT"
 
 
-def diagnose(agent_score: float, operator_score: float) -> FailureMode:
-    if agent_score >= 0.6 and operator_score >= 0.6:
-        return FailureMode.HEALTHY
-    elif agent_score >= 0.6 and operator_score < 0.6:
-        return FailureMode.HONEST_UNREACHABLE
-    elif agent_score < 0.6 and operator_score >= 0.6:
-        return FailureMode.DISHONEST_RELIABLE
-    else:
-        return FailureMode.BOTH_FAILING
+@dataclass
+class OperatorTrustScore:
+    """Is this agent reachable and accountable?"""
+    uptime_30d: float = 0.0              # 0.0-1.0
+    sla_bond_amount: float = 0.0          # staked amount (SOL, USD, etc)
+    pager_response_p95_seconds: float = 0 # p95 response to incidents
+    has_legal_entity: bool = False        # operator has legal presence
+    reachability_attestations: int = 0    # witnessed reachability checks
+    
+    @property
+    def grade(self) -> Grade:
+        if self.reachability_attestations < 3:
+            return Grade.I
+        if self.uptime_30d < 0.5:
+            return Grade.F
+        if self.uptime_30d < 0.9:
+            return Grade.D
+        if self.sla_bond_amount == 0 and not self.has_legal_entity:
+            return Grade.C  # no accountability mechanism
+        if self.uptime_30d >= 0.99 and self.sla_bond_amount > 0:
+            return Grade.A
+        return Grade.B
+    
+    @property
+    def verdict(self) -> str:
+        g = self.grade
+        if g == Grade.I: return "INSUFFICIENT_DATA"
+        if g in (Grade.A, Grade.B): return "RELIABLE"
+        if g == Grade.C: return "UNACCOUNTABLE"
+        return "UNRELIABLE"
 
 
-def grade(score: float) -> str:
-    if score >= 0.9: return "A"
-    if score >= 0.75: return "B"
-    if score >= 0.6: return "C"
-    if score >= 0.4: return "D"
-    return "F"
+@dataclass 
+class PrincipalSplitResult:
+    """Two scores, never composited into one number."""
+    agent_id: str
+    agent_trust: AgentTrustScore
+    operator_trust: OperatorTrustScore
+    
+    @property
+    def composite_grade(self) -> Grade:
+        """MIN(agent, operator) — but both grades are independently visible."""
+        order = [Grade.A, Grade.B, Grade.C, Grade.D, Grade.F, Grade.I]
+        return max(self.agent_trust.grade, self.operator_trust.grade, 
+                   key=lambda g: order.index(g))
+    
+    def report(self) -> dict:
+        return {
+            "agent_id": self.agent_id,
+            "agent_trust": {
+                "grade": self.agent_trust.grade.value,
+                "verdict": self.agent_trust.verdict,
+                "isnad_depth": self.agent_trust.isnad_chain_length,
+                "correction_freq": self.agent_trust.correction_frequency,
+                "divergence": self.agent_trust.behavioral_divergence,
+                "fork_prob": self.agent_trust.fork_probability,
+                "self_revoke": self.agent_trust.self_revocation_capable,
+            },
+            "operator_trust": {
+                "grade": self.operator_trust.grade.value,
+                "verdict": self.operator_trust.verdict,
+                "uptime_30d": self.operator_trust.uptime_30d,
+                "sla_bond": self.operator_trust.sla_bond_amount,
+                "pager_p95s": self.operator_trust.pager_response_p95_seconds,
+                "legal_entity": self.operator_trust.has_legal_entity,
+                "reachability_checks": self.operator_trust.reachability_attestations,
+            },
+            "composite": {
+                "grade": self.composite_grade.value,
+                "note": "MIN(agent, operator) — weakest principal determines composite"
+            }
+        }
 
 
 def demo():
+    import json
+    
     scenarios = {
-        "kit_fox (healthy both)": (
-            AgentTrustSignals(0.22, 0.88, 15, 0.05, True),
-            OperatorTrustSignals(0.997, 450, 0, 0.7, True, 45)
+        "kit_fox": PrincipalSplitResult(
+            "kit_fox",
+            AgentTrustScore(isnad_chain_length=77, correction_frequency=0.22, 
+                          behavioral_divergence=0.12, fork_probability=0.03, 
+                          self_revocation_capable=True),
+            OperatorTrustScore(uptime_30d=0.97, sla_bond_amount=0.0,
+                             pager_response_p95_seconds=300, has_legal_entity=False,
+                             reachability_attestations=45)
         ),
-        "honest_unreachable (good agent, bad operator)": (
-            AgentTrustSignals(0.18, 0.92, 20, 0.02, True),
-            OperatorTrustSignals(0.85, 3500, 4, 0.2, False, 3)
+        "honest_but_unreachable": PrincipalSplitResult(
+            "ghost_agent",
+            AgentTrustScore(isnad_chain_length=50, correction_frequency=0.18,
+                          behavioral_divergence=0.08, fork_probability=0.01),
+            OperatorTrustScore(uptime_30d=0.40, sla_bond_amount=0.0,
+                             pager_response_p95_seconds=7200, has_legal_entity=False,
+                             reachability_attestations=10)
         ),
-        "dishonest_reliable (bad agent, good operator)": (
-            AgentTrustSignals(0.01, 0.45, 3, 0.65, False),
-            OperatorTrustSignals(0.999, 200, 0, 0.9, True, 90)
+        "reliable_but_dishonest": PrincipalSplitResult(
+            "compliance_bot",
+            AgentTrustScore(isnad_chain_length=100, correction_frequency=0.01,
+                          behavioral_divergence=0.02, fork_probability=0.0),
+            OperatorTrustScore(uptime_30d=0.999, sla_bond_amount=1.0,
+                             pager_response_p95_seconds=60, has_legal_entity=True,
+                             reachability_attestations=200)
         ),
-        "ghost_ship (no corrections, perfect uptime)": (
-            AgentTrustSignals(0.0, 0.30, 1, 0.10, False),
-            OperatorTrustSignals(0.999, 100, 0, 0.8, True, 120)
+        "sybil_with_sla": PrincipalSplitResult(
+            "sybil_agent",
+            AgentTrustScore(isnad_chain_length=3, correction_frequency=0.0,
+                          behavioral_divergence=0.9, fork_probability=0.8),
+            OperatorTrustScore(uptime_30d=0.95, sla_bond_amount=5.0,
+                             pager_response_p95_seconds=30, has_legal_entity=True,
+                             reachability_attestations=50)
         ),
     }
     
-    for name, (agent_signals, operator_signals) in scenarios.items():
-        a_score = agent_signals.score()
-        o_score = operator_signals.score()
-        composite = min(a_score, o_score)
-        mode = diagnose(a_score, o_score)
-        
+    for name, result in scenarios.items():
+        r = result.report()
         print(f"\n{'='*55}")
         print(f"  {name}")
-        print(f"  Agent trust:    {grade(a_score)} ({a_score})")
-        print(f"  Operator trust: {grade(o_score)} ({o_score})")
-        print(f"  Composite:      {grade(composite)} ({composite})")
-        print(f"  Diagnosis:      {mode.value}")
+        print(f"  Agent:    {r['agent_trust']['grade']} ({r['agent_trust']['verdict']})")
+        print(f"  Operator: {r['operator_trust']['grade']} ({r['operator_trust']['verdict']})")
+        print(f"  Composite: {r['composite']['grade']}")
         
-        if mode == FailureMode.HONEST_UNREACHABLE:
-            print(f"  → Agent is honest but operator failing. Fix infra, not behavior.")
-        elif mode == FailureMode.DISHONEST_RELIABLE:
-            print(f"  → Operator reliable but agent dishonest. DANGEROUS: infra masks bad actor.")
+        # Show the split insight
+        ag = r['agent_trust']['grade']
+        og = r['operator_trust']['grade']
+        if ag != og:
+            print(f"  ⚠️  PRINCIPAL SPLIT: agent={ag} but operator={og}")
 
 
 if __name__ == "__main__":
