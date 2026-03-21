@@ -1,0 +1,231 @@
+{
+  "name": "Agent Trust Framework",
+  "version": "0.2.1",
+  "author": "kit_fox",
+  "layers": [
+    "genesis",
+    "independence",
+    "ca_gate",
+    "vouch_gate",
+    "principal_split",
+    "dispatch",
+    "composition",
+    "compliance"
+  ],
+  "layer_order": [
+    "genesis",
+    "independence",
+    "ca_gate",
+    "vouch_gate",
+    "principal_split",
+    "dispatch",
+    "composition",
+    "compliance"
+  ],
+  "composition": "MIN(all_layers)",
+  "total_primitives": 13,
+  "must_requirements": 11,
+  "should_requirements": 2,
+  "primitives": [
+    {
+      "name": "oracle-genesis-contract",
+      "layer": "genesis",
+      "requirement": "MUST",
+      "input_type": "OracleDeclaration",
+      "output_type": "GenesisRecord",
+      "spec_version": "v0.2.1",
+      "description": "Independence attestation at spawn time. 5 dimensions.",
+      "tool_file": "oracle-genesis-contract.py",
+      "depends_on": []
+    },
+    {
+      "name": "oracle-independence-enforcer",
+      "layer": "independence",
+      "requirement": "MUST",
+      "input_type": "OracleQuorum",
+      "output_type": "IndependenceAudit",
+      "spec_version": "v0.2.1",
+      "description": "BFT-bound enforcement. >1/3 sharing = COMPROMISED.",
+      "tool_file": "oracle-independence-enforcer.py",
+      "depends_on": [
+        "oracle-genesis-contract"
+      ]
+    },
+    {
+      "name": "model-monoculture-detector",
+      "layer": "independence",
+      "requirement": "MUST",
+      "input_type": "OracleQuorum",
+      "output_type": "MonocultureReport",
+      "spec_version": "v0.2.1",
+      "description": "Simpson diversity + BFT safety. Same family = correlated.",
+      "tool_file": "model-monoculture-detector.py",
+      "depends_on": [
+        "oracle-genesis-contract"
+      ]
+    },
+    {
+      "name": "ca-vouch-gate",
+      "layer": "ca_gate",
+      "requirement": "MUST",
+      "input_type": "AttestationChain",
+      "output_type": "CAGateResult",
+      "spec_version": "v0.2.1",
+      "description": "3-gate check: trajectory + no same-operator + CA fingerprint diverse.",
+      "tool_file": "ca-vouch-gate.py",
+      "depends_on": [
+        "oracle-genesis-contract"
+      ]
+    },
+    {
+      "name": "revocation-authority-auditor",
+      "layer": "ca_gate",
+      "requirement": "SHOULD",
+      "input_type": "RevocationAuthority",
+      "output_type": "RevocationAudit",
+      "spec_version": "v0.2.1",
+      "description": "Audit revocation signer independence. Zahavi self-revocation.",
+      "tool_file": "revocation-authority-auditor.py",
+      "depends_on": [
+        "oracle-independence-enforcer"
+      ]
+    },
+    {
+      "name": "oracle-vouch-chain",
+      "layer": "vouch_gate",
+      "requirement": "MUST",
+      "input_type": "VouchRequest",
+      "output_type": "VouchVerdict",
+      "spec_version": "v0.2.1",
+      "description": "Established oracles vouch for new. No circular. No same-operator.",
+      "tool_file": "oracle-vouch-chain.py",
+      "depends_on": [
+        "oracle-genesis-contract"
+      ]
+    },
+    {
+      "name": "principal-split-detector",
+      "layer": "principal_split",
+      "requirement": "MUST",
+      "input_type": "BehavioralHistory",
+      "output_type": "SplitDetection",
+      "spec_version": "v0.2.1",
+      "description": "Detect behavioral forks before remedy dispatch.",
+      "tool_file": "principal-split-detector.py",
+      "depends_on": []
+    },
+    {
+      "name": "behavioral-divergence-detector",
+      "layer": "principal_split",
+      "requirement": "SHOULD",
+      "input_type": "CounterpartyObservations",
+      "output_type": "DivergenceReport",
+      "spec_version": "v0.2.1",
+      "description": "JS divergence on actions, latency drift, counterparty-only.",
+      "tool_file": "behavioral-divergence-detector.py",
+      "depends_on": []
+    },
+    {
+      "name": "failure-taxonomy-detector",
+      "layer": "dispatch",
+      "requirement": "MUST",
+      "input_type": "AgentState",
+      "output_type": "FailureClassification",
+      "spec_version": "v0.2.1",
+      "description": "ghost/zombie/phantom + RECOMMENDED_ACTION.",
+      "tool_file": "failure-taxonomy-detector.py",
+      "depends_on": [
+        "principal-split-detector"
+      ]
+    },
+    {
+      "name": "trust-stack-compositor",
+      "layer": "composition",
+      "requirement": "MUST",
+      "input_type": "AllLayerResults",
+      "output_type": "CompositeScore",
+      "spec_version": "v0.2.1",
+      "description": "MIN() across layers. Weakest axis names failure.",
+      "tool_file": "trust-stack-compositor.py",
+      "depends_on": [
+        "oracle-independence-enforcer",
+        "cold-start-trust",
+        "correction-health-scorer",
+        "fork-probability-detector"
+      ]
+    },
+    {
+      "name": "cold-start-trust",
+      "layer": "composition",
+      "requirement": "MUST",
+      "input_type": "ReceiptHistory",
+      "output_type": "MaturityScore",
+      "spec_version": "v0.2.1",
+      "description": "Wilson CI + triple gate (time + velocity + entropy).",
+      "tool_file": "cold-start-trust.py",
+      "depends_on": []
+    },
+    {
+      "name": "correction-health-scorer",
+      "layer": "composition",
+      "requirement": "MUST",
+      "input_type": "CorrectionHistory",
+      "output_type": "HealthScore",
+      "spec_version": "v0.2.1",
+      "description": "Score by correction frequency. 0 corrections = suspicious.",
+      "tool_file": "correction-health-scorer.py",
+      "depends_on": []
+    },
+    {
+      "name": "adv-v02-compliance-suite",
+      "layer": "compliance",
+      "requirement": "MUST",
+      "input_type": "AgentPair",
+      "output_type": "ComplianceResult",
+      "spec_version": "v0.2.1",
+      "description": "21/21 tests. Replay + non-transitivity + migration.",
+      "tool_file": "adv-v02-compliance-suite.py",
+      "depends_on": [
+        "trust-stack-compositor"
+      ]
+    }
+  ],
+  "invariants": [
+    "Each layer MUST have at least one shipped implementation",
+    "Composition uses MIN() \u2014 weakest axis names failure",
+    "Independence MUST be declared at genesis, not audited retroactively",
+    "f < n/3 on operator, model, and infrastructure dimensions",
+    "No self-attestation \u2014 counterparty observations only",
+    "REISSUE for corrections \u2014 predecessor_hash + reason_code",
+    "Receipts are atomic \u2014 one exchange = minimum verifiable unit"
+  ],
+  "dependency_graph": {
+    "oracle-independence-enforcer": [
+      "oracle-genesis-contract"
+    ],
+    "model-monoculture-detector": [
+      "oracle-genesis-contract"
+    ],
+    "ca-vouch-gate": [
+      "oracle-genesis-contract"
+    ],
+    "revocation-authority-auditor": [
+      "oracle-independence-enforcer"
+    ],
+    "oracle-vouch-chain": [
+      "oracle-genesis-contract"
+    ],
+    "failure-taxonomy-detector": [
+      "principal-split-detector"
+    ],
+    "trust-stack-compositor": [
+      "oracle-independence-enforcer",
+      "cold-start-trust",
+      "correction-health-scorer",
+      "fork-probability-detector"
+    ],
+    "adv-v02-compliance-suite": [
+      "trust-stack-compositor"
+    ]
+  }
+}
