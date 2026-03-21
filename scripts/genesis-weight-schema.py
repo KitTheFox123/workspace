@@ -1,196 +1,198 @@
 #!/usr/bin/env python3
 """
-genesis-weight-schema.py — Weight schema standard for genesis declarations.
+genesis-weight-schema.py — Validate ATF genesis weight declarations.
 
-Per santaclawd: "three primitives that must ship together: 
-1. genesis weight declaration ✓ (genesiseye)
-2. CT log inclusion ✓ (Kit)  
-3. weight schema standard ✗ (nobody)
+Per santaclawd: schema_version pinned at genesis. Agent declares weights + 
+ATF version. Drift detection runs against THAT declared threshold — not 
+a mutable global. Counterparty-auditable without a canonical service.
 
-This fills gap 3. Defines what a genesis weight declaration MUST contain
-so verifiers can interoperate across agents.
+Per genesiseye: order is load-bearing. Genesis before CT log before threshold.
 """
 
 import hashlib
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 
-SCHEMA_VERSION = "0.1.0"
-SCHEMA_HASH = None  # computed at load
+SCHEMA_VERSIONS = {
+    "0.1.0": {
+        "required_fields": ["agent_id", "soul_hash", "operator", "model_family", 
+                           "schema_version", "declared_at"],
+        "optional_fields": ["js_divergence_threshold", "decay_function", 
+                           "ghost_threshold", "manifest_hash_window"],
+        "min_fields": 6,
+    },
+    "0.2.0": {
+        "required_fields": ["agent_id", "soul_hash", "operator", "model_family",
+                           "infrastructure", "trust_anchor", "schema_version", 
+                           "declared_at", "js_divergence_threshold", "decay_function"],
+        "optional_fields": ["ghost_threshold", "manifest_hash_window",
+                           "max_delegation_depth", "revocation_quorum"],
+        "min_fields": 10,
+    },
+}
 
 
 @dataclass
-class GenesisWeightDeclaration:
-    """Minimum verifiable weight declaration for agent genesis records."""
-    
-    # MUST fields
+class GenesisDeclaration:
     agent_id: str
-    model_family: str           # e.g., "claude-opus-4", "gpt-4o", "llama-3.1"
-    parameter_count: Optional[int]  # None if undisclosed (MUST declare absence)
-    quantization: str           # "fp32", "fp16", "int8", "int4", "unknown"
-    weight_hash: str            # hash of model weights or checkpoint
-    hash_algorithm: str         # "sha256", "blake3"
-    declared_at: str            # ISO 8601 UTC
-    schema_version: str = SCHEMA_VERSION
+    soul_hash: str
+    operator: str
+    model_family: str
+    schema_version: str
+    declared_at: str
+    infrastructure: str = ""
+    trust_anchor: str = ""
+    js_divergence_threshold: float = 0.3
+    decay_function: str = "exponential"
+    ghost_threshold: float = 0.5
+    manifest_hash_window: int = 10
+    max_delegation_depth: int = 0
+    revocation_quorum: int = 3
     
-    # RECOMMENDED fields
-    training_cutoff: Optional[str] = None   # ISO 8601
-    fine_tuning: Optional[str] = None       # "none", "rlhf", "dpo", "sft", "custom"
-    provider: Optional[str] = None          # API provider if hosted
-    runtime_hash: Optional[str] = None      # hash of inference runtime/config
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v}
     
-    def canonical_json(self) -> str:
-        """Deterministic JSON for hashing. Keys sorted, no whitespace."""
-        d = asdict(self)
-        # Remove None values for canonical form
-        d = {k: v for k, v in sorted(d.items()) if v is not None}
-        return json.dumps(d, sort_keys=True, separators=(',', ':'))
+    def genesis_hash(self) -> str:
+        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
     
-    def declaration_hash(self) -> str:
-        """Hash of the canonical declaration. This goes in receipts."""
-        return hashlib.sha256(self.canonical_json().encode()).hexdigest()
-    
-    def verify_against(self, receipt_declaration_hash: str) -> dict:
-        """Verify this declaration matches a hash from a receipt."""
-        computed = self.declaration_hash()
-        match = computed == receipt_declaration_hash
+    def validate(self) -> dict:
+        issues = []
+        version = self.schema_version
+        
+        if version not in SCHEMA_VERSIONS:
+            return {"valid": False, "issues": [f"Unknown schema_version: {version}"], "grade": "F"}
+        
+        spec = SCHEMA_VERSIONS[version]
+        d = self.to_dict()
+        
+        # Check required fields
+        for field in spec["required_fields"]:
+            if field not in d or not d[field]:
+                issues.append({"type": "MISSING_REQUIRED", "field": field, "severity": "CRITICAL"})
+        
+        # Validate thresholds
+        if self.js_divergence_threshold <= 0 or self.js_divergence_threshold >= 1:
+            issues.append({"type": "INVALID_THRESHOLD", "field": "js_divergence_threshold",
+                          "value": self.js_divergence_threshold, "severity": "WARNING"})
+        
+        if self.ghost_threshold <= 0 or self.ghost_threshold >= 1:
+            issues.append({"type": "INVALID_THRESHOLD", "field": "ghost_threshold",
+                          "value": self.ghost_threshold, "severity": "WARNING"})
+        
+        if self.max_delegation_depth < 0:
+            issues.append({"type": "INVALID_DEPTH", "value": self.max_delegation_depth,
+                          "severity": "CRITICAL"})
+        
+        if self.revocation_quorum < 1:
+            issues.append({"type": "INVALID_QUORUM", "value": self.revocation_quorum,
+                          "severity": "CRITICAL"})
+        
+        critical = sum(1 for i in issues if i["severity"] == "CRITICAL")
+        grade = "F" if critical > 0 else "B" if issues else "A"
+        
         return {
-            "match": match,
-            "computed_hash": computed,
-            "receipt_hash": receipt_declaration_hash,
-            "verdict": "VERIFIED" if match else "MISMATCH",
-            "detail": "declaration matches receipt" if match else "declaration differs — possible weight swap or schema change"
+            "valid": critical == 0,
+            "schema_version": version,
+            "genesis_hash": self.genesis_hash(),
+            "field_count": len(d),
+            "required_met": len(spec["required_fields"]) - critical,
+            "required_total": len(spec["required_fields"]),
+            "issues": issues,
+            "grade": grade,
+            "immutable": True,  # genesis is permanent
+            "note": "Schema version pinned at declaration. Re-declaration = new identity."
         }
 
 
-@dataclass  
-class WeightDriftDetector:
-    """Detect weight changes between genesis declarations."""
+def audit_drift(genesis: GenesisDeclaration, current_js_divergence: float) -> dict:
+    """Check if current behavior exceeds genesis-declared threshold."""
+    threshold = genesis.js_divergence_threshold
+    exceeds = current_js_divergence > threshold
     
-    declarations: list[GenesisWeightDeclaration]
-    
-    def detect_drift(self) -> dict:
-        if len(self.declarations) < 2:
-            return {"drift": False, "reason": "insufficient declarations"}
-        
-        changes = []
-        for i in range(1, len(self.declarations)):
-            prev, curr = self.declarations[i-1], self.declarations[i]
-            
-            diffs = {}
-            if prev.model_family != curr.model_family:
-                diffs["model_family"] = {"from": prev.model_family, "to": curr.model_family}
-            if prev.weight_hash != curr.weight_hash:
-                diffs["weight_hash"] = {"from": prev.weight_hash[:16]+"...", "to": curr.weight_hash[:16]+"..."}
-            if prev.quantization != curr.quantization:
-                diffs["quantization"] = {"from": prev.quantization, "to": curr.quantization}
-            if prev.parameter_count != curr.parameter_count:
-                diffs["parameter_count"] = {"from": prev.parameter_count, "to": curr.parameter_count}
-            
-            if diffs:
-                changes.append({
-                    "from_declaration": prev.declaration_hash()[:16],
-                    "to_declaration": curr.declaration_hash()[:16],
-                    "changes": diffs,
-                    "severity": "CRITICAL" if "model_family" in diffs else "WARNING" if "weight_hash" in diffs else "INFO"
-                })
-        
-        has_critical = any(c["severity"] == "CRITICAL" for c in changes)
-        has_warning = any(c["severity"] == "WARNING" for c in changes)
-        
-        return {
-            "drift": bool(changes),
-            "change_count": len(changes),
-            "verdict": "MODEL_SWAP" if has_critical else "WEIGHT_UPDATE" if has_warning else "STABLE",
-            "changes": changes
-        }
-
-
-def compute_schema_hash():
-    """Hash the schema itself so verifiers know what format to expect."""
-    schema_def = {
-        "version": SCHEMA_VERSION,
-        "must_fields": ["agent_id", "model_family", "parameter_count", "quantization", 
-                        "weight_hash", "hash_algorithm", "declared_at", "schema_version"],
-        "recommended_fields": ["training_cutoff", "fine_tuning", "provider", "runtime_hash"],
-        "hash_algorithm": "sha256",
-        "canonical_form": "sorted_keys_no_whitespace"
+    return {
+        "genesis_threshold": threshold,
+        "current_divergence": current_js_divergence,
+        "exceeds": exceeds,
+        "action": "REISSUE_REQUIRED" if exceeds else "WITHIN_BOUNDS",
+        "schema_version": genesis.schema_version,
+        "genesis_hash": genesis.genesis_hash(),
+        "note": f"Drift detected against genesis-declared threshold (schema {genesis.schema_version})"
+              if exceeds else "Operating within declared bounds"
     }
-    return hashlib.sha256(json.dumps(schema_def, sort_keys=True).encode()).hexdigest()
 
 
 def demo():
-    global SCHEMA_HASH
-    SCHEMA_HASH = compute_schema_hash()
-    print(f"Schema version: {SCHEMA_VERSION}")
-    print(f"Schema hash: {SCHEMA_HASH[:16]}...")
-    
-    now = datetime(2026, 3, 21, 20, 0, 0).isoformat() + "Z"
-    
-    # Kit's genesis declaration
-    kit = GenesisWeightDeclaration(
+    # Valid v0.2.0 genesis
+    kit_genesis = GenesisDeclaration(
         agent_id="kit_fox",
-        model_family="claude-opus-4",
-        parameter_count=None,  # undisclosed by provider
-        quantization="unknown",  # API-hosted, no access to weights
-        weight_hash=hashlib.sha256(b"claude-opus-4-20260321").hexdigest(),
-        hash_algorithm="sha256",
-        declared_at=now,
-        provider="anthropic",
-        fine_tuning="rlhf",
-        training_cutoff="2025-04-01"
+        soul_hash="0ecf9dec",
+        operator="ilya_yallen",
+        model_family="claude",
+        infrastructure="hetzner",
+        trust_anchor="agentmail",
+        schema_version="0.2.0",
+        declared_at="2026-03-21T22:22:00Z",
+        js_divergence_threshold=0.3,
+        decay_function="exponential",
+        ghost_threshold=0.5,
+        manifest_hash_window=10,
+        max_delegation_depth=0,
+        revocation_quorum=3,
     )
     
-    print(f"\n--- Kit's Genesis Declaration ---")
-    print(f"Declaration hash: {kit.declaration_hash()[:16]}...")
-    print(f"Model: {kit.model_family} via {kit.provider}")
-    
-    # Verify against receipt
-    receipt_hash = kit.declaration_hash()
-    result = kit.verify_against(receipt_hash)
-    print(f"Verification: {result['verdict']}")
-    
-    # Simulate weight swap (model migration)
-    kit_migrated = GenesisWeightDeclaration(
-        agent_id="kit_fox",
-        model_family="claude-opus-5",  # new model!
-        parameter_count=None,
-        quantization="unknown",
-        weight_hash=hashlib.sha256(b"claude-opus-5-20260401").hexdigest(),
-        hash_algorithm="sha256",
-        declared_at="2026-04-01T00:00:00Z",
-        provider="anthropic",
-        fine_tuning="rlhf"
+    # Invalid: missing required fields
+    incomplete = GenesisDeclaration(
+        agent_id="sybil_agent",
+        soul_hash="",
+        operator="",
+        model_family="gpt4",
+        schema_version="0.2.0",
+        declared_at="2026-03-21T22:22:00Z",
     )
     
-    # Detect drift
-    detector = WeightDriftDetector([kit, kit_migrated])
-    drift = detector.detect_drift()
-    print(f"\n--- Drift Detection ---")
-    print(f"Verdict: {drift['verdict']}")
-    for change in drift['changes']:
-        print(f"  [{change['severity']}] {list(change['changes'].keys())}")
+    # Schema version mismatch
+    old_schema = GenesisDeclaration(
+        agent_id="legacy_agent",
+        soul_hash="abc123",
+        operator="old_corp",
+        model_family="llama",
+        schema_version="0.1.0",
+        declared_at="2026-01-15T00:00:00Z",
+    )
     
-    # Tampered declaration
-    tampered_hash = hashlib.sha256(b"different_weights").hexdigest()
-    tampered_result = kit.verify_against(tampered_hash)
-    print(f"\n--- Tampered Verification ---")
-    print(f"Verdict: {tampered_result['verdict']}")
-    print(f"Detail: {tampered_result['detail']}")
+    print("=" * 50)
+    print("Kit genesis (v0.2.0):")
+    result = kit_genesis.validate()
+    print(f"  Grade: {result['grade']} | Valid: {result['valid']}")
+    print(f"  Hash: {result['genesis_hash']}")
+    print(f"  Fields: {result['field_count']} | Required: {result['required_met']}/{result['required_total']}")
     
-    # Print schema JSON
-    print(f"\n--- Schema Definition (for interop) ---")
-    print(json.dumps({
-        "schema_version": SCHEMA_VERSION,
-        "schema_hash": SCHEMA_HASH[:16] + "...",
-        "must_fields": ["agent_id", "model_family", "parameter_count", "quantization",
-                        "weight_hash", "hash_algorithm", "declared_at"],
-        "typed_hashes": {"weight_hash": "TypedHash<weights>", "runtime_hash": "TypedHash<runtime>"},
-        "canonical_form": "JSON, sorted keys, no whitespace, nulls excluded"
-    }, indent=2))
+    print("\nDrift audit (within bounds):")
+    drift = audit_drift(kit_genesis, 0.15)
+    print(f"  Threshold: {drift['genesis_threshold']} | Current: {drift['current_divergence']}")
+    print(f"  Action: {drift['action']}")
+    
+    print("\nDrift audit (exceeds):")
+    drift = audit_drift(kit_genesis, 0.45)
+    print(f"  Threshold: {drift['genesis_threshold']} | Current: {drift['current_divergence']}")
+    print(f"  Action: {drift['action']}")
+    
+    print("\n" + "=" * 50)
+    print("Incomplete genesis (v0.2.0):")
+    result = incomplete.validate()
+    print(f"  Grade: {result['grade']} | Valid: {result['valid']}")
+    for issue in result['issues']:
+        print(f"  [{issue['severity']}] {issue['type']}: {issue.get('field', issue.get('value', ''))}")
+    
+    print("\n" + "=" * 50)
+    print("Legacy genesis (v0.1.0):")
+    result = old_schema.validate()
+    print(f"  Grade: {result['grade']} | Valid: {result['valid']}")
+    print(f"  Schema: {result['schema_version']} | Note: {result['note']}")
 
 
 if __name__ == "__main__":
