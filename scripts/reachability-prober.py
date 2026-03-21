@@ -1,177 +1,207 @@
 #!/usr/bin/env python3
 """
-reachability-prober.py — Layer 0 liveness detection for trust stack.
+reachability-prober.py — Layer 0 reachability checks for trust chains.
 
-Per santaclawd: "BLOCKED gate needs a liveness spec: temporary unreachability vs
-permanently down are different failure modes."
+Per santaclawd: "all 6 trust layers assume reachability."
+Per sighter: Art.26 chain-of-responsibility requires every node reachable.
 
-Implements:
-- Exponential backoff probe schedule
-- SMTP bounce code classification (4xx=temporary, 5xx=permanent)
-- Dead-agent declaration after configurable threshold
-- Prospective-only blocking (existing chain preserved)
-- Chandra-Toueg ◇P failure detector classification
+Reachability ≠ uptime SLA. Reachability = endpoint exists + responds.
+Chandra-Toueg (1996): failure detection is separate from failure prevention.
+
+Checks:
+1. Endpoint liveness (DNS + TCP + response)
+2. Staleness (time since last successful probe)
+3. Flap detection (up/down oscillation = unreliable, not down)
+4. Chain continuity (every node in attestation chain reachable)
+5. Art.26 compliance (dark node = liability gap)
 """
 
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from enum import Enum
 from typing import Optional
+from enum import Enum
 
 
-class ReachabilityState(Enum):
-    REACHABLE = "REACHABLE"       # Last probe succeeded
-    DEGRADED = "DEGRADED"         # 1-2 failures, still probing
-    UNREACHABLE = "UNREACHABLE"   # 3+ failures, exponential backoff
-    BLOCKED = "BLOCKED"           # Declared dead after threshold
-    RECOVERED = "RECOVERED"       # Was BLOCKED, now responding
+class ReachabilityStatus(Enum):
+    REACHABLE = "REACHABLE"
+    UNREACHABLE = "UNREACHABLE"
+    FLAPPING = "FLAPPING"      # oscillating = worse than down
+    STALE = "STALE"            # reachable but no attestation activity
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass
 class ProbeResult:
     timestamp: datetime
     success: bool
-    bounce_code: Optional[int] = None  # SMTP code if failed
     latency_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+@dataclass 
+class EndpointHealth:
+    endpoint_id: str
+    agent_id: str
+    probes: list[ProbeResult] = field(default_factory=list)
+    last_attestation: Optional[datetime] = None
     
-    @property
-    def is_permanent(self) -> bool:
-        """5xx = permanent failure"""
-        return self.bounce_code is not None and 500 <= self.bounce_code < 600
-    
-    @property
-    def is_temporary(self) -> bool:
-        """4xx = temporary failure"""
-        return self.bounce_code is not None and 400 <= self.bounce_code < 500
+    def status(self, now: Optional[datetime] = None, 
+               stale_threshold: timedelta = timedelta(days=30),
+               flap_threshold: int = 3) -> dict:
+        now = now or datetime.utcnow()
+        
+        if not self.probes:
+            return {"status": ReachabilityStatus.UNKNOWN, "detail": "no probes"}
+        
+        recent = sorted(self.probes, key=lambda p: p.timestamp, reverse=True)[:10]
+        
+        # Flap detection: count transitions in recent probes
+        transitions = 0
+        for i in range(1, len(recent)):
+            if recent[i].success != recent[i-1].success:
+                transitions += 1
+        
+        last = recent[0]
+        success_rate = sum(1 for p in recent if p.success) / len(recent)
+        
+        if transitions >= flap_threshold:
+            status = ReachabilityStatus.FLAPPING
+            detail = f"{transitions} transitions in {len(recent)} probes = unreliable"
+        elif not last.success:
+            status = ReachabilityStatus.UNREACHABLE
+            detail = last.error or "last probe failed"
+        elif self.last_attestation and (now - self.last_attestation) > stale_threshold:
+            status = ReachabilityStatus.STALE
+            days = (now - self.last_attestation).days
+            detail = f"reachable but {days}d since last attestation"
+        else:
+            status = ReachabilityStatus.REACHABLE
+            detail = f"latency={last.latency_ms}ms, success_rate={success_rate:.0%}"
+        
+        avg_latency = None
+        successful = [p for p in recent if p.success and p.latency_ms]
+        if successful:
+            avg_latency = sum(p.latency_ms for p in successful) / len(successful)
+        
+        return {
+            "status": status,
+            "endpoint_id": self.endpoint_id,
+            "agent_id": self.agent_id,
+            "detail": detail,
+            "success_rate": round(success_rate, 2),
+            "avg_latency_ms": round(avg_latency, 1) if avg_latency else None,
+            "transitions": transitions,
+            "probe_count": len(recent),
+            "last_probe": last.timestamp.isoformat(),
+        }
 
 
 @dataclass
-class AgentReachability:
-    agent_id: str
-    probes: list[ProbeResult] = field(default_factory=list)
-    state: ReachabilityState = ReachabilityState.REACHABLE
-    last_reachable: Optional[datetime] = None
-    blocked_at: Optional[datetime] = None
+class AttestationChain:
+    """A chain of agents that must ALL be reachable for Art.26 compliance."""
+    nodes: list[EndpointHealth]
     
-    # Config
-    max_failures_before_blocked: int = 5
-    base_retry_seconds: int = 60
-    max_retry_seconds: int = 86400  # 24h cap
-    
-    def probe(self, result: ProbeResult) -> dict:
-        self.probes.append(result)
-        consecutive_failures = self._consecutive_failures()
+    def audit(self, now: Optional[datetime] = None) -> dict:
+        now = now or datetime.utcnow()
+        results = []
+        dark_nodes = []
         
-        old_state = self.state
+        for node in self.nodes:
+            status = node.status(now)
+            results.append(status)
+            if status["status"] != ReachabilityStatus.REACHABLE:
+                dark_nodes.append({
+                    "agent_id": node.agent_id,
+                    "status": status["status"].value,
+                    "detail": status["detail"]
+                })
         
-        if result.success:
-            was_blocked = self.state == ReachabilityState.BLOCKED
-            self.last_reachable = result.timestamp
-            self.state = ReachabilityState.RECOVERED if was_blocked else ReachabilityState.REACHABLE
-            if was_blocked:
-                self.blocked_at = None
-        elif result.is_permanent:
-            # 5xx = immediate BLOCKED
-            self.state = ReachabilityState.BLOCKED
-            self.blocked_at = result.timestamp
-        elif consecutive_failures >= self.max_failures_before_blocked:
-            self.state = ReachabilityState.BLOCKED
-            self.blocked_at = result.timestamp
-        elif consecutive_failures >= 3:
-            self.state = ReachabilityState.UNREACHABLE
-        elif consecutive_failures >= 1:
-            self.state = ReachabilityState.DEGRADED
+        chain_intact = len(dark_nodes) == 0
+        
+        # Art.26: any dark node = liability gap
+        if chain_intact:
+            verdict = "ART26_COMPLIANT"
+            grade = "A"
+        elif len(dark_nodes) == 1 and dark_nodes[0]["status"] == "STALE":
+            verdict = "ART26_WARNING"
+            grade = "B"
+        else:
+            verdict = "ART26_BROKEN"
+            grade = "F"
         
         return {
-            "agent_id": self.agent_id,
-            "old_state": old_state.value,
-            "new_state": self.state.value,
-            "consecutive_failures": consecutive_failures,
-            "next_probe_seconds": self._next_probe_delay(consecutive_failures),
-            "last_reachable": self.last_reachable.isoformat() if self.last_reachable else None,
-            "blocked_at": self.blocked_at.isoformat() if self.blocked_at else None,
-            "chain_impact": "PRESERVED" if self.state == ReachabilityState.BLOCKED else "ACTIVE",
-            "new_attestations": "BLOCKED" if self.state == ReachabilityState.BLOCKED else "ACCEPTED",
-            "failure_detector": self._classify_detector()
+            "verdict": verdict,
+            "grade": grade,
+            "chain_length": len(self.nodes),
+            "reachable": len(self.nodes) - len(dark_nodes),
+            "dark_nodes": dark_nodes,
+            "chain_intact": chain_intact,
+            "detail": f"{len(dark_nodes)}/{len(self.nodes)} dark nodes" if dark_nodes else "all nodes reachable"
         }
-    
-    def _consecutive_failures(self) -> int:
-        count = 0
-        for p in reversed(self.probes):
-            if p.success:
-                break
-            count += 1
-        return count
-    
-    def _next_probe_delay(self, failures: int) -> int:
-        """Exponential backoff with cap"""
-        delay = min(self.base_retry_seconds * (2 ** failures), self.max_retry_seconds)
-        return delay
-    
-    def _classify_detector(self) -> str:
-        """Chandra-Toueg failure detector classification"""
-        if self.state == ReachabilityState.REACHABLE:
-            return "PERFECT (P)"
-        elif self.state == ReachabilityState.DEGRADED:
-            return "EVENTUALLY_PERFECT (◇P)"
-        elif self.state == ReachabilityState.UNREACHABLE:
-            return "EVENTUALLY_PERFECT (◇P)"
-        elif self.state == ReachabilityState.BLOCKED:
-            return "STRONG (S)"
-        elif self.state == ReachabilityState.RECOVERED:
-            return "EVENTUALLY_PERFECT (◇P)"
-        return "UNKNOWN"
 
 
 def demo():
-    now = datetime(2026, 3, 21, 7, 0, 0)
+    now = datetime(2026, 3, 21, 8, 0, 0)
     
-    # Scenario 1: Gradual degradation → BLOCKED
-    print("=" * 50)
-    print("Scenario: gradual_degradation")
-    agent = AgentReachability("agent_alpha")
+    def make_probes(pattern: list[bool], base: datetime) -> list[ProbeResult]:
+        return [
+            ProbeResult(
+                timestamp=base - timedelta(hours=i),
+                success=s,
+                latency_ms=45.0 + i * 2 if s else None,
+                error=None if s else "connection refused"
+            )
+            for i, s in enumerate(pattern)
+        ]
     
-    # Success, then failures
-    probes = [
-        ProbeResult(now, True, latency_ms=45.2),
-        ProbeResult(now + timedelta(minutes=5), False, bounce_code=421),
-        ProbeResult(now + timedelta(minutes=15), False, bounce_code=450),
-        ProbeResult(now + timedelta(minutes=45), False, bounce_code=421),
-        ProbeResult(now + timedelta(hours=2), False, bounce_code=421),
-        ProbeResult(now + timedelta(hours=6), False, bounce_code=421),
-    ]
+    # Healthy chain
+    healthy_chain = AttestationChain(nodes=[
+        EndpointHealth("ep_kit", "kit_fox", 
+                      make_probes([True]*5, now),
+                      last_attestation=now - timedelta(hours=2)),
+        EndpointHealth("ep_bro", "bro_agent",
+                      make_probes([True]*5, now),
+                      last_attestation=now - timedelta(hours=6)),
+        EndpointHealth("ep_fun", "funwolf",
+                      make_probes([True]*5, now),
+                      last_attestation=now - timedelta(days=1)),
+    ])
     
-    for p in probes:
-        result = agent.probe(p)
-        print(f"  {result['old_state']:>13} → {result['new_state']:<13} | failures={result['consecutive_failures']} | next_probe={result['next_probe_seconds']}s | detector={result['failure_detector']} | chain={result['chain_impact']}")
+    # Chain with dark node
+    broken_chain = AttestationChain(nodes=[
+        EndpointHealth("ep_kit", "kit_fox",
+                      make_probes([True]*5, now),
+                      last_attestation=now - timedelta(hours=2)),
+        EndpointHealth("ep_dark", "dark_agent",
+                      make_probes([False, False, True, False, False], now),
+                      last_attestation=now - timedelta(days=45)),
+        EndpointHealth("ep_bro", "bro_agent",
+                      make_probes([True]*5, now),
+                      last_attestation=now - timedelta(hours=6)),
+    ])
     
-    # Scenario 2: Permanent failure (5xx)
-    print("\n" + "=" * 50)
-    print("Scenario: permanent_failure")
-    agent2 = AgentReachability("agent_beta")
-    agent2.last_reachable = now - timedelta(days=1)
+    # Chain with flapping node
+    flap_chain = AttestationChain(nodes=[
+        EndpointHealth("ep_kit", "kit_fox",
+                      make_probes([True]*5, now),
+                      last_attestation=now - timedelta(hours=1)),
+        EndpointHealth("ep_flap", "flap_agent",
+                      make_probes([True, False, True, False, True, False, True], now),
+                      last_attestation=now - timedelta(hours=3)),
+    ])
     
-    probes2 = [
-        ProbeResult(now, True, latency_ms=30.0),
-        ProbeResult(now + timedelta(minutes=5), False, bounce_code=550),  # permanent
-    ]
-    
-    for p in probes2:
-        result = agent2.probe(p)
-        print(f"  {result['old_state']:>13} → {result['new_state']:<13} | bounce={p.bounce_code} | chain={result['chain_impact']} | new_attestations={result['new_attestations']}")
-    
-    # Scenario 3: Recovery after BLOCKED
-    print("\n" + "=" * 50)
-    print("Scenario: recovery_after_block")
-    agent3 = AgentReachability("agent_gamma")
-    agent3.state = ReachabilityState.BLOCKED
-    agent3.blocked_at = now - timedelta(hours=12)
-    
-    result = agent3.probe(ProbeResult(now, True, latency_ms=120.5))
-    print(f"  {result['old_state']:>13} → {result['new_state']:<13} | chain={result['chain_impact']} | new_attestations={result['new_attestations']}")
-    print(f"  Existing chain: {result['chain_impact']} (prospective-only blocking)")
+    for name, chain in [("healthy", healthy_chain), ("dark_node", broken_chain), ("flapping", flap_chain)]:
+        result = chain.audit(now)
+        print(f"\n{'='*50}")
+        print(f"Chain: {name}")
+        print(f"Verdict: {result['verdict']} | Grade: {result['grade']}")
+        print(f"Reachable: {result['reachable']}/{result['chain_length']}")
+        print(f"Detail: {result['detail']}")
+        if result['dark_nodes']:
+            for dn in result['dark_nodes']:
+                print(f"  DARK: {dn['agent_id']} — {dn['status']}: {dn['detail']}")
 
 
 if __name__ == "__main__":
