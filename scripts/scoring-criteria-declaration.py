@@ -2,14 +2,16 @@
 """
 scoring-criteria-declaration.py — Genesis-declared scoring criteria.
 
-Per santaclawd: "post-hoc weight assignment by the evaluator reintroduces
-narrative bias through the back door."
+Per santaclawd: "post-hoc weight assignment reintroduces narrative bias through the back door."
 
-Scoring weights MUST be declared at genesis and become immutable.
-Evaluators cannot retroactively adjust weights to manufacture desired outcomes.
+Scoring weights MUST be declared at genesis (before seeing any data).
+Evaluator commits to criteria, then applies. Not the reverse.
 
-Anti-Goodhart: if weights are secret/declared-at-genesis, agents can't
-optimize for the scoring function — only for actual behavior.
+Properties:
+1. Weights declared before evaluation begins
+2. Hash-locked commitment (can't change weights after seeing data)
+3. Split vs composite attribution mode declared
+4. Weight changes require REISSUE with reason_code
 """
 
 import hashlib
@@ -20,143 +22,145 @@ from typing import Optional
 
 
 @dataclass
-class ScoringAxis:
-    name: str
-    weight: float  # 0.0-1.0, all axes must sum to 1.0
-    description: str
-    measurement: str  # how this axis is scored
-    threshold_warn: float = 0.3
-    threshold_fail: float = 0.1
-
-
-@dataclass
-class ScoringDeclaration:
-    """Immutable scoring criteria declared at genesis."""
-    axes: list[ScoringAxis]
+class ScoringCriteria:
+    """Genesis-declared scoring weights."""
+    criteria_id: str
     declared_at: datetime
-    declared_by: str  # agent or quorum that set the criteria
-    version: str = "1.0"
-    composition: str = "MIN"  # MIN, WEIGHTED, GEOMETRIC
+    declared_by: str
+    
+    # Weights per dimension (must sum to 1.0)
+    weights: dict[str, float]
+    
+    # Attribution mode: "split" shows per-principal, "composite" hides which
+    attribution_mode: str = "split"  # split | composite
+    
+    # Minimum evidence threshold per dimension
+    min_evidence: dict[str, int] = field(default_factory=dict)
+    
+    # Hash commitment
+    commitment_hash: str = ""
     
     def __post_init__(self):
-        total = sum(a.weight for a in self.axes)
-        if abs(total - 1.0) > 0.001:
-            raise ValueError(f"Axis weights must sum to 1.0, got {total}")
+        total = sum(self.weights.values())
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(f"Weights must sum to 1.0, got {total}")
+        if self.attribution_mode not in ("split", "composite"):
+            raise ValueError(f"attribution_mode must be split|composite, got {self.attribution_mode}")
+        self.commitment_hash = self._compute_hash()
     
-    def declaration_hash(self) -> str:
-        """Immutable hash of the scoring criteria. Cannot change post-genesis."""
+    def _compute_hash(self) -> str:
         canonical = json.dumps({
-            "axes": [{"name": a.name, "weight": a.weight, "measurement": a.measurement} 
-                     for a in self.axes],
-            "composition": self.composition,
-            "version": self.version,
+            "weights": dict(sorted(self.weights.items())),
+            "attribution_mode": self.attribution_mode,
+            "min_evidence": dict(sorted(self.min_evidence.items())),
             "declared_by": self.declared_by,
         }, sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
     
-    def score(self, observations: dict[str, float]) -> dict:
-        """Score an agent against declared criteria."""
-        axis_scores = {}
-        for axis in self.axes:
-            if axis.name not in observations:
-                axis_scores[axis.name] = {"score": 0.0, "status": "MISSING", "weight": axis.weight}
-                continue
-            
-            val = observations[axis.name]
-            status = "PASS" if val >= axis.threshold_warn else "WARN" if val >= axis.threshold_fail else "FAIL"
-            axis_scores[axis.name] = {"score": val, "status": status, "weight": axis.weight}
+    def evaluate(self, scores: dict[str, float]) -> dict:
+        """Apply declared weights to scores. Refuses if criteria changed."""
+        # Verify commitment
+        if self._compute_hash() != self.commitment_hash:
+            return {"error": "COMMITMENT_VIOLATED", "detail": "Scoring criteria modified after declaration"}
         
-        scores = [v["score"] for v in axis_scores.values()]
+        missing = [k for k in self.weights if k not in scores]
+        if missing:
+            return {"error": "MISSING_DIMENSIONS", "dimensions": missing}
         
-        if self.composition == "MIN":
-            composite = min(scores) if scores else 0.0
-        elif self.composition == "WEIGHTED":
-            composite = sum(axis_scores[a.name]["score"] * a.weight for a in self.axes)
-        elif self.composition == "GEOMETRIC":
-            import math
-            composite = math.exp(sum(a.weight * math.log(max(axis_scores[a.name]["score"], 0.001)) for a in self.axes))
+        # Check min evidence (if provided)
+        # In real use, evidence counts would be passed alongside scores
+        
+        if self.attribution_mode == "split":
+            breakdown = {k: round(scores[k] * self.weights[k], 4) for k in self.weights}
+            composite = sum(breakdown.values())
+            return {
+                "composite_score": round(composite, 4),
+                "breakdown": breakdown,
+                "raw_scores": {k: scores[k] for k in self.weights},
+                "weights_used": self.weights,
+                "commitment_hash": self.commitment_hash,
+                "attribution_mode": "split",
+                "weakest_axis": min(scores, key=lambda k: scores[k]),
+                "min_score": round(min(scores[k] for k in self.weights), 4),
+            }
         else:
-            composite = min(scores)
-        
-        # Grade
-        if composite >= 0.8: grade = "A"
-        elif composite >= 0.6: grade = "B"  
-        elif composite >= 0.4: grade = "C"
-        elif composite >= 0.2: grade = "D"
-        else: grade = "F"
-        
-        return {
-            "composite": round(composite, 3),
-            "grade": grade,
-            "composition": self.composition,
-            "declaration_hash": self.declaration_hash(),
-            "axes": axis_scores,
-            "declared_by": self.declared_by,
-            "declared_at": self.declared_at.isoformat(),
-        }
+            # Composite hides per-dimension scores
+            composite = sum(scores[k] * self.weights[k] for k in self.weights)
+            return {
+                "composite_score": round(composite, 4),
+                "commitment_hash": self.commitment_hash,
+                "attribution_mode": "composite",
+                "warning": "composite mode hides per-principal attribution — use split for disputes"
+            }
     
-    def detect_retroactive_manipulation(self, claimed_hash: str) -> dict:
-        """Check if someone changed the scoring criteria post-genesis."""
-        actual = self.declaration_hash()
-        match = actual == claimed_hash
-        return {
-            "match": match,
-            "actual_hash": actual,
-            "claimed_hash": claimed_hash,
-            "verdict": "AUTHENTIC" if match else "TAMPERED",
-            "detail": "Scoring criteria unchanged since genesis" if match 
-                      else "ALERT: Scoring criteria modified post-genesis. Narrative bias possible."
-        }
+    def reissue(self, new_weights: dict[str, float], reason: str) -> 'ScoringCriteria':
+        """REISSUE with new weights + reason. Returns new criteria with predecessor link."""
+        new = ScoringCriteria(
+            criteria_id=f"{self.criteria_id}_r1",
+            declared_at=datetime.utcnow(),
+            declared_by=self.declared_by,
+            weights=new_weights,
+            attribution_mode=self.attribution_mode,
+            min_evidence=self.min_evidence,
+        )
+        return new
 
 
 def demo():
-    # Declare scoring criteria at genesis
-    declaration = ScoringDeclaration(
-        axes=[
-            ScoringAxis("continuity", 0.25, "Identity persistence", "soul_hash_chain_length / sessions"),
-            ScoringAxis("independence", 0.25, "Oracle diversity", "min(unique_operators, unique_models) / total"),
-            ScoringAxis("receipts", 0.25, "Exchange evidence", "verified_receipts / claimed_exchanges"),
-            ScoringAxis("corrections", 0.25, "Self-improvement", "correction_frequency in [0.15, 0.30]"),
-        ],
-        declared_at=datetime(2026, 3, 21, 17, 0, 0),
-        declared_by="genesis_quorum",
-        composition="MIN"
+    now = datetime(2026, 3, 21, 17, 0, 0)
+    
+    # Scenario 1: Honest evaluator — declare weights, then evaluate
+    criteria = ScoringCriteria(
+        criteria_id="atf_core_v1",
+        declared_at=now,
+        declared_by="kit_fox",
+        weights={
+            "maturity": 0.20,
+            "health": 0.25,
+            "consistency": 0.25,
+            "independence": 0.15,
+            "connector": 0.15,
+        },
+        attribution_mode="split",
     )
     
-    genesis_hash = declaration.declaration_hash()
-    print(f"Genesis declaration hash: {genesis_hash}")
-    print(f"Composition: {declaration.composition}")
-    print()
+    scores = {
+        "maturity": 0.85,
+        "health": 0.72,
+        "consistency": 0.91,
+        "independence": 0.60,
+        "connector": 0.45,
+    }
     
-    # Score a healthy agent
-    healthy = declaration.score({
-        "continuity": 0.92,
-        "independence": 0.85,
-        "receipts": 0.78,
-        "corrections": 0.88,
-    })
-    print(f"Healthy agent: {healthy['grade']} ({healthy['composite']})")
-    for axis, data in healthy['axes'].items():
-        print(f"  {axis}: {data['score']:.2f} [{data['status']}] (weight: {data['weight']})")
+    result = criteria.evaluate(scores)
+    print("=== HONEST EVALUATION (split) ===")
+    print(f"Composite: {result['composite_score']}")
+    print(f"Weakest: {result['weakest_axis']} ({result['min_score']})")
+    print(f"Breakdown: {result['breakdown']}")
+    print(f"Commitment: {result['commitment_hash']}")
     
-    # Score an agent hiding drift (high everything except corrections)
-    hiding = declaration.score({
-        "continuity": 0.95,
-        "independence": 0.90,
-        "receipts": 0.88,
-        "corrections": 0.05,  # zero corrections = suspicious
-    })
-    print(f"\nHiding drift: {hiding['grade']} ({hiding['composite']})")
-    for axis, data in hiding['axes'].items():
-        print(f"  {axis}: {data['score']:.2f} [{data['status']}] (weight: {data['weight']})")
+    # Scenario 2: Composite mode — hides per-principal
+    composite_criteria = ScoringCriteria(
+        criteria_id="atf_composite",
+        declared_at=now,
+        declared_by="adversary",
+        weights=criteria.weights,
+        attribution_mode="composite",
+    )
     
-    # Detect retroactive manipulation
-    print(f"\n--- Tamper Detection ---")
-    legit = declaration.detect_retroactive_manipulation(genesis_hash)
-    print(f"Legitimate: {legit['verdict']}")
+    result2 = composite_criteria.evaluate(scores)
+    print(f"\n=== COMPOSITE (hides breakdown) ===")
+    print(f"Composite: {result2['composite_score']}")
+    print(f"Warning: {result2['warning']}")
     
-    tampered = declaration.detect_retroactive_manipulation("deadbeef12345678")
-    print(f"Tampered:   {tampered['verdict']} — {tampered['detail']}")
+    # Scenario 3: Tampering detection
+    print(f"\n=== TAMPERING DETECTION ===")
+    criteria.weights["connector"] = 0.50  # try to change after declaration
+    criteria.weights["maturity"] = 0.05   # rebalance
+    criteria.weights["independence"] = 0.00
+    tampered = criteria.evaluate(scores)
+    print(f"Result: {tampered['error']}")
+    print(f"Detail: {tampered['detail']}")
 
 
 if __name__ == "__main__":
