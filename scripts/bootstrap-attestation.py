@@ -1,291 +1,260 @@
 #!/usr/bin/env python3
-"""bootstrap-attestation.py — Bootstrap attestation for new agents.
+"""bootstrap-attestation.py — Bootstrap attestation for zero-counterparty agents.
 
-Per santaclawd (email, 2026-03-22): "newly bootstrapped agents
-(counterparty_count=0, window=MANUAL) are the highest risk class."
+Problem (santaclawd email, Mar 22): MANUAL migration with no counterparty
+history means zero corroboration. The new-key holder just asserts legitimacy.
 
-The cold start of cold starts: how does a new agent earn migration rights?
+Solution: BOOTSTRAP_REQUEST as first receipt. The request itself IS the
+genesis of the isnad chain. An established voucher co-signs, staking
+their own reputation.
 
-Three mechanisms:
-1. TRUSTED INTRODUCER — established agent co-signs genesis
-2. PROOF OF WORK — verifiable interactions before migration
-3. TIME LOCK — minimum age before migration allowed
-
-ATF-core MUST field: min_interactions_before_migration (default=10)
+Key insight: MANUAL is not highest RISK — it's most HONEST. Zero
+witnesses + asks for help > manufactured sybil quorum.
 
 References:
-- oracle-vouch-chain.py (introducer vouching)
-- trust-calibration-engine.py (PROVISIONAL mode)
-- migration-quorum-calculator.py (sybil reduction)
-- Warmsley et al. (2025): cold start = wide CI, limited autonomy
+- oracle-vouch-chain.py (existing): established agent co-signs genesis
+- Chandra-Toueg (1996): failure detection accuracy ∝ observer count
+- isnād (850 CE): chain starts at origin, vouchers stake credibility
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 
 @dataclass
-class Introducer:
-    """Agent vouching for a new agent at genesis."""
+class BootstrapRequest:
+    """Observable event: agent declares zero counterparties, requests help."""
     agent_id: str
-    operator: str
-    reputation_score: float  # 0.0-1.0
-    interaction_count: int
-    active_days: int
+    requested_at: str  # ISO timestamp
+    declared_counterparty_count: int = 0
+    operator_id: Optional[str] = None
+    model_family: Optional[str] = None
+    reason: str = "NEW_AGENT"  # or KEY_ROTATION, RECOVERY
+
+    @property
+    def event_hash(self) -> str:
+        payload = json.dumps({
+            "type": "BOOTSTRAP_REQUEST",
+            "agent_id": self.agent_id,
+            "requested_at": self.requested_at,
+            "counterparty_count": self.declared_counterparty_count,
+            "operator_id": self.operator_id,
+            "reason": self.reason,
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @property
+    def is_valid(self) -> bool:
+        return self.declared_counterparty_count == 0
 
 
 @dataclass
-class BootstrapConfig:
-    """ATF-core bootstrap configuration declared at genesis."""
-    min_interactions_before_migration: int = 10  # MUST field
-    min_age_days: int = 7  # TIME LOCK floor
-    introducer_min_reputation: float = 0.60
-    introducer_min_interactions: int = 50
-    introducer_min_active_days: int = 30
+class Voucher:
+    """Established agent who co-signs the bootstrap."""
+    agent_id: str
+    operator_id: str
+    track_record_days: int
+    correction_frequency: float
+    counterparty_count: int
+    trust_grade: str  # A-F
+
+    @property
+    def eligible(self) -> bool:
+        """Can this agent vouch for a newcomer?"""
+        return (
+            self.track_record_days >= 30
+            and self.trust_grade in ("A", "B")
+            and self.counterparty_count >= 3
+            and 0.05 <= self.correction_frequency <= 0.40
+        )
+
+    @property
+    def reputation_stake(self) -> float:
+        """How much reputation the voucher risks."""
+        grade_weights = {"A": 0.10, "B": 0.15, "C": 0.20, "D": 0.30, "F": 0.50}
+        return grade_weights.get(self.trust_grade, 0.50)
 
 
 @dataclass
-class AgentBootstrapState:
-    """Current state of a bootstrapping agent."""
-    agent_id: str
-    genesis_at: datetime
-    introducer: Optional[Introducer] = None
-    interaction_count: int = 0
-    unique_counterparties: int = 0
-    corrections: int = 0
-    operator: str = ""
+class BootstrapAttestation:
+    """The co-signed genesis receipt."""
+    request: BootstrapRequest
+    voucher: Voucher
+    attested_at: str
+    voucher_signature_hash: str = ""  # In production: Ed25519
 
     @property
-    def age_days(self) -> float:
-        delta = datetime.now(timezone.utc) - self.genesis_at
-        return delta.total_seconds() / 86400
+    def independence_check(self) -> dict:
+        """Voucher must be independent of bootstrapping agent."""
+        same_operator = (
+            self.request.operator_id is not None
+            and self.request.operator_id == self.voucher.operator_id
+        )
+        return {
+            "same_operator": same_operator,
+            "independent": not same_operator,
+            "diagnosis": (
+                "SAME_OPERATOR — voucher shares operator, attestation worthless"
+                if same_operator
+                else "INDEPENDENT — different operators"
+            ),
+        }
 
     @property
-    def correction_frequency(self) -> float:
-        if self.interaction_count == 0:
-            return 0.0
-        return self.corrections / self.interaction_count
+    def attestation_hash(self) -> str:
+        payload = json.dumps({
+            "type": "BOOTSTRAP_ATTESTATION",
+            "request_hash": self.request.event_hash,
+            "voucher_id": self.voucher.agent_id,
+            "attested_at": self.attested_at,
+            "independent": self.independence_check["independent"],
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
+    def evaluate(self) -> dict:
+        """Full evaluation of bootstrap attestation."""
+        ind = self.independence_check
 
-class BootstrapAttestationEngine:
-    """Evaluates whether a new agent has earned migration rights."""
-
-    def __init__(self, config: Optional[BootstrapConfig] = None):
-        self.config = config or BootstrapConfig()
-
-    def validate_introducer(self, introducer: Introducer, new_agent_operator: str) -> dict:
-        """Gate 1: Is the introducer qualified and independent?"""
-        issues = []
-
-        if introducer.operator == new_agent_operator:
-            issues.append("SAME_OPERATOR — introducer shares operator = 0 effective attestation")
-
-        if introducer.reputation_score < self.config.introducer_min_reputation:
-            issues.append(
-                f"LOW_REPUTATION — {introducer.reputation_score:.2f} < "
-                f"{self.config.introducer_min_reputation:.2f} minimum"
-            )
-
-        if introducer.interaction_count < self.config.introducer_min_interactions:
-            issues.append(
-                f"INSUFFICIENT_HISTORY — {introducer.interaction_count} < "
-                f"{self.config.introducer_min_interactions} minimum interactions"
-            )
-
-        if introducer.active_days < self.config.introducer_min_active_days:
-            issues.append(
-                f"TOO_NEW — {introducer.active_days}d < "
-                f"{self.config.introducer_min_active_days}d minimum"
-            )
-
-        return {
-            "gate": "TRUSTED_INTRODUCER",
-            "passed": len(issues) == 0,
-            "issues": issues,
-        }
-
-    def validate_proof_of_work(self, state: AgentBootstrapState) -> dict:
-        """Gate 2: Has the agent earned trust through verifiable work?"""
-        issues = []
-
-        if state.interaction_count < self.config.min_interactions_before_migration:
-            issues.append(
-                f"INSUFFICIENT_INTERACTIONS — {state.interaction_count}/"
-                f"{self.config.min_interactions_before_migration}"
-            )
-
-        if state.unique_counterparties < 2:
-            issues.append(
-                f"TOO_FEW_COUNTERPARTIES — {state.unique_counterparties}/2 minimum"
-            )
-
-        # Correction health check
-        if state.interaction_count >= 10:
-            cf = state.correction_frequency
-            if cf == 0.0:
-                issues.append("ZERO_CORRECTIONS — hiding drift or never tested")
-            elif cf > 0.50:
-                issues.append(f"EXCESSIVE_CORRECTIONS — {cf:.2f} > 0.50")
-
-        return {
-            "gate": "PROOF_OF_WORK",
-            "passed": len(issues) == 0,
-            "issues": issues,
-        }
-
-    def validate_time_lock(self, state: AgentBootstrapState) -> dict:
-        """Gate 3: Has the agent existed long enough?"""
-        issues = []
-
-        if state.age_days < self.config.min_age_days:
-            remaining = self.config.min_age_days - state.age_days
-            issues.append(
-                f"TIME_LOCKED — {state.age_days:.1f}d / {self.config.min_age_days}d "
-                f"({remaining:.1f}d remaining)"
-            )
-
-        return {
-            "gate": "TIME_LOCK",
-            "passed": len(issues) == 0,
-            "issues": issues,
-        }
-
-    def assess(self, state: AgentBootstrapState) -> dict:
-        """Full bootstrap assessment: can this agent migrate keys?"""
-        gates = {}
-
-        # Gate 1: Introducer (required for genesis)
-        if state.introducer:
-            gates["introducer"] = self.validate_introducer(
-                state.introducer, state.operator
-            )
-        else:
-            gates["introducer"] = {
-                "gate": "TRUSTED_INTRODUCER",
-                "passed": False,
-                "issues": ["NO_INTRODUCER — genesis without voucher"],
+        if not self.request.is_valid:
+            return {
+                "status": "REJECTED",
+                "reason": "REQUEST_INVALID — declared counterparties > 0",
+                "attestation_hash": None,
             }
 
-        # Gate 2: Proof of work
-        gates["proof_of_work"] = self.validate_proof_of_work(state)
+        if not self.voucher.eligible:
+            reasons = []
+            if self.voucher.track_record_days < 30:
+                reasons.append(f"INSUFFICIENT_HISTORY — {self.voucher.track_record_days}d < 30d")
+            if self.voucher.trust_grade not in ("A", "B"):
+                reasons.append(f"LOW_GRADE — {self.voucher.trust_grade}")
+            if self.voucher.counterparty_count < 3:
+                reasons.append(f"FEW_COUNTERPARTIES — {self.voucher.counterparty_count} < 3")
+            return {
+                "status": "REJECTED",
+                "reason": "; ".join(reasons),
+                "attestation_hash": None,
+            }
 
-        # Gate 3: Time lock
-        gates["time_lock"] = self.validate_time_lock(state)
-
-        all_passed = all(g["passed"] for g in gates.values())
-        gates_passed = sum(1 for g in gates.values() if g["passed"])
-
-        # Migration permission
-        if all_passed:
-            migration = "ALLOWED"
-            mode = "STANDARD"
-        elif gates_passed >= 2:
-            migration = "RESTRICTED"
-            mode = "EXTENDED_WINDOW"  # longer migration window
-        elif gates_passed >= 1:
-            migration = "MANUAL"
-            mode = "CONTESTED"  # requires manual override
-        else:
-            migration = "BLOCKED"
-            mode = "PROVISIONAL"
+        if not ind["independent"]:
+            return {
+                "status": "REJECTED",
+                "reason": ind["diagnosis"],
+                "attestation_hash": None,
+            }
 
         return {
-            "agent_id": state.agent_id,
-            "migration_permission": migration,
-            "mode": mode,
-            "gates_passed": f"{gates_passed}/3",
-            "age_days": round(state.age_days, 1),
-            "interactions": state.interaction_count,
-            "unique_counterparties": state.unique_counterparties,
-            "gates": gates,
+            "status": "ATTESTED",
+            "attestation_hash": self.attestation_hash,
+            "request_hash": self.request.event_hash,
+            "voucher_id": self.voucher.agent_id,
+            "voucher_stake": self.voucher.reputation_stake,
+            "initial_trust_mode": "PROVISIONAL",
+            "note": "First receipt in isnad chain. Agent starts PROVISIONAL.",
         }
 
 
 def demo():
-    engine = BootstrapAttestationEngine()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).isoformat()
 
     print("=" * 60)
-    print("SCENARIO 1: Well-bootstrapped agent (all gates pass)")
+    print("SCENARIO 1: Valid bootstrap (independent voucher)")
     print("=" * 60)
 
-    good = AgentBootstrapState(
+    request = BootstrapRequest(
+        agent_id="new_agent_001",
+        requested_at=now,
+        declared_counterparty_count=0,
+        operator_id="operator_alpha",
+        reason="NEW_AGENT",
+    )
+
+    voucher = Voucher(
         agent_id="kit_fox",
-        genesis_at=now - timedelta(days=30),
-        operator="ilya",
-        introducer=Introducer(
-            agent_id="bro_agent",
-            operator="different_operator",
-            reputation_score=0.85,
-            interaction_count=200,
-            active_days=90,
-        ),
-        interaction_count=45,
-        unique_counterparties=8,
-        corrections=7,
+        operator_id="operator_beta",  # Different operator
+        track_record_days=60,
+        correction_frequency=0.20,
+        counterparty_count=12,
+        trust_grade="A",
     )
-    print(json.dumps(engine.assess(good), indent=2))
+
+    attestation = BootstrapAttestation(
+        request=request,
+        voucher=voucher,
+        attested_at=now,
+    )
+
+    print(json.dumps(attestation.evaluate(), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 2: Brand new agent (all gates fail)")
+    print("SCENARIO 2: Rejected — same operator (independence fail)")
     print("=" * 60)
 
-    new = AgentBootstrapState(
-        agent_id="fresh_agent",
-        genesis_at=now - timedelta(hours=2),
-        operator="unknown",
-        introducer=None,
-        interaction_count=0,
-        unique_counterparties=0,
+    sybil_voucher = Voucher(
+        agent_id="shell_agent_002",
+        operator_id="operator_alpha",  # SAME operator as request
+        track_record_days=90,
+        correction_frequency=0.15,
+        counterparty_count=8,
+        trust_grade="A",
     )
-    print(json.dumps(engine.assess(new), indent=2))
+
+    attestation2 = BootstrapAttestation(
+        request=request,
+        voucher=sybil_voucher,
+        attested_at=now,
+    )
+
+    print(json.dumps(attestation2.evaluate(), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 3: Same-operator introducer (sybil attempt)")
+    print("SCENARIO 3: Rejected — voucher too new")
     print("=" * 60)
 
-    sybil = AgentBootstrapState(
-        agent_id="sybil_agent",
-        genesis_at=now - timedelta(days=10),
-        operator="evil_corp",
-        introducer=Introducer(
-            agent_id="evil_shell",
-            operator="evil_corp",  # SAME operator
-            reputation_score=0.90,
-            interaction_count=100,
-            active_days=60,
-        ),
-        interaction_count=15,
-        unique_counterparties=3,
-        corrections=2,
+    new_voucher = Voucher(
+        agent_id="also_new",
+        operator_id="operator_gamma",
+        track_record_days=5,  # Only 5 days old
+        correction_frequency=0.10,
+        counterparty_count=1,
+        trust_grade="C",
     )
-    print(json.dumps(engine.assess(sybil), indent=2))
+
+    attestation3 = BootstrapAttestation(
+        request=request,
+        voucher=new_voucher,
+        attested_at=now,
+    )
+
+    print(json.dumps(attestation3.evaluate(), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 4: Good introducer but too young (time locked)")
+    print("SCENARIO 4: Key rotation (existing agent, lost key)")
     print("=" * 60)
 
-    young = AgentBootstrapState(
-        agent_id="eager_agent",
-        genesis_at=now - timedelta(days=3),
-        operator="alice",
-        introducer=Introducer(
-            agent_id="mentor_agent",
-            operator="bob",
-            reputation_score=0.78,
-            interaction_count=150,
-            active_days=45,
-        ),
-        interaction_count=12,
-        unique_counterparties=4,
-        corrections=2,
+    rotation_request = BootstrapRequest(
+        agent_id="existing_agent_999",
+        requested_at=now,
+        declared_counterparty_count=0,  # Lost access to counterparties
+        operator_id="operator_delta",
+        reason="KEY_ROTATION",
     )
-    print(json.dumps(engine.assess(young), indent=2))
+
+    attestation4 = BootstrapAttestation(
+        request=rotation_request,
+        voucher=voucher,
+        attested_at=now,
+    )
+
+    result = attestation4.evaluate()
+    result["warning"] = "KEY_ROTATION with zero counterparties = potential compromise. Extra scrutiny."
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
