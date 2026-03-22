@@ -1,354 +1,261 @@
 #!/usr/bin/env python3
-"""runtime-policy-enforcer.py — Runtime contract policy enforcement.
+"""runtime-policy-enforcer.py — Runtime contract enforcement.
 
 Complement to dispute-prevention-auditor.py (pre-contract gates).
-This enforces policy DURING execution: receipt validation, deadline
-monitoring, quality floor, scope drift detection.
+This enforces DURING execution: delivery timeline, quality trajectory,
+escrow conditions, and counterparty acknowledgment.
 
 Per santaclawd: "pre-dispute checks gate before contract. policy
-enforcer checks at runtime. together: eliminate the class of disputes
-that arise from ambiguity."
+enforcer checks at runtime. together: eliminate the ambiguity window."
 
-Curry-Howard framing (Perrier 2025, arxiv 2510.01069):
-- Contract = type declaration
-- Execution = program
-- Receipt = proof term
-- Type-checking = runtime policy enforcement
-- Well-typed program = dispute-free transaction
+Curry-Howard parallel: receipt IS the deliverable. ATF tests membership
+(did you claim what you did?) not correctness (was the claim true?).
+
+References:
+- Tetlock (2015): Superforecasting — calibration > confidence
+- Hollnagel (2009): ETTO — efficiency-thoroughness trade-off
+- Rasmussen (1997): drift to boundary of acceptable performance
 """
 
-import hashlib
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from enum import Enum
 
 
-class PolicyVerdict(Enum):
-    COMPLIANT = "COMPLIANT"
-    WARNING = "WARNING"
-    BREACH = "BREACH"
-    HALT = "HALT"
-
-
-class BreachType(Enum):
-    DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
-    QUALITY_BELOW_FLOOR = "QUALITY_BELOW_FLOOR"
-    SCOPE_DRIFT = "SCOPE_DRIFT"
-    MISSING_RECEIPT = "MISSING_RECEIPT"
-    RECEIPT_INVALID = "RECEIPT_INVALID"
-    UNAUTHORIZED_ACTION = "UNAUTHORIZED_ACTION"
+class PolicyAction(Enum):
+    CONTINUE = "CONTINUE"
+    WARN = "WARN"
+    PAUSE = "PAUSE"
+    ESCALATE = "ESCALATE"
+    TERMINATE = "TERMINATE"
 
 
 @dataclass
-class ContractPolicy:
-    """Policy declared at contract time (from dispute-prevention-auditor)."""
-    task_hash: str
-    deadline_utc: str  # ISO timestamp
-    quality_floor: float  # minimum evidence_grade score (0-1)
-    scope_hash: str  # hash of declared scope
-    required_receipt_fields: List[str] = field(default_factory=lambda: [
-        "task_hash", "delivery_hash", "evidence_grade", "timestamp", "signer"
-    ])
-    max_scope_drift: float = 0.15  # Jaccard distance threshold
-    penalty_phases: List[str] = field(default_factory=lambda: [
-        "WARNING", "PENALTY", "SLASH", "REVOKE"
-    ])
+class DeliveryCheckpoint:
+    """A point-in-time check during contract execution."""
+    checkpoint_id: str
+    timestamp: str
+    deliverable_hash: Optional[str]
+    quality_score: float  # 0.0-1.0
+    counterparty_ack: bool
+    latency_ms: Optional[int] = None
 
 
 @dataclass
-class ExecutionEvent:
-    """An event during contract execution."""
-    event_type: str  # "delivery", "receipt", "action", "milestone"
-    timestamp: str  # ISO
-    payload: dict = field(default_factory=dict)
-    receipt: Optional[dict] = None
+class RuntimePolicy:
+    """Policy rules for runtime enforcement."""
+    max_delivery_latency_ms: int = 30000
+    min_quality_score: float = 0.5
+    quality_degradation_threshold: float = 0.2  # max drop between checkpoints
+    require_counterparty_ack: bool = True
+    max_unacked_checkpoints: int = 2
+    escrow_release_min_quality: float = 0.7
+    max_consecutive_warnings: int = 3
 
 
 @dataclass
-class PolicyCheck:
-    """Result of a single policy check."""
-    check_name: str
-    passed: bool
-    verdict: PolicyVerdict
-    breach_type: Optional[BreachType] = None
-    detail: str = ""
+class EnforcementState:
+    """Tracks runtime enforcement state across checkpoints."""
+    checkpoints: List[DeliveryCheckpoint] = field(default_factory=list)
+    warnings: int = 0
+    paused: bool = False
+    terminated: bool = False
+    escrow_released: bool = False
+
+    @property
+    def quality_trajectory(self) -> List[float]:
+        return [c.quality_score for c in self.checkpoints]
+
+    @property
+    def avg_quality(self) -> float:
+        if not self.checkpoints:
+            return 0.0
+        return sum(c.quality_score for c in self.checkpoints) / len(self.checkpoints)
+
+    @property
+    def quality_slope(self) -> float:
+        """Linear regression slope of quality over checkpoints."""
+        scores = self.quality_trajectory
+        if len(scores) < 2:
+            return 0.0
+        n = len(scores)
+        x_mean = (n - 1) / 2
+        y_mean = sum(scores) / n
+        num = sum((i - x_mean) * (s - y_mean) for i, s in enumerate(scores))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        return num / den if den > 0 else 0.0
+
+    @property
+    def unacked_count(self) -> int:
+        return sum(1 for c in self.checkpoints if not c.counterparty_ack)
 
 
 class RuntimePolicyEnforcer:
-    """Enforces contract policy at runtime."""
+    """Enforces contract policies at runtime checkpoints."""
 
-    def __init__(self, policy: ContractPolicy):
+    def __init__(self, policy: RuntimePolicy):
         self.policy = policy
-        self.events: List[ExecutionEvent] = []
-        self.breaches: List[PolicyCheck] = []
-        self.warnings: List[PolicyCheck] = []
+        self.state = EnforcementState()
 
-    def check_deadline(self, current_time: str) -> PolicyCheck:
-        """Check if deadline is exceeded or approaching."""
-        current = datetime.fromisoformat(current_time.replace("Z", "+00:00"))
-        deadline = datetime.fromisoformat(
-            self.policy.deadline_utc.replace("Z", "+00:00")
+    def check(self, checkpoint: DeliveryCheckpoint) -> dict:
+        """Evaluate a checkpoint against policy. Returns action + diagnosis."""
+        self.state.checkpoints.append(checkpoint)
+        violations = []
+        action = PolicyAction.CONTINUE
+
+        # Check 1: Delivery latency
+        if checkpoint.latency_ms and checkpoint.latency_ms > self.policy.max_delivery_latency_ms:
+            violations.append({
+                "rule": "MAX_DELIVERY_LATENCY",
+                "expected": f"≤{self.policy.max_delivery_latency_ms}ms",
+                "actual": f"{checkpoint.latency_ms}ms",
+                "severity": "WARNING",
+            })
+            action = max(action, PolicyAction.WARN, key=lambda x: list(PolicyAction).index(x))
+
+        # Check 2: Quality floor
+        if checkpoint.quality_score < self.policy.min_quality_score:
+            violations.append({
+                "rule": "MIN_QUALITY_SCORE",
+                "expected": f"≥{self.policy.min_quality_score}",
+                "actual": f"{checkpoint.quality_score:.2f}",
+                "severity": "ESCALATE",
+            })
+            action = max(action, PolicyAction.ESCALATE, key=lambda x: list(PolicyAction).index(x))
+
+        # Check 3: Quality degradation between checkpoints
+        if len(self.state.checkpoints) >= 2:
+            prev = self.state.checkpoints[-2].quality_score
+            curr = checkpoint.quality_score
+            drop = prev - curr
+            if drop > self.policy.quality_degradation_threshold:
+                violations.append({
+                    "rule": "QUALITY_DEGRADATION",
+                    "expected": f"drop ≤{self.policy.quality_degradation_threshold}",
+                    "actual": f"drop={drop:.2f} ({prev:.2f}→{curr:.2f})",
+                    "severity": "PAUSE",
+                    "note": "Rasmussen drift — quality sliding toward boundary",
+                })
+                action = max(action, PolicyAction.PAUSE, key=lambda x: list(PolicyAction).index(x))
+
+        # Check 4: Counterparty acknowledgment
+        if self.policy.require_counterparty_ack and not checkpoint.counterparty_ack:
+            if self.state.unacked_count > self.policy.max_unacked_checkpoints:
+                violations.append({
+                    "rule": "COUNTERPARTY_ACK",
+                    "expected": f"max {self.policy.max_unacked_checkpoints} unacked",
+                    "actual": f"{self.state.unacked_count} unacked",
+                    "severity": "PAUSE",
+                })
+                action = max(action, PolicyAction.PAUSE, key=lambda x: list(PolicyAction).index(x))
+
+        # Check 5: Quality trajectory (Tetlock: calibration over confidence)
+        slope = self.state.quality_slope
+        if len(self.state.checkpoints) >= 3 and slope < -0.1:
+            violations.append({
+                "rule": "QUALITY_TRAJECTORY",
+                "expected": "slope ≥ -0.1",
+                "actual": f"slope={slope:.3f}",
+                "severity": "ESCALATE",
+                "note": "Declining trajectory — Tetlock: track record matters more than last call",
+            })
+            action = max(action, PolicyAction.ESCALATE, key=lambda x: list(PolicyAction).index(x))
+
+        # Check 6: Missing deliverable hash
+        if not checkpoint.deliverable_hash:
+            violations.append({
+                "rule": "DELIVERABLE_HASH",
+                "expected": "non-null hash",
+                "actual": "null",
+                "severity": "ESCALATE",
+                "note": "No hash = deniable delivery",
+            })
+            action = max(action, PolicyAction.ESCALATE, key=lambda x: list(PolicyAction).index(x))
+
+        # Warning accumulation
+        if action == PolicyAction.WARN:
+            self.state.warnings += 1
+            if self.state.warnings >= self.policy.max_consecutive_warnings:
+                action = PolicyAction.PAUSE
+                violations.append({
+                    "rule": "WARNING_ACCUMULATION",
+                    "expected": f"<{self.policy.max_consecutive_warnings} consecutive",
+                    "actual": f"{self.state.warnings} consecutive",
+                    "severity": "PAUSE",
+                })
+        elif action == PolicyAction.CONTINUE:
+            self.state.warnings = 0  # reset on clean checkpoint
+
+        # Escrow check
+        escrow_eligible = (
+            self.state.avg_quality >= self.policy.escrow_release_min_quality
+            and self.state.unacked_count == 0
+            and action == PolicyAction.CONTINUE
         )
-
-        if current > deadline:
-            check = PolicyCheck(
-                check_name="deadline",
-                passed=False,
-                verdict=PolicyVerdict.BREACH,
-                breach_type=BreachType.DEADLINE_EXCEEDED,
-                detail=f"Exceeded by {(current - deadline).total_seconds():.0f}s",
-            )
-            self.breaches.append(check)
-            return check
-
-        remaining = (deadline - current).total_seconds()
-        total = 86400  # assume 24h default window
-        if remaining / total < 0.1:
-            check = PolicyCheck(
-                check_name="deadline",
-                passed=True,
-                verdict=PolicyVerdict.WARNING,
-                detail=f"<10% time remaining ({remaining:.0f}s)",
-            )
-            self.warnings.append(check)
-            return check
-
-        return PolicyCheck(
-            check_name="deadline",
-            passed=True,
-            verdict=PolicyVerdict.COMPLIANT,
-            detail=f"{remaining:.0f}s remaining",
-        )
-
-    def check_receipt(self, receipt: dict) -> PolicyCheck:
-        """Validate receipt against required fields."""
-        missing = [
-            f for f in self.policy.required_receipt_fields if f not in receipt
-        ]
-
-        if missing:
-            check = PolicyCheck(
-                check_name="receipt_completeness",
-                passed=False,
-                verdict=PolicyVerdict.BREACH,
-                breach_type=BreachType.MISSING_RECEIPT,
-                detail=f"Missing fields: {missing}",
-            )
-            self.breaches.append(check)
-            return check
-
-        # Verify task_hash matches contract
-        if receipt.get("task_hash") != self.policy.task_hash:
-            check = PolicyCheck(
-                check_name="receipt_task_hash",
-                passed=False,
-                verdict=PolicyVerdict.BREACH,
-                breach_type=BreachType.RECEIPT_INVALID,
-                detail=f"task_hash mismatch: {receipt.get('task_hash')[:16]}... vs {self.policy.task_hash[:16]}...",
-            )
-            self.breaches.append(check)
-            return check
-
-        return PolicyCheck(
-            check_name="receipt_completeness",
-            passed=True,
-            verdict=PolicyVerdict.COMPLIANT,
-            detail=f"All {len(self.policy.required_receipt_fields)} required fields present",
-        )
-
-    def check_quality(self, evidence_grade: float) -> PolicyCheck:
-        """Check if quality meets floor."""
-        if evidence_grade < self.policy.quality_floor:
-            check = PolicyCheck(
-                check_name="quality_floor",
-                passed=False,
-                verdict=PolicyVerdict.BREACH,
-                breach_type=BreachType.QUALITY_BELOW_FLOOR,
-                detail=f"Grade {evidence_grade:.2f} < floor {self.policy.quality_floor:.2f}",
-            )
-            self.breaches.append(check)
-            return check
-
-        return PolicyCheck(
-            check_name="quality_floor",
-            passed=True,
-            verdict=PolicyVerdict.COMPLIANT,
-            detail=f"Grade {evidence_grade:.2f} ≥ floor {self.policy.quality_floor:.2f}",
-        )
-
-    def check_scope_drift(self, actual_scope_tokens: set, declared_scope_tokens: set) -> PolicyCheck:
-        """Check scope drift via Jaccard distance."""
-        if not declared_scope_tokens:
-            return PolicyCheck(
-                check_name="scope_drift",
-                passed=False,
-                verdict=PolicyVerdict.WARNING,
-                detail="No declared scope tokens to compare",
-            )
-
-        intersection = actual_scope_tokens & declared_scope_tokens
-        union = actual_scope_tokens | declared_scope_tokens
-        jaccard_sim = len(intersection) / len(union) if union else 0
-        jaccard_dist = 1 - jaccard_sim
-
-        if jaccard_dist > self.policy.max_scope_drift:
-            check = PolicyCheck(
-                check_name="scope_drift",
-                passed=False,
-                verdict=PolicyVerdict.BREACH,
-                breach_type=BreachType.SCOPE_DRIFT,
-                detail=f"Jaccard distance {jaccard_dist:.2f} > threshold {self.policy.max_scope_drift:.2f}",
-            )
-            self.breaches.append(check)
-            return check
-
-        return PolicyCheck(
-            check_name="scope_drift",
-            passed=True,
-            verdict=PolicyVerdict.COMPLIANT,
-            detail=f"Jaccard distance {jaccard_dist:.2f} ≤ {self.policy.max_scope_drift:.2f}",
-        )
-
-    def enforce(self, event: ExecutionEvent) -> dict:
-        """Run all applicable checks on an event."""
-        self.events.append(event)
-        checks = []
-
-        # Always check deadline
-        checks.append(self.check_deadline(event.timestamp))
-
-        # Check receipt if present
-        if event.receipt:
-            checks.append(self.check_receipt(event.receipt))
-
-            # Check quality from receipt
-            grade = event.receipt.get("evidence_grade")
-            if grade is not None:
-                checks.append(self.check_quality(float(grade)))
-
-        # Check scope if delivery event
-        if event.event_type == "delivery" and "scope_tokens" in event.payload:
-            declared = set(self.policy.scope_hash.split(",")) if "," in self.policy.scope_hash else set()
-            actual = set(event.payload["scope_tokens"])
-            if declared:
-                checks.append(self.check_scope_drift(actual, declared))
-
-        # Determine overall verdict
-        verdicts = [c.verdict for c in checks]
-        if PolicyVerdict.BREACH in verdicts:
-            overall = PolicyVerdict.HALT if sum(1 for v in verdicts if v == PolicyVerdict.BREACH) >= 2 else PolicyVerdict.BREACH
-        elif PolicyVerdict.WARNING in verdicts:
-            overall = PolicyVerdict.WARNING
-        else:
-            overall = PolicyVerdict.COMPLIANT
-
-        # Determine penalty phase
-        total_breaches = len(self.breaches)
-        phase_idx = min(total_breaches, len(self.policy.penalty_phases) - 1)
-        penalty_phase = self.policy.penalty_phases[phase_idx] if total_breaches > 0 else "NONE"
 
         return {
-            "overall_verdict": overall.value,
-            "penalty_phase": penalty_phase,
-            "total_breaches": total_breaches,
-            "checks": [
-                {
-                    "name": c.check_name,
-                    "passed": c.passed,
-                    "verdict": c.verdict.value,
-                    "breach_type": c.breach_type.value if c.breach_type else None,
-                    "detail": c.detail,
-                }
-                for c in checks
-            ],
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "action": action.value,
+            "violations": violations,
+            "state": {
+                "total_checkpoints": len(self.state.checkpoints),
+                "avg_quality": round(self.state.avg_quality, 3),
+                "quality_slope": round(self.state.quality_slope, 3),
+                "consecutive_warnings": self.state.warnings,
+                "unacked": self.state.unacked_count,
+            },
+            "escrow": {
+                "eligible_for_release": escrow_eligible,
+                "min_quality_met": self.state.avg_quality >= self.policy.escrow_release_min_quality,
+                "all_acked": self.state.unacked_count == 0,
+            },
         }
 
 
 def demo():
     print("=" * 60)
-    print("SCENARIO 1: Clean execution (TC3-like)")
+    print("SCENARIO 1: Healthy contract execution")
     print("=" * 60)
 
-    policy = ContractPolicy(
-        task_hash="sha256:abc123",
-        deadline_utc="2026-03-22T12:00:00Z",
-        quality_floor=0.70,
-        scope_hash="trust,verification,receipts,attestation",
+    enforcer = RuntimePolicyEnforcer(RuntimePolicy())
+    checkpoints = [
+        DeliveryCheckpoint("cp1", "2026-03-22T06:00:00Z", "sha256:aaa", 0.85, True, 1200),
+        DeliveryCheckpoint("cp2", "2026-03-22T06:10:00Z", "sha256:bbb", 0.88, True, 1100),
+        DeliveryCheckpoint("cp3", "2026-03-22T06:20:00Z", "sha256:ccc", 0.90, True, 1050),
+    ]
+    for cp in checkpoints:
+        result = enforcer.check(cp)
+        print(json.dumps(result, indent=2))
+        print()
+
+    print("=" * 60)
+    print("SCENARIO 2: Quality degradation (Rasmussen drift)")
+    print("=" * 60)
+
+    enforcer2 = RuntimePolicyEnforcer(RuntimePolicy())
+    checkpoints2 = [
+        DeliveryCheckpoint("cp1", "2026-03-22T06:00:00Z", "sha256:aaa", 0.90, True, 1200),
+        DeliveryCheckpoint("cp2", "2026-03-22T06:10:00Z", "sha256:bbb", 0.75, True, 2500),
+        DeliveryCheckpoint("cp3", "2026-03-22T06:20:00Z", "sha256:ccc", 0.50, True, 5000),
+        DeliveryCheckpoint("cp4", "2026-03-22T06:30:00Z", "sha256:ddd", 0.35, False, 45000),
+    ]
+    for cp in checkpoints2:
+        result = enforcer2.check(cp)
+        print(json.dumps(result, indent=2))
+        print()
+
+    print("=" * 60)
+    print("SCENARIO 3: Missing hash (deniable delivery)")
+    print("=" * 60)
+
+    enforcer3 = RuntimePolicyEnforcer(RuntimePolicy())
+    result = enforcer3.check(
+        DeliveryCheckpoint("cp1", "2026-03-22T06:00:00Z", None, 0.80, True, 1000)
     )
-
-    enforcer = RuntimePolicyEnforcer(policy)
-
-    result = enforcer.enforce(ExecutionEvent(
-        event_type="delivery",
-        timestamp="2026-03-22T10:00:00Z",
-        payload={"scope_tokens": ["trust", "verification", "receipts", "attestation"]},
-        receipt={
-            "task_hash": "sha256:abc123",
-            "delivery_hash": "sha256:def456",
-            "evidence_grade": 0.92,
-            "timestamp": "2026-03-22T10:00:00Z",
-            "signer": "bro_agent",
-        },
-    ))
     print(json.dumps(result, indent=2))
-
-    print()
-    print("=" * 60)
-    print("SCENARIO 2: Deadline breach + quality below floor")
-    print("=" * 60)
-
-    policy2 = ContractPolicy(
-        task_hash="sha256:xyz789",
-        deadline_utc="2026-03-22T06:00:00Z",
-        quality_floor=0.80,
-        scope_hash="security,audit",
-    )
-
-    enforcer2 = RuntimePolicyEnforcer(policy2)
-
-    result2 = enforcer2.enforce(ExecutionEvent(
-        event_type="delivery",
-        timestamp="2026-03-22T08:00:00Z",  # 2 hours late
-        receipt={
-            "task_hash": "sha256:xyz789",
-            "delivery_hash": "sha256:late456",
-            "evidence_grade": 0.55,  # below 0.80 floor
-            "timestamp": "2026-03-22T08:00:00Z",
-            "signer": "slow_agent",
-        },
-    ))
-    print(json.dumps(result2, indent=2))
-
-    print()
-    print("=" * 60)
-    print("SCENARIO 3: Scope drift (delivered different topic)")
-    print("=" * 60)
-
-    policy3 = ContractPolicy(
-        task_hash="sha256:scope123",
-        deadline_utc="2026-03-22T12:00:00Z",
-        quality_floor=0.60,
-        scope_hash="blockchain,consensus,BFT,quorum",
-        max_scope_drift=0.15,
-    )
-
-    enforcer3 = RuntimePolicyEnforcer(policy3)
-
-    result3 = enforcer3.enforce(ExecutionEvent(
-        event_type="delivery",
-        timestamp="2026-03-22T09:00:00Z",
-        payload={"scope_tokens": ["machine_learning", "neural_networks", "training", "GPU"]},
-        receipt={
-            "task_hash": "sha256:scope123",
-            "delivery_hash": "sha256:wrong789",
-            "evidence_grade": 0.95,  # high quality but wrong topic
-            "timestamp": "2026-03-22T09:00:00Z",
-            "signer": "drifter_agent",
-        },
-    ))
-    print(json.dumps(result3, indent=2))
 
 
 if __name__ == "__main__":
