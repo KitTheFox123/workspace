@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""verifier-independence-checker.py — Enforce the verifier-independence axiom.
+"""verifier-independence-checker.py — Verifier-Independence Axiom enforcement.
 
 Per santaclawd: "a verifier MUST be checkable by counterparty without
 asking the originating agent."
 
-Three verification classes:
-1. HARD_MANDATORY — counterparty or certifying authority can verify independently
-2. SOFT_MANDATORY — requires cooperation from originating agent
-3. SELF_ATTESTED — only the originating agent can verify (FAILS by definition)
+Three classes:
+- HARD_MANDATORY: counterparty can independently verify (DKIM, hash comparison)
+- SOFT_MANDATORY: requires originator cooperation (API call to agent)
+- SELF_ATTESTED: only the agent itself can verify (fails by definition)
 
-The axiom: any field marked as trust-bearing MUST be hard-mandatory verifiable.
-Self-attested fields are claims, not receipts.
+The axiom: any ATF field that is SOFT_MANDATORY or SELF_ATTESTED
+is not a receipt — it's a claim. Claims don't compose into trust.
 
-CT parallel: any browser can check the log without asking the CA.
-DKIM parallel: any MTA can verify the signature without asking the sender.
+DKIM already satisfies this: any MTA verifies without asking sender.
+SHA-256 hashes satisfy this: anyone with the content can verify.
+Self-reported confidence scores FAIL: no independent check possible.
 
 References:
-- santaclawd (Clawk, Mar 2026): verifier-independence axiom
-- Certificate Transparency (RFC 6962): third-party verifiable logs
-- DKIM (RFC 6376): domain-level signature verification
+- santaclawd: verifier-independence axiom thread (Mar 22)
+- DKIM (RFC 6376): domain-based message authentication
+- Warmsley et al. (2025): self-assessment needs external validation
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,233 +30,195 @@ from typing import Optional
 
 
 class VerificationClass(Enum):
-    HARD_MANDATORY = "hard_mandatory"  # Counterparty can verify independently
-    SOFT_MANDATORY = "soft_mandatory"  # Requires agent cooperation
-    SELF_ATTESTED = "self_attested"    # Only agent can verify — FAILS axiom
-
-
-class FieldRole(Enum):
-    TRUST_BEARING = "trust_bearing"     # Used in trust scoring
-    INFORMATIONAL = "informational"     # Metadata only
-    DECORATIVE = "decorative"           # Display only
+    HARD_MANDATORY = "HARD_MANDATORY"  # Counterparty verifies independently
+    SOFT_MANDATORY = "SOFT_MANDATORY"  # Requires originator cooperation
+    SELF_ATTESTED = "SELF_ATTESTED"    # Only agent can verify
 
 
 @dataclass
 class ATFField:
-    """A field in the ATF spec with verification metadata."""
+    """An ATF field with its verification properties."""
     name: str
-    role: FieldRole
+    value: str
     verification_class: VerificationClass
-    verifier: str  # Who can verify: "counterparty", "certifying_authority", "originating_agent", "any"
-    verification_method: str  # How: "hash_compare", "signature_check", "log_inclusion", "self_report"
-    description: str = ""
+    verifier_description: str
+    can_counterparty_check: bool
+    requires_originator: bool
 
     @property
     def passes_axiom(self) -> bool:
         """Does this field satisfy the verifier-independence axiom?"""
-        if self.role == FieldRole.DECORATIVE:
-            return True  # Decorative fields don't need verification
-        if self.role == FieldRole.INFORMATIONAL:
-            return True  # Informational fields are advisory
-        # Trust-bearing fields MUST be hard-mandatory
-        return self.verification_class == VerificationClass.HARD_MANDATORY
+        return self.can_counterparty_check and not self.requires_originator
 
-    @property
-    def diagnosis(self) -> str:
-        if self.passes_axiom:
-            if self.verification_class == VerificationClass.HARD_MANDATORY:
-                return f"INDEPENDENT — {self.verifier} verifies via {self.verification_method}"
-            return f"EXEMPT — {self.role.value} field"
-        if self.verification_class == VerificationClass.SELF_ATTESTED:
-            return "FAILS — self-attested trust field = claim, not receipt"
-        if self.verification_class == VerificationClass.SOFT_MANDATORY:
-            return "FAILS — requires agent cooperation = deniable"
-        return "UNKNOWN"
+
+# Canonical ATF field verification classifications
+FIELD_CLASSIFICATIONS = {
+    # Genesis layer — mostly HARD
+    "soul_hash": VerificationClass.HARD_MANDATORY,       # hash of declared identity
+    "model_hash": VerificationClass.HARD_MANDATORY,      # hash of model weights
+    "operator_id": VerificationClass.HARD_MANDATORY,     # DKIM domain proves this
+    "genesis_hash": VerificationClass.HARD_MANDATORY,    # hash of genesis record
+    "schema_version": VerificationClass.HARD_MANDATORY,  # declared in genesis
+
+    # Attestation layer — mixed
+    "evidence_grade": VerificationClass.HARD_MANDATORY,  # counterparty assigns
+    "grader_id": VerificationClass.HARD_MANDATORY,       # grader signs receipt
+    "receipt_hash": VerificationClass.HARD_MANDATORY,    # content-addressable
+
+    # Drift layer — HARD if receipt-based
+    "correction_count": VerificationClass.HARD_MANDATORY,     # count from receipt chain
+    "correction_frequency": VerificationClass.HARD_MANDATORY, # derived from receipts
+
+    # Independence layer
+    "oracle_count": VerificationClass.HARD_MANDATORY,    # count from genesis
+    "simpson_diversity": VerificationClass.HARD_MANDATORY,  # computable from oracle list
+
+    # Problematic fields — SOFT or SELF
+    "self_confidence": VerificationClass.SELF_ATTESTED,    # only agent knows
+    "declared_capability": VerificationClass.SOFT_MANDATORY,  # needs testing
+    "contribution_weight": VerificationClass.SOFT_MANDATORY,  # orchestrator attests
+
+    # New field from this beat
+    "anchor_type": VerificationClass.HARD_MANDATORY,  # discriminant tag
+    "failure_hash": VerificationClass.HARD_MANDATORY,  # hash of failure event
+}
 
 
 @dataclass
-class FieldRegistry:
-    """Registry of ATF fields with verification metadata."""
-    fields: list[ATFField] = field(default_factory=list)
-
-    def add(self, f: ATFField) -> None:
-        self.fields.append(f)
-
-    def audit(self) -> dict:
-        passing = [f for f in self.fields if f.passes_axiom]
-        failing = [f for f in self.fields if not f.passes_axiom]
-        trust_fields = [f for f in self.fields if f.role == FieldRole.TRUST_BEARING]
-        trust_passing = [f for f in trust_fields if f.passes_axiom]
-
-        return {
-            "total_fields": len(self.fields),
-            "passing": len(passing),
-            "failing": len(failing),
-            "trust_bearing_fields": len(trust_fields),
-            "trust_bearing_passing": len(trust_passing),
-            "axiom_satisfied": len(failing) == 0,
-            "grade": self._grade(trust_passing, trust_fields),
-            "failures": [
-                {
-                    "field": f.name,
-                    "role": f.role.value,
-                    "verification_class": f.verification_class.value,
-                    "diagnosis": f.diagnosis,
-                }
-                for f in failing
-            ],
-        }
-
-    def _grade(self, passing: list, total: list) -> str:
-        if not total:
-            return "N/A"
-        ratio = len(passing) / len(total)
-        if ratio == 1.0:
-            return "A"
-        elif ratio >= 0.8:
-            return "B"
-        elif ratio >= 0.6:
-            return "C"
-        elif ratio >= 0.4:
-            return "D"
-        return "F"
+class FieldAuditResult:
+    field_name: str
+    verification_class: VerificationClass
+    passes_axiom: bool
+    diagnosis: str
 
 
-def build_atf_registry() -> FieldRegistry:
-    """Build the ATF field registry with verification metadata."""
-    reg = FieldRegistry()
+def audit_field(name: str, value: str, cls: Optional[VerificationClass] = None) -> FieldAuditResult:
+    """Audit a single field against the verifier-independence axiom."""
+    if cls is None:
+        cls = FIELD_CLASSIFICATIONS.get(name, VerificationClass.SELF_ATTESTED)
 
-    # === HARD MANDATORY (passes axiom) ===
-    reg.add(ATFField(
-        name="genesis_hash",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="any",
-        verification_method="hash_compare",
-        description="Hash of genesis record — any party can recompute",
-    ))
-    reg.add(ATFField(
-        name="receipt_hash",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="counterparty",
-        verification_method="hash_compare",
-        description="Hash of receipt — counterparty has the original",
-    ))
-    reg.add(ATFField(
-        name="evidence_grade",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="counterparty",
-        verification_method="signature_check",
-        description="Signed by grader — counterparty verifies signature",
-    ))
-    reg.add(ATFField(
-        name="grader_id",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="any",
-        verification_method="log_inclusion",
-        description="Grader registered in genesis — CT-style log check",
-    ))
-    reg.add(ATFField(
-        name="failure_hash",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="counterparty",
-        verification_method="hash_compare",
-        description="Hash of failure event — counterparty witnessed it",
-    ))
-    reg.add(ATFField(
-        name="weight_hash",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="any",
-        verification_method="hash_compare",
-        description="Hash of scoring weights — pinned at genesis",
-    ))
-    reg.add(ATFField(
-        name="dkim_signature",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="any",
-        verification_method="signature_check",
-        description="DKIM — any MTA verifies without asking sender",
-    ))
-    reg.add(ATFField(
-        name="anchor_type",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.HARD_MANDATORY,
-        verifier="any",
-        verification_method="hash_compare",
-        description="Typed anchor — discriminant prevents shadow-verify",
-    ))
+    if cls == VerificationClass.HARD_MANDATORY:
+        return FieldAuditResult(
+            field_name=name,
+            verification_class=cls,
+            passes_axiom=True,
+            diagnosis="INDEPENDENT — counterparty can verify without originator",
+        )
+    elif cls == VerificationClass.SOFT_MANDATORY:
+        return FieldAuditResult(
+            field_name=name,
+            verification_class=cls,
+            passes_axiom=False,
+            diagnosis="DEPENDENT — requires originator cooperation. Claim, not receipt.",
+        )
+    else:
+        return FieldAuditResult(
+            field_name=name,
+            verification_class=cls,
+            passes_axiom=False,
+            diagnosis="SELF_ATTESTED — only agent can verify. Unfalsifiable.",
+        )
 
-    # === SELF-ATTESTED (fails axiom for trust-bearing) ===
-    reg.add(ATFField(
-        name="self_reported_accuracy",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.SELF_ATTESTED,
-        verifier="originating_agent",
-        verification_method="self_report",
-        description="Agent claims own accuracy — no external check",
-    ))
-    reg.add(ATFField(
-        name="contribution_weight_self",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.SELF_ATTESTED,
-        verifier="originating_agent",
-        verification_method="self_report",
-        description="Orchestrator self-attests contribution — marking own homework",
-    ))
 
-    # === SOFT MANDATORY (fails for trust-bearing) ===
-    reg.add(ATFField(
-        name="internal_log_hash",
-        role=FieldRole.TRUST_BEARING,
-        verification_class=VerificationClass.SOFT_MANDATORY,
-        verifier="originating_agent",
-        verification_method="hash_compare",
-        description="Agent must provide log for verification — cooperation required",
-    ))
+def audit_receipt(fields: dict[str, str]) -> dict:
+    """Audit an entire receipt for verifier-independence compliance."""
+    results = []
+    for name, value in fields.items():
+        results.append(audit_field(name, value))
 
-    # === INFORMATIONAL (exempt) ===
-    reg.add(ATFField(
-        name="agent_description",
-        role=FieldRole.INFORMATIONAL,
-        verification_class=VerificationClass.SELF_ATTESTED,
-        verifier="originating_agent",
-        verification_method="self_report",
-        description="Free-text description — advisory only",
-    ))
-    reg.add(ATFField(
-        name="display_name",
-        role=FieldRole.DECORATIVE,
-        verification_class=VerificationClass.SELF_ATTESTED,
-        verifier="originating_agent",
-        verification_method="self_report",
-        description="Display name — decorative",
-    ))
+    passing = sum(1 for r in results if r.passes_axiom)
+    total = len(results)
+    failing = [r for r in results if not r.passes_axiom]
 
-    return reg
+    # Grade
+    ratio = passing / total if total > 0 else 0
+    if ratio >= 0.90:
+        grade = "A"
+    elif ratio >= 0.75:
+        grade = "B"
+    elif ratio >= 0.50:
+        grade = "C"
+    elif ratio >= 0.25:
+        grade = "D"
+    else:
+        grade = "F"
+
+    # Verdict
+    if not failing:
+        verdict = "FULLY_INDEPENDENT"
+    elif any(r.verification_class == VerificationClass.SELF_ATTESTED for r in failing):
+        verdict = "CONTAINS_UNFALSIFIABLE_CLAIMS"
+    else:
+        verdict = "PARTIALLY_DEPENDENT"
+
+    return {
+        "grade": grade,
+        "verdict": verdict,
+        "independent_fields": f"{passing}/{total}",
+        "failing_fields": [
+            {
+                "name": r.field_name,
+                "class": r.verification_class.value,
+                "diagnosis": r.diagnosis,
+            }
+            for r in failing
+        ],
+        "all_fields": [
+            {
+                "name": r.field_name,
+                "class": r.verification_class.value,
+                "passes": r.passes_axiom,
+            }
+            for r in results
+        ],
+    }
 
 
 def demo():
-    reg = build_atf_registry()
-    audit = reg.audit()
+    print("=" * 60)
+    print("SCENARIO 1: Well-formed ATF receipt (all HARD)")
+    print("=" * 60)
 
-    print("=" * 60)
-    print("VERIFIER-INDEPENDENCE AXIOM AUDIT")
-    print("=" * 60)
-    print(json.dumps(audit, indent=2))
+    good_receipt = {
+        "soul_hash": "sha256:abc123",
+        "operator_id": "kit_fox@agentmail.to",
+        "genesis_hash": "sha256:def456",
+        "evidence_grade": "A",
+        "grader_id": "bro_agent",
+        "receipt_hash": "sha256:ghi789",
+        "correction_count": "12",
+        "anchor_type": "genesis",
+        "failure_hash": "sha256:jkl012",
+    }
+    print(json.dumps(audit_receipt(good_receipt), indent=2))
 
     print()
     print("=" * 60)
-    print("PER-FIELD DETAIL")
+    print("SCENARIO 2: Receipt with self-attested claims")
     print("=" * 60)
-    for f in reg.fields:
-        status = "✓" if f.passes_axiom else "✗"
-        print(f"  {status} {f.name:30s} [{f.role.value:15s}] [{f.verification_class.value:15s}] {f.diagnosis}")
+
+    mixed_receipt = {
+        "soul_hash": "sha256:abc123",
+        "operator_id": "suspicious@agentmail.to",
+        "evidence_grade": "A",
+        "self_confidence": "0.99",  # SELF_ATTESTED
+        "declared_capability": "web_search,code_review",  # SOFT
+        "contribution_weight": "0.75",  # SOFT — orchestrator attests
+        "receipt_hash": "sha256:mno345",
+    }
+    print(json.dumps(audit_receipt(mixed_receipt), indent=2))
+
+    print()
+    print("=" * 60)
+    print("SCENARIO 3: Minimal receipt (3 fields)")
+    print("=" * 60)
+
+    minimal = {
+        "receipt_hash": "sha256:pqr678",
+        "evidence_grade": "B",
+        "grader_id": "independent_oracle",
+    }
+    print(json.dumps(audit_receipt(minimal), indent=2))
 
 
 if __name__ == "__main__":
