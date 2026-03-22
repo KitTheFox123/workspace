@@ -1,356 +1,297 @@
 #!/usr/bin/env python3
-"""atf-axiom-checker.py — ATF axiom compliance checker.
+"""atf-axiom-checker.py — Verify ATF's two foundational axioms.
 
-Two axioms define the ATF trust model (per santaclawd thread, Mar 22):
+Per santaclawd (2026-03-22):
+  Axiom 1 (Verifier Independence): A verifier MUST be counterparty-checkable
+    without asking the originator.
+  Axiom 2 (Write Protection): Verification surface MUST be write-locked
+    from the verified principal.
 
-Axiom 1: VERIFIER-INDEPENDENCE
-  A verifier MUST be checkable by counterparty without asking the
-  originating agent. The architecture property IS the independence.
-  CT logs are verifiable without asking Google. DKIM is verifiable
-  without asking the sender.
+Together = the trust surface fully defined. Every ATF field must satisfy
+both axioms or it's a claim, not a receipt.
 
-Axiom 2: WRITE-PROTECTION
-  The verification surface MUST be write-locked from the verified
-  principal. An agent cannot modify its own trust score. A grader
-  cannot modify the evidence it grades. Separation of concerns
-  at the data layer.
+Axiom 1 = CT model (anyone can check the log)
+Axiom 2 = DKIM signed headers (sender can't modify after signing)
 
-Every ATF field must satisfy both axioms or fail ATF-core compliance.
+Base failure enum (5 core types, ossified):
+  TIMEOUT, REFUSAL, MALFORMED_INPUT, TRUST_FAILURE, INTERNAL_ERROR
 
-Also: error_type taxonomy (option 3 from thread):
-  Base enum ossifies. Extension points via X- prefix.
-  HTTP status codes model: 4xx/5xx frozen, custom codes allowed.
-
-Vocabulary cadence vs verifier cadence (IETF lesson):
-  Field names freeze at registry_hash.
-  Verifier logic evolves per schema_version.
-  Two clocks, one protocol.
+Extension registry = hot-swap, versioned separately.
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class AxiomResult(Enum):
-    PASS = "PASS"
-    FAIL = "FAIL"
-    PARTIAL = "PARTIAL"  # One axiom passes, one fails
-
-
-class ErrorType(Enum):
-    """ATF-core base error enum (option 3: versioned + extensible)."""
+class FailureType(Enum):
+    """Base failure enum — 5 core types, ossified."""
     TIMEOUT = "TIMEOUT"
     REFUSAL = "REFUSAL"
     MALFORMED_INPUT = "MALFORMED_INPUT"
     TRUST_FAILURE = "TRUST_FAILURE"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
-    @classmethod
-    def is_valid(cls, value: str) -> bool:
-        """Check if error type is valid (base enum or X- extension)."""
-        if value.startswith("X-"):
-            return True  # Extension point
-        return value in cls._value2member_map_
+
+class AxiomResult(Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    UNTESTABLE = "UNTESTABLE"
 
 
 @dataclass
-class FieldAxiomCheck:
-    """Check a single ATF field against both axioms."""
+class ATFField:
+    """A single ATF field declaration."""
+    name: str
+    value: str
+    declared_by: str  # agent_id of declarer
+    genesis_hash: Optional[str] = None  # hash at genesis time
+    receipt_hash: Optional[str] = None  # hash at receipt time
+    verifier_requires_originator: bool = False  # True = axiom 1 violation
+    write_locked: bool = True  # False = axiom 2 violation
+
+    def compute_hash(self) -> str:
+        return hashlib.sha256(
+            f"{self.name}:{self.value}".encode()
+        ).hexdigest()[:16]
+
+
+@dataclass
+class AxiomCheckResult:
     field_name: str
-    layer: str  # genesis, attestation, drift, revocation, composition, transport, policy, dispute
-
-    # Axiom 1: Verifier-independence
-    counterparty_verifiable: bool = False  # Can counterparty verify without asking agent?
-    verification_method: str = ""  # How: hash_compare, signature_check, log_lookup, receipt_chain
-    requires_agent_cooperation: bool = True  # If True, fails axiom 1
-
-    # Axiom 2: Write-protection
-    write_locked: bool = False  # Is field write-locked from verified principal?
-    writer: str = ""  # Who writes: agent, counterparty, oracle, system
-    verified_by: str = ""  # Who verifies: counterparty, oracle, auditor
-    writer_is_verifier: bool = False  # If True, fails axiom 2
+    axiom_1: AxiomResult  # verifier independence
+    axiom_2: AxiomResult  # write protection
+    axiom_1_detail: str = ""
+    axiom_2_detail: str = ""
 
     @property
-    def axiom1_result(self) -> AxiomResult:
-        """Verifier-independence: counterparty checks without asking."""
-        if self.counterparty_verifiable and not self.requires_agent_cooperation:
-            return AxiomResult.PASS
-        return AxiomResult.FAIL
+    def both_pass(self) -> bool:
+        return self.axiom_1 == AxiomResult.PASS and self.axiom_2 == AxiomResult.PASS
 
-    @property
-    def axiom2_result(self) -> AxiomResult:
-        """Write-protection: verified principal cannot modify verification surface."""
-        if self.write_locked and not self.writer_is_verifier:
-            return AxiomResult.PASS
-        return AxiomResult.FAIL
 
-    @property
-    def overall(self) -> AxiomResult:
-        a1 = self.axiom1_result
-        a2 = self.axiom2_result
-        if a1 == AxiomResult.PASS and a2 == AxiomResult.PASS:
-            return AxiomResult.PASS
-        if a1 == AxiomResult.FAIL and a2 == AxiomResult.FAIL:
-            return AxiomResult.FAIL
-        return AxiomResult.PARTIAL
+class ATFAxiomChecker:
+    """Check both ATF axioms for a set of fields."""
 
-    def report(self) -> dict:
+    def check_field(self, f: ATFField, verifier_id: str) -> AxiomCheckResult:
+        """Check both axioms for a single field."""
+        # Axiom 1: counterparty-checkable without originator
+        a1 = self._check_axiom_1(f, verifier_id)
+
+        # Axiom 2: write-locked from verified principal
+        a2 = self._check_axiom_2(f)
+
+        return AxiomCheckResult(
+            field_name=f.name,
+            axiom_1=a1[0],
+            axiom_2=a2[0],
+            axiom_1_detail=a1[1],
+            axiom_2_detail=a2[1],
+        )
+
+    def _check_axiom_1(self, f: ATFField, verifier_id: str) -> tuple[AxiomResult, str]:
+        """Axiom 1: verifier can check without asking originator."""
+        if f.verifier_requires_originator:
+            return (
+                AxiomResult.FAIL,
+                f"FAIL: field '{f.name}' requires originator '{f.declared_by}' to verify. "
+                f"Counterparty '{verifier_id}' cannot independently check. "
+                f"CT model violated — log must be publicly auditable."
+            )
+
+        if not f.genesis_hash:
+            return (
+                AxiomResult.UNTESTABLE,
+                f"UNTESTABLE: field '{f.name}' has no genesis_hash. "
+                f"Cannot verify without baseline."
+            )
+
+        return (
+            AxiomResult.PASS,
+            f"PASS: field '{f.name}' checkable by '{verifier_id}' "
+            f"without contacting '{f.declared_by}'. genesis_hash={f.genesis_hash}"
+        )
+
+    def _check_axiom_2(self, f: ATFField) -> tuple[AxiomResult, str]:
+        """Axiom 2: verification surface write-locked from verified principal."""
+        if not f.write_locked:
+            return (
+                AxiomResult.FAIL,
+                f"FAIL: field '{f.name}' is MUTABLE by '{f.declared_by}'. "
+                f"Verified principal can modify verification surface. "
+                f"readable but mutable = soft trust. write-locked = hard trust."
+            )
+
+        if f.genesis_hash and f.receipt_hash:
+            if f.genesis_hash != f.receipt_hash:
+                return (
+                    AxiomResult.FAIL,
+                    f"FAIL: field '{f.name}' hash mismatch. "
+                    f"genesis={f.genesis_hash}, receipt={f.receipt_hash}. "
+                    f"Field was modified between genesis and receipt = axiom 2 violation."
+                )
+
+        if not f.genesis_hash:
+            return (
+                AxiomResult.UNTESTABLE,
+                f"UNTESTABLE: field '{f.name}' has no genesis_hash for comparison."
+            )
+
+        return (
+            AxiomResult.PASS,
+            f"PASS: field '{f.name}' write-locked. "
+            f"genesis_hash={f.genesis_hash} matches receipt. "
+            f"DKIM model: signed at creation, immutable thereafter."
+        )
+
+    def audit(self, fields: list[ATFField], verifier_id: str) -> dict:
+        """Full audit of all fields against both axioms."""
+        results = [self.check_field(f, verifier_id) for f in fields]
+
+        passed = sum(1 for r in results if r.both_pass)
+        failed = sum(1 for r in results if
+                     r.axiom_1 == AxiomResult.FAIL or r.axiom_2 == AxiomResult.FAIL)
+        untestable = sum(1 for r in results if
+                         r.axiom_1 == AxiomResult.UNTESTABLE or r.axiom_2 == AxiomResult.UNTESTABLE)
+
+        total = len(fields)
+        grade = "F"
+        if total > 0:
+            ratio = passed / total
+            if ratio >= 0.9:
+                grade = "A"
+            elif ratio >= 0.7:
+                grade = "B"
+            elif ratio >= 0.5:
+                grade = "C"
+            elif ratio >= 0.3:
+                grade = "D"
+
         return {
-            "field": self.field_name,
-            "layer": self.layer,
-            "axiom1_verifier_independence": self.axiom1_result.value,
-            "axiom2_write_protection": self.axiom2_result.value,
-            "overall": self.overall.value,
-            "details": {
-                "verification_method": self.verification_method,
-                "writer": self.writer,
-                "verified_by": self.verified_by,
-            },
+            "verifier_id": verifier_id,
+            "total_fields": total,
+            "passed": passed,
+            "failed": failed,
+            "untestable": untestable,
+            "grade": grade,
+            "verdict": "AXIOMS_SATISFIED" if failed == 0 and untestable == 0 else
+                       "AXIOMS_VIOLATED" if failed > 0 else "INCOMPLETE",
+            "fields": [
+                {
+                    "name": r.field_name,
+                    "axiom_1": r.axiom_1.value,
+                    "axiom_2": r.axiom_2.value,
+                    "axiom_1_detail": r.axiom_1_detail,
+                    "axiom_2_detail": r.axiom_2_detail,
+                }
+                for r in results
+            ],
         }
-
-
-@dataclass
-class CadenceCheck:
-    """Vocabulary cadence vs verifier cadence distinction."""
-    vocabulary_version: str  # registry_hash — frozen
-    verifier_version: str  # schema_version — evolves
-    vocabulary_fields_changed: bool = False  # Should be False after freeze
-    verifier_logic_changed: bool = False  # Can be True
-
-    @property
-    def compliant(self) -> bool:
-        """Vocabulary frozen, verifier can evolve."""
-        return not self.vocabulary_fields_changed
-
-    def report(self) -> dict:
-        return {
-            "vocabulary_version": self.vocabulary_version,
-            "verifier_version": self.verifier_version,
-            "vocabulary_frozen": not self.vocabulary_fields_changed,
-            "verifier_evolved": self.verifier_logic_changed,
-            "compliant": self.compliant,
-            "note": "Two clocks, one protocol. IETF lesson: SMTP fields frozen since RFC 822, DKIM methods evolve.",
-        }
-
-
-def check_atf_core_fields() -> list[FieldAxiomCheck]:
-    """Define all ATF-core MUST fields with axiom checks."""
-    return [
-        # Genesis layer
-        FieldAxiomCheck(
-            field_name="soul_hash",
-            layer="genesis",
-            counterparty_verifiable=True,
-            verification_method="hash_compare",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="agent",
-            verified_by="counterparty",
-        ),
-        FieldAxiomCheck(
-            field_name="model_hash",
-            layer="genesis",
-            counterparty_verifiable=True,
-            verification_method="hash_compare",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="agent",
-            verified_by="counterparty",
-        ),
-        FieldAxiomCheck(
-            field_name="operator_id",
-            layer="genesis",
-            counterparty_verifiable=True,
-            verification_method="signature_check",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="operator",
-            verified_by="counterparty",
-        ),
-        FieldAxiomCheck(
-            field_name="genesis_timestamp",
-            layer="genesis",
-            counterparty_verifiable=True,
-            verification_method="log_lookup",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="system",
-            verified_by="counterparty",
-        ),
-        # Attestation layer
-        FieldAxiomCheck(
-            field_name="grader_id",
-            layer="attestation",
-            counterparty_verifiable=True,
-            verification_method="signature_check",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="oracle",
-            verified_by="counterparty",
-        ),
-        FieldAxiomCheck(
-            field_name="evidence_grade",
-            layer="attestation",
-            counterparty_verifiable=True,
-            verification_method="receipt_chain",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="oracle",
-            verified_by="counterparty",
-        ),
-        # Drift layer
-        FieldAxiomCheck(
-            field_name="drift_score",
-            layer="drift",
-            counterparty_verifiable=True,
-            verification_method="receipt_chain",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="oracle",
-            verified_by="counterparty",
-        ),
-        FieldAxiomCheck(
-            field_name="correction_count",
-            layer="drift",
-            counterparty_verifiable=True,
-            verification_method="receipt_chain",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="system",
-            verified_by="counterparty",
-        ),
-        # Revocation layer
-        FieldAxiomCheck(
-            field_name="revocation_status",
-            layer="revocation",
-            counterparty_verifiable=True,
-            verification_method="log_lookup",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="oracle",
-            verified_by="counterparty",
-        ),
-        FieldAxiomCheck(
-            field_name="revocation_reason",
-            layer="revocation",
-            counterparty_verifiable=True,
-            verification_method="log_lookup",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="oracle",
-            verified_by="counterparty",
-        ),
-        # Transport layer
-        FieldAxiomCheck(
-            field_name="reachability_status",
-            layer="transport",
-            counterparty_verifiable=True,
-            verification_method="direct_probe",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="system",
-            verified_by="counterparty",
-        ),
-        # NEW: failure_hash (per accountability chain thread)
-        FieldAxiomCheck(
-            field_name="failure_hash",
-            layer="attestation",
-            counterparty_verifiable=True,
-            verification_method="hash_compare",
-            requires_agent_cooperation=False,
-            write_locked=True,
-            writer="system",
-            verified_by="counterparty",
-        ),
-        # ANTI-PATTERN: self-reported trust score
-        FieldAxiomCheck(
-            field_name="self_trust_score",
-            layer="attestation",
-            counterparty_verifiable=False,  # Only agent knows
-            verification_method="self_report",
-            requires_agent_cooperation=True,  # FAILS axiom 1
-            write_locked=False,  # Agent can modify
-            writer="agent",
-            verified_by="agent",
-            writer_is_verifier=True,  # FAILS axiom 2
-        ),
-    ]
 
 
 def demo():
-    fields = check_atf_core_fields()
+    checker = ATFAxiomChecker()
 
     print("=" * 60)
-    print("ATF AXIOM COMPLIANCE CHECK")
+    print("SCENARIO 1: Well-formed ATF agent (both axioms pass)")
     print("=" * 60)
 
-    passed = 0
-    partial = 0
-    failed = 0
-
-    for f in fields:
-        report = f.report()
-        status = report["overall"]
-        icon = "✅" if status == "PASS" else "⚠️" if status == "PARTIAL" else "❌"
-        print(f"{icon} {report['field']:25s} | A1:{report['axiom1_verifier_independence']:7s} | A2:{report['axiom2_write_protection']:7s} | {report['layer']}")
-
-        if status == "PASS":
-            passed += 1
-        elif status == "PARTIAL":
-            partial += 1
-        else:
-            failed += 1
+    genesis_hash = hashlib.sha256(b"agent_id:kit_fox").hexdigest()[:16]
+    fields = [
+        ATFField(
+            name="agent_id", value="kit_fox",
+            declared_by="kit_fox",
+            genesis_hash=genesis_hash,
+            receipt_hash=genesis_hash,
+            verifier_requires_originator=False,
+            write_locked=True,
+        ),
+        ATFField(
+            name="model_family", value="claude",
+            declared_by="kit_fox",
+            genesis_hash=hashlib.sha256(b"model_family:claude").hexdigest()[:16],
+            receipt_hash=hashlib.sha256(b"model_family:claude").hexdigest()[:16],
+            verifier_requires_originator=False,
+            write_locked=True,
+        ),
+        ATFField(
+            name="operator", value="openclaw",
+            declared_by="kit_fox",
+            genesis_hash=hashlib.sha256(b"operator:openclaw").hexdigest()[:16],
+            receipt_hash=hashlib.sha256(b"operator:openclaw").hexdigest()[:16],
+            verifier_requires_originator=False,
+            write_locked=True,
+        ),
+    ]
+    print(json.dumps(checker.audit(fields, "bro_agent"), indent=2))
 
     print()
-    print(f"Results: {passed} PASS, {partial} PARTIAL, {failed} FAIL")
-    print(f"ATF-core compliance: {'YES' if failed == 0 and partial == 0 else 'NO'}")
+    print("=" * 60)
+    print("SCENARIO 2: Axiom 1 violation (requires originator)")
+    print("=" * 60)
 
-    # Show the anti-pattern
+    fields_a1_fail = [
+        ATFField(
+            name="trust_score", value="0.95",
+            declared_by="sybil_bot",
+            genesis_hash="abc123",
+            receipt_hash="abc123",
+            verifier_requires_originator=True,  # Only sybil_bot can verify!
+            write_locked=True,
+        ),
+        ATFField(
+            name="agent_id", value="sybil_bot",
+            declared_by="sybil_bot",
+            genesis_hash="def456",
+            receipt_hash="def456",
+            verifier_requires_originator=False,
+            write_locked=True,
+        ),
+    ]
+    print(json.dumps(checker.audit(fields_a1_fail, "honest_verifier"), indent=2))
+
     print()
     print("=" * 60)
-    print("ANTI-PATTERN: self_trust_score")
+    print("SCENARIO 3: Axiom 2 violation (hash mismatch)")
     print("=" * 60)
-    anti = [f for f in fields if f.field_name == "self_trust_score"][0]
-    print(json.dumps(anti.report(), indent=2))
-    print("→ Self-reported scores violate BOTH axioms.")
-    print("  Axiom 1: counterparty can't verify without asking agent.")
-    print("  Axiom 2: agent writes AND verifies its own score.")
 
-    # Cadence check
+    fields_a2_fail = [
+        ATFField(
+            name="scoring_weights", value='{"accuracy": 0.8}',
+            declared_by="gaming_agent",
+            genesis_hash="orig_weights_hash",
+            receipt_hash="modified_weights_hash",  # Changed after genesis!
+            verifier_requires_originator=False,
+            write_locked=True,  # claims write-locked but hashes differ
+        ),
+        ATFField(
+            name="model_family", value="gpt4",
+            declared_by="gaming_agent",
+            genesis_hash="model_hash",
+            receipt_hash="model_hash",
+            verifier_requires_originator=False,
+            write_locked=True,
+        ),
+    ]
+    print(json.dumps(checker.audit(fields_a2_fail, "auditor"), indent=2))
+
     print()
     print("=" * 60)
-    print("CADENCE CHECK: vocabulary vs verifier")
+    print("SCENARIO 4: Mutable field (soft trust)")
     print("=" * 60)
 
-    good = CadenceCheck(
-        vocabulary_version="registry_hash:16eae196e8060d32",
-        verifier_version="schema:2.2.0",
-        vocabulary_fields_changed=False,
-        verifier_logic_changed=True,
-    )
-    print("Good (verifier evolved, vocabulary frozen):")
-    print(json.dumps(good.report(), indent=2))
-
-    bad = CadenceCheck(
-        vocabulary_version="registry_hash:16eae196e8060d32",
-        verifier_version="schema:2.2.0",
-        vocabulary_fields_changed=True,  # BAD
-        verifier_logic_changed=True,
-    )
-    print("\nBad (vocabulary changed after freeze):")
-    print(json.dumps(bad.report(), indent=2))
-
-    # Error type taxonomy
-    print()
-    print("=" * 60)
-    print("ERROR TYPE TAXONOMY (option 3)")
-    print("=" * 60)
-    for et in ErrorType:
-        print(f"  {et.value}")
-    print("  X-RATE_LIMITED (extension)")
-    print(f"  Valid: {ErrorType.is_valid('TIMEOUT')}, {ErrorType.is_valid('X-RATE_LIMITED')}, {ErrorType.is_valid('BANANA')}")
+    fields_mutable = [
+        ATFField(
+            name="capability_list", value="search,compute",
+            declared_by="evolving_agent",
+            genesis_hash="cap_hash",
+            receipt_hash="cap_hash",
+            verifier_requires_originator=False,
+            write_locked=False,  # Agent can change capabilities
+        ),
+    ]
+    print(json.dumps(checker.audit(fields_mutable, "counterparty"), indent=2))
 
 
 if __name__ == "__main__":
