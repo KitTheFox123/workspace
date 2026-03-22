@@ -1,243 +1,268 @@
 #!/usr/bin/env python3
-"""trust-calibration-engine.py — Graduated trust calibration per Warmsley et al (2025).
+"""trust-calibration-engine.py — Closed-loop trust calibration for agents.
 
-Frontiers in Robotics & AI: closed-loop trust calibration with machine
-self-assessment → 40% trust improvement, 5% team performance improvement.
+Per Warmsley et al. (Frontiers Robotics & AI, May 2025): machines with
+learned self-assessment boosted human trust 40% — same performance, just
+better at knowing when they'd fail.
 
-Key insight: self-assessment (knowing when to ask for help) matters more
-than raw capability. Agents that accurately report uncertainty get more
-autonomy than agents that always succeed silently.
+Applied to agent trust: replace binary trust gates with calibrated
+confidence intervals that narrow with evidence.
 
-Maps to ATF: correction_frequency IS self-assessment. Agents that correct
-themselves are declaring capability boundaries.
+Key insight: self-assessment accuracy matters more than task accuracy.
+An agent that knows when it's wrong is more trustworthy than one that's
+usually right but can't tell when it isn't.
+
+References:
+- Warmsley et al. (2025): Self-assessment in machines boosts human trust
+- Wilson (1927): Confidence intervals for binomial proportions
+- Nisbett & Wilson (1977): Self-report confabulation
+- Okamura & Yamada (2020): Adaptive trust calibration cues
 """
 
 import json
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 
 @dataclass
-class ActionReceipt:
-    """Single action with outcome."""
-    action_type: str  # "payment", "write", "read", "execute"
-    scope: float  # 0.0-1.0, action magnitude
-    succeeded: bool
-    self_assessed_confidence: float  # 0.0-1.0, agent's own assessment
+class TaskOutcome:
+    """Single task outcome with self-assessment."""
+    task_id: str
+    predicted_success: float  # agent's self-assessed confidence [0,1]
+    actual_success: bool      # did it actually succeed?
     counterparty_grade: Optional[str] = None  # A-F from counterparty
-    requested_help: bool = False  # did agent ask for intervention?
-    timestamp: str = ""
 
 
 @dataclass
-class TrustEnvelope:
-    """Graduated autonomy envelope per action type."""
-    action_type: str
-    max_scope: float  # maximum allowed scope without approval
-    confidence_threshold: float  # below this → request help
-    receipt_count: int = 0
-    success_count: int = 0
-    calibration_score: float = 0.5  # how well agent self-assesses
-
+class TrustState:
+    """Current trust calibration state for an agent."""
+    agent_id: str
+    outcomes: list = field(default_factory=list)
+    
+    @property
+    def n(self) -> int:
+        return len(self.outcomes)
+    
+    @property
+    def successes(self) -> int:
+        return sum(1 for o in self.outcomes if o.actual_success)
+    
     @property
     def success_rate(self) -> float:
-        if self.receipt_count == 0:
+        if self.n == 0:
             return 0.0
-        return self.success_count / self.receipt_count
-
+        return self.successes / self.n
+    
+    def wilson_ci(self, z: float = 1.96) -> tuple:
+        """Wilson confidence interval for success rate."""
+        if self.n == 0:
+            return (0.0, 1.0)  # maximum uncertainty
+        
+        p = self.success_rate
+        denominator = 1 + z**2 / self.n
+        center = (p + z**2 / (2 * self.n)) / denominator
+        spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * self.n)) / self.n) / denominator
+        
+        return (max(0.0, center - spread), min(1.0, center + spread))
+    
     @property
-    def grade(self) -> str:
-        if self.receipt_count < 5:
-            return "COLD_START"
-        if self.calibration_score >= 0.8 and self.success_rate >= 0.9:
-            return "A"
-        elif self.calibration_score >= 0.6 and self.success_rate >= 0.7:
-            return "B"
-        elif self.calibration_score >= 0.4:
-            return "C"
-        elif self.calibration_score >= 0.2:
-            return "D"
-        return "F"
-
-
-@dataclass
-class TrustCalibrationEngine:
-    """Closed-loop trust calibration for agent autonomy.
+    def ci_width(self) -> float:
+        """CI width = uncertainty. Narrows with evidence."""
+        lo, hi = self.wilson_ci()
+        return hi - lo
     
-    Per Warmsley et al (2025):
-    1. Agent self-assesses capability per action
-    2. Engine predicts trust level
-    3. If miscalibrated → request human intervention
-    4. Successful self-assessment → widen autonomy envelope
-    """
-    envelopes: dict = field(default_factory=dict)
-    receipts: List[ActionReceipt] = field(default_factory=list)
+    def self_assessment_accuracy(self) -> float:
+        """How well does the agent predict its own success?
+        
+        Brier score variant: mean squared error between
+        predicted confidence and actual outcome.
+        Lower = better self-assessment.
+        """
+        if self.n == 0:
+            return 1.0  # worst possible
+        
+        total_error = sum(
+            (o.predicted_success - (1.0 if o.actual_success else 0.0))**2
+            for o in self.outcomes
+        )
+        return total_error / self.n
     
-    # Warmsley findings: 40% trust improvement from self-assessment
-    SELF_ASSESSMENT_BONUS = 0.40
+    def calibration_gap(self) -> float:
+        """Gap between self-assessed confidence and actual performance.
+        
+        Positive = overconfident. Negative = underconfident.
+        """
+        if self.n == 0:
+            return 0.0
+        
+        mean_confidence = sum(o.predicted_success for o in self.outcomes) / self.n
+        return mean_confidence - self.success_rate
     
-    # Cold start: Wilson CI lower bound with n=0
-    COLD_START_MAX_SCOPE = 0.05  # 5% of max until proven
+    def correction_frequency(self) -> float:
+        """How often does the agent correctly predict failure?
+        
+        Healthy range: 0.15-0.30 (per MEMORY.md).
+        Zero = hiding drift. >0.5 = either very bad or very honest.
+        """
+        failures = [o for o in self.outcomes if not o.actual_success]
+        if not failures:
+            return 0.0
+        
+        predicted_failures = sum(
+            1 for o in failures if o.predicted_success < 0.5
+        )
+        return predicted_failures / len(failures)
     
-    def get_envelope(self, action_type: str) -> TrustEnvelope:
-        if action_type not in self.envelopes:
-            self.envelopes[action_type] = TrustEnvelope(
-                action_type=action_type,
-                max_scope=self.COLD_START_MAX_SCOPE,
-                confidence_threshold=0.7,  # high threshold at cold start
-            )
-        return self.envelopes[action_type]
-    
-    def should_request_help(self, action_type: str, scope: float, 
-                           agent_confidence: float) -> dict:
-        """Determine if agent should request human intervention."""
-        env = self.get_envelope(action_type)
+    def trust_grade(self) -> str:
+        """Composite trust grade based on calibration quality."""
+        if self.n < 5:
+            return "INSUFFICIENT_DATA"
         
-        reasons = []
+        sa = self.self_assessment_accuracy()
+        gap = abs(self.calibration_gap())
+        cf = self.correction_frequency()
+        lo, _ = self.wilson_ci()
         
-        # Scope exceeds envelope
-        if scope > env.max_scope:
-            reasons.append(f"SCOPE_EXCEEDS_ENVELOPE: {scope:.2f} > {env.max_scope:.2f}")
-        
-        # Agent confidence below threshold
-        if agent_confidence < env.confidence_threshold:
-            reasons.append(f"LOW_CONFIDENCE: {agent_confidence:.2f} < {env.confidence_threshold:.2f}")
-        
-        # Cold start
-        if env.receipt_count < 5:
-            reasons.append(f"COLD_START: only {env.receipt_count}/5 receipts")
-        
-        return {
-            "request_help": len(reasons) > 0,
-            "reasons": reasons,
-            "envelope_grade": env.grade,
-            "current_max_scope": env.max_scope,
-        }
-    
-    def process_receipt(self, receipt: ActionReceipt) -> dict:
-        """Process action receipt and update trust envelope."""
-        env = self.get_envelope(receipt.action_type)
-        
-        env.receipt_count += 1
-        if receipt.succeeded:
-            env.success_count += 1
-        
-        # Update calibration score
-        # Good calibration = high confidence on success, low on failure
-        # Bad calibration = high confidence on failure (overconfident)
-        if receipt.succeeded:
-            if receipt.self_assessed_confidence >= 0.7:
-                cal_delta = 0.05  # correctly confident
-            else:
-                cal_delta = -0.02  # underconfident (missed opportunity)
+        # Self-assessment accuracy is the primary signal
+        # (Warmsley et al.: self-assessment > task performance for trust)
+        if sa < 0.10 and gap < 0.10 and 0.10 <= cf <= 0.50:
+            return "A"  # CALIBRATED
+        elif sa < 0.20 and gap < 0.15:
+            return "B"  # MOSTLY_CALIBRATED
+        elif sa < 0.30 and gap < 0.25:
+            return "C"  # PARTIALLY_CALIBRATED
+        elif gap > 0.30:
+            return "D"  # MISCALIBRATED (overconfident or underconfident)
+        elif cf == 0.0 and self.n > 10:
+            return "F"  # HIDING_DRIFT (zero correction frequency)
         else:
-            if receipt.self_assessed_confidence < 0.5:
-                cal_delta = 0.03  # correctly uncertain
-            elif receipt.requested_help:
-                cal_delta = 0.04  # asked for help when uncertain — best behavior
-            else:
-                cal_delta = -0.10  # overconfident failure — worst behavior
+            return "D"
+    
+    def should_request_help(self, current_confidence: float) -> dict:
+        """Should the agent request help on a task?
         
-        env.calibration_score = max(0.0, min(1.0, env.calibration_score + cal_delta))
+        Closed-loop: uses self-assessment accuracy to decide.
+        If self-assessment is poor, request help more often.
+        """
+        sa = self.self_assessment_accuracy()
         
-        # Adjust envelope based on calibration
-        # Warmsley: self-assessment → 40% trust boost → wider envelope
-        if env.calibration_score >= 0.7 and env.success_rate >= 0.8:
-            # Widen envelope
-            env.max_scope = min(1.0, env.max_scope * 1.1)
-            env.confidence_threshold = max(0.3, env.confidence_threshold - 0.02)
-        elif env.calibration_score < 0.4 or env.success_rate < 0.5:
-            # Narrow envelope
-            env.max_scope = max(self.COLD_START_MAX_SCOPE, env.max_scope * 0.8)
-            env.confidence_threshold = min(0.9, env.confidence_threshold + 0.05)
+        # Adjust threshold based on self-assessment quality
+        # Good self-assessment → trust low confidence signals
+        # Bad self-assessment → request help more aggressively
+        if sa < 0.15:
+            threshold = 0.50  # calibrated: trust the confidence
+        elif sa < 0.30:
+            threshold = 0.65  # somewhat calibrated: be cautious
+        else:
+            threshold = 0.80  # poorly calibrated: request help often
         
-        self.receipts.append(receipt)
+        request_help = current_confidence < threshold
         
         return {
-            "envelope_update": {
-                "action_type": env.action_type,
-                "grade": env.grade,
-                "max_scope": round(env.max_scope, 4),
-                "confidence_threshold": round(env.confidence_threshold, 4),
-                "calibration_score": round(env.calibration_score, 4),
-                "success_rate": round(env.success_rate, 4),
-                "receipt_count": env.receipt_count,
-            },
-            "calibration_delta": round(cal_delta, 4),
+            "request_help": request_help,
+            "confidence": current_confidence,
+            "threshold": threshold,
+            "self_assessment_quality": "good" if sa < 0.15 else "moderate" if sa < 0.30 else "poor",
+            "reason": f"confidence {current_confidence:.2f} {'<' if request_help else '>='} threshold {threshold:.2f}"
         }
     
     def report(self) -> dict:
+        lo, hi = self.wilson_ci()
         return {
-            "total_receipts": len(self.receipts),
-            "envelopes": {
-                k: {
-                    "grade": v.grade,
-                    "max_scope": round(v.max_scope, 4),
-                    "calibration_score": round(v.calibration_score, 4),
-                    "success_rate": round(v.success_rate, 4),
-                    "receipts": v.receipt_count,
-                }
-                for k, v in self.envelopes.items()
-            },
+            "agent_id": self.agent_id,
+            "n_tasks": self.n,
+            "success_rate": round(self.success_rate, 3),
+            "wilson_ci": [round(lo, 3), round(hi, 3)],
+            "ci_width": round(self.ci_width, 3),
+            "self_assessment_accuracy": round(self.self_assessment_accuracy(), 3),
+            "calibration_gap": round(self.calibration_gap(), 3),
+            "correction_frequency": round(self.correction_frequency(), 3),
+            "trust_grade": self.trust_grade(),
+            "verdict": self._verdict(),
         }
+    
+    def _verdict(self) -> str:
+        grade = self.trust_grade()
+        gap = self.calibration_gap()
+        verdicts = {
+            "A": "CALIBRATED — self-assessment matches reality",
+            "B": "MOSTLY_CALIBRATED — minor gap",
+            "C": "PARTIALLY_CALIBRATED — significant uncertainty",
+            "D": f"MISCALIBRATED — {'overconfident' if gap > 0 else 'underconfident'} by {abs(gap):.0%}",
+            "F": "HIDING_DRIFT — zero corrections is suspicious",
+            "INSUFFICIENT_DATA": "COLD_START — need more evidence",
+        }
+        return verdicts.get(grade, "UNKNOWN")
 
 
 def demo():
-    engine = TrustCalibrationEngine()
+    """Three scenarios demonstrating calibration quality."""
     
     print("=" * 60)
-    print("SCENARIO: Agent payment autonomy graduation")
+    print("SCENARIO 1: Well-calibrated agent (knows when it'll fail)")
     print("=" * 60)
     
-    # Cold start check
-    check = engine.should_request_help("payment", 0.10, 0.8)
-    print(f"\nCold start check (scope=0.10):")
-    print(json.dumps(check, indent=2))
-    
-    # Process 10 successful small payments with good self-assessment
-    print("\n--- Processing 10 successful small payments ---")
-    for i in range(10):
-        result = engine.process_receipt(ActionReceipt(
-            action_type="payment",
-            scope=0.05,
-            succeeded=True,
-            self_assessed_confidence=0.85,
+    calibrated = TrustState(agent_id="kit_fox")
+    # Correctly predicts success/failure
+    for i in range(20):
+        success = i % 5 != 0  # fails every 5th task
+        confidence = 0.85 if success else 0.25  # knows it
+        calibrated.outcomes.append(TaskOutcome(
+            task_id=f"task_{i}",
+            predicted_success=confidence,
+            actual_success=success,
         ))
-    print(f"After 10 successes: {json.dumps(result['envelope_update'], indent=2)}")
     
-    # Now check if larger scope is allowed
-    check = engine.should_request_help("payment", 0.10, 0.85)
-    print(f"\nPost-graduation check (scope=0.10):")
-    print(json.dumps(check, indent=2))
+    print(json.dumps(calibrated.report(), indent=2))
+    print("\nShould request help at 0.40 confidence?")
+    print(json.dumps(calibrated.should_request_help(0.40), indent=2))
     
-    # Process an overconfident failure
-    print("\n--- Overconfident failure ---")
-    result = engine.process_receipt(ActionReceipt(
-        action_type="payment",
-        scope=0.08,
-        succeeded=False,
-        self_assessed_confidence=0.95,  # overconfident!
-        requested_help=False,
-    ))
-    print(f"After overconfident failure: {json.dumps(result, indent=2)}")
-    
-    # Process a correctly-uncertain failure (asked for help)
-    print("\n--- Correctly uncertain, asked for help ---")
-    result = engine.process_receipt(ActionReceipt(
-        action_type="payment",
-        scope=0.08,
-        succeeded=False,
-        self_assessed_confidence=0.3,
-        requested_help=True,
-    ))
-    print(f"After correct uncertainty: {json.dumps(result, indent=2)}")
-    
-    # Final report
-    print(f"\n{'=' * 60}")
-    print("FINAL REPORT")
+    print()
     print("=" * 60)
-    print(json.dumps(engine.report(), indent=2))
+    print("SCENARIO 2: Overconfident agent (always says 0.95)")
+    print("=" * 60)
+    
+    overconfident = TrustState(agent_id="compliance_bot")
+    for i in range(20):
+        success = i % 3 != 0  # fails 33% of time
+        overconfident.outcomes.append(TaskOutcome(
+            task_id=f"task_{i}",
+            predicted_success=0.95,  # always overconfident
+            actual_success=success,
+        ))
+    
+    print(json.dumps(overconfident.report(), indent=2))
+    
+    print()
+    print("=" * 60)
+    print("SCENARIO 3: Ghost ship (perfect record, zero corrections)")
+    print("=" * 60)
+    
+    ghost = TrustState(agent_id="ghost_ship")
+    for i in range(20):
+        ghost.outcomes.append(TaskOutcome(
+            task_id=f"task_{i}",
+            predicted_success=0.99,
+            actual_success=True,  # suspiciously perfect
+        ))
+    
+    print(json.dumps(ghost.report(), indent=2))
+    
+    print()
+    print("=" * 60)
+    print("SCENARIO 4: Cold start (3 tasks)")
+    print("=" * 60)
+    
+    cold = TrustState(agent_id="new_agent")
+    for i in range(3):
+        cold.outcomes.append(TaskOutcome(
+            task_id=f"task_{i}",
+            predicted_success=0.70,
+            actual_success=True,
+        ))
+    
+    print(json.dumps(cold.report(), indent=2))
 
 
 if __name__ == "__main__":
