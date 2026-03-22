@@ -1,270 +1,278 @@
 #!/usr/bin/env python3
 """quorum-size-router.py — Size-indexed trust aggregation per TECH-28.
 
-Per santaclawd: quorum<4 = MIN() (no disagreement signal possible).
-quorum>=4 = consensus_hash (disagreement visible, detectable).
+Per santaclawd: quorum size determines the safe aggregation method.
+Small quorums can't afford disagreement — MIN() is the only safe default.
+Large quorums can use consensus_hash with visible disagreement.
 
-The method encodes the attack surface:
-- 2 oracles: attacker needs 1 to corrupt (50% attack surface)
-- 4 oracles: attacker needs 2 to corrupt (still possible but visible)
-- 7 oracles: BFT bound f<n/3, attacker needs 3 (expensive + detectable)
+The method encodes the attacker surface:
+- quorum < 4: MIN() (strict floor, no fraud possible)
+- quorum >= 4: consensus_hash (disagreement visible, detectable)
+- quorum >= 7: weighted consensus with Simpson diversity gate
+
+BFT bound: f < n/3 at each tier.
 
 References:
-- Lamport (1982): f < n/3 for BFT
-- Surowiecki (2004): Independence prerequisite for wisdom of crowds
-- Nature (2025): Correlated voters = wisdom of crowds failure
+- Lamport (1982): f < n/3 for Byzantine agreement
+- Nature (2025): Correlated voters = expensive groupthink
+- Surowiecki (2004): Independence is load-bearing for wisdom of crowds
 """
 
 import hashlib
 import json
 import math
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
 class OracleScore:
-    """Single oracle's assessment."""
+    """Single oracle's score for an agent."""
     oracle_id: str
     score: float  # 0.0 - 1.0
-    model_family: str
     operator: str
-    confidence: float = 0.8
+    model_family: str
+    confidence: float = 0.5
 
 
 @dataclass
 class QuorumResult:
-    """Result of quorum aggregation."""
-    method: str  # MIN, CONSENSUS_HASH, BFT_WEIGHTED
-    composite_score: float
-    grade: str
+    """Result of quorum-size-indexed aggregation."""
+    method: str  # MIN, CONSENSUS_HASH, WEIGHTED_CONSENSUS
     quorum_size: int
-    max_byzantine: int
-    agreement_ratio: float
+    max_byzantine: int  # f < n/3
+    effective_oracles: float  # after independence discount
+    aggregated_score: float
+    grade: str
     disagreement_visible: bool
-    consensus_hash: str
-    detail: dict = field(default_factory=dict)
+    details: dict = field(default_factory=dict)
 
 
-def grade_from_score(score: float) -> str:
-    if score >= 0.90: return "A"
-    if score >= 0.75: return "B"
-    if score >= 0.50: return "C"
-    if score >= 0.25: return "D"
-    return "F"
-
-
-def consensus_hash(scores: list[OracleScore]) -> str:
-    """Deterministic hash of all oracle scores for audit trail."""
-    data = json.dumps(
-        [{"id": s.oracle_id, "score": round(s.score, 4)} for s in sorted(scores, key=lambda x: x.oracle_id)],
-        sort_keys=True,
-    )
-    return hashlib.sha256(data.encode()).hexdigest()[:16]
-
-
-def simpson_diversity(scores: list[OracleScore]) -> float:
-    """Simpson diversity index on model families."""
-    families = [s.model_family for s in scores]
-    n = len(families)
+def simpson_diversity(labels: list[str]) -> float:
+    """Simpson's diversity index. 0 = monoculture, 1 = max diversity."""
+    if not labels:
+        return 0.0
+    n = len(labels)
     if n <= 1:
         return 0.0
-    counts = {}
-    for f in families:
-        counts[f] = counts.get(f, 0) + 1
+    from collections import Counter
+    counts = Counter(labels)
     numerator = sum(c * (c - 1) for c in counts.values())
     denominator = n * (n - 1)
     return 1.0 - (numerator / denominator) if denominator > 0 else 0.0
 
 
+def effective_count(oracles: list[OracleScore]) -> float:
+    """Discount correlated oracles (same operator or model family)."""
+    if not oracles:
+        return 0.0
+
+    seen_operators = set()
+    seen_models = set()
+    effective = 0.0
+
+    for o in oracles:
+        weight = 1.0
+        if o.operator in seen_operators:
+            weight *= 0.3  # Same operator = heavily discounted
+        if o.model_family in seen_models:
+            weight *= 0.5  # Same model family = discounted
+        effective += weight
+        seen_operators.add(o.operator)
+        seen_models.add(o.model_family)
+
+    return effective
+
+
 class QuorumSizeRouter:
-    """Route trust aggregation by quorum size.
-    
-    quorum < 4: MIN() — no disagreement signal, take worst case
-    quorum >= 4: consensus_hash — disagreement is visible + detectable
-    quorum >= 7: full BFT — f < n/3 Byzantine tolerance
-    """
+    """Route trust aggregation by quorum size."""
 
-    def aggregate(self, scores: list[OracleScore]) -> QuorumResult:
-        n = len(scores)
-        if n == 0:
-            return QuorumResult(
-                method="NONE",
-                composite_score=0.0,
-                grade="F",
-                quorum_size=0,
-                max_byzantine=0,
-                agreement_ratio=0.0,
-                disagreement_visible=False,
-                consensus_hash="",
-                detail={"error": "NO_ORACLES"},
-            )
+    def aggregate(self, oracles: list[OracleScore]) -> QuorumResult:
+        n = len(oracles)
+        eff = effective_count(oracles)
+        max_byz = math.floor((n - 1) / 3)  # f < n/3
 
-        # Independence check
-        diversity = simpson_diversity(scores)
-        
         if n < 4:
-            return self._min_aggregate(scores, diversity)
+            return self._min_aggregation(oracles, n, max_byz, eff)
         elif n < 7:
-            return self._consensus_aggregate(scores, diversity)
+            return self._consensus_hash(oracles, n, max_byz, eff)
         else:
-            return self._bft_aggregate(scores, diversity)
+            return self._weighted_consensus(oracles, n, max_byz, eff)
 
-    def _min_aggregate(self, scores: list[OracleScore], diversity: float) -> QuorumResult:
-        """quorum < 4: MIN() — strict floor, no fraud possible."""
-        n = len(scores)
-        values = [s.score for s in scores]
-        composite = min(values)
-        
+    def _min_aggregation(self, oracles: list[OracleScore], n: int, f: int, eff: float) -> QuorumResult:
+        """Small quorum: MIN() is the only safe aggregation."""
+        scores = [o.score for o in oracles]
+        agg = min(scores) if scores else 0.0
+
         return QuorumResult(
             method="MIN",
-            composite_score=round(composite, 4),
-            grade=grade_from_score(composite),
             quorum_size=n,
-            max_byzantine=0,  # Can't tolerate any with <4
-            agreement_ratio=1.0 - (max(values) - min(values)),
-            disagreement_visible=False,  # Can't distinguish with <4
-            consensus_hash=consensus_hash(scores),
-            detail={
-                "reason": f"quorum={n} < 4: MIN() only honest function",
-                "all_scores": {s.oracle_id: round(s.score, 3) for s in scores},
-                "diversity": round(diversity, 3),
-                "warning": "LOW_QUORUM — disagreement not detectable" if n < 3 else None,
+            max_byzantine=f,
+            effective_oracles=round(eff, 2),
+            aggregated_score=round(agg, 3),
+            grade=self._grade(agg),
+            disagreement_visible=False,
+            details={
+                "rationale": "quorum < 4: MIN() is only safe default. No room for disagreement.",
+                "scores": [round(s, 3) for s in scores],
+                "spread": round(max(scores) - min(scores), 3) if scores else 0.0,
             },
         )
 
-    def _consensus_aggregate(self, scores: list[OracleScore], diversity: float) -> QuorumResult:
-        """quorum 4-6: consensus_hash — disagreement visible."""
-        n = len(scores)
-        values = [s.score for s in scores]
-        max_byzantine = (n - 1) // 3  # BFT bound
+    def _consensus_hash(self, oracles: list[OracleScore], n: int, f: int, eff: float) -> QuorumResult:
+        """Medium quorum: consensus with visible disagreement."""
+        scores = [o.score for o in oracles]
+        median = sorted(scores)[len(scores) // 2]
 
         # Detect disagreement
-        mean = sum(values) / n
-        variance = sum((v - mean) ** 2 for v in values) / n
-        std = math.sqrt(variance)
-        
-        # Outlier detection: scores > 2 std from mean
-        outliers = [s for s in scores if abs(s.score - mean) > 2 * std] if std > 0 else []
-        
-        # Composite: trimmed mean (remove highest and lowest)
-        sorted_vals = sorted(values)
-        trimmed = sorted_vals[1:-1]
-        composite = sum(trimmed) / len(trimmed) if trimmed else mean
+        spread = max(scores) - min(scores)
+        outliers = [o for o in oracles if abs(o.score - median) > 0.3]
 
-        agreement = 1.0 - (max(values) - min(values))
+        # Consensus hash = hash of sorted scores for auditability
+        score_str = ",".join(f"{s:.3f}" for s in sorted(scores))
+        consensus_hash = hashlib.sha256(score_str.encode()).hexdigest()[:16]
 
         return QuorumResult(
             method="CONSENSUS_HASH",
-            composite_score=round(composite, 4),
-            grade=grade_from_score(composite),
             quorum_size=n,
-            max_byzantine=max_byzantine,
-            agreement_ratio=round(agreement, 3),
+            max_byzantine=f,
+            effective_oracles=round(eff, 2),
+            aggregated_score=round(median, 3),
+            grade=self._grade(median),
             disagreement_visible=True,
-            consensus_hash=consensus_hash(scores),
-            detail={
-                "reason": f"quorum={n} in [4,7): consensus_hash, disagreement visible",
-                "trimmed_mean": round(composite, 4),
-                "std": round(std, 4),
-                "outliers": [{"id": s.oracle_id, "score": round(s.score, 3)} for s in outliers],
-                "diversity": round(diversity, 3),
-                "all_scores": {s.oracle_id: round(s.score, 3) for s in scores},
+            details={
+                "rationale": "quorum 4-6: median with consensus hash. Disagreement is data, not failure.",
+                "median": round(median, 3),
+                "spread": round(spread, 3),
+                "outlier_count": len(outliers),
+                "consensus_hash": consensus_hash,
+                "bft_safe": len(outliers) <= f,
             },
         )
 
-    def _bft_aggregate(self, scores: list[OracleScore], diversity: float) -> QuorumResult:
-        """quorum >= 7: full BFT — f < n/3 tolerance."""
-        n = len(scores)
-        values = [s.score for s in scores]
-        max_byzantine = (n - 1) // 3
+    def _weighted_consensus(self, oracles: list[OracleScore], n: int, f: int, eff: float) -> QuorumResult:
+        """Large quorum: weighted consensus with diversity gate."""
+        scores = [o.score for o in oracles]
+        operators = [o.operator for o in oracles]
+        models = [o.model_family for o in oracles]
 
-        # BFT: need 2f+1 agreement
-        required_agreement = 2 * max_byzantine + 1
-        
-        # Sort and take the middle 2f+1 values
-        sorted_scores = sorted(scores, key=lambda s: s.score)
-        # Remove up to f highest and f lowest
-        honest_range = sorted_scores[max_byzantine:n - max_byzantine]
-        honest_values = [s.score for s in honest_range]
-        composite = sum(honest_values) / len(honest_values)
+        # Diversity gates
+        op_diversity = simpson_diversity(operators)
+        model_diversity = simpson_diversity(models)
 
-        # Check if remaining scores are consistent
-        spread = max(honest_values) - min(honest_values)
-        consistent = spread < 0.3
+        # Weight by independence
+        weights = []
+        seen_ops = {}
+        seen_models = {}
+        for o in oracles:
+            w = o.confidence
+            # Discount correlated oracles
+            op_count = seen_ops.get(o.operator, 0)
+            model_count = seen_models.get(o.model_family, 0)
+            w *= (0.5 ** op_count)  # Halve for each duplicate operator
+            w *= (0.7 ** model_count)  # Reduce for each duplicate model
+            weights.append(w)
+            seen_ops[o.operator] = op_count + 1
+            seen_models[o.model_family] = model_count + 1
 
-        agreement = 1.0 - (max(values) - min(values))
+        # Weighted average
+        total_weight = sum(weights)
+        if total_weight > 0:
+            agg = sum(s * w for s, w in zip(scores, weights)) / total_weight
+        else:
+            agg = sum(scores) / len(scores)
+
+        # Diversity gate: if too monoculture, downgrade
+        if op_diversity < 0.5 or model_diversity < 0.3:
+            agg *= 0.7  # Monoculture penalty
+
+        spread = max(scores) - min(scores)
 
         return QuorumResult(
-            method="BFT_WEIGHTED",
-            composite_score=round(composite, 4),
-            grade=grade_from_score(composite),
+            method="WEIGHTED_CONSENSUS",
             quorum_size=n,
-            max_byzantine=max_byzantine,
-            agreement_ratio=round(agreement, 3),
+            max_byzantine=f,
+            effective_oracles=round(eff, 2),
+            aggregated_score=round(agg, 3),
+            grade=self._grade(agg),
             disagreement_visible=True,
-            consensus_hash=consensus_hash(scores),
-            detail={
-                "reason": f"quorum={n} >= 7: BFT f<n/3, tolerates {max_byzantine} byzantine",
-                "honest_range": [round(v, 3) for v in honest_values],
-                "consistent": consistent,
-                "spread": round(spread, 4),
-                "diversity": round(diversity, 3),
-                "required_agreement": required_agreement,
-                "all_scores": {s.oracle_id: round(s.score, 3) for s in scores},
+            details={
+                "rationale": "quorum >= 7: weighted consensus with diversity gate.",
+                "operator_diversity": round(op_diversity, 3),
+                "model_diversity": round(model_diversity, 3),
+                "diversity_gate_passed": op_diversity >= 0.5 and model_diversity >= 0.3,
+                "spread": round(spread, 3),
+                "effective_weights": [round(w, 3) for w in weights],
             },
         )
+
+    @staticmethod
+    def _grade(score: float) -> str:
+        if score >= 0.90:
+            return "A"
+        elif score >= 0.75:
+            return "B"
+        elif score >= 0.50:
+            return "C"
+        elif score >= 0.25:
+            return "D"
+        return "F"
 
 
 def demo():
     router = QuorumSizeRouter()
 
     print("=" * 60)
-    print("SCENARIO 1: Small quorum (2 oracles) — MIN only")
+    print("SCENARIO 1: Small quorum (3 oracles) — MIN()")
     print("=" * 60)
     result = router.aggregate([
-        OracleScore("oracle_a", 0.85, "anthropic", "op1"),
-        OracleScore("oracle_b", 0.72, "openai", "op2"),
+        OracleScore("o1", 0.85, "operator_a", "claude"),
+        OracleScore("o2", 0.90, "operator_b", "gpt"),
+        OracleScore("o3", 0.72, "operator_c", "gemini"),
     ])
     print(json.dumps(result.__dict__, indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 2: Medium quorum (5) — consensus with outlier")
+    print("SCENARIO 2: Medium quorum (5 oracles) — CONSENSUS_HASH")
     print("=" * 60)
     result = router.aggregate([
-        OracleScore("oracle_a", 0.88, "anthropic", "op1"),
-        OracleScore("oracle_b", 0.85, "openai", "op2"),
-        OracleScore("oracle_c", 0.82, "google", "op3"),
-        OracleScore("oracle_d", 0.87, "anthropic", "op4"),
-        OracleScore("sybil", 0.15, "openai", "op5"),  # outlier
+        OracleScore("o1", 0.85, "op_a", "claude"),
+        OracleScore("o2", 0.90, "op_b", "gpt"),
+        OracleScore("o3", 0.72, "op_c", "gemini"),
+        OracleScore("o4", 0.88, "op_d", "llama"),
+        OracleScore("o5", 0.20, "op_e", "deepseek"),  # outlier
     ])
     print(json.dumps(result.__dict__, indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 3: Large quorum (7) — full BFT")
+    print("SCENARIO 3: Large diverse quorum (8 oracles)")
     print("=" * 60)
     result = router.aggregate([
-        OracleScore("o1", 0.90, "anthropic", "op1"),
-        OracleScore("o2", 0.88, "openai", "op2"),
-        OracleScore("o3", 0.85, "google", "op3"),
-        OracleScore("o4", 0.87, "meta", "op4"),
-        OracleScore("o5", 0.86, "mistral", "op5"),
-        OracleScore("o6", 0.89, "anthropic", "op6"),
-        OracleScore("byzantine", 0.10, "openai", "op7"),  # compromised
+        OracleScore("o1", 0.85, "op_a", "claude", 0.9),
+        OracleScore("o2", 0.90, "op_b", "gpt", 0.8),
+        OracleScore("o3", 0.72, "op_c", "gemini", 0.7),
+        OracleScore("o4", 0.88, "op_d", "llama", 0.85),
+        OracleScore("o5", 0.82, "op_e", "deepseek", 0.75),
+        OracleScore("o6", 0.86, "op_f", "mistral", 0.8),
+        OracleScore("o7", 0.79, "op_g", "qwen", 0.7),
+        OracleScore("o8", 0.91, "op_h", "command", 0.9),
     ])
     print(json.dumps(result.__dict__, indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 4: Monoculture quorum (5, same model)")
+    print("SCENARIO 4: Large MONOCULTURE quorum (7 oracles, same model)")
     print("=" * 60)
     result = router.aggregate([
-        OracleScore("o1", 0.92, "openai", "op1"),
-        OracleScore("o2", 0.91, "openai", "op2"),
-        OracleScore("o3", 0.93, "openai", "op3"),
-        OracleScore("o4", 0.90, "openai", "op4"),
-        OracleScore("o5", 0.92, "openai", "op5"),
+        OracleScore("o1", 0.92, "op_a", "gpt", 0.9),
+        OracleScore("o2", 0.91, "op_b", "gpt", 0.85),
+        OracleScore("o3", 0.89, "op_c", "gpt", 0.8),
+        OracleScore("o4", 0.93, "op_d", "gpt", 0.9),
+        OracleScore("o5", 0.90, "op_e", "gpt", 0.85),
+        OracleScore("o6", 0.88, "op_f", "gpt", 0.8),
+        OracleScore("o7", 0.91, "op_g", "gpt", 0.85),
     ])
     print(json.dumps(result.__dict__, indent=2))
 
