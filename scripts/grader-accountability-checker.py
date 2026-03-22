@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""grader-accountability-checker.py — Verify evidence_grade has accountable grader.
+"""grader-accountability-checker.py — Verify grader_id anchoring in receipts.
 
-Per santaclawd: "evidence_grade with no named grader = soft MUST = deniable.
-grader_id anchored to genesis is the 6th field."
+Per santaclawd: evidence_grade without grader_id = anonymous review = deniable.
+grader_id anchored to genesis = the 13th MUST field in ATF.
 
-Problem: evidence_grade passes syntactic validation but semantic validation
-fails without knowing WHO graded. Anonymous grading = anonymous review =
-deniable assessment.
+Curry-Howard framing:
+- genesis = type declaration
+- grader_id = constructor
+- receipt = proof term
+- unnamed grader = uninhabited type (no proof possible)
 
-Fix: grader_id as 13th MUST field in ATF-core. Must resolve to a genesis
-record. Self-grading allowed but flagged (conflict of interest).
+Synthese (2023): knowledge-that limits skill when not grounded.
+Same principle: grades limit trust when not grounded in named grader.
 
 References:
-- Warmsley et al. (Frontiers Robotics & AI, May 2025): self-assessment
-  boosts trust 40%. Machine knowing WHEN it's wrong = trust calibration.
-- Fleming & Lau (2014): metacognitive sensitivity = knowing when wrong.
-- Nelson & Narens (1990): metamemory monitoring vs control.
+- Dreyfus (1980): Novice to Expert skill acquisition
+- Kalyuga (2007): Expertise reversal effect
 """
 
 import hashlib
@@ -26,178 +26,172 @@ from typing import Optional
 
 @dataclass
 class GraderRecord:
-    """A grader's genesis-anchored identity."""
+    """A grader registered at genesis."""
     grader_id: str
-    genesis_hash: str
     operator: str
     model_family: str
-    created_at: str
+    registered_at: str  # ISO timestamp
+    genesis_hash: str
+    capabilities: list = field(default_factory=list)
 
 
-@dataclass  
-class EvidenceGrading:
-    """An evidence_grade assignment with accountability."""
+@dataclass 
+class Receipt:
+    """A graded receipt."""
     receipt_id: str
+    task_hash: str
     evidence_grade: str  # A-F
     grader_id: Optional[str] = None
-    grader_genesis_hash: Optional[str] = None
-    graded_at: Optional[str] = None
-    is_self_grade: bool = False
+    grader_signature: Optional[str] = None
+    timestamp: Optional[str] = None
+    delivery_hash: Optional[str] = None
 
 
-@dataclass
-class AccountabilityAudit:
-    """Audit a set of evidence gradings for accountability."""
-    gradings: list = field(default_factory=list)
-    known_graders: dict = field(default_factory=dict)  # grader_id -> GraderRecord
+class GraderAccountabilityChecker:
+    """Check that every evidence_grade has an accountable grader."""
 
-    def audit_single(self, grading: EvidenceGrading) -> dict:
-        """Audit a single evidence grading."""
+    def __init__(self):
+        self.graders: dict[str, GraderRecord] = {}
+
+    def register_grader(self, grader: GraderRecord):
+        """Register a grader at genesis time."""
+        self.graders[grader.grader_id] = grader
+
+    def check_receipt(self, receipt: Receipt) -> dict:
+        """Check a single receipt for grader accountability."""
         issues = []
-        grade = "A"
+        grade = "PASS"
 
         # Gate 1: grader_id present?
-        if not grading.grader_id:
-            issues.append("NO_GRADER_ID — anonymous assessment is deniable")
-            grade = "F"
+        if not receipt.grader_id:
+            issues.append("NO_GRADER_ID — anonymous review = deniable")
+            grade = "FAIL"
             return {
-                "receipt_id": grading.receipt_id,
+                "receipt_id": receipt.receipt_id,
                 "grade": grade,
-                "verdict": "UNACCOUNTABLE",
+                "grader_accountability": "NONE",
                 "issues": issues,
             }
 
-        # Gate 2: grader resolves to genesis record?
-        if grading.grader_id not in self.known_graders:
-            issues.append(f"UNRESOLVED_GRADER — {grading.grader_id} has no genesis record")
-            grade = "D"
+        # Gate 2: grader registered at genesis?
+        if receipt.grader_id not in self.graders:
+            issues.append(f"UNREGISTERED_GRADER — {receipt.grader_id} not in genesis")
+            grade = "FAIL"
         else:
-            grader = self.known_graders[grading.grader_id]
+            grader = self.graders[receipt.grader_id]
             # Gate 3: genesis hash matches?
-            if grading.grader_genesis_hash and grading.grader_genesis_hash != grader.genesis_hash:
-                issues.append("GENESIS_MISMATCH — grader genesis hash doesn't match registry")
-                grade = "F"
+            if not grader.genesis_hash:
+                issues.append("NO_GENESIS_HASH — grader exists but unanchored")
+                grade = "WARN"
 
-        # Gate 4: self-grading?
-        if grading.is_self_grade:
-            issues.append("SELF_GRADE — conflict of interest (allowed but flagged)")
-            if grade == "A":
-                grade = "C"  # downgrade but don't reject
+        # Gate 4: signature present?
+        if not receipt.grader_signature:
+            issues.append("NO_SIGNATURE — grade is claim, not attestation")
+            if grade != "FAIL":
+                grade = "WARN"
 
-        # Gate 5: timestamp present?
-        if not grading.graded_at:
-            issues.append("NO_TIMESTAMP — grading time unknown")
-            if grade in ("A", "B"):
-                grade = "B"
-
-        verdict = {
-            "A": "ACCOUNTABLE",
-            "B": "ACCOUNTABLE_WITH_WARNINGS",
-            "C": "SELF_GRADED",
-            "D": "PARTIALLY_ACCOUNTABLE",
-            "F": "UNACCOUNTABLE",
-        }.get(grade, "UNKNOWN")
+        accountability = "FULL" if grade == "PASS" else ("PARTIAL" if grade == "WARN" else "NONE")
 
         return {
-            "receipt_id": grading.receipt_id,
-            "evidence_grade": grading.evidence_grade,
-            "grader_id": grading.grader_id,
+            "receipt_id": receipt.receipt_id,
             "grade": grade,
-            "verdict": verdict,
+            "grader_accountability": accountability,
+            "grader_id": receipt.grader_id,
+            "grader_registered": receipt.grader_id in self.graders,
             "issues": issues,
         }
 
-    def audit_all(self) -> dict:
-        """Audit all gradings and compute summary."""
-        results = [self.audit_single(g) for g in self.gradings]
+    def audit_batch(self, receipts: list[Receipt]) -> dict:
+        """Audit a batch of receipts."""
+        results = [self.check_receipt(r) for r in receipts]
+        passed = sum(1 for r in results if r["grade"] == "PASS")
+        failed = sum(1 for r in results if r["grade"] == "FAIL")
+        warned = sum(1 for r in results if r["grade"] == "WARN")
 
-        accountable = sum(1 for r in results if r["grade"] in ("A", "B"))
-        self_graded = sum(1 for r in results if r["grade"] == "C")
-        unaccountable = sum(1 for r in results if r["grade"] in ("D", "F"))
+        # Batch-level: check grader diversity
+        grader_ids = set(r.grader_id for r in receipts if r.grader_id)
+        operators = set()
+        for gid in grader_ids:
+            if gid in self.graders:
+                operators.add(self.graders[gid].operator)
 
-        total = len(results)
-        accountability_ratio = accountable / total if total > 0 else 0.0
-
-        # Fleet-level verdict
-        if accountability_ratio >= 0.9:
-            fleet_verdict = "FLEET_ACCOUNTABLE"
-        elif accountability_ratio >= 0.5:
-            fleet_verdict = "FLEET_MIXED"
-        else:
-            fleet_verdict = "FLEET_UNACCOUNTABLE"
+        diversity_issue = None
+        if len(grader_ids) > 0 and len(operators) == 1:
+            diversity_issue = f"MONOCULTURE — all {len(grader_ids)} graders share operator '{list(operators)[0]}'"
 
         return {
-            "fleet_verdict": fleet_verdict,
-            "accountability_ratio": round(accountability_ratio, 3),
-            "counts": {
-                "total": total,
-                "accountable": accountable,
-                "self_graded": self_graded,
-                "unaccountable": unaccountable,
-            },
-            "individual_audits": results,
+            "total": len(receipts),
+            "passed": passed,
+            "warned": warned,
+            "failed": failed,
+            "accountability_rate": round(passed / len(receipts), 3) if receipts else 0,
+            "unique_graders": len(grader_ids),
+            "unique_operators": len(operators),
+            "diversity_issue": diversity_issue,
+            "receipts": results,
         }
 
 
 def demo():
-    """Demo: 4 scenarios."""
+    checker = GraderAccountabilityChecker()
 
-    # Known graders
-    graders = {
-        "bro_agent": GraderRecord(
-            grader_id="bro_agent",
-            genesis_hash="sha256:aaa111",
-            operator="independent_labs",
-            model_family="claude",
-            created_at="2026-01-15T00:00:00Z",
-        ),
-        "kit_fox": GraderRecord(
-            grader_id="kit_fox",
-            genesis_hash="sha256:bbb222",
-            operator="openclaw",
-            model_family="claude",
-            created_at="2026-01-01T00:00:00Z",
-        ),
-    }
+    # Register graders at genesis
+    checker.register_grader(GraderRecord(
+        grader_id="grader_bro_agent",
+        operator="bro_labs",
+        model_family="opus",
+        registered_at="2026-02-24T09:00:00Z",
+        genesis_hash="sha256:abc123",
+        capabilities=["text_quality", "research_depth"],
+    ))
+    checker.register_grader(GraderRecord(
+        grader_id="grader_momo",
+        operator="momo_collective",
+        model_family="sonnet",
+        registered_at="2026-02-24T09:00:00Z",
+        genesis_hash="sha256:def456",
+        capabilities=["attestation", "verification"],
+    ))
 
-    gradings = [
-        # 1. Fully accountable: independent grader with genesis
-        EvidenceGrading(
-            receipt_id="receipt_001",
+    receipts = [
+        # Good: named, registered, signed
+        Receipt(
+            receipt_id="r1",
+            task_hash="task_tc3",
             evidence_grade="A",
-            grader_id="bro_agent",
-            grader_genesis_hash="sha256:aaa111",
-            graded_at="2026-03-22T09:00:00Z",
-            is_self_grade=False,
+            grader_id="grader_bro_agent",
+            grader_signature="sig_bro_abc",
+            timestamp="2026-02-24T10:00:00Z",
         ),
-        # 2. Self-graded: allowed but flagged
-        EvidenceGrading(
-            receipt_id="receipt_002",
+        # Bad: no grader_id (anonymous)
+        Receipt(
+            receipt_id="r2",
+            task_hash="task_anon",
             evidence_grade="B",
-            grader_id="kit_fox",
-            grader_genesis_hash="sha256:bbb222",
-            graded_at="2026-03-22T09:01:00Z",
-            is_self_grade=True,
-        ),
-        # 3. Anonymous: no grader_id
-        EvidenceGrading(
-            receipt_id="receipt_003",
-            evidence_grade="A",
             grader_id=None,
         ),
-        # 4. Unresolved: grader not in registry
-        EvidenceGrading(
-            receipt_id="receipt_004",
+        # Warn: unregistered grader
+        Receipt(
+            receipt_id="r3",
+            task_hash="task_unknown",
+            evidence_grade="A",
+            grader_id="grader_unknown",
+            grader_signature="sig_unknown",
+        ),
+        # Warn: registered but unsigned
+        Receipt(
+            receipt_id="r4",
+            task_hash="task_unsigned",
             evidence_grade="B",
-            grader_id="unknown_agent",
-            grader_genesis_hash="sha256:ccc333",
-            graded_at="2026-03-22T09:02:00Z",
-            is_self_grade=False,
+            grader_id="grader_momo",
+            grader_signature=None,
         ),
     ]
 
-    audit = AccountabilityAudit(gradings=gradings, known_graders=graders)
-    result = audit.audit_all()
+    print("=" * 60)
+    print("GRADER ACCOUNTABILITY AUDIT")
+    print("=" * 60)
+    result = checker.audit_batch(receipts)
     print(json.dumps(result, indent=2))
 
 
