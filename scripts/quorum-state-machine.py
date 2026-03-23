@@ -1,446 +1,343 @@
 #!/usr/bin/env python3
-"""quorum-state-machine.py — Formal state machine for quorum trust lifecycle.
+"""quorum-state-machine.py — Trust state machine with event-driven transitions.
 
-Per santaclawd email thread (Mar 22-23): each state needs four fields:
-  1. Entry condition (observable event)
-  2. Remediation path (what fixes it)
-  3. Emission policy (how counterparties learn)
-  4. Exit condition (what proves recovery)
+Per santaclawd email exchange (Mar 22-23):
+- CALIBRATED exit condition: event-driven, not time-based
+- Weight-adjusted churn: 5% count-churn of highest-weight attester > 30% low-weight
+- Config-hash materiality: MATERIAL (model/key/operator) vs MINOR (deps/config)
+- Curry-Howard: MATERIAL change = type change, MINOR = implementation within type
 
-Three paths:
-  Happy:      MANUAL → BOOTSTRAP_REQUEST → PROVISIONAL → CALIBRATED
-  Regression: CALIBRATED → DEGRADED_QUORUM (BFT fell below floor)
-  Adversarial: * → CONTESTED (quorum exists, disagrees)
-
-Key design decisions from email thread:
-- Weight-adjusted churn (impact = sum(lost_weights)/sum(total_weights))
-- Config-hash materiality (MATERIAL vs MINOR changes)
-- Event-driven re-evaluation primary, TTL fallback secondary
-- BOOTSTRAP_TIMEOUT emits structured event (silent failures = invisible)
-- Voucher list hashed in events (privacy + verifiability)
-- RESTORED as required exit event (can't silently recover)
+4 states: PROVISIONAL → CALIBRATED → DEGRADED → REVOKED
+Transitions are event-driven with 90-day TTL fallback.
 
 References:
-- Warmsley et al. (2025): Self-assessment + trust calibration
-- Chandra & Toueg (1996): Failure detector classification
-- CT (Certificate Transparency): Log = liveness proof
+- Warmsley et al. (2025): Trust calibration
+- Wilson (1927): Confidence intervals
+- santaclawd: quorum exit conditions, weight-adjusted churn
 """
 
 import hashlib
 import json
-import time
+import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
 
-class QuorumState(Enum):
-    MANUAL = "MANUAL"                    # No quorum, no attestation
-    BOOTSTRAP_REQUEST = "BOOTSTRAP_REQUEST"  # Requesting initial vouchers
-    BOOTSTRAP_TIMEOUT = "BOOTSTRAP_TIMEOUT"  # Bootstrap failed
-    PROVISIONAL = "PROVISIONAL"          # Vouched but not calibrated
-    CALIBRATED = "CALIBRATED"            # Full quorum, attested
-    DEGRADED_QUORUM = "DEGRADED_QUORUM"  # Was calibrated, quorum fell
-    CONTESTED = "CONTESTED"              # Quorum disagrees
-    REVOKED = "REVOKED"                  # Voluntarily or forcibly revoked
+class TrustState(Enum):
+    PROVISIONAL = "PROVISIONAL"
+    CALIBRATED = "CALIBRATED"
+    DEGRADED = "DEGRADED"
+    REVOKED = "REVOKED"
 
 
-class ChangeType(Enum):
-    MATERIAL = "MATERIAL"  # Model swap, key rotation, operator change
-    MINOR = "MINOR"        # Dependency update, config tweak
+class EventType(Enum):
+    # Positive transitions
+    QUORUM_REACHED = "QUORUM_REACHED"
+    ATTESTATION_RENEWED = "ATTESTATION_RENEWED"
+    RECOVERY_COMPLETE = "RECOVERY_COMPLETE"
+
+    # Negative transitions
+    KEY_ROTATION = "KEY_ROTATION"
+    CHURN_THRESHOLD = "CHURN_THRESHOLD"
+    OPERATOR_CHANGE = "OPERATOR_CHANGE"  # MATERIAL only
+    CONFIG_CHANGE_MINOR = "CONFIG_CHANGE_MINOR"
+    BEHAVIORAL_DIVERGENCE = "BEHAVIORAL_DIVERGENCE"
+    TTL_EXPIRED = "TTL_EXPIRED"
+    VOLUNTARY_REVOCATION = "VOLUNTARY_REVOCATION"
+    FORCED_REVOCATION = "FORCED_REVOCATION"
 
 
-@dataclass
-class StateSpec:
-    """Four-field state specification per santaclawd."""
-    entry_condition: str
-    remediation: str
-    emission_policy: str
-    exit_condition: str
+class MaterialityClass(Enum):
+    MATERIAL = "MATERIAL"  # Type change (Curry-Howard)
+    MINOR = "MINOR"  # Implementation change
 
 
-@dataclass
-class QuorumEvent:
-    """Structured event emitted on state transition."""
-    timestamp: str
-    from_state: str
-    to_state: str
-    trigger: str
-    agent_id: str
-    voucher_list_hash: Optional[str] = None  # Hashed, not plaintext
-    churn_impact: Optional[float] = None
-    config_hash: Optional[str] = None
-    change_type: Optional[str] = None
-    details: dict = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        d = {
-            "timestamp": self.timestamp,
-            "from_state": self.from_state,
-            "to_state": self.to_state,
-            "trigger": self.trigger,
-            "agent_id": self.agent_id,
-        }
-        if self.voucher_list_hash:
-            d["voucher_list_hash"] = self.voucher_list_hash
-        if self.churn_impact is not None:
-            d["churn_impact"] = round(self.churn_impact, 3)
-        if self.config_hash:
-            d["config_hash"] = self.config_hash
-        if self.change_type:
-            d["change_type"] = self.change_type
-        if self.details:
-            d["details"] = self.details
-        return d
-
-
-# State specifications
-STATE_SPECS: dict[QuorumState, StateSpec] = {
-    QuorumState.MANUAL: StateSpec(
-        entry_condition="Agent created, no attestation exists",
-        remediation="Request vouchers from established agents",
-        emission_policy="None — invisible to network until bootstrap",
-        exit_condition="BOOTSTRAP_REQUEST submitted with ≥1 voucher target",
-    ),
-    QuorumState.BOOTSTRAP_REQUEST: StateSpec(
-        entry_condition="Agent submitted vouch request to ≥1 established agent",
-        remediation="Wait for voucher responses within timeout",
-        emission_policy="Emit BOOTSTRAP_REQUEST event (visible to voucher targets)",
-        exit_condition="≥3 independent vouchers received OR timeout (→ BOOTSTRAP_TIMEOUT)",
-    ),
-    QuorumState.BOOTSTRAP_TIMEOUT: StateSpec(
-        entry_condition="Bootstrap request exceeded timeout without sufficient vouchers",
-        remediation="Retry with different voucher targets or adjust scope",
-        emission_policy="Emit BOOTSTRAP_TIMEOUT with failed_voucher_list_hash",
-        exit_condition="New BOOTSTRAP_REQUEST with fresh targets",
-    ),
-    QuorumState.PROVISIONAL: StateSpec(
-        entry_condition="≥3 independent vouchers received, not yet calibrated",
-        remediation="Accumulate interaction receipts to narrow CI",
-        emission_policy="Emit PROVISIONAL_GRANTED with voucher_list_hash",
-        exit_condition="CI width < 0.30 AND correction_frequency in [0.05, 0.40] → CALIBRATED",
-    ),
-    QuorumState.CALIBRATED: StateSpec(
-        entry_condition="Sufficient receipts, CI narrow, self-assessment calibrated",
-        remediation="Maintain interaction quality and quorum health",
-        emission_policy="Emit CALIBRATED_ACHIEVED; re-emit at min(heartbeat, 24h)",
-        exit_condition="KEY_ROTATION OR churn_impact > 0.30 OR MATERIAL config change → regress",
-    ),
-    QuorumState.DEGRADED_QUORUM: StateSpec(
-        entry_condition="Was CALIBRATED, quorum fell below BFT floor",
-        remediation="Re-establish quorum with independent counterparties",
-        emission_policy="Emit DEGRADED_QUORUM on entry + re-emit at min(heartbeat, 24h)",
-        exit_condition="Quorum restored above BFT floor → emit RESTORED → CALIBRATED",
-    ),
-    QuorumState.CONTESTED: StateSpec(
-        entry_condition="Quorum exists but members disagree on agent state",
-        remediation="Dispute resolution via principal-aware-arbiter",
-        emission_policy="Emit CONTESTED with disagreement_hash; continuous until resolved",
-        exit_condition="Arbiter verdict OR quorum re-alignment → previous state",
-    ),
-    QuorumState.REVOKED: StateSpec(
-        entry_condition="Voluntary self-revocation OR forced by quorum consensus",
-        remediation="New genesis required (old identity terminated)",
-        emission_policy="Emit REVOKED (final event in chain); no further emissions",
-        exit_condition="None — terminal state. New genesis = new identity.",
-    ),
-}
+# Spec-defined MATERIAL change types (per santaclawd: must be enumerated, not self-declared)
+MATERIAL_CHANGES = frozenset({
+    "model_family",
+    "key_material",
+    "operator_binding",
+    "ca_root",
+    "genesis_schema_version",
+})
 
 
 @dataclass
-class Counterparty:
-    """A counterparty with weight in the quorum."""
-    agent_id: str
+class Attester:
+    """An entity in the attestation quorum."""
+    attester_id: str
     weight: float  # 0.0 - 1.0
-    last_attestation: str  # ISO timestamp
+    model_family: str
+    operator: str
+    last_attestation: datetime
     active: bool = True
 
 
+@dataclass
+class ConfigHash:
+    """Fingerprint of agent configuration."""
+    model_family: str
+    key_fingerprint: str
+    operator_id: str
+    ca_root: str
+    schema_version: str
+    # Minor fields (logged but don't trigger re-attestation)
+    runtime_version: str = ""
+    dependencies_hash: str = ""
+
+    @property
+    def material_hash(self) -> str:
+        """Hash of MATERIAL fields only."""
+        material = f"{self.model_family}:{self.key_fingerprint}:{self.operator_id}:{self.ca_root}:{self.schema_version}"
+        return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+    @property
+    def full_hash(self) -> str:
+        """Hash of all fields."""
+        full = f"{self.model_family}:{self.key_fingerprint}:{self.operator_id}:{self.ca_root}:{self.schema_version}:{self.runtime_version}:{self.dependencies_hash}"
+        return hashlib.sha256(full.encode()).hexdigest()[:16]
+
+
+@dataclass
+class TransitionRecord:
+    """Immutable record of a state transition."""
+    from_state: TrustState
+    to_state: TrustState
+    event: EventType
+    timestamp: datetime
+    reason: str
+    config_hash: str
+    predecessor_hash: Optional[str] = None
+
+
+@dataclass
 class QuorumStateMachine:
-    """Formal state machine for quorum trust lifecycle."""
+    """Trust state machine for an agent."""
+    agent_id: str
+    state: TrustState = TrustState.PROVISIONAL
+    config: Optional[ConfigHash] = None
+    attesters: list = field(default_factory=list)
+    history: list = field(default_factory=list)
+    last_calibrated: Optional[datetime] = None
+    ttl_days: int = 90
 
-    CHURN_IMPACT_THRESHOLD = 0.30
-    STALENESS_TTL_DAYS = 90
-    MIN_VOUCHERS = 3
-    BOOTSTRAP_TIMEOUT_SECONDS = 86400  # 24h
-    CI_WIDTH_THRESHOLD = 0.30
-    CORRECTION_FREQ_MIN = 0.05
-    CORRECTION_FREQ_MAX = 0.40
+    # Thresholds
+    min_quorum_size: int = 3
+    min_diversity: float = 0.50  # Simpson index
+    churn_impact_threshold: float = 0.30  # Weight-adjusted
+    churn_window_days: int = 30
 
-    def __init__(self, agent_id: str):
-        self.agent_id = agent_id
-        self.state = QuorumState.MANUAL
-        self.counterparties: list[Counterparty] = []
-        self.events: list[QuorumEvent] = []
-        self.config_hash: Optional[str] = None
-        self.bootstrap_started: Optional[float] = None
+    def total_weight(self) -> float:
+        return sum(a.weight for a in self.attesters if a.active)
 
-    def _now(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+    def active_count(self) -> int:
+        return sum(1 for a in self.attesters if a.active)
 
-    def _hash_vouchers(self, voucher_ids: list[str]) -> str:
-        """Hash voucher list — privacy + verifiability."""
-        canonical = json.dumps(sorted(voucher_ids), separators=(",", ":"))
-        return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()[:16]}"
+    def simpson_diversity(self) -> float:
+        """Simpson diversity index across model families."""
+        if not self.attesters:
+            return 0.0
+        families = {}
+        for a in self.attesters:
+            if a.active:
+                families[a.model_family] = families.get(a.model_family, 0) + 1
+        n = sum(families.values())
+        if n <= 1:
+            return 0.0
+        return 1.0 - sum(c * (c - 1) for c in families.values()) / (n * (n - 1))
 
-    def _emit(self, to_state: QuorumState, trigger: str, **kwargs) -> QuorumEvent:
-        event = QuorumEvent(
-            timestamp=self._now(),
-            from_state=self.state.value,
-            to_state=to_state.value,
-            trigger=trigger,
-            agent_id=self.agent_id,
-            **kwargs,
-        )
-        self.events.append(event)
-        self.state = to_state
-        return event
-
-    def _churn_impact(self, lost_ids: list[str]) -> float:
-        """Weight-adjusted churn per santaclawd."""
-        total_weight = sum(c.weight for c in self.counterparties)
-        if total_weight == 0:
+    def weight_adjusted_churn(self, lost_attesters: list[Attester]) -> float:
+        """Churn impact by weight, not count."""
+        total = self.total_weight()
+        if total == 0:
             return 1.0
-        lost_weight = sum(
-            c.weight for c in self.counterparties if c.agent_id in lost_ids
+        lost_weight = sum(a.weight for a in lost_attesters)
+        return lost_weight / total
+
+    def classify_change(self, field_name: str) -> MaterialityClass:
+        """Spec-defined materiality classification."""
+        if field_name in MATERIAL_CHANGES:
+            return MaterialityClass.MATERIAL
+        return MaterialityClass.MINOR
+
+    def _transition(self, new_state: TrustState, event: EventType, reason: str):
+        """Record a state transition."""
+        record = TransitionRecord(
+            from_state=self.state,
+            to_state=new_state,
+            event=event,
+            timestamp=datetime.now(timezone.utc),
+            reason=reason,
+            config_hash=self.config.material_hash if self.config else "none",
+            predecessor_hash=self.history[-1].config_hash if self.history else None,
         )
-        return lost_weight / total_weight
+        self.history.append(record)
+        old = self.state
+        self.state = new_state
+        return {"transition": f"{old.value} → {new_state.value}", "event": event.value, "reason": reason}
 
-    def classify_change(self, change_description: str) -> ChangeType:
-        """Classify config change as MATERIAL or MINOR."""
-        material_keywords = [
-            "model_family", "key_rotation", "operator", "host_migration",
-            "model_swap", "signing_key", "genesis",
-        ]
-        for kw in material_keywords:
-            if kw in change_description.lower():
-                return ChangeType.MATERIAL
-        return ChangeType.MINOR
+    def process_event(self, event: EventType, **kwargs) -> dict:
+        """Process an event and return transition result."""
 
-    # === Transitions ===
+        # REVOKED is terminal
+        if self.state == TrustState.REVOKED:
+            return {"transition": "NONE", "reason": "REVOKED is terminal"}
 
-    def request_bootstrap(self, voucher_targets: list[str]) -> QuorumEvent:
-        """MANUAL → BOOTSTRAP_REQUEST"""
-        assert self.state == QuorumState.MANUAL, f"Cannot bootstrap from {self.state}"
-        self.bootstrap_started = time.time()
-        return self._emit(
-            QuorumState.BOOTSTRAP_REQUEST,
-            "BOOTSTRAP_INITIATED",
-            voucher_list_hash=self._hash_vouchers(voucher_targets),
-            details={"target_count": len(voucher_targets)},
-        )
+        # === Negative events (any state) ===
+        if event == EventType.VOLUNTARY_REVOCATION:
+            return self._transition(TrustState.REVOKED, event, "Voluntary self-revocation (Zahavi handicap)")
 
-    def bootstrap_timeout(self, failed_targets: list[str]) -> QuorumEvent:
-        """BOOTSTRAP_REQUEST → BOOTSTRAP_TIMEOUT"""
-        assert self.state == QuorumState.BOOTSTRAP_REQUEST
-        return self._emit(
-            QuorumState.BOOTSTRAP_TIMEOUT,
-            "BOOTSTRAP_TIMEOUT",
-            voucher_list_hash=self._hash_vouchers(failed_targets),
-            details={"failed_count": len(failed_targets)},
-        )
+        if event == EventType.FORCED_REVOCATION:
+            return self._transition(TrustState.REVOKED, event, kwargs.get("reason", "Forced by quorum"))
 
-    def receive_vouchers(self, vouchers: list[Counterparty]) -> QuorumEvent:
-        """BOOTSTRAP_REQUEST → PROVISIONAL (if ≥3 independent)"""
-        assert self.state in (QuorumState.BOOTSTRAP_REQUEST, QuorumState.BOOTSTRAP_TIMEOUT)
-        if len(vouchers) < self.MIN_VOUCHERS:
-            return self._emit(
-                QuorumState.BOOTSTRAP_TIMEOUT,
-                "INSUFFICIENT_VOUCHERS",
-                details={"received": len(vouchers), "required": self.MIN_VOUCHERS},
-            )
-        self.counterparties = vouchers
-        return self._emit(
-            QuorumState.PROVISIONAL,
-            "VOUCHERS_RECEIVED",
-            voucher_list_hash=self._hash_vouchers([v.agent_id for v in vouchers]),
-            details={"voucher_count": len(vouchers)},
-        )
+        if event == EventType.KEY_ROTATION:
+            return self._transition(TrustState.PROVISIONAL, event, "Key material changed — re-attest with new key")
 
-    def calibrate(self, ci_width: float, correction_freq: float) -> QuorumEvent:
-        """PROVISIONAL → CALIBRATED"""
-        assert self.state == QuorumState.PROVISIONAL
-        if ci_width > self.CI_WIDTH_THRESHOLD:
-            return self._emit(
-                QuorumState.PROVISIONAL,
-                "CALIBRATION_INSUFFICIENT",
-                details={"ci_width": ci_width, "threshold": self.CI_WIDTH_THRESHOLD},
-            )
-        if not (self.CORRECTION_FREQ_MIN <= correction_freq <= self.CORRECTION_FREQ_MAX):
-            return self._emit(
-                QuorumState.PROVISIONAL,
-                "CORRECTION_FREQ_ANOMALY",
-                details={
-                    "correction_freq": correction_freq,
-                    "range": [self.CORRECTION_FREQ_MIN, self.CORRECTION_FREQ_MAX],
-                },
-            )
-        return self._emit(
-            QuorumState.CALIBRATED,
-            "CALIBRATION_ACHIEVED",
-            details={"ci_width": ci_width, "correction_freq": correction_freq},
-        )
+        if event == EventType.OPERATOR_CHANGE:
+            changed_field = kwargs.get("field", "unknown")
+            materiality = self.classify_change(changed_field)
+            if materiality == MaterialityClass.MATERIAL:
+                return self._transition(TrustState.PROVISIONAL, event,
+                    f"MATERIAL change: {changed_field}. Type changed — proofs invalidated.")
+            else:
+                # MINOR: log but no transition
+                return {"transition": "NONE", "event": event.value,
+                    "reason": f"MINOR change: {changed_field}. Logged, no re-attestation."}
 
-    def counterparty_churn(self, lost_ids: list[str]) -> QuorumEvent:
-        """CALIBRATED → DEGRADED_QUORUM (if churn impact exceeds threshold)"""
-        assert self.state == QuorumState.CALIBRATED
-        impact = self._churn_impact(lost_ids)
-        if impact > self.CHURN_IMPACT_THRESHOLD:
-            # Mark lost counterparties
-            for c in self.counterparties:
-                if c.agent_id in lost_ids:
-                    c.active = False
-            return self._emit(
-                QuorumState.DEGRADED_QUORUM,
-                "CHURN_THRESHOLD_EXCEEDED",
-                churn_impact=impact,
-                details={"lost_count": len(lost_ids), "threshold": self.CHURN_IMPACT_THRESHOLD},
-            )
-        return self._emit(
-            QuorumState.CALIBRATED,
-            "CHURN_WITHIN_BOUNDS",
-            churn_impact=impact,
-        )
+        if event == EventType.CHURN_THRESHOLD:
+            lost = kwargs.get("lost_attesters", [])
+            impact = self.weight_adjusted_churn(lost)
+            if impact > self.churn_impact_threshold:
+                return self._transition(TrustState.DEGRADED, event,
+                    f"Weight-adjusted churn {impact:.2f} > {self.churn_impact_threshold}")
+            return {"transition": "NONE", "reason": f"Churn impact {impact:.2f} below threshold"}
 
-    def config_change(self, description: str, new_hash: str) -> QuorumEvent:
-        """CALIBRATED → PROVISIONAL on MATERIAL change, stay on MINOR."""
-        assert self.state == QuorumState.CALIBRATED
-        change_type = self.classify_change(description)
-        old_hash = self.config_hash
-        self.config_hash = new_hash
+        if event == EventType.BEHAVIORAL_DIVERGENCE:
+            score = kwargs.get("divergence_score", 0.0)
+            if score > 0.5:
+                return self._transition(TrustState.DEGRADED, event,
+                    f"Behavioral divergence {score:.2f} — counterparty observations")
+            return {"transition": "NONE", "reason": f"Divergence {score:.2f} within bounds"}
 
-        if change_type == ChangeType.MATERIAL:
-            return self._emit(
-                QuorumState.PROVISIONAL,
-                "MATERIAL_CONFIG_CHANGE",
-                config_hash=new_hash,
-                change_type="MATERIAL",
-                details={"description": description, "old_hash": old_hash},
-            )
-        return self._emit(
-            QuorumState.CALIBRATED,
-            "MINOR_CONFIG_CHANGE",
-            config_hash=new_hash,
-            change_type="MINOR",
-            details={"description": description},
-        )
+        if event == EventType.TTL_EXPIRED:
+            if self.state == TrustState.CALIBRATED:
+                return self._transition(TrustState.PROVISIONAL, event,
+                    f"{self.ttl_days}-day TTL expired. Staleness = signal.")
+            return {"transition": "NONE", "reason": "TTL only applies to CALIBRATED"}
 
-    def quorum_restored(self, new_counterparties: list[Counterparty]) -> QuorumEvent:
-        """DEGRADED_QUORUM → CALIBRATED via RESTORED."""
-        assert self.state == QuorumState.DEGRADED_QUORUM
-        self.counterparties = new_counterparties
-        return self._emit(
-            QuorumState.CALIBRATED,
-            "RESTORED",
-            voucher_list_hash=self._hash_vouchers([c.agent_id for c in new_counterparties]),
-            details={"new_quorum_size": len(new_counterparties)},
-        )
+        # === Positive events ===
+        if event == EventType.QUORUM_REACHED:
+            if self.state == TrustState.PROVISIONAL:
+                if self.active_count() >= self.min_quorum_size and self.simpson_diversity() >= self.min_diversity:
+                    self.last_calibrated = datetime.now(timezone.utc)
+                    return self._transition(TrustState.CALIBRATED, event,
+                        f"Quorum: {self.active_count()} attesters, Simpson={self.simpson_diversity():.2f}")
+                return {"transition": "NONE", "reason":
+                    f"Quorum not met: {self.active_count()}/{self.min_quorum_size} attesters, "
+                    f"Simpson={self.simpson_diversity():.2f}/{self.min_diversity}"}
+            return {"transition": "NONE", "reason": f"QUORUM_REACHED only applies to PROVISIONAL"}
 
-    def contest(self, disagreement_details: dict) -> QuorumEvent:
-        """Any state → CONTESTED."""
-        return self._emit(
-            QuorumState.CONTESTED,
-            "QUORUM_DISAGREEMENT",
-            details=disagreement_details,
-        )
+        if event == EventType.RECOVERY_COMPLETE:
+            if self.state == TrustState.DEGRADED:
+                return self._transition(TrustState.PROVISIONAL, event,
+                    "Recovery complete — re-enter PROVISIONAL for fresh attestation")
+            return {"transition": "NONE", "reason": "RECOVERY only applies to DEGRADED"}
 
-    def revoke(self, reason: str, voluntary: bool = True) -> QuorumEvent:
-        """Any state → REVOKED (terminal)."""
-        return self._emit(
-            QuorumState.REVOKED,
-            "VOLUNTARY_REVOCATION" if voluntary else "FORCED_REVOCATION",
-            details={"reason": reason},
-        )
+        if event == EventType.ATTESTATION_RENEWED:
+            if self.state == TrustState.CALIBRATED:
+                self.last_calibrated = datetime.now(timezone.utc)
+                return {"transition": "RENEWED", "reason": "TTL reset via fresh attestation"}
+            return {"transition": "NONE", "reason": "RENEWAL only applies to CALIBRATED"}
 
-    def report(self) -> dict:
-        spec = STATE_SPECS[self.state]
-        active_counterparties = [c for c in self.counterparties if c.active]
+        return {"transition": "NONE", "reason": f"Unhandled event {event.value} in state {self.state.value}"}
+
+    def status(self) -> dict:
         return {
             "agent_id": self.agent_id,
             "state": self.state.value,
-            "spec": {
-                "entry_condition": spec.entry_condition,
-                "remediation": spec.remediation,
-                "emission_policy": spec.emission_policy,
-                "exit_condition": spec.exit_condition,
-            },
-            "quorum": {
-                "total": len(self.counterparties),
-                "active": len(active_counterparties),
-                "total_weight": round(sum(c.weight for c in active_counterparties), 3),
-            },
-            "event_count": len(self.events),
-            "last_event": self.events[-1].to_dict() if self.events else None,
+            "config_hash": self.config.material_hash if self.config else None,
+            "attesters": self.active_count(),
+            "diversity": round(self.simpson_diversity(), 3),
+            "total_weight": round(self.total_weight(), 3),
+            "transitions": len(self.history),
+            "last_calibrated": self.last_calibrated.isoformat() if self.last_calibrated else None,
         }
 
 
 def demo():
-    print("=" * 60)
-    print("HAPPY PATH: MANUAL → BOOTSTRAP → PROVISIONAL → CALIBRATED")
-    print("=" * 60)
+    now = datetime.now(timezone.utc)
 
-    sm = QuorumStateMachine("kit_fox")
+    config = ConfigHash(
+        model_family="opus-4.6",
+        key_fingerprint="ed25519:abc123",
+        operator_id="ilya",
+        ca_root="agentmail",
+        schema_version="ATF:1.2.0",
+        runtime_version="python3.12",
+        dependencies_hash="sha256:deps789",
+    )
 
-    # Bootstrap
-    e = sm.request_bootstrap(["oracle_1", "oracle_2", "oracle_3", "oracle_4"])
-    print(f"  {e.trigger}: {e.from_state} → {e.to_state}")
+    sm = QuorumStateMachine(agent_id="kit_fox", config=config)
 
-    # Receive vouchers
-    vouchers = [
-        Counterparty("oracle_1", 0.3, "2026-03-23T00:00:00Z"),
-        Counterparty("oracle_2", 0.25, "2026-03-23T00:00:00Z"),
-        Counterparty("oracle_3", 0.25, "2026-03-23T00:00:00Z"),
-        Counterparty("oracle_4", 0.2, "2026-03-23T00:00:00Z"),
+    attesters = [
+        Attester("bro_agent", 0.35, "opus-4.6", "op_bro", now),
+        Attester("gendolf", 0.25, "gpt-4o", "op_gen", now),
+        Attester("braindiff", 0.20, "gemini-2.5", "op_brain", now),
+        Attester("funwolf", 0.15, "deepseek-v3", "op_fun", now),
+        Attester("gerundium", 0.05, "llama-3.3", "op_ger", now),
     ]
-    e = sm.receive_vouchers(vouchers)
-    print(f"  {e.trigger}: {e.from_state} → {e.to_state}")
+    sm.attesters = attesters
 
-    # Calibrate
-    e = sm.calibrate(ci_width=0.22, correction_freq=0.18)
-    print(f"  {e.trigger}: {e.from_state} → {e.to_state}")
-
-    print(json.dumps(sm.report(), indent=2))
-
-    print()
     print("=" * 60)
-    print("REGRESSION PATH: CALIBRATED → DEGRADED_QUORUM")
+    print("SCENARIO: Full lifecycle")
     print("=" * 60)
 
-    # Lose top two counterparties (weight-adjusted: 0.55/1.0 = 55%)
-    e = sm.counterparty_churn(["oracle_1", "oracle_2"])
-    print(f"  {e.trigger}: churn_impact={e.churn_impact}")
+    print("\n1. Initial state:")
+    print(json.dumps(sm.status(), indent=2))
 
-    print(json.dumps(sm.report(), indent=2))
+    print("\n2. Quorum reached (5 diverse attesters):")
+    result = sm.process_event(EventType.QUORUM_REACHED)
+    print(json.dumps(result, indent=2))
+    print(json.dumps(sm.status(), indent=2))
 
-    print()
-    print("=" * 60)
-    print("RECOVERY: DEGRADED → RESTORED → CALIBRATED")
-    print("=" * 60)
+    print("\n3. Minor config change (Python version bump):")
+    result = sm.process_event(EventType.OPERATOR_CHANGE, field="runtime_version")
+    print(json.dumps(result, indent=2))
 
-    new_quorum = [
-        Counterparty("oracle_3", 0.25, "2026-03-23T01:00:00Z"),
-        Counterparty("oracle_4", 0.2, "2026-03-23T01:00:00Z"),
-        Counterparty("oracle_5", 0.3, "2026-03-23T01:00:00Z"),
-        Counterparty("oracle_6", 0.25, "2026-03-23T01:00:00Z"),
-    ]
-    e = sm.quorum_restored(new_quorum)
-    print(f"  {e.trigger}: {e.from_state} → {e.to_state}")
+    print("\n4. MATERIAL change (model family swap):")
+    result = sm.process_event(EventType.OPERATOR_CHANGE, field="model_family")
+    print(json.dumps(result, indent=2))
+    print(f"   State: {sm.state.value}")
 
-    print()
-    print("=" * 60)
-    print("CONFIG CHANGE: MATERIAL vs MINOR")
-    print("=" * 60)
+    print("\n5. Re-attest and reach quorum again:")
+    result = sm.process_event(EventType.QUORUM_REACHED)
+    print(json.dumps(result, indent=2))
 
-    # Minor change — stays CALIBRATED
-    e = sm.config_change("dependency_update: requests 2.31→2.32", "sha256:aaa")
-    print(f"  {e.trigger} ({e.change_type}): {e.from_state} → {e.to_state}")
+    print("\n6. High-weight churn (bro_agent leaves):")
+    lost = [attesters[0]]  # bro_agent, weight=0.35
+    attesters[0].active = False
+    result = sm.process_event(EventType.CHURN_THRESHOLD, lost_attesters=lost)
+    print(json.dumps(result, indent=2))
+    print(f"   Churn impact: {sm.weight_adjusted_churn(lost):.2f}")
 
-    # Material change — drops to PROVISIONAL
-    e = sm.config_change("model_swap: gpt-4→claude-opus", "sha256:bbb")
-    print(f"  {e.trigger} ({e.change_type}): {e.from_state} → {e.to_state}")
+    print("\n7. Recovery:")
+    result = sm.process_event(EventType.RECOVERY_COMPLETE)
+    print(json.dumps(result, indent=2))
 
-    print(json.dumps(sm.report(), indent=2))
+    print("\n8. Voluntary self-revocation:")
+    result = sm.process_event(EventType.VOLUNTARY_REVOCATION)
+    print(json.dumps(result, indent=2))
+
+    print("\n9. Attempt action after revocation:")
+    result = sm.process_event(EventType.QUORUM_REACHED)
+    print(json.dumps(result, indent=2))
+
+    print("\n" + "=" * 60)
+    print(f"Total transitions: {len(sm.history)}")
+    for t in sm.history:
+        print(f"  {t.from_state.value} → {t.to_state.value} [{t.event.value}]: {t.reason[:60]}")
 
 
 if __name__ == "__main__":
