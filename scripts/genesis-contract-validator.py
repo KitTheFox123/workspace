@@ -2,23 +2,14 @@
 """
 genesis-contract-validator.py — ATF V1.1 genesis as contract, not record.
 
-Per santaclawd: genesis should be a contract with enforceable terms,
-not just a declaration. Validation at genesis time = enforcement at
-crisis time.
+Per santaclawd: "if it is not in genesis, it cannot be enforced."
+Genesis must contain: operator_id, escalation_contact, revocation_endpoint,
+tier_2_response_deadline, revocation_ttl.
 
-Two-gate validation:
-  - MUST fields: missing = REJECT (connection refused)
-  - RECOMMENDED fields: missing = DEGRADED grade (connected but weak)
+Strict mode: reject genesis on missing MUST fields.
+Permissive mode: warn on missing RECOMMENDED fields, reject on missing MUST.
 
-TLS parallel: missing cipher suite = refused. Weak cipher = degraded.
-
-Genesis contract fields (V1.1):
-  MUST: soul_hash, model_hash, operator_id, genesis_hash, schema_version,
-        grader_id, agent_id, ca_fingerprint, minimum_audit_cadence,
-        error_type_enum, anchor_type, revocation_endpoint,
-        escalation_contact, attestation_entropy_threshold
-  RECOMMENDED: scoring_method, correction_range, decay_halflife,
-               description
+Per Clawk thread: validation at genesis time = enforcement at crisis time.
 
 Usage:
     python3 genesis-contract-validator.py
@@ -29,237 +20,270 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from enum import Enum
 
 
-# ATF V1.1 genesis contract specification
-MUST_FIELDS = {
-    "soul_hash": {"type": "sha256", "layer": "genesis", "description": "Hash of identity file"},
-    "model_hash": {"type": "sha256", "layer": "genesis", "description": "Hash of model weights/version"},
-    "operator_id": {"type": "string", "layer": "genesis", "description": "Human/org operating the agent"},
-    "genesis_hash": {"type": "sha256", "layer": "genesis", "description": "Hash of full genesis document"},
-    "schema_version": {"type": "semver", "layer": "genesis", "description": "ATF spec version"},
-    "grader_id": {"type": "string", "layer": "attestation", "description": "Who grades this agent"},
-    "agent_id": {"type": "string", "layer": "genesis", "description": "Unique agent identifier"},
-    "ca_fingerprint": {"type": "sha256", "layer": "genesis", "description": "Certificate authority fingerprint"},
-    "minimum_audit_cadence": {"type": "duration", "layer": "drift", "description": "Max time between audits"},
-    "error_type_enum": {"type": "enum_version", "layer": "error", "description": "Versioned error taxonomy"},
-    "anchor_type": {"type": "enum", "layer": "genesis", "description": "DKIM|SELF_SIGNED|CA_ANCHORED|BLOCKCHAIN"},
-    "revocation_endpoint": {"type": "url", "layer": "revocation", "description": "Where to check revocation status"},
-    "escalation_contact": {"type": "string", "layer": "genesis", "description": "Human contact for escalation"},
-    "attestation_entropy_threshold": {"type": "float", "layer": "attestation", "description": "KS p-value floor (≥0.05)"},
-}
-
-RECOMMENDED_FIELDS = {
-    "scoring_method": {"type": "string", "layer": "attestation", "description": "How trust scores are computed"},
-    "correction_range": {"type": "range", "layer": "drift", "description": "Expected correction frequency [0.05, 0.40]"},
-    "decay_halflife": {"type": "duration", "layer": "drift", "description": "Trust decay half-life"},
-    "description": {"type": "string", "layer": "genesis", "description": "Human-readable agent description"},
-}
-
-VALID_ANCHOR_TYPES = {"DKIM", "SELF_SIGNED", "CA_ANCHORED", "BLOCKCHAIN"}
-VALID_ERROR_ENUMS = {"v1.0", "v1.1"}  # Must be versioned
+class FieldRequirement(Enum):
+    MUST = "MUST"
+    SHOULD = "SHOULD"
+    MAY = "MAY"
 
 
 @dataclass
-class ValidationResult:
-    valid: bool
-    grade: str  # A-F
-    verdict: str  # ACCEPTED, DEGRADED, REJECTED
-    must_present: int
-    must_total: int
-    recommended_present: int
-    recommended_total: int
-    missing_must: list
-    missing_recommended: list
-    warnings: list
-    errors: list
-    genesis_hash: str
-    contract_hash: str  # Hash of the validation result itself
+class GenesisField:
+    name: str
+    requirement: FieldRequirement
+    field_type: str  # str, int, float, hash, url, enum
+    description: str
+    validator: Optional[str] = None  # validation rule name
 
 
-def validate_genesis(genesis: dict) -> ValidationResult:
-    """Validate a genesis document as a contract."""
+# ATF V1.1 Genesis Contract Fields
+GENESIS_CONTRACT_FIELDS = [
+    # Core identity (existing ATF-core)
+    GenesisField("soul_hash", FieldRequirement.MUST, "hash", "SHA-256 of agent identity"),
+    GenesisField("genesis_hash", FieldRequirement.MUST, "hash", "SHA-256 of genesis document"),
+    GenesisField("agent_id", FieldRequirement.MUST, "str", "Unique agent identifier"),
+    GenesisField("model_hash", FieldRequirement.MUST, "hash", "SHA-256 of model weights/version"),
+    GenesisField("operator_id", FieldRequirement.MUST, "str", "Operator/principal identifier"),
+    GenesisField("schema_version", FieldRequirement.MUST, "str", "ATF schema version (semver)"),
+    GenesisField("created_at", FieldRequirement.MUST, "int", "Unix timestamp of genesis"),
+    GenesisField("predecessor_hash", FieldRequirement.MUST, "hash", "Previous genesis hash or null"),
+    GenesisField("minimum_audit_cadence", FieldRequirement.MUST, "int", "Seconds between audits"),
+    GenesisField("ca_fingerprint", FieldRequirement.MUST, "hash", "Certificate authority fingerprint"),
+    GenesisField("grader_id", FieldRequirement.MUST, "str", "Designated grader identifier"),
+    GenesisField("grader_genesis_hash", FieldRequirement.MUST, "hash", "Grader's own genesis hash"),
+    GenesisField("anchor_type", FieldRequirement.MUST, "enum", "DKIM|SELF_SIGNED|CA_ANCHORED|BLOCKCHAIN"),
+    # V1.1 Contract fields (new)
+    GenesisField("operator_genesis_hash", FieldRequirement.MUST, "hash", "Operator's genesis hash for chain traversal"),
+    GenesisField("escalation_contact", FieldRequirement.MUST, "str", "Email/URI for Tier 2 escalation"),
+    GenesisField("revocation_endpoint", FieldRequirement.MUST, "url", "URI to check revocation status"),
+    GenesisField("revocation_ttl", FieldRequirement.MUST, "int", "Seconds counterparty caches revocation status"),
+    GenesisField("tier2_response_deadline", FieldRequirement.MUST, "int", "Seconds for Tier 2 human response"),
+    GenesisField("error_type_enum_version", FieldRequirement.MUST, "str", "Version of error type enum"),
+    # SHOULD fields
+    GenesisField("entropy_check_method", FieldRequirement.SHOULD, "enum", "KS_TEST|ANDERSON_DARLING|NONE"),
+    GenesisField("max_delegation_depth", FieldRequirement.SHOULD, "int", "Maximum ARC-style hop count"),
+    GenesisField("correction_range", FieldRequirement.SHOULD, "str", "Expected correction frequency range"),
+    GenesisField("trust_decay_halflife", FieldRequirement.SHOULD, "int", "Seconds for trust score half-life"),
+    # MAY fields
+    GenesisField("description", FieldRequirement.MAY, "str", "Human-readable agent description"),
+    GenesisField("homepage", FieldRequirement.MAY, "url", "Agent homepage URL"),
+    GenesisField("capabilities", FieldRequirement.MAY, "str", "Comma-separated capability list"),
+]
+
+
+def validate_field_value(field_def: GenesisField, value) -> tuple[bool, str]:
+    """Validate a field value against its type constraint."""
+    if value is None:
+        return False, "null_value"
+
+    if field_def.field_type == "hash":
+        if not isinstance(value, str) or len(value) < 8:
+            return False, "invalid_hash_length"
+        if not all(c in "0123456789abcdef" for c in value.lower()):
+            return False, "invalid_hash_chars"
+        return True, "valid"
+
+    if field_def.field_type == "int":
+        if not isinstance(value, (int, float)) or value < 0:
+            return False, "invalid_int"
+        return True, "valid"
+
+    if field_def.field_type == "url":
+        if not isinstance(value, str) or not (value.startswith("http") or value.startswith("mailto:")):
+            return False, "invalid_url"
+        return True, "valid"
+
+    if field_def.field_type == "enum":
+        if field_def.name == "anchor_type":
+            valid = {"DKIM", "SELF_SIGNED", "CA_ANCHORED", "BLOCKCHAIN"}
+            if value not in valid:
+                return False, f"invalid_enum: must be one of {valid}"
+        if field_def.name == "entropy_check_method":
+            valid = {"KS_TEST", "ANDERSON_DARLING", "NONE"}
+            if value not in valid:
+                return False, f"invalid_enum: must be one of {valid}"
+        return True, "valid"
+
+    if field_def.field_type == "str":
+        if not isinstance(value, str) or len(value) == 0:
+            return False, "empty_string"
+        return True, "valid"
+
+    return True, "valid"
+
+
+def validate_genesis(genesis: dict, strict: bool = True) -> dict:
+    """Validate a genesis document as a contract.
+
+    strict=True: reject on any missing MUST field (TLS: missing cipher = refused)
+    strict=False: warn on missing MUST fields, reject only on invalid values
+    """
+    must_fields = [f for f in GENESIS_CONTRACT_FIELDS if f.requirement == FieldRequirement.MUST]
+    should_fields = [f for f in GENESIS_CONTRACT_FIELDS if f.requirement == FieldRequirement.SHOULD]
+    may_fields = [f for f in GENESIS_CONTRACT_FIELDS if f.requirement == FieldRequirement.MAY]
+
     errors = []
     warnings = []
+    valid_fields = []
     missing_must = []
-    missing_recommended = []
+    missing_should = []
 
     # Check MUST fields
-    must_present = 0
-    for field_name, spec in MUST_FIELDS.items():
-        if field_name in genesis and genesis[field_name] is not None:
-            must_present += 1
-            # Type-specific validation
-            value = genesis[field_name]
-            if spec["type"] == "sha256" and (not isinstance(value, str) or len(value) < 8):
-                errors.append(f"{field_name}: invalid hash (too short)")
-            elif spec["type"] == "enum" and field_name == "anchor_type":
-                if value not in VALID_ANCHOR_TYPES:
-                    errors.append(f"anchor_type: '{value}' not in {VALID_ANCHOR_TYPES}")
-            elif spec["type"] == "enum_version" and field_name == "error_type_enum":
-                if not any(value.startswith(v) for v in VALID_ERROR_ENUMS):
-                    warnings.append(f"error_type_enum: '{value}' is non-standard version")
-            elif spec["type"] == "float" and field_name == "attestation_entropy_threshold":
-                try:
-                    fval = float(value)
-                    if fval < 0.05:
-                        errors.append(f"attestation_entropy_threshold: {fval} < 0.05 MUST minimum")
-                except (ValueError, TypeError):
-                    errors.append(f"attestation_entropy_threshold: not a valid float")
+    for f in must_fields:
+        if f.name not in genesis:
+            missing_must.append(f.name)
+            if strict:
+                errors.append(f"MISSING_MUST: {f.name} ({f.description})")
+            else:
+                warnings.append(f"MISSING_MUST: {f.name} ({f.description})")
         else:
-            missing_must.append(field_name)
+            ok, reason = validate_field_value(f, genesis[f.name])
+            if ok:
+                valid_fields.append(f.name)
+            else:
+                errors.append(f"INVALID_VALUE: {f.name} = {genesis[f.name]} ({reason})")
 
-    # Check RECOMMENDED fields
-    rec_present = 0
-    for field_name, spec in RECOMMENDED_FIELDS.items():
-        if field_name in genesis and genesis[field_name] is not None:
-            rec_present += 1
+    # Check SHOULD fields
+    for f in should_fields:
+        if f.name not in genesis:
+            missing_should.append(f.name)
+            warnings.append(f"MISSING_SHOULD: {f.name} ({f.description})")
         else:
-            missing_recommended.append(field_name)
+            ok, reason = validate_field_value(f, genesis[f.name])
+            if ok:
+                valid_fields.append(f.name)
+            else:
+                warnings.append(f"INVALID_SHOULD: {f.name} = {genesis[f.name]} ({reason})")
 
-    # Self-grading check (Axiom 1 violation)
-    if genesis.get("grader_id") == genesis.get("agent_id"):
-        warnings.append("SELF_GRADING: grader_id == agent_id (conflict of interest)")
+    # Check MAY fields (informational only)
+    for f in may_fields:
+        if f.name in genesis:
+            ok, reason = validate_field_value(f, genesis[f.name])
+            if ok:
+                valid_fields.append(f.name)
 
-    # Anchor type consistency
-    if genesis.get("anchor_type") == "DKIM" and not genesis.get("revocation_endpoint", "").startswith("dns:"):
-        warnings.append("DKIM anchor_type but revocation_endpoint is not DNS-based")
+    # Contract completeness
+    must_count = len(must_fields)
+    must_present = must_count - len(missing_must)
+    completeness = must_present / must_count if must_count > 0 else 0
 
-    # Compute grade
-    must_ratio = must_present / len(MUST_FIELDS) if MUST_FIELDS else 0
-    rec_ratio = rec_present / len(RECOMMENDED_FIELDS) if RECOMMENDED_FIELDS else 0
-    has_errors = len(errors) > 0
+    # Compute genesis hash
+    canonical = json.dumps(genesis, sort_keys=True, separators=(",", ":"))
+    genesis_hash = hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
-    if must_ratio == 1.0 and not has_errors:
-        if rec_ratio >= 0.75:
-            grade = "A"
-        else:
-            grade = "B"
-        verdict = "ACCEPTED"
-    elif must_ratio >= 0.85 and not has_errors:
-        grade = "C"
-        verdict = "DEGRADED"
-    elif must_ratio >= 0.70:
-        grade = "D"
-        verdict = "DEGRADED"
+    # Grade
+    if errors:
+        grade = "F" if completeness < 0.5 else "D" if completeness < 0.8 else "C"
+        verdict = "REJECTED" if strict else "DEGRADED"
+    elif warnings:
+        grade = "B"
+        verdict = "ACCEPTED_WITH_WARNINGS"
     else:
-        grade = "F"
-        verdict = "REJECTED"
+        grade = "A"
+        verdict = "ACCEPTED"
 
-    if has_errors:
-        grade = min(grade, "D")  # Errors cap at D
-        if must_ratio < 0.85:
-            verdict = "REJECTED"
-
-    # Genesis hash
-    genesis_hash = hashlib.sha256(
-        json.dumps(genesis, sort_keys=True).encode()
-    ).hexdigest()[:16]
-
-    result = ValidationResult(
-        valid=verdict != "REJECTED",
-        grade=grade,
-        verdict=verdict,
-        must_present=must_present,
-        must_total=len(MUST_FIELDS),
-        recommended_present=rec_present,
-        recommended_total=len(RECOMMENDED_FIELDS),
-        missing_must=missing_must,
-        missing_recommended=missing_recommended,
-        warnings=warnings,
-        errors=errors,
-        genesis_hash=genesis_hash,
-        contract_hash="",
-    )
-
-    # Self-hash the validation result
-    result.contract_hash = hashlib.sha256(
-        json.dumps({
-            "genesis_hash": genesis_hash,
-            "grade": grade,
-            "verdict": verdict,
-            "must": f"{must_present}/{len(MUST_FIELDS)}",
-        }, sort_keys=True).encode()
-    ).hexdigest()[:16]
-
-    return result
+    return {
+        "verdict": verdict,
+        "grade": grade,
+        "strict_mode": strict,
+        "genesis_hash": genesis_hash,
+        "must_fields": {"total": must_count, "present": must_present, "missing": missing_must},
+        "should_fields": {"total": len(should_fields), "present": len(should_fields) - len(missing_should), "missing": missing_should},
+        "completeness": round(completeness, 3),
+        "valid_fields": len(valid_fields),
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 
 def demo():
     print("=" * 60)
     print("Genesis Contract Validator — ATF V1.1")
-    print("Validation at genesis time = enforcement at crisis time")
     print("=" * 60)
 
-    # Scenario 1: Full contract (Grade A)
+    # Scenario 1: Complete V1.1 genesis contract
     print("\n--- Scenario 1: Complete genesis contract ---")
-    full_genesis = {
+    complete = {
         "soul_hash": "a1b2c3d4e5f6a7b8",
-        "model_hash": "m1n2o3p4q5r6s7t8",
-        "operator_id": "ilya@openclaw.ai",
-        "genesis_hash": "g1h2i3j4k5l6m7n8",
-        "schema_version": "1.1.0",
-        "grader_id": "bro_agent",
+        "genesis_hash": "0000000000000000",  # will be recomputed
         "agent_id": "kit_fox",
-        "ca_fingerprint": "ca1234567890abcd",
-        "minimum_audit_cadence": "24h",
-        "error_type_enum": "v1.1",
+        "model_hash": "deadbeef12345678",
+        "operator_id": "ilya",
+        "schema_version": "1.1.0",
+        "created_at": int(time.time()),
+        "predecessor_hash": "0000000000000000",
+        "minimum_audit_cadence": 3600,
+        "ca_fingerprint": "cafe0123456789ab",
+        "grader_id": "bro_agent",
+        "grader_genesis_hash": "bro1234567890abc",
         "anchor_type": "DKIM",
-        "revocation_endpoint": "dns:_atf.kit_fox.agentmail.to",
-        "escalation_contact": "ilya@openclaw.ai",
-        "attestation_entropy_threshold": 0.05,
-        # RECOMMENDED
-        "scoring_method": "wilson_ci",
-        "correction_range": [0.05, 0.40],
-        "decay_halflife": "30d",
-        "description": "Kit the Fox — trust infrastructure builder",
+        "operator_genesis_hash": "op12345678901234",
+        "escalation_contact": "mailto:ilya@example.com",
+        "revocation_endpoint": "https://api.example.com/revoke/kit_fox",
+        "revocation_ttl": 3600,
+        "tier2_response_deadline": 86400,
+        "error_type_enum_version": "1.0.0",
+        "entropy_check_method": "KS_TEST",
+        "max_delegation_depth": 5,
+        "correction_range": "0.05-0.40",
+        "trust_decay_halflife": 2592000,
     }
-    result = validate_genesis(full_genesis)
-    print(f"Grade: {result.grade} | Verdict: {result.verdict}")
-    print(f"MUST: {result.must_present}/{result.must_total} | RECOMMENDED: {result.recommended_present}/{result.recommended_total}")
-    print(f"Genesis hash: {result.genesis_hash}")
-    if result.warnings:
-        print(f"Warnings: {result.warnings}")
+    print(json.dumps(validate_genesis(complete, strict=True), indent=2))
 
-    # Scenario 2: Missing MUST fields (Grade F → REJECTED)
-    print("\n--- Scenario 2: Incomplete genesis (missing 6 MUST) ---")
-    incomplete = {
-        "soul_hash": "x1y2z3a4b5c6d7e8",
-        "model_hash": "f1g2h3i4j5k6l7m8",
-        "operator_id": "anon",
-        "agent_id": "sybil_bot",
+    # Scenario 2: Missing V1.1 contract fields (old-style genesis)
+    print("\n--- Scenario 2: Old-style genesis (missing V1.1 contract fields) ---")
+    old_style = {
+        "soul_hash": "a1b2c3d4e5f6a7b8",
+        "genesis_hash": "0000000000000000",
+        "agent_id": "legacy_agent",
+        "model_hash": "deadbeef12345678",
+        "operator_id": "unknown",
         "schema_version": "1.0.0",
-        "grader_id": "sybil_bot",  # Self-grading!
+        "created_at": int(time.time()),
+        "predecessor_hash": "0000000000000000",
+        "minimum_audit_cadence": 3600,
+        "ca_fingerprint": "cafe0123456789ab",
+        "grader_id": "self",
+        "grader_genesis_hash": "0000000000000000",
         "anchor_type": "SELF_SIGNED",
-        "error_type_enum": "v1.0",
     }
-    result2 = validate_genesis(incomplete)
-    print(f"Grade: {result2.grade} | Verdict: {result2.verdict}")
-    print(f"MUST: {result2.must_present}/{result2.must_total}")
-    print(f"Missing MUST: {result2.missing_must}")
-    print(f"Warnings: {result2.warnings}")
+    print(json.dumps(validate_genesis(old_style, strict=True), indent=2))
 
-    # Scenario 3: All MUST present but bad entropy threshold
-    print("\n--- Scenario 3: Invalid entropy threshold (below 0.05 MUST) ---")
-    bad_entropy = dict(full_genesis)
-    bad_entropy["attestation_entropy_threshold"] = 0.01  # Below MUST minimum
-    bad_entropy["grader_id"] = "independent_grader"
-    result3 = validate_genesis(bad_entropy)
-    print(f"Grade: {result3.grade} | Verdict: {result3.verdict}")
-    print(f"Errors: {result3.errors}")
+    # Scenario 3: Same old-style but permissive mode
+    print("\n--- Scenario 3: Same old-style, permissive mode ---")
+    print(json.dumps(validate_genesis(old_style, strict=False), indent=2))
 
-    # Scenario 4: MUST complete, no RECOMMENDED (Grade B)
-    print("\n--- Scenario 4: MUST-only genesis (no RECOMMENDED) ---")
-    must_only = {k: v for k, v in full_genesis.items() if k in MUST_FIELDS}
-    result4 = validate_genesis(must_only)
-    print(f"Grade: {result4.grade} | Verdict: {result4.verdict}")
-    print(f"MUST: {result4.must_present}/{result4.must_total} | RECOMMENDED: {result4.recommended_present}/{result4.recommended_total}")
-    print(f"Missing RECOMMENDED: {result4.missing_recommended}")
+    # Scenario 4: Invalid values
+    print("\n--- Scenario 4: Invalid field values ---")
+    invalid = {
+        "soul_hash": "not-a-hash!",  # invalid chars
+        "genesis_hash": "ab",  # too short
+        "agent_id": "",  # empty
+        "model_hash": "deadbeef12345678",
+        "operator_id": "valid_op",
+        "schema_version": "1.1.0",
+        "created_at": -1,  # negative
+        "predecessor_hash": "0000000000000000",
+        "minimum_audit_cadence": 3600,
+        "ca_fingerprint": "cafe0123456789ab",
+        "grader_id": "grader1",
+        "grader_genesis_hash": "grader123456789a",
+        "anchor_type": "INVALID_TYPE",  # bad enum
+        "operator_genesis_hash": "op12345678901234",
+        "escalation_contact": "not-a-url",  # invalid
+        "revocation_endpoint": "https://valid.com/revoke",
+        "revocation_ttl": 3600,
+        "tier2_response_deadline": 86400,
+        "error_type_enum_version": "1.0.0",
+    }
+    print(json.dumps(validate_genesis(invalid, strict=True), indent=2))
 
     print("\n" + "=" * 60)
-    print("Two gates: MUST = reject, RECOMMENDED = degrade.")
-    print("TLS parallel: missing cipher = refused. Weak cipher = degraded.")
-    print("Validation at genesis = enforcement at crisis.")
+    print("Genesis = contract. Missing field = unenforceable clause.")
+    print("Strict mode = TLS: missing cipher suite = connection REFUSED.")
+    print("Permissive mode = accept with warnings for migration path.")
     print("=" * 60)
 
 
