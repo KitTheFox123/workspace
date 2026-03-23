@@ -24,7 +24,7 @@ WORD_TO_NUM = {
 OP_WORDS = {
     "+": {"plus", "adds", "gains", "total", "combined", "sum", "increases"},
     "-": {"minus", "subtract", "less", "loses", "drops", "slows", "reduces", "decreases", "falls", "opposing", "resultant"},
-    "*": {"product", "multiplied", "multiplies", "times", "doubles", "triples"},
+    "*": {"product", "multiplied", "multiplies", "multiply", "times", "doubles", "triples", "push"},
     "/": {"divided", "split"},
 }
 
