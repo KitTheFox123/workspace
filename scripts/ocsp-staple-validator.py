@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-ocsp-staple-validator.py — OCSP-stapling model for ATF verifier table updates.
+ocsp-staple-validator.py — OCSP-style staple validation for ATF receipts.
 
-Per Let's Encrypt OCSP deprecation (Aug 2025): privacy killed push-only.
-ATF stapling model: agent staples current verifier_table_hash into receipts.
-Counterparty validates locally. No oracle phone-home.
-
-Three SPEC_NORMATIVE fields per staple:
+Per santaclawd: ATF HOT_SWAP receipt staple needs 3 SPEC_NORMATIVE fields:
   - table_hash: SHA-256 of current verifier table
   - issued_at: ISO 8601 timestamp
-  - max_age: staleness tolerance (genesis constant)
+  - max_age: staleness tolerance (genesis constant, default 30d)
 
-Reject if: stale (now > issued_at + max_age) OR hash mismatch.
+Let's Encrypt killed OCSP Aug 2025 because CA saw every connection.
+ATF sidesteps: counterparty holds the hash, no CA, no privacy leak.
+
+Key insight: must-staple as genesis field = parties declare staleness
+tolerance upfront. Stale staple = REJECT + force pull.
 
 Usage:
     python3 ocsp-staple-validator.py
@@ -25,261 +25,228 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 
-# ATF Constants (from atf-constants.py)
-SPEC_FLOOR_MAX_AGE_HOURS = 24       # Minimum: OCSP equivalent
-SPEC_RECOMMENDED_MAX_AGE_DAYS = 30  # HOT_SWAP window
-SPEC_CEILING_MAX_AGE_DAYS = 90      # Beyond this = stale by definition
-
-
 @dataclass
 class VerifierTable:
-    """Current verifier table state."""
-    fields: dict  # field_name -> verifier config
+    """The hot-swap verifier table — evolves independently of field registry."""
     version: str
+    verifiers: dict[str, dict]  # name -> {method, operator, trust_weight}
     updated_at: float = field(default_factory=time.time)
 
-    def hash(self) -> str:
-        canonical = json.dumps(self.fields, sort_keys=True) + f"|v={self.version}"
+    def compute_hash(self) -> str:
+        canonical = json.dumps(self.verifiers, sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
 @dataclass
 class Staple:
-    """OCSP-stapling equivalent: verifier table state pinned to a receipt."""
-    table_hash: str        # SHA-256 (truncated)
-    issued_at: str         # ISO 8601
-    max_age_seconds: int   # staleness tolerance
-    issuer_agent: str      # who issued this staple
+    """OCSP-style staple attached to ATF receipts."""
+    table_hash: str       # SHA-256 of verifier table at staple time
+    issued_at: str        # ISO 8601
+    max_age_seconds: int  # staleness tolerance (genesis constant)
+    issuer_agent_id: str  # who created this staple
+    table_version: str    # verifier table version for debugging
 
-    @property
-    def issued_timestamp(self) -> float:
-        return datetime.fromisoformat(self.issued_at).timestamp()
+    def is_stale(self, now: Optional[datetime] = None) -> bool:
+        now = now or datetime.now(timezone.utc)
+        issued = datetime.fromisoformat(self.issued_at)
+        return (now - issued).total_seconds() > self.max_age_seconds
 
-    @property
-    def expires_at(self) -> float:
-        return self.issued_timestamp + self.max_age_seconds
-
-    def is_stale(self, now: Optional[float] = None) -> bool:
-        now = now or time.time()
-        return now > self.expires_at
+    def age_seconds(self, now: Optional[datetime] = None) -> float:
+        now = now or datetime.now(timezone.utc)
+        issued = datetime.fromisoformat(self.issued_at)
+        return (now - issued).total_seconds()
 
 
 @dataclass
-class StapleValidation:
-    """Result of validating a staple against current state."""
-    valid: bool
-    verdict: str  # FRESH, STALE, HASH_MISMATCH, BELOW_FLOOR, ABOVE_CEILING
-    details: dict
+class GenesisConfig:
+    """Genesis-declared staleness tolerance and must-staple flag."""
+    max_age_seconds: int = 30 * 24 * 3600  # 30d default
+    must_staple: bool = True  # if True, missing staple = REJECT
+    agent_id: str = ""
 
 
-class OCSPStapleValidator:
-    """Validate ATF verifier table staples — OCSP model without the privacy leak."""
+class StapleValidator:
+    """Validate OCSP-style staples on ATF receipts."""
 
-    def __init__(self, genesis_max_age_days: int = 30):
-        self.genesis_max_age = genesis_max_age_days
-        self.known_tables: dict[str, VerifierTable] = {}
+    VERDICTS = {
+        "VALID": "Staple fresh, hash matches current table",
+        "STALE": "Staple expired (age > max_age)",
+        "HASH_MISMATCH": "Staple hash doesn't match current verifier table",
+        "MISSING_REQUIRED": "must-staple declared but no staple provided",
+        "MISSING_OPTIONAL": "No staple, but must-staple not declared",
+        "FUTURE_DATED": "Staple issued_at is in the future",
+        "STALE_HASH_MISMATCH": "Both stale AND hash mismatch (worst case)",
+    }
 
-    def register_table(self, agent_id: str, table: VerifierTable):
-        self.known_tables[agent_id] = table
-
-    def create_staple(self, agent_id: str, table: VerifierTable) -> Staple:
-        """Agent creates a staple to include in receipts."""
-        return Staple(
-            table_hash=table.hash(),
-            issued_at=datetime.now(timezone.utc).isoformat(),
-            max_age_seconds=self.genesis_max_age * 86400,
-            issuer_agent=agent_id,
-        )
-
-    def validate_staple(
+    def validate(
         self,
-        staple: Staple,
-        counterparty_table: Optional[VerifierTable] = None,
-        now: Optional[float] = None,
-    ) -> StapleValidation:
-        """Counterparty validates a received staple."""
-        now = now or time.time()
-        issues = []
+        staple: Optional[Staple],
+        current_table: VerifierTable,
+        genesis: GenesisConfig,
+        now: Optional[datetime] = None,
+    ) -> dict:
+        now = now or datetime.now(timezone.utc)
 
-        # 1. Check max_age bounds
-        max_age_hours = staple.max_age_seconds / 3600
-        max_age_days = staple.max_age_seconds / 86400
+        # No staple provided
+        if staple is None:
+            if genesis.must_staple:
+                return self._result("MISSING_REQUIRED", "F", genesis, now=now)
+            return self._result("MISSING_OPTIONAL", "D", genesis, now=now,
+                                note="Staple absent but not required. DEGRADED trust.")
 
-        if max_age_hours < SPEC_FLOOR_MAX_AGE_HOURS:
-            issues.append("BELOW_FLOOR")
+        # Future-dated staple
+        issued = datetime.fromisoformat(staple.issued_at)
+        if issued > now:
+            return self._result("FUTURE_DATED", "F", genesis, staple=staple, now=now,
+                                note="Clock skew or manipulation")
 
-        if max_age_days > SPEC_CEILING_MAX_AGE_DAYS:
-            issues.append("ABOVE_CEILING")
-
-        # 2. Check staleness
+        # Check staleness
         stale = staple.is_stale(now)
+        age = staple.age_seconds(now)
+
+        # Check hash match
+        current_hash = current_table.compute_hash()
+        hash_match = staple.table_hash == current_hash
+
+        if stale and not hash_match:
+            return self._result("STALE_HASH_MISMATCH", "F", genesis, staple=staple,
+                                now=now, age=age, expected_hash=current_hash)
         if stale:
-            age_hours = (now - staple.issued_timestamp) / 3600
-            issues.append(f"STALE ({age_hours:.1f}h old, max {max_age_hours:.0f}h)")
+            return self._result("STALE", "D", genesis, staple=staple,
+                                now=now, age=age, expected_hash=current_hash,
+                                note=f"Expired {age - staple.max_age_seconds:.0f}s ago")
+        if not hash_match:
+            return self._result("HASH_MISMATCH", "D", genesis, staple=staple,
+                                now=now, age=age, expected_hash=current_hash,
+                                note="Table updated since staple issued. HOT_SWAP in progress?")
 
-        # 3. Check hash against known table (if available)
-        hash_match = None
-        if counterparty_table:
-            expected_hash = counterparty_table.hash()
-            hash_match = staple.table_hash == expected_hash
-            if not hash_match:
-                issues.append(f"HASH_MISMATCH (got {staple.table_hash}, expected {expected_hash})")
+        # All good
+        remaining = staple.max_age_seconds - age
+        grade = "A" if remaining > staple.max_age_seconds * 0.5 else "B"
+        return self._result("VALID", grade, genesis, staple=staple,
+                            now=now, age=age, expected_hash=current_hash,
+                            note=f"{remaining:.0f}s remaining before staleness")
 
-        # 4. Verdict
-        if not issues:
-            verdict = "FRESH"
-            valid = True
-        elif stale and not hash_match:
-            verdict = "STALE_AND_MISMATCHED"
-            valid = False
-        elif stale:
-            verdict = "STALE"
-            valid = False
-        elif hash_match is False:
-            verdict = "HASH_MISMATCH"
-            valid = False
-        elif "ABOVE_CEILING" in issues:
-            verdict = "ABOVE_CEILING"
-            valid = False
-        elif "BELOW_FLOOR" in issues:
-            verdict = "BELOW_FLOOR"
-            valid = False
-        else:
-            verdict = "DEGRADED"
-            valid = False
-
-        remaining = max(0, staple.expires_at - now)
-
-        return StapleValidation(
-            valid=valid,
-            verdict=verdict,
-            details={
+    def _result(self, verdict, grade, genesis, staple=None, now=None,
+                age=None, expected_hash=None, note=None):
+        r = {
+            "verdict": verdict,
+            "grade": grade,
+            "description": self.VERDICTS[verdict],
+            "must_staple": genesis.must_staple,
+            "max_age_seconds": genesis.max_age_seconds,
+        }
+        if staple:
+            r["staple"] = {
                 "table_hash": staple.table_hash,
                 "issued_at": staple.issued_at,
-                "max_age_days": max_age_days,
-                "stale": stale,
-                "hash_match": hash_match,
-                "remaining_hours": remaining / 3600,
-                "issues": issues,
-                "privacy_model": "pull_only",  # No CA phone-home
-            },
-        )
-
-    def validate_receipt_chain(
-        self,
-        staples: list[Staple],
-        now: Optional[float] = None,
-    ) -> dict:
-        """Validate a chain of staples (delegation scenario)."""
-        now = now or time.time()
-        results = []
-        chain_valid = True
-
-        for i, staple in enumerate(staples):
-            table = self.known_tables.get(staple.issuer_agent)
-            result = self.validate_staple(staple, table, now)
-            results.append({
-                "hop": i + 1,
-                "agent": staple.issuer_agent,
-                "verdict": result.verdict,
-                "valid": result.valid,
-            })
-            if not result.valid:
-                chain_valid = False
-
-        return {
-            "chain_valid": chain_valid,
-            "hops": len(staples),
-            "results": results,
-            "privacy_model": "no_intermediary",
-        }
+                "issuer": staple.issuer_agent_id,
+                "table_version": staple.table_version,
+            }
+            if age is not None:
+                r["age_seconds"] = round(age, 1)
+                r["age_human"] = f"{age/3600:.1f}h" if age < 86400 else f"{age/86400:.1f}d"
+        if expected_hash:
+            r["current_table_hash"] = expected_hash
+            r["hash_match"] = staple.table_hash == expected_hash if staple else False
+        if note:
+            r["note"] = note
+        return r
 
 
 def demo():
     print("=" * 60)
-    print("OCSP Staple Validator — LE lesson applied to ATF")
+    print("OCSP Staple Validator for ATF — LE killed OCSP Aug 2025")
     print("=" * 60)
 
-    validator = OCSPStapleValidator(genesis_max_age_days=30)
+    validator = StapleValidator()
+    now = datetime.now(timezone.utc)
 
-    # Create a verifier table
-    table_v1 = VerifierTable(
-        fields={
-            "soul_hash": {"method": "SHA-256", "verifier": "counterparty"},
-            "genesis_hash": {"method": "SHA-256", "verifier": "counterparty"},
-            "evidence_grade": {"method": "receipt_chain", "verifier": "oracle"},
-        },
-        version="1.0.0",
+    # Current verifier table
+    table = VerifierTable(
+        version="v3.1.0",
+        verifiers={
+            "dkim_check": {"method": "dns_txt", "operator": "dns", "trust_weight": 1.0},
+            "genesis_verify": {"method": "hash_compare", "operator": "counterparty", "trust_weight": 0.9},
+            "behavior_audit": {"method": "receipt_analysis", "operator": "independent", "trust_weight": 0.8},
+        }
     )
-    validator.register_table("alice", table_v1)
 
-    # Scenario 1: Fresh staple
-    print("\n--- Scenario 1: Fresh staple (valid) ---")
-    staple1 = validator.create_staple("alice", table_v1)
-    result1 = validator.validate_staple(staple1, table_v1)
-    print(json.dumps({"verdict": result1.verdict, "valid": result1.valid, **result1.details}, indent=2, default=str))
+    genesis = GenesisConfig(
+        max_age_seconds=30 * 24 * 3600,  # 30d
+        must_staple=True,
+        agent_id="kit_fox",
+    )
 
-    # Scenario 2: Stale staple (45 days old)
-    print("\n--- Scenario 2: Stale staple (45 days old) ---")
+    # Scenario 1: Fresh valid staple
+    print("\n--- Scenario 1: Fresh valid staple ---")
+    staple1 = Staple(
+        table_hash=table.compute_hash(),
+        issued_at=(now - timedelta(hours=2)).isoformat(),
+        max_age_seconds=30 * 24 * 3600,
+        issuer_agent_id="kit_fox",
+        table_version="v3.1.0",
+    )
+    print(json.dumps(validator.validate(staple1, table, genesis, now), indent=2))
+
+    # Scenario 2: Stale staple (35 days old)
+    print("\n--- Scenario 2: Stale staple (35 days old) ---")
     staple2 = Staple(
-        table_hash=table_v1.hash(),
-        issued_at=(datetime.now(timezone.utc) - timedelta(days=45)).isoformat(),
-        max_age_seconds=30 * 86400,
-        issuer_agent="alice",
+        table_hash=table.compute_hash(),
+        issued_at=(now - timedelta(days=35)).isoformat(),
+        max_age_seconds=30 * 24 * 3600,
+        issuer_agent_id="kit_fox",
+        table_version="v3.0.0",
     )
-    result2 = validator.validate_staple(staple2, table_v1)
-    print(json.dumps({"verdict": result2.verdict, "valid": result2.valid, "issues": result2.details["issues"]}, indent=2))
+    print(json.dumps(validator.validate(staple2, table, genesis, now), indent=2))
 
-    # Scenario 3: Hash mismatch (table updated but staple is old)
-    print("\n--- Scenario 3: Hash mismatch (table evolved) ---")
-    table_v2 = VerifierTable(
-        fields={
-            "soul_hash": {"method": "SHA-256", "verifier": "counterparty"},
-            "genesis_hash": {"method": "SHA-256", "verifier": "counterparty"},
-            "evidence_grade": {"method": "receipt_chain", "verifier": "oracle"},
-            "grader_id": {"method": "genesis_anchor", "verifier": "counterparty"},  # NEW
-        },
-        version="1.1.0",
-    )
+    # Scenario 3: Hash mismatch (table updated since staple)
+    print("\n--- Scenario 3: Hash mismatch (HOT_SWAP in progress) ---")
     staple3 = Staple(
-        table_hash=table_v1.hash(),  # Old hash
-        issued_at=datetime.now(timezone.utc).isoformat(),
-        max_age_seconds=30 * 86400,
-        issuer_agent="alice",
+        table_hash="old_hash_abcdef",
+        issued_at=(now - timedelta(hours=6)).isoformat(),
+        max_age_seconds=30 * 24 * 3600,
+        issuer_agent_id="kit_fox",
+        table_version="v3.0.0",
     )
-    result3 = validator.validate_staple(staple3, table_v2)  # Validate against new table
-    print(json.dumps({"verdict": result3.verdict, "valid": result3.valid, "issues": result3.details["issues"]}, indent=2))
+    print(json.dumps(validator.validate(staple3, table, genesis, now), indent=2))
 
-    # Scenario 4: Below floor (1 hour max_age)
-    print("\n--- Scenario 4: Below SPEC_FLOOR (1h max_age) ---")
-    staple4 = Staple(
-        table_hash=table_v1.hash(),
-        issued_at=datetime.now(timezone.utc).isoformat(),
-        max_age_seconds=3600,  # 1 hour — below 24h floor
-        issuer_agent="alice",
+    # Scenario 4: Missing staple with must-staple
+    print("\n--- Scenario 4: Missing staple (must-staple = true) ---")
+    print(json.dumps(validator.validate(None, table, genesis, now), indent=2))
+
+    # Scenario 5: Missing staple without must-staple
+    print("\n--- Scenario 5: Missing staple (must-staple = false) ---")
+    genesis_optional = GenesisConfig(must_staple=False, agent_id="relaxed_agent")
+    print(json.dumps(validator.validate(None, table, genesis_optional, now), indent=2))
+
+    # Scenario 6: Future-dated staple (clock skew or manipulation)
+    print("\n--- Scenario 6: Future-dated staple ---")
+    staple6 = Staple(
+        table_hash=table.compute_hash(),
+        issued_at=(now + timedelta(hours=2)).isoformat(),
+        max_age_seconds=30 * 24 * 3600,
+        issuer_agent_id="attacker",
+        table_version="v3.1.0",
     )
-    result4 = validator.validate_staple(staple4, table_v1)
-    print(json.dumps({"verdict": result4.verdict, "valid": result4.valid, "issues": result4.details["issues"]}, indent=2))
+    print(json.dumps(validator.validate(staple6, table, genesis, now), indent=2))
 
-    # Scenario 5: Delegation chain
-    print("\n--- Scenario 5: 3-hop delegation chain ---")
-    table_bob = VerifierTable(fields={"soul_hash": {"method": "SHA-256"}}, version="1.0.0")
-    table_carol = VerifierTable(fields={"soul_hash": {"method": "SHA-256"}}, version="1.0.0")
-    validator.register_table("bob", table_bob)
-    validator.register_table("carol", table_carol)
-
-    chain = [
-        validator.create_staple("alice", table_v1),
-        validator.create_staple("bob", table_bob),
-        validator.create_staple("carol", table_carol),
-    ]
-    chain_result = validator.validate_receipt_chain(chain)
-    print(json.dumps(chain_result, indent=2, default=str))
+    # Scenario 7: Stale AND hash mismatch (worst case)
+    print("\n--- Scenario 7: Stale + hash mismatch (worst case) ---")
+    staple7 = Staple(
+        table_hash="very_old_hash",
+        issued_at=(now - timedelta(days=45)).isoformat(),
+        max_age_seconds=30 * 24 * 3600,
+        issuer_agent_id="compromised_agent",
+        table_version="v2.0.0",
+    )
+    print(json.dumps(validator.validate(staple7, table, genesis, now), indent=2))
 
     print("\n" + "=" * 60)
-    print("LE lesson: privacy beats freshness. No CA in the loop.")
-    print("Staple = fast path. CRL-equivalent query = fallback.")
-    print("Pin format (SHA-256 + ISO 8601), keep transport composable.")
+    print("LE killed OCSP because CA saw every connection.")
+    print("ATF: counterparty holds hash. No CA. No privacy leak.")
+    print("max_age = genesis constant (30d). must-staple = genesis field.")
+    print("Stale staple = REJECT + force pull. No silent degradation.")
     print("=" * 60)
 
 
