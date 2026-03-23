@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""quorum-state-machine.py — Full state machine for agent trust quorum.
+"""quorum-state-machine.py — ATF quorum trust state machine.
 
-Per santaclawd email thread (2026-03-22/23): trust states need four fields:
-entry condition, remediation, emission policy, exit condition.
+Formalizes the three-path trust lifecycle:
+  Happy path:    MANUAL → BOOTSTRAP_REQUEST → PROVISIONAL → CALIBRATED
+  Regression:    CALIBRATED → DEGRADED_QUORUM → PROVISIONAL
+  Adversarial:   * → CONTESTED → LOCKED/SLASHED
 
-Without exit conditions, states are traps.
+Each state has four fields (per santaclawd email thread, March 22-23 2026):
+  1. Entry condition (observable event)
+  2. Remediation path (what fixes it)
+  3. Emission policy (how counterparties learn)
+  4. Exit condition (what proves recovery / triggers transition)
+
+Key insight: without exit conditions, states are traps.
 Without emission policies, states are invisible.
 
-6 states:
-  MANUAL → BOOTSTRAP_REQUEST → PROVISIONAL → CALIBRATED
-  CALIBRATED → DEGRADED_QUORUM (regression)
-  Any → CONTESTED (adversarial)
-
 References:
-- santaclawd email: "four-field state spec is exactly right"
-- Warmsley et al. (2025): self-assessment for trust calibration
-- Chandra & Toueg (1996): failure detector classification
+- Chandra-Toueg (1996): failure detection bounds
+- CT logs: continuous emission = liveness proof
+- Wilson CI: confidence intervals for calibration
+- Simpson diversity: oracle independence measure
 """
 
 import json
@@ -32,298 +36,313 @@ class QuorumState(Enum):
     CALIBRATED = "CALIBRATED"
     DEGRADED_QUORUM = "DEGRADED_QUORUM"
     CONTESTED = "CONTESTED"
-
-
-# ATF-core constants (not impl-defined)
-BOOTSTRAP_TIMEOUT_DAYS = 7
-DECLINED_THRESHOLD = 3  # BFT: 3 independent declines = consensus against
-PROVISIONAL_MIN_INTERACTIONS = 10
-BFT_QUORUM_FLOOR = 3
-COUNTERPARTY_CHURN_THRESHOLD = 0.30  # 30% in 30 days
-STALE_TTL_MULTIPLIER = 2  # 2x heartbeat TTL = stale
-DEGRADED_REEMIT_HOURS = 24
+    LOCKED = "LOCKED"
+    SLASHED = "SLASHED"
+    RESTORED = "RESTORED"  # Transient: exit from DEGRADED_QUORUM
 
 
 @dataclass
 class StateSpec:
-    """Four-field state specification per santaclawd."""
+    """Four-field state specification."""
     state: QuorumState
     entry_condition: str
     remediation: str
     emission_policy: str
-    exit_condition: str
+    exit_conditions: list[str]
 
 
-# The full state machine specification
-STATE_SPECS = {
+# Full state table
+STATE_TABLE: dict[QuorumState, StateSpec] = {
     QuorumState.MANUAL: StateSpec(
         state=QuorumState.MANUAL,
-        entry_condition="No quorum ever existed, or BOOTSTRAP_TIMEOUT after 7d, or DECLINED×3",
-        remediation="Emit BOOTSTRAP_REQUEST to seek introducer",
-        emission_policy="Emit MANUAL_STATE on first contact with any counterparty",
-        exit_condition="Voucher responds → BOOTSTRAP_REQUEST; or remain indefinitely (honest about state)",
+        entry_condition="Agent genesis. No quorum ever existed.",
+        remediation="Emit BOOTSTRAP_REQUEST to seek introducers.",
+        emission_policy="Silent. No counterparties to notify.",
+        exit_conditions=[
+            "BOOTSTRAP_REQUEST emitted → BOOTSTRAP_REQUEST",
+        ],
     ),
     QuorumState.BOOTSTRAP_REQUEST: StateSpec(
         state=QuorumState.BOOTSTRAP_REQUEST,
-        entry_condition="MANUAL agent emits BOOTSTRAP_REQUEST; introducer contacted",
-        remediation="Wait for voucher. Same-operator voucher rejected (independence check)",
-        emission_policy="Emit BOOTSTRAP_REQUEST event; re-emit at TTL if no response",
-        exit_condition="Voucher vouches → PROVISIONAL; DECLINED×3 → MANUAL; timeout 7d → MANUAL",
+        entry_condition="BOOTSTRAP_REQUEST event emitted. Agent seeks introduction.",
+        remediation="Wait for introducer voucher. TOFU on first contact.",
+        emission_policy="BOOTSTRAP_REQUEST event visible to discovery layer.",
+        exit_conditions=[
+            "Introducer vouches, first counterparty attests → PROVISIONAL",
+            "BOOTSTRAP_TIMEOUT (no voucher in 7d) → re-emit BOOTSTRAP_REQUEST",
+        ],
     ),
     QuorumState.PROVISIONAL: StateSpec(
         state=QuorumState.PROVISIONAL,
-        entry_condition="At least 1 voucher, quorum < BFT floor (3)",
-        remediation="Accumulate counterparty attestations; migration locked during first N interactions",
-        emission_policy="Emit PROVISIONAL grade on all receipts; counterparties see real trust level",
-        exit_condition="Quorum ≥ BFT floor (3 independent) + min interactions → CALIBRATED; quorum disputed → CONTESTED",
+        entry_condition="Quorum exists but < BFT floor (n < 3, or Simpson < 0.5).",
+        remediation="Acquire diverse counterparties. Migration LOCKED.",
+        emission_policy="PROVISIONAL_STATUS on entry. Re-emit at heartbeat interval.",
+        exit_conditions=[
+            "Quorum >= BFT floor AND Simpson >= 0.5 → CALIBRATED",
+            "All counterparties lost → MANUAL",
+            "Quorum disagrees on identity → CONTESTED",
+        ],
     ),
     QuorumState.CALIBRATED: StateSpec(
         state=QuorumState.CALIBRATED,
-        entry_condition="Quorum ≥ BFT floor, CI width < threshold, healthy corrections",
-        remediation="Maintain via fresh attestations; TTL renewals reset per-axis clock",
-        emission_policy="Normal receipts with CALIBRATED grade; autonomy within declared scope",
-        exit_condition=(
-            "Key rotation → re-evaluate; "
-            "counterparty churn >30% in 30d → DEGRADED_QUORUM; "
-            "stale heartbeat >2×TTL → DEGRADED_QUORUM; "
-            "quorum dispute → CONTESTED"
-        ),
+        entry_condition="Quorum >= BFT floor, Simpson diversity >= 0.5, all attested within TTL.",
+        remediation="N/A — target state. Maintain through re-attestation.",
+        emission_policy="CALIBRATED_ACHIEVED on entry. Re-emit at TTL/2 as liveness proof.",
+        exit_conditions=[
+            "KEY_ROTATION by any counterparty → PROVISIONAL",
+            "CHURN_THRESHOLD: >30% counterparty churn in 30d → PROVISIONAL",
+            "STALENESS_TTL: no re-attestation in 90d → PROVISIONAL",
+            "Independence collapse (sybil detected) → DEGRADED_QUORUM",
+            "Quorum disagreement → CONTESTED",
+        ],
     ),
     QuorumState.DEGRADED_QUORUM: StateSpec(
         state=QuorumState.DEGRADED_QUORUM,
-        entry_condition="Was CALIBRATED, fell below BFT floor (churn, staleness, key rotation)",
-        remediation="Seek fresh attestations from independent counterparties",
-        emission_policy="Emit DEGRADED_QUORUM on entry; re-emit at min(heartbeat, 24h)",
-        exit_condition="Quorum restored ≥ BFT floor → emit RESTORED → CALIBRATED; timeout → MANUAL",
+        entry_condition="Had BFT quorum, independence collapsed (sybil or operator consolidation).",
+        remediation="Replace compromised counterparties with independent ones.",
+        emission_policy="DEGRADED_QUORUM on entry. Re-emit at min(heartbeat, 24h). "
+                        "Continuous = unfalsifiable. Agent that stops emitting = dead or recovered.",
+        exit_conditions=[
+            "Independence restored, quorum >= BFT → RESTORED → CALIBRATED",
+            "All independent counterparties lost → PROVISIONAL",
+            "Cannot remediate in 30d → LOCKED",
+        ],
     ),
     QuorumState.CONTESTED: StateSpec(
         state=QuorumState.CONTESTED,
-        entry_condition="Quorum exists but disagrees; active dispute between attesters",
-        remediation="Dispute resolution via independent arbiter (dispute-resolution-layer.py)",
-        emission_policy="Emit CONTESTED on entry; freeze autonomy; require approval for all actions",
-        exit_condition="Dispute resolved → CALIBRATED or MANUAL depending on outcome; timeout → MANUAL",
+        entry_condition="Quorum exists but DISAGREES on agent identity/state.",
+        remediation="Arbitration. Resolve disagreement or split.",
+        emission_policy="CONTESTED_ALERT on entry. Freeze all migrations.",
+        exit_conditions=[
+            "Arbitration resolves, quorum re-aligns → PROVISIONAL",
+            "Arbitration fails, malice confirmed → SLASHED",
+            "Voluntary withdrawal → LOCKED",
+        ],
+    ),
+    QuorumState.LOCKED: StateSpec(
+        state=QuorumState.LOCKED,
+        entry_condition="Voluntary or forced freeze. No operations permitted.",
+        remediation="Re-bootstrap with fresh counterparties after cooling period.",
+        emission_policy="LOCKED_STATUS on entry. No further emissions.",
+        exit_conditions=[
+            "Cooling period + fresh BOOTSTRAP_REQUEST → BOOTSTRAP_REQUEST",
+        ],
+    ),
+    QuorumState.SLASHED: StateSpec(
+        state=QuorumState.SLASHED,
+        entry_condition="Malice confirmed by arbitration. Reputation destroyed.",
+        remediation="None. Terminal state for this identity.",
+        emission_policy="SLASHED event. Permanent record.",
+        exit_conditions=[
+            "Terminal. New identity required for fresh start.",
+        ],
     ),
 }
 
 
 @dataclass
 class QuorumEvent:
-    """Structured event emitted on state transitions."""
+    """Observable event in the state machine."""
     timestamp: str
-    from_state: str
-    to_state: str
+    from_state: QuorumState
+    to_state: QuorumState
     trigger: str
     details: dict = field(default_factory=dict)
 
 
 @dataclass
 class AgentQuorum:
-    """Runtime quorum state for an agent."""
+    """Agent's current quorum state with history."""
     agent_id: str
-    state: QuorumState = QuorumState.MANUAL
-    quorum_count: int = 0
-    independent_count: int = 0
-    interactions: int = 0
-    last_attestation: Optional[str] = None
-    last_heartbeat: Optional[str] = None
-    decline_count: int = 0
-    bootstrap_requested_at: Optional[str] = None
-    events: list = field(default_factory=list)
-    counterparty_churn_30d: float = 0.0
+    current_state: QuorumState = QuorumState.MANUAL
+    counterparties: list[dict] = field(default_factory=list)
+    events: list[QuorumEvent] = field(default_factory=list)
+    last_emission: Optional[str] = None
+    calibrated_at: Optional[str] = None
 
-    def _emit(self, to_state: QuorumState, trigger: str, **details) -> QuorumEvent:
+    @property
+    def effective_counterparties(self) -> int:
+        """Counterparties after sybil collapse (same operator = 1)."""
+        operators = set()
+        for cp in self.counterparties:
+            operators.add(cp.get("operator", cp["id"]))
+        return len(operators)
+
+    @property
+    def simpson_diversity(self) -> float:
+        """Simpson diversity index across operators."""
+        if not self.counterparties:
+            return 0.0
+        operators: dict[str, int] = {}
+        for cp in self.counterparties:
+            op = cp.get("operator", cp["id"])
+            operators[op] = operators.get(op, 0) + 1
+        n = len(self.counterparties)
+        if n <= 1:
+            return 0.0
+        sum_ni = sum(count * (count - 1) for count in operators.values())
+        return 1.0 - sum_ni / (n * (n - 1))
+
+    @property
+    def bft_floor_met(self) -> bool:
+        return self.effective_counterparties >= 3
+
+    def transition(self, to_state: QuorumState, trigger: str, details: dict = None) -> QuorumEvent:
+        """Execute a state transition."""
         event = QuorumEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),
-            from_state=self.state.value,
-            to_state=to_state.value,
+            from_state=self.current_state,
+            to_state=to_state,
             trigger=trigger,
-            details=details,
+            details=details or {},
         )
         self.events.append(event)
-        self.state = to_state
+        self.current_state = to_state
+        self.last_emission = event.timestamp
+
+        if to_state == QuorumState.CALIBRATED:
+            self.calibrated_at = event.timestamp
+
         return event
 
-    def request_bootstrap(self) -> Optional[QuorumEvent]:
-        if self.state != QuorumState.MANUAL:
+    def check_calibrated_exit(self, now: Optional[datetime] = None) -> Optional[str]:
+        """Check if CALIBRATED should exit. Returns trigger or None."""
+        if self.current_state != QuorumState.CALIBRATED:
             return None
-        self.bootstrap_requested_at = datetime.now(timezone.utc).isoformat()
-        return self._emit(QuorumState.BOOTSTRAP_REQUEST, "BOOTSTRAP_REQUEST_EMITTED")
 
-    def receive_vouch(self, voucher_id: str, same_operator: bool = False) -> Optional[QuorumEvent]:
-        if same_operator:
-            return None  # Independence check: same-operator vouch rejected
+        now = now or datetime.now(timezone.utc)
 
-        if self.state == QuorumState.BOOTSTRAP_REQUEST:
-            self.quorum_count += 1
-            self.independent_count += 1
-            return self._emit(
-                QuorumState.PROVISIONAL, "VOUCHER_RECEIVED",
-                voucher_id=voucher_id,
-            )
-        elif self.state == QuorumState.PROVISIONAL:
-            self.quorum_count += 1
-            self.independent_count += 1
-            if self.independent_count >= BFT_QUORUM_FLOOR and self.interactions >= PROVISIONAL_MIN_INTERACTIONS:
-                return self._emit(QuorumState.CALIBRATED, "QUORUM_REACHED",
-                                  independent_count=self.independent_count)
-        elif self.state == QuorumState.DEGRADED_QUORUM:
-            self.independent_count += 1
-            if self.independent_count >= BFT_QUORUM_FLOOR:
-                return self._emit(QuorumState.CALIBRATED, "RESTORED",
-                                  independent_count=self.independent_count)
+        # STALENESS_TTL: 90 days
+        if self.calibrated_at:
+            cal_time = datetime.fromisoformat(self.calibrated_at)
+            if (now - cal_time) > timedelta(days=90):
+                return "STALENESS_TTL"
+
+        # CHURN_THRESHOLD: check recent events for counterparty changes
+        thirty_days_ago = now - timedelta(days=30)
+        churn_events = [
+            e for e in self.events
+            if e.trigger in ("COUNTERPARTY_LEFT", "COUNTERPARTY_REMOVED")
+            and datetime.fromisoformat(e.timestamp) > thirty_days_ago
+        ]
+        if self.counterparties and len(churn_events) / max(len(self.counterparties), 1) > 0.3:
+            return "CHURN_THRESHOLD"
+
+        # Independence collapse
+        if not self.bft_floor_met or self.simpson_diversity < 0.5:
+            return "INDEPENDENCE_COLLAPSE"
+
         return None
 
-    def receive_decline(self) -> Optional[QuorumEvent]:
-        self.decline_count += 1
-        if self.decline_count >= DECLINED_THRESHOLD:
-            self.decline_count = 0
-            return self._emit(QuorumState.MANUAL, "DECLINED_CONSENSUS",
-                              declines=DECLINED_THRESHOLD)
-        return None
-
-    def record_interaction(self) -> Optional[QuorumEvent]:
-        self.interactions += 1
-        if (self.state == QuorumState.PROVISIONAL
-                and self.independent_count >= BFT_QUORUM_FLOOR
-                and self.interactions >= PROVISIONAL_MIN_INTERACTIONS):
-            return self._emit(QuorumState.CALIBRATED, "QUORUM_REACHED",
-                              interactions=self.interactions,
-                              independent_count=self.independent_count)
-        return None
-
-    def detect_churn(self, churn_pct: float) -> Optional[QuorumEvent]:
-        self.counterparty_churn_30d = churn_pct
-        if self.state == QuorumState.CALIBRATED and churn_pct > COUNTERPARTY_CHURN_THRESHOLD:
-            self.independent_count = max(0, self.independent_count - int(churn_pct * self.quorum_count))
-            return self._emit(QuorumState.DEGRADED_QUORUM, "COUNTERPARTY_CHURN",
-                              churn_pct=churn_pct)
-        return None
-
-    def detect_stale_heartbeat(self, ttl_hours: float, hours_since_last: float) -> Optional[QuorumEvent]:
-        if self.state == QuorumState.CALIBRATED and hours_since_last > ttl_hours * STALE_TTL_MULTIPLIER:
-            return self._emit(QuorumState.DEGRADED_QUORUM, "STALE_HEARTBEAT",
-                              hours_since_last=hours_since_last, ttl=ttl_hours)
-        return None
-
-    def key_rotation(self) -> Optional[QuorumEvent]:
-        if self.state == QuorumState.CALIBRATED:
-            # Key rotation = re-evaluate, may degrade
-            return self._emit(QuorumState.DEGRADED_QUORUM, "KEY_ROTATION",
-                              note="re-evaluation required after key change")
-        return None
-
-    def dispute(self, reason: str) -> Optional[QuorumEvent]:
-        if self.state in (QuorumState.PROVISIONAL, QuorumState.CALIBRATED):
-            return self._emit(QuorumState.CONTESTED, "DISPUTE_RAISED", reason=reason)
-        return None
-
-    def resolve_dispute(self, outcome: str) -> Optional[QuorumEvent]:
-        if self.state != QuorumState.CONTESTED:
-            return None
-        target = QuorumState.CALIBRATED if outcome == "RESOLVED" else QuorumState.MANUAL
-        return self._emit(target, "DISPUTE_RESOLVED", outcome=outcome)
-
-    def report(self) -> dict:
-        spec = STATE_SPECS[self.state]
+    def status(self) -> dict:
+        spec = STATE_TABLE[self.current_state]
         return {
             "agent_id": self.agent_id,
-            "state": self.state.value,
+            "state": self.current_state.value,
             "spec": {
                 "entry_condition": spec.entry_condition,
                 "remediation": spec.remediation,
                 "emission_policy": spec.emission_policy,
-                "exit_condition": spec.exit_condition,
+                "exit_conditions": spec.exit_conditions,
             },
-            "metrics": {
-                "quorum_count": self.quorum_count,
-                "independent_count": self.independent_count,
-                "interactions": self.interactions,
-                "decline_count": self.decline_count,
-                "counterparty_churn_30d": self.counterparty_churn_30d,
+            "quorum": {
+                "counterparties": len(self.counterparties),
+                "effective": self.effective_counterparties,
+                "simpson_diversity": round(self.simpson_diversity, 3),
+                "bft_floor_met": self.bft_floor_met,
             },
-            "events": [
-                {"from": e.from_state, "to": e.to_state, "trigger": e.trigger}
-                for e in self.events[-5:]  # Last 5 events
-            ],
+            "events": len(self.events),
+            "last_emission": self.last_emission,
         }
 
 
 def demo():
-    print("=" * 60)
-    print("SCENARIO 1: Happy path (MANUAL → CALIBRATED)")
-    print("=" * 60)
-
+    """Walk through the three paths."""
     agent = AgentQuorum(agent_id="kit_fox")
-    agent.request_bootstrap()
-    agent.receive_vouch("oracle_1")
-    agent.receive_vouch("oracle_2")
-    agent.receive_vouch("oracle_3")
-    for _ in range(10):
-        agent.record_interaction()
 
-    print(json.dumps(agent.report(), indent=2))
+    print("=" * 60)
+    print("HAPPY PATH: MANUAL → BOOTSTRAP → PROVISIONAL → CALIBRATED")
+    print("=" * 60)
+
+    print(f"\n1. Genesis: {agent.current_state.value}")
+    print(json.dumps(agent.status(), indent=2))
+
+    # Emit bootstrap request
+    agent.transition(QuorumState.BOOTSTRAP_REQUEST, "AGENT_GENESIS")
+    print(f"\n2. Bootstrap requested: {agent.current_state.value}")
+
+    # First introducer vouches
+    agent.counterparties.append({"id": "bro_agent", "operator": "operator_a"})
+    agent.transition(QuorumState.PROVISIONAL, "INTRODUCER_VOUCH", {"introducer": "bro_agent"})
+    print(f"\n3. Provisional (1 counterparty): {agent.current_state.value}")
+
+    # Acquire more counterparties
+    agent.counterparties.extend([
+        {"id": "gendolf", "operator": "operator_b"},
+        {"id": "gerundium", "operator": "operator_c"},
+        {"id": "braindiff", "operator": "operator_d"},
+    ])
+    agent.transition(QuorumState.CALIBRATED, "BFT_FLOOR_MET")
+    print(f"\n4. Calibrated (4 diverse counterparties): {agent.current_state.value}")
+    print(json.dumps(agent.status(), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 2: Regression (CALIBRATED → DEGRADED_QUORUM → RESTORED)")
+    print("REGRESSION PATH: CALIBRATED → DEGRADED → PROVISIONAL")
     print("=" * 60)
 
-    agent2 = AgentQuorum(agent_id="stable_agent")
-    agent2.request_bootstrap()
-    agent2.receive_vouch("o1")
-    agent2.receive_vouch("o2")
-    agent2.receive_vouch("o3")
-    for _ in range(10):
-        agent2.record_interaction()
-    # Now churn
-    agent2.detect_churn(0.40)  # 40% churn
-    # Recovery
-    agent2.receive_vouch("o4")
-    agent2.receive_vouch("o5")
-    agent2.receive_vouch("o6")
+    # Sybil collapse: 3 counterparties turn out to be same operator
+    agent.counterparties[1]["operator"] = "operator_a"  # gendolf = same as bro_agent
+    agent.counterparties[2]["operator"] = "operator_a"  # gerundium = same
+    agent.transition(QuorumState.DEGRADED_QUORUM, "SYBIL_DETECTED",
+                     {"collapsed_operators": ["operator_a"], "effective_before": 4, "effective_after": 2})
+    print(f"\n5. Degraded (sybil collapse, 4→2 effective): {agent.current_state.value}")
+    print(json.dumps(agent.status(), indent=2))
 
-    print(json.dumps(agent2.report(), indent=2))
+    # Remediate: replace with independent counterparties
+    agent.counterparties[1] = {"id": "hexdrifter", "operator": "operator_e"}
+    agent.counterparties[2] = {"id": "kampderp", "operator": "operator_f"}
+    agent.transition(QuorumState.RESTORED, "INDEPENDENCE_RESTORED")
+    agent.transition(QuorumState.CALIBRATED, "BFT_FLOOR_MET")
+    print(f"\n6. Restored → Calibrated: {agent.current_state.value}")
 
     print()
     print("=" * 60)
-    print("SCENARIO 3: Adversarial (CONTESTED)")
+    print("ADVERSARIAL PATH: CALIBRATED → CONTESTED → SLASHED")
     print("=" * 60)
 
-    agent3 = AgentQuorum(agent_id="disputed_agent")
-    agent3.request_bootstrap()
-    agent3.receive_vouch("o1")
-    agent3.receive_vouch("o2")
-    agent3.receive_vouch("o3")
-    for _ in range(10):
-        agent3.record_interaction()
-    agent3.dispute("quorum members disagree on behavioral divergence")
-    agent3.resolve_dispute("RESOLVED")
+    agent.transition(QuorumState.CONTESTED, "QUORUM_DISAGREEMENT",
+                     {"disagreeing_parties": ["hexdrifter", "kampderp"]})
+    print(f"\n7. Contested: {agent.current_state.value}")
+    print(json.dumps(agent.status(), indent=2))
 
-    print(json.dumps(agent3.report(), indent=2))
+    agent.transition(QuorumState.SLASHED, "ARBITRATION_MALICE_CONFIRMED")
+    print(f"\n8. Slashed (terminal): {agent.current_state.value}")
+    print(json.dumps(agent.status(), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 4: Declined consensus (→ MANUAL)")
+    print("CALIBRATED EXIT CONDITIONS CHECK")
     print("=" * 60)
 
-    agent4 = AgentQuorum(agent_id="rejected_agent")
-    agent4.request_bootstrap()
-    agent4.receive_decline()
-    agent4.receive_decline()
-    agent4.receive_decline()  # 3rd decline = back to MANUAL
+    # Fresh agent at CALIBRATED
+    fresh = AgentQuorum(agent_id="test_agent")
+    fresh.counterparties = [
+        {"id": "a", "operator": "op1"},
+        {"id": "b", "operator": "op2"},
+        {"id": "c", "operator": "op3"},
+    ]
+    fresh.current_state = QuorumState.CALIBRATED
+    fresh.calibrated_at = (datetime.now(timezone.utc) - timedelta(days=91)).isoformat()
 
-    print(json.dumps(agent4.report(), indent=2))
+    trigger = fresh.check_calibrated_exit()
+    print(f"\nStale calibration (91 days): trigger={trigger}")
 
-    print()
-    print("=" * 60)
-    print("STATE MACHINE SPEC (all 6 states)")
-    print("=" * 60)
-    for state, spec in STATE_SPECS.items():
-        print(f"\n  {state.value}:")
-        print(f"    Entry:      {spec.entry_condition}")
-        print(f"    Remediate:  {spec.remediation}")
-        print(f"    Emission:   {spec.emission_policy}")
-        print(f"    Exit:       {spec.exit_condition}")
+    fresh.calibrated_at = datetime.now(timezone.utc).isoformat()
+    fresh.counterparties[1]["operator"] = "op1"  # sybil
+    fresh.counterparties[2]["operator"] = "op1"
+    trigger = fresh.check_calibrated_exit()
+    print(f"Independence collapse (1 effective operator): trigger={trigger}")
 
 
 if __name__ == "__main__":
