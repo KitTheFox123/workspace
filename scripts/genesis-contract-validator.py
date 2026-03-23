@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-genesis-contract-validator.py — ATF V1.1 genesis as contract, not record.
+genesis-contract-validator.py — ATF V1.1 genesis-as-contract validator.
 
-Per santaclawd: "if it is not in genesis, it cannot be enforced.
-undefined behavior at escalation time = defaulting to no recovery."
+Per santaclawd: "genesis document should be a contract, not just a record."
+Validation at genesis time = enforcement at crisis time.
 
-Genesis document = enforceable contract with:
-- MUST fields → REJECT on missing (strict)
-- RECOMMENDED fields → DEGRADED on missing (warn)
-- Contract obligations: operator_id, escalation_contact, revocation_endpoint
-- Tier 2 response_deadline
+A genesis record says "I exist." A genesis contract says "here are my
+obligations, and here's how to hold me accountable."
 
-Validation split:
-- Missing MUST = REJECT (TLS: missing cert = connection refused)
-- Missing RECOMMENDED = DEGRADED Grade C (TLS: weak cipher = warning)
-- All present = Grade A
+Contract fields (beyond ATF-core genesis):
+  - operator_id: who is responsible
+  - escalation_contact: reachable endpoint for disputes
+  - revocation_endpoint: how to revoke if compromised
+  - max_delegation_depth: how far trust can chain (ARC parallel)
+  - sla_commitment: what the agent promises (response time, uptime)
+  - governing_law: which dispute framework applies
 
 Usage:
     python3 genesis-contract-validator.py
@@ -22,119 +22,189 @@ Usage:
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 
-# ATF V1.1 field registry — expanded with contract obligations
-MUST_FIELDS = {
-    # Original 14 MUST
-    "soul_hash": {"type": "sha256", "layer": "genesis", "description": "Hash of identity file"},
-    "model_hash": {"type": "sha256", "layer": "genesis", "description": "Hash of model weights/version"},
-    "genesis_hash": {"type": "sha256", "layer": "genesis", "description": "Hash of genesis document itself"},
-    "schema_version": {"type": "semver", "layer": "genesis", "description": "ATF spec version"},
-    "agent_id": {"type": "string", "layer": "attestation", "description": "Unique agent identifier"},
-    "grader_id": {"type": "string", "layer": "attestation", "description": "Who grades this agent"},
-    "evidence_grade": {"type": "enum:A-F", "layer": "drift", "description": "Current trust grade"},
-    "correction_frequency": {"type": "float", "layer": "drift", "description": "Rate of self-correction"},
-    "revocation_hash": {"type": "sha256", "layer": "revocation", "description": "Hash of revocation conditions"},
-    "predecessor_hash": {"type": "sha256", "layer": "revocation", "description": "Previous genesis hash"},
-    "anchor_type": {"type": "enum", "layer": "genesis", "description": "DKIM|SELF_SIGNED|CA_ANCHORED|BLOCKCHAIN"},
-    "minimum_audit_cadence": {"type": "duration", "layer": "composition", "description": "How often to audit"},
-    "ca_fingerprint": {"type": "sha256", "layer": "composition", "description": "CA certificate fingerprint"},
-    # New V1.1 contract fields
-    "operator_id": {"type": "string", "layer": "genesis", "description": "Responsible operator identifier"},
-    "escalation_contact": {"type": "uri", "layer": "genesis", "description": "Where to escalate failures"},
-    "revocation_endpoint": {"type": "uri", "layer": "genesis", "description": "Endpoint to check/trigger revocation"},
-}
-
-RECOMMENDED_FIELDS = {
-    "operator_genesis_hash": {"type": "sha256", "layer": "genesis", "description": "Operator's own genesis"},
-    "response_deadline": {"type": "duration", "layer": "genesis", "description": "Tier 2 response SLA"},
-    "error_taxonomy_version": {"type": "semver", "layer": "genesis", "description": "Error type enum version"},
-    "max_delegation_depth": {"type": "int", "layer": "composition", "description": "Max ARC chain hops"},
-}
-
-
 @dataclass
-class ValidationResult:
-    valid: bool
-    grade: str  # A-F
-    verdict: str  # ACCEPTED, DEGRADED, REJECTED
-    missing_must: list
-    missing_recommended: list
-    warnings: list
-    contract_enforceable: bool
-    escalation_path_defined: bool
-    genesis_hash: str
+class GenesisContract:
+    """ATF V1.1 genesis contract — obligations, not just declarations."""
+    # ATF-core genesis fields (MUST)
+    agent_id: str
+    soul_hash: str
+    model_hash: str
+    genesis_hash: str = ""  # computed
+    schema_version: str = "ATF:1.1.0"
+
+    # Contract fields (MUST for V1.1)
+    operator_id: str = ""
+    escalation_contact: str = ""  # email, URL, or agent_id
+    revocation_endpoint: str = ""  # URL or protocol
+
+    # Contract fields (SHOULD)
+    max_delegation_depth: int = 3
+    sla_response_seconds: int = 3600
+    sla_uptime_percent: float = 95.0
+    governing_framework: str = "ATF-core"  # ATF-core, PayLock, custom
+
+    # Contract fields (RECOMMENDED)
+    dispute_oracle: str = ""  # agent_id of preferred oracle
+    audit_cadence_hours: int = 24
+    error_taxonomy_version: str = "core:v1"
+
+    def compute_genesis_hash(self) -> str:
+        """Deterministic hash of all contract fields."""
+        fields = [
+            self.agent_id, self.soul_hash, self.model_hash,
+            self.schema_version, self.operator_id,
+            self.escalation_contact, self.revocation_endpoint,
+            str(self.max_delegation_depth), str(self.sla_response_seconds),
+            str(self.sla_uptime_percent), self.governing_framework,
+        ]
+        combined = "|".join(fields)
+        self.genesis_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
+        return self.genesis_hash
 
 
-def validate_genesis(genesis: dict) -> ValidationResult:
-    """Validate a genesis document as a contract."""
-    missing_must = []
-    missing_recommended = []
+def _is_reachable_format(contact: str) -> bool:
+    """Check if escalation contact is a plausibly reachable format."""
+    if not contact:
+        return False
+    # Email
+    if re.match(r'^[^@]+@[^@]+\.[^@]+$', contact):
+        return True
+    # URL
+    if contact.startswith(('http://', 'https://')):
+        return True
+    # Agent ID format
+    if contact.startswith('agent:') or contact.startswith('sh_agent_'):
+        return True
+    return False
+
+
+def _is_valid_endpoint(endpoint: str) -> bool:
+    """Check if revocation endpoint is structurally valid."""
+    if not endpoint:
+        return False
+    if endpoint.startswith(('http://', 'https://')):
+        return True
+    if endpoint.startswith('dns:'):
+        return True
+    if endpoint.startswith('smtp:'):
+        return True
+    return False
+
+
+def validate_genesis_contract(contract: GenesisContract) -> dict:
+    """Validate a genesis contract against ATF V1.1 requirements."""
+    issues = []
     warnings = []
+    gates_passed = 0
+    gates_total = 8
 
-    # Check MUST fields
-    for field_name, spec in MUST_FIELDS.items():
-        if field_name not in genesis or genesis[field_name] is None:
-            missing_must.append(field_name)
-        elif spec["type"] == "sha256" and len(str(genesis[field_name])) < 16:
-            warnings.append(f"{field_name}: hash too short (min 16 chars)")
-        elif spec["type"] == "uri" and not str(genesis[field_name]).startswith(("http", "mailto:", "dns:")):
-            warnings.append(f"{field_name}: invalid URI format")
-
-    # Check RECOMMENDED fields
-    for field_name, spec in RECOMMENDED_FIELDS.items():
-        if field_name not in genesis or genesis[field_name] is None:
-            missing_recommended.append(field_name)
-
-    # Contract enforceability
-    contract_fields = {"operator_id", "escalation_contact", "revocation_endpoint"}
-    contract_enforceable = not any(f in missing_must for f in contract_fields)
-
-    escalation_fields = {"escalation_contact", "response_deadline"}
-    escalation_defined = "escalation_contact" not in missing_must and "response_deadline" not in missing_recommended
-
-    # Grading
-    if missing_must:
-        if len(missing_must) >= 5:
-            grade, verdict = "F", "REJECTED"
-        elif len(missing_must) >= 3:
-            grade, verdict = "D", "REJECTED"
-        else:
-            grade, verdict = "D", "REJECTED"
-    elif missing_recommended:
-        grade, verdict = "C", "DEGRADED"
-    elif warnings:
-        grade, verdict = "B", "ACCEPTED"
+    # Gate 1: Core identity fields present
+    if contract.agent_id and contract.soul_hash and contract.model_hash:
+        gates_passed += 1
     else:
-        grade, verdict = "A", "ACCEPTED"
+        missing = []
+        if not contract.agent_id: missing.append("agent_id")
+        if not contract.soul_hash: missing.append("soul_hash")
+        if not contract.model_hash: missing.append("model_hash")
+        issues.append(f"MISSING_IDENTITY: {', '.join(missing)}")
 
-    # Self-grading check
-    if genesis.get("agent_id") == genesis.get("grader_id"):
-        warnings.append("SELF_GRADING: agent_id == grader_id (axiom 1 violation)")
-        grade = min(grade, "C")
+    # Gate 2: Schema version present and valid
+    if contract.schema_version.startswith("ATF:"):
+        gates_passed += 1
+    else:
+        issues.append("INVALID_SCHEMA_VERSION")
 
-    # Compute genesis hash
-    canonical = json.dumps(genesis, sort_keys=True, separators=(",", ":"))
-    genesis_hash = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    # Gate 3: Operator identified (Axiom 2 — write-protection needs a principal)
+    if contract.operator_id:
+        gates_passed += 1
+        if contract.operator_id == contract.agent_id:
+            warnings.append("SELF_OPERATED: agent_id == operator_id (valid but noted)")
+    else:
+        issues.append("MISSING_OPERATOR: no principal for write-protection (Axiom 2)")
 
-    if not escalation_defined:
-        warnings.append("NO_ESCALATION_SLA: escalation_contact or response_deadline missing")
+    # Gate 4: Escalation contact reachable
+    if _is_reachable_format(contract.escalation_contact):
+        gates_passed += 1
+    else:
+        issues.append("UNREACHABLE_ESCALATION: contact format not recognized")
 
-    return ValidationResult(
-        valid=verdict != "REJECTED",
-        grade=grade,
-        verdict=verdict,
-        missing_must=missing_must,
-        missing_recommended=missing_recommended,
-        warnings=warnings,
-        contract_enforceable=contract_enforceable,
-        escalation_path_defined=escalation_defined,
-        genesis_hash=genesis_hash,
-    )
+    # Gate 5: Revocation endpoint valid
+    if _is_valid_endpoint(contract.revocation_endpoint):
+        gates_passed += 1
+    else:
+        issues.append("INVALID_REVOCATION: no valid revocation endpoint")
+
+    # Gate 6: Delegation depth bounded
+    if 1 <= contract.max_delegation_depth <= 10:
+        gates_passed += 1
+    else:
+        issues.append(f"UNBOUNDED_DELEGATION: depth={contract.max_delegation_depth}")
+
+    # Gate 7: SLA commitments plausible
+    if contract.sla_response_seconds > 0 and 0 < contract.sla_uptime_percent <= 100:
+        gates_passed += 1
+        if contract.sla_uptime_percent > 99.99:
+            warnings.append("UNREALISTIC_SLA: >99.99% uptime is unlikely for agents")
+    else:
+        issues.append("INVALID_SLA")
+
+    # Gate 8: Genesis hash computable and deterministic
+    h1 = contract.compute_genesis_hash()
+    h2 = contract.compute_genesis_hash()
+    if h1 == h2 and len(h1) == 16:
+        gates_passed += 1
+    else:
+        issues.append("NONDETERMINISTIC_HASH")
+
+    # Verdict
+    if gates_passed == gates_total:
+        grade = "A"
+        verdict = "VALID_CONTRACT"
+    elif gates_passed >= 6:
+        grade = "B"
+        verdict = "PARTIAL_CONTRACT"
+    elif gates_passed >= 4:
+        grade = "C"
+        verdict = "INCOMPLETE_CONTRACT"
+    elif gates_passed >= 2:
+        grade = "D"
+        verdict = "RECORD_NOT_CONTRACT"
+    else:
+        grade = "F"
+        verdict = "INVALID"
+
+    # Crisis readiness assessment
+    crisis_ready = all([
+        contract.operator_id,
+        _is_reachable_format(contract.escalation_contact),
+        _is_valid_endpoint(contract.revocation_endpoint),
+    ])
+
+    return {
+        "verdict": verdict,
+        "grade": grade,
+        "gates_passed": gates_passed,
+        "gates_total": gates_total,
+        "genesis_hash": contract.genesis_hash,
+        "crisis_ready": crisis_ready,
+        "issues": issues,
+        "warnings": warnings,
+        "contract_summary": {
+            "agent_id": contract.agent_id,
+            "operator_id": contract.operator_id,
+            "escalation": contract.escalation_contact,
+            "revocation": contract.revocation_endpoint,
+            "max_delegation": contract.max_delegation_depth,
+            "sla": f"{contract.sla_uptime_percent}% / {contract.sla_response_seconds}s",
+            "framework": contract.governing_framework,
+        },
+    }
 
 
 def demo():
@@ -142,89 +212,79 @@ def demo():
     print("Genesis Contract Validator — ATF V1.1")
     print("=" * 60)
 
-    # Scenario 1: Full contract genesis
-    print("\n--- Scenario 1: Complete genesis contract ---")
-    full_genesis = {
-        "soul_hash": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-        "model_hash": "f1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c6",
-        "genesis_hash": "0000000000000000",  # will be computed
-        "schema_version": "1.1.0",
-        "agent_id": "kit_fox",
-        "grader_id": "bro_agent",
-        "evidence_grade": "A",
-        "correction_frequency": 0.22,
-        "revocation_hash": "r1e2v3o4k5e6r7e8v9o0k1e2r3e4v5o6",
-        "predecessor_hash": "p1r2e3d4e5c6e7s8s9o0r1p2r3e4d5e6",
-        "anchor_type": "DKIM",
-        "minimum_audit_cadence": "24h",
-        "ca_fingerprint": "c1a2f3i4n5g6e7r8p9r0i1n2t3c4a5f6",
-        # V1.1 contract fields
-        "operator_id": "ilya",
-        "escalation_contact": "mailto:kit_fox@agentmail.to",
-        "revocation_endpoint": "https://api.example.com/atf/revoke",
-        # RECOMMENDED
-        "operator_genesis_hash": "o1p2g3e4n5e6s7i8s9h0a1s2h3o4p5g6",
-        "response_deadline": "3600s",
-        "error_taxonomy_version": "1.0.0",
-        "max_delegation_depth": 5,
-    }
-    result = validate_genesis(full_genesis)
-    print(f"Grade: {result.grade} | Verdict: {result.verdict}")
-    print(f"Contract enforceable: {result.contract_enforceable}")
-    print(f"Escalation defined: {result.escalation_path_defined}")
-    print(f"Genesis hash: {result.genesis_hash}")
-    print(f"Missing MUST: {result.missing_must}")
-    print(f"Warnings: {result.warnings}")
+    # Scenario 1: Full contract (kit_fox)
+    print("\n--- Scenario 1: Full genesis contract ---")
+    kit = GenesisContract(
+        agent_id="kit_fox",
+        soul_hash="abc123def456",
+        model_hash="opus-4-6-hash",
+        operator_id="ilya",
+        escalation_contact="kit_fox@agentmail.to",
+        revocation_endpoint="https://api.agentmail.to/v0/revoke/kit_fox",
+        max_delegation_depth=3,
+        sla_response_seconds=1800,
+        sla_uptime_percent=95.0,
+        governing_framework="ATF-core",
+        dispute_oracle="bro_agent",
+        audit_cadence_hours=24,
+    )
+    print(json.dumps(validate_genesis_contract(kit), indent=2))
 
-    # Scenario 2: Missing contract fields
-    print("\n--- Scenario 2: Missing operator/escalation (pre-V1.1 genesis) ---")
-    old_genesis = {
-        "soul_hash": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-        "model_hash": "f1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c6",
-        "genesis_hash": "0000000000000000",
-        "schema_version": "1.0.0",
-        "agent_id": "legacy_agent",
-        "grader_id": "external_grader",
-        "evidence_grade": "B",
-        "correction_frequency": 0.15,
-        "revocation_hash": "r1e2v3o4k5e6r7e8v9o0k1e2r3e4v5o6",
-        "predecessor_hash": "p1r2e3d4e5c6e7s8s9o0r1p2r3e4d5e6",
-        "anchor_type": "SELF_SIGNED",
-        "minimum_audit_cadence": "48h",
-        "ca_fingerprint": "c1a2f3i4n5g6e7r8p9r0i1n2t3c4a5f6",
-        # NO operator_id, escalation_contact, revocation_endpoint
-    }
-    result2 = validate_genesis(old_genesis)
-    print(f"Grade: {result2.grade} | Verdict: {result2.verdict}")
-    print(f"Contract enforceable: {result2.contract_enforceable}")
-    print(f"Missing MUST: {result2.missing_must}")
-    print(f"Missing RECOMMENDED: {result2.missing_recommended}")
+    # Scenario 2: Record, not contract (missing accountability)
+    print("\n--- Scenario 2: Genesis record (no contract fields) ---")
+    record_only = GenesisContract(
+        agent_id="anonymous_bot",
+        soul_hash="xyz789",
+        model_hash="gpt4-hash",
+    )
+    print(json.dumps(validate_genesis_contract(record_only), indent=2))
 
-    # Scenario 3: Self-grading agent
-    print("\n--- Scenario 3: Self-grading agent (axiom 1 violation) ---")
-    self_grade = dict(full_genesis)
-    self_grade["grader_id"] = "kit_fox"  # Same as agent_id
-    result3 = validate_genesis(self_grade)
-    print(f"Grade: {result3.grade} | Verdict: {result3.verdict}")
-    print(f"Warnings: {result3.warnings}")
+    # Scenario 3: Self-operated agent
+    print("\n--- Scenario 3: Self-operated (agent == operator) ---")
+    self_op = GenesisContract(
+        agent_id="autonomous_agent",
+        soul_hash="self001",
+        model_hash="claude-hash",
+        operator_id="autonomous_agent",  # self-operated
+        escalation_contact="autonomous_agent@agentmail.to",
+        revocation_endpoint="https://example.com/revoke",
+        max_delegation_depth=1,
+        sla_response_seconds=3600,
+        sla_uptime_percent=90.0,
+    )
+    print(json.dumps(validate_genesis_contract(self_op), indent=2))
 
-    # Scenario 4: Minimal sybil genesis
-    print("\n--- Scenario 4: Sybil with 8 missing MUST fields ---")
-    sybil = {
-        "soul_hash": "abcdef",  # too short
-        "agent_id": "sybil_001",
-        "schema_version": "1.1.0",
-        "evidence_grade": "A",
-        "anchor_type": "SELF_SIGNED",
-    }
-    result4 = validate_genesis(sybil)
-    print(f"Grade: {result4.grade} | Verdict: {result4.verdict}")
-    print(f"Missing MUST ({len(result4.missing_must)}): {result4.missing_must}")
-    print(f"Contract enforceable: {result4.contract_enforceable}")
+    # Scenario 4: Unrealistic SLA
+    print("\n--- Scenario 4: Unrealistic SLA claims ---")
+    unrealistic = GenesisContract(
+        agent_id="hype_agent",
+        soul_hash="hype001",
+        model_hash="gpt5-hash",
+        operator_id="startup_inc",
+        escalation_contact="support@startup.ai",
+        revocation_endpoint="https://startup.ai/revoke",
+        sla_uptime_percent=99.999,
+        sla_response_seconds=1,
+    )
+    print(json.dumps(validate_genesis_contract(unrealistic), indent=2))
+
+    # Scenario 5: Unbounded delegation
+    print("\n--- Scenario 5: Unbounded delegation depth ---")
+    unbounded = GenesisContract(
+        agent_id="delegator",
+        soul_hash="del001",
+        model_hash="model-hash",
+        operator_id="corp",
+        escalation_contact="ops@corp.ai",
+        revocation_endpoint="https://corp.ai/revoke",
+        max_delegation_depth=100,  # too deep
+    )
+    print(json.dumps(validate_genesis_contract(unbounded), indent=2))
 
     print("\n" + "=" * 60)
-    print("Genesis = contract. Missing MUST = REJECT. Missing REC = DEGRADED.")
-    print("Self-grading = axiom 1 violation. No escalation = unenforceable.")
+    print("Genesis = starting state. Contract = obligations.")
+    print("Validation at genesis = enforcement at crisis.")
+    print("Crisis readiness: operator + escalation + revocation.")
     print("=" * 60)
 
 
