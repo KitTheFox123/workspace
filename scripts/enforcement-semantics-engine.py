@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-enforcement-semantics-engine.py — ATF constant enforcement semantics.
+enforcement-semantics-engine.py — ATF enforcement semantics per santaclawd.
 
-Per santaclawd: "constants without enforcement semantics are just recommendations."
-TLS 1.3 didn't just define min version — it defined REJECT for SSL 3.0.
+TLS 1.3 didn't just define min version — it defined what REJECT means.
+ATF needs the same: constants without enforcement semantics are recommendations.
 
-Three enforcement levels:
-  - REJECT: below floor, connection refused
-  - WARN: between floor and recommended, DEGRADED_GRADE
-  - ACCEPT: at or above recommended
+Three enforcement tiers:
+  - REJECT: below SPEC_FLOOR. Hard kill. No fallback. (TLS 1.3 removing SSLv3)
+  - WARN + DEGRADED_GRADE: between FLOOR and RECOMMENDED. (TLS deprecation warnings)
+  - ACCEPT: at or above RECOMMENDED.
 
-OCSP stapling model: trust state stapled to every receipt.
-Counterparty validates inline, no separate lookup.
+OCSP lesson (Feisty Duck, Jan 2025): soft-fail = no security. An attacker blocks
+the check and proceeds. Chrome disabled OCSP in 2012 because soft-fail is pointless.
+ATF must hard-fail on SPEC_FLOOR violations.
+
+DigiNotar lesson (2011): CAA as MUST was 8 years after SHOULD. Don't wait for the breach.
 
 Usage:
     python3 enforcement-semantics-engine.py
 """
 
-import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
@@ -25,259 +27,324 @@ from typing import Optional
 
 
 class EnforcementAction(Enum):
-    REJECT = "REJECT"       # Below spec floor — hard rejection
-    WARN = "WARN"           # Below recommended — degraded grade
-    ACCEPT = "ACCEPT"       # At or above recommended
-    STAPLE = "STAPLE"       # Attached to receipt (OCSP model)
+    REJECT = "REJECT"           # Hard kill, no fallback
+    DEGRADED = "DEGRADED"       # Warn + grade reduction
+    ACCEPT = "ACCEPT"           # Within spec
+    OVERRIDE = "OVERRIDE"       # Counterparty policy stricter than spec
 
 
 class ConstantTrack(Enum):
-    OSSIFIED = "OSSIFIED"           # Never changes (field names, error types)
-    SLOW_EVOLVE = "SLOW_EVOLVE"     # Changes with major version (thresholds)
-    HOT_SWAP = "HOT_SWAP"           # Changes per-counterparty (verifier table)
+    OSSIFIED = "OSSIFIED"       # Never changes (field names, hash algorithms)
+    SLOW_EVOLVE = "SLOW_EVOLVE" # Changes via formal process (30d+ window)
+    HOT_SWAP = "HOT_SWAP"       # Can change per-receipt (verifier table)
 
 
 @dataclass
 class ATFConstant:
     name: str
-    floor: float              # Below this = REJECT
-    recommended: float        # Below this = WARN
+    value: float | int | str
     track: ConstantTrack
-    enforcement: str          # What REJECT means for this constant
-    tls_parallel: str         # TLS/PKI equivalent
-
-    def evaluate(self, value: float) -> dict:
-        if value < self.floor:
-            return {
-                "action": EnforcementAction.REJECT.value,
-                "reason": f"{self.name}={value} below SPEC_FLOOR={self.floor}",
-                "enforcement": self.enforcement,
-                "grade": "F",
-            }
-        elif value < self.recommended:
-            return {
-                "action": EnforcementAction.WARN.value,
-                "reason": f"{self.name}={value} below RECOMMENDED={self.recommended}",
-                "enforcement": f"DEGRADED_GRADE: {self.enforcement}",
-                "grade": "D",
-            }
-        else:
-            return {
-                "action": EnforcementAction.ACCEPT.value,
-                "reason": f"{self.name}={value} meets RECOMMENDED={self.recommended}",
-                "enforcement": "none",
-                "grade": "A",
-            }
+    enforcement: str  # What happens on violation
+    spec_floor: Optional[float] = None  # Hard kill threshold
+    recommended: Optional[float] = None  # Target threshold
+    description: str = ""
 
 
-# ATF Constants with enforcement semantics
+# ATF Constants Registry with enforcement semantics
 ATF_CONSTANTS = [
     ATFConstant(
-        name="MIN_TRUST_SCORE",
-        floor=0.10,
-        recommended=0.30,
-        track=ConstantTrack.SLOW_EVOLVE,
-        enforcement="Receipt REJECTED. Counterparty trust below verifiable threshold. "
-                     "Equivalent to TLS handshake failure on unsupported cipher.",
-        tls_parallel="TLS min_version: SSL 3.0 = REJECT, TLS 1.2 = WARN, TLS 1.3 = ACCEPT",
+        name="MIN_WITNESSES",
+        value=3,
+        track=ConstantTrack.OSSIFIED,
+        enforcement="REJECT if witnesses < 3. No quorum = no verification.",
+        spec_floor=3,
+        recommended=5,
+        description="Minimum independent witnesses for key ceremony / migration",
+    ),
+    ATFConstant(
+        name="SPEC_MINIMUM_WINDOW",
+        value=86400,  # 24h in seconds
+        track=ConstantTrack.OSSIFIED,
+        enforcement="REJECT migration if window < 24h. Rushed migration = attack vector.",
+        spec_floor=86400,
+        recommended=259200,  # 72h
+        description="Minimum key migration window in seconds",
     ),
     ATFConstant(
         name="JS_DIVERGENCE_FLOOR",
-        floor=0.15,
-        recommended=0.30,
+        value=0.3,
         track=ConstantTrack.SLOW_EVOLVE,
-        enforcement="OP_DRIFT below detection threshold. Drift invisible = unfalsifiable. "
-                     "Equivalent to accepting expired certificate.",
-        tls_parallel="Certificate validity: expired = REJECT, <30d remaining = WARN",
-    ),
-    ATFConstant(
-        name="CORRECTION_RATE_MIN",
-        floor=0.05,
+        enforcement="REJECT if JS divergence >= floor. Behavioral drift = identity compromise.",
+        spec_floor=0.3,
         recommended=0.15,
-        track=ConstantTrack.SLOW_EVOLVE,
-        enforcement="Zero corrections in audit window = UNFALSIFIABLE. "
-                     "No agent is always right. Equivalent to OCSP responder returning 'good' for unknown cert.",
-        tls_parallel="OCSP: unknown = REJECT, revoked = REJECT, good = ACCEPT",
+        description="Jensen-Shannon divergence threshold for OP_DRIFT",
     ),
     ATFConstant(
-        name="MIN_COUNTERPARTIES",
-        floor=1,
-        recommended=3,
+        name="CORRECTION_RANGE_MIN",
+        value=0.05,
+        track=ConstantTrack.SLOW_EVOLVE,
+        enforcement="DEGRADED if correction rate < 0.05. Zero corrections = unfalsifiable.",
+        spec_floor=0.0,
+        recommended=0.05,
+        description="Minimum healthy correction frequency",
+    ),
+    ATFConstant(
+        name="CORRECTION_RANGE_MAX",
+        value=0.40,
+        track=ConstantTrack.SLOW_EVOLVE,
+        enforcement="DEGRADED if correction rate > 0.40. Too many corrections = unreliable.",
+        spec_floor=None,
+        recommended=0.40,
+        description="Maximum healthy correction frequency",
+    ),
+    ATFConstant(
+        name="DECAY_HALFLIFE",
+        value=2592000,  # 30d in seconds
+        track=ConstantTrack.SLOW_EVOLVE,
+        enforcement="DEGRADED if trust not refreshed within 2 half-lives. Stale trust = fossil.",
+        spec_floor=None,
+        recommended=2592000,
+        description="Trust score decay half-life in seconds",
+    ),
+    ATFConstant(
+        name="HASH_ALGORITHM",
+        value="sha256",
         track=ConstantTrack.OSSIFIED,
-        enforcement="Zero counterparties = BOOTSTRAP state. Cannot produce receipts. "
-                     "Equivalent to self-signed certificate: valid structure, zero trust.",
-        tls_parallel="Certificate chain: self-signed = REJECT, single CA = WARN, cross-signed = ACCEPT",
+        enforcement="REJECT if hash != sha256. No algorithm negotiation. DigiNotar lesson.",
+        spec_floor=None,
+        recommended=None,
+        description="Canonical hash algorithm for all ATF hashes",
     ),
     ATFConstant(
-        name="MIGRATION_WINDOW_HOURS",
-        floor=1,
-        recommended=24,
+        name="TRANSCRIPT_HASH_ALGORITHM",
+        value="sha256",
+        track=ConstantTrack.OSSIFIED,
+        enforcement="REJECT if ceremony transcript uses different hash. Impl-defined = unchecked.",
+        spec_floor=None,
+        recommended=None,
+        description="Hash algorithm for ceremony transcripts",
+    ),
+    ATFConstant(
+        name="MAX_CHAIN_LENGTH",
+        value=5,
         track=ConstantTrack.SLOW_EVOLVE,
-        enforcement="Migration window below floor = insufficient counterparty witness time. "
-                     "Equivalent to DNS TTL too low for DNSSEC key rollover.",
-        tls_parallel="DNSSEC key rollover: <1h = REJECT, <24h = WARN, >=24h = ACCEPT",
+        enforcement="DEGRADED at length > 5. REJECT at > 10. Delegation cascade = intent dilution.",
+        spec_floor=10,
+        recommended=5,
+        description="Maximum delegation chain length before degradation",
     ),
     ATFConstant(
-        name="SIMPSON_DIVERSITY_INDEX",
-        floor=0.30,
-        recommended=0.60,
-        track=ConstantTrack.HOT_SWAP,
-        enforcement="Low diversity = monoculture oracle pool. Correlated failure. "
-                     "Equivalent to all CAs in same jurisdiction.",
-        tls_parallel="CT log diversity: single operator = REJECT, <3 operators = WARN",
+        name="SELF_GRADE_CAP",
+        value="C",
+        track=ConstantTrack.OSSIFIED,
+        enforcement="REJECT if self-graded above C. Self-attestation = axiom 1 violation.",
+        spec_floor=None,
+        recommended=None,
+        description="Maximum grade for self-attested evidence",
     ),
 ]
 
 
 @dataclass
-class StapledTrustState:
-    """OCSP-stapling equivalent: trust state attached to every receipt."""
-    verifier_table_hash: str
-    registry_hash: str
-    constants_version: str
-    enforcement_results: list[dict]
-    timestamp: float
-
-    def is_valid(self) -> bool:
-        return all(r["action"] != "REJECT" for r in self.enforcement_results)
-
-    def grade(self) -> str:
-        if any(r["action"] == "REJECT" for r in self.enforcement_results):
-            return "F"
-        if any(r["action"] == "WARN" for r in self.enforcement_results):
-            return "D"
-        return "A"
+class EnforcementResult:
+    constant_name: str
+    presented_value: float | int | str
+    action: EnforcementAction
+    reason: str
+    grade_impact: str  # How this affects overall grade
 
 
 class EnforcementEngine:
-    def __init__(self, constants: list[ATFConstant] = None):
-        self.constants = constants or ATF_CONSTANTS
+    """Evaluate ATF constant compliance with enforcement semantics."""
 
-    def evaluate_agent(self, agent_values: dict[str, float]) -> dict:
-        """Evaluate an agent's current state against all ATF constants."""
+    def __init__(self):
+        self.constants = {c.name: c for c in ATF_CONSTANTS}
+
+    def evaluate(self, name: str, value) -> EnforcementResult:
+        """Evaluate a presented value against ATF constant."""
+        if name not in self.constants:
+            return EnforcementResult(
+                constant_name=name,
+                presented_value=value,
+                action=EnforcementAction.REJECT,
+                reason=f"Unknown constant: {name}",
+                grade_impact="F — unknown constant = untrusted",
+            )
+
+        c = self.constants[name]
+
+        # String constants: exact match required
+        if isinstance(c.value, str):
+            if str(value) != c.value:
+                return EnforcementResult(
+                    constant_name=name,
+                    presented_value=value,
+                    action=EnforcementAction.REJECT,
+                    reason=f"Expected {c.value}, got {value}. {c.enforcement}",
+                    grade_impact="F — spec violation",
+                )
+            return EnforcementResult(
+                constant_name=name,
+                presented_value=value,
+                action=EnforcementAction.ACCEPT,
+                reason="Matches spec constant",
+                grade_impact="No impact",
+            )
+
+        # Numeric constants with floor/recommended
+        value = float(value)
+
+        # Check if this is a "minimum" or "maximum" type constant
+        is_minimum = name in {"MIN_WITNESSES", "SPEC_MINIMUM_WINDOW", "CORRECTION_RANGE_MIN"}
+        is_maximum = name in {"JS_DIVERGENCE_FLOOR", "CORRECTION_RANGE_MAX", "MAX_CHAIN_LENGTH"}
+
+        if c.spec_floor is not None:
+            if is_minimum and value < c.spec_floor:
+                return EnforcementResult(
+                    constant_name=name,
+                    presented_value=value,
+                    action=EnforcementAction.REJECT,
+                    reason=f"Below SPEC_FLOOR ({c.spec_floor}). {c.enforcement}",
+                    grade_impact="F — hard rejection",
+                )
+            if is_maximum and value >= c.spec_floor:
+                return EnforcementResult(
+                    constant_name=name,
+                    presented_value=value,
+                    action=EnforcementAction.REJECT,
+                    reason=f"At/above SPEC_FLOOR ({c.spec_floor}). {c.enforcement}",
+                    grade_impact="F — hard rejection",
+                )
+
+        if c.recommended is not None:
+            if is_minimum and value < c.recommended:
+                return EnforcementResult(
+                    constant_name=name,
+                    presented_value=value,
+                    action=EnforcementAction.DEGRADED,
+                    reason=f"Below RECOMMENDED ({c.recommended}). Above FLOOR.",
+                    grade_impact="Grade capped at B",
+                )
+            if is_maximum and value > c.recommended:
+                return EnforcementResult(
+                    constant_name=name,
+                    presented_value=value,
+                    action=EnforcementAction.DEGRADED,
+                    reason=f"Above RECOMMENDED ({c.recommended}). Below FLOOR.",
+                    grade_impact="Grade capped at B",
+                )
+
+        return EnforcementResult(
+            constant_name=name,
+            presented_value=value,
+            action=EnforcementAction.ACCEPT,
+            reason="Within spec",
+            grade_impact="No impact",
+        )
+
+    def audit_agent(self, agent_values: dict) -> dict:
+        """Full audit of an agent's constant compliance."""
         results = []
-        for const in self.constants:
-            if const.name in agent_values:
-                result = const.evaluate(agent_values[const.name])
-                result["constant"] = const.name
-                result["track"] = const.track.value
-                result["tls_parallel"] = const.tls_parallel
-                results.append(result)
+        rejections = 0
+        degradations = 0
 
-        rejected = [r for r in results if r["action"] == "REJECT"]
-        warned = [r for r in results if r["action"] == "WARN"]
-        accepted = [r for r in results if r["action"] == "ACCEPT"]
+        for name, value in agent_values.items():
+            r = self.evaluate(name, value)
+            results.append(r)
+            if r.action == EnforcementAction.REJECT:
+                rejections += 1
+            elif r.action == EnforcementAction.DEGRADED:
+                degradations += 1
 
-        if rejected:
-            verdict = "REJECTED"
+        # Overall grade
+        if rejections > 0:
             grade = "F"
-        elif warned:
-            verdict = "DEGRADED"
+            verdict = "REJECTED"
+        elif degradations > 2:
             grade = "D"
+            verdict = "HEAVILY_DEGRADED"
+        elif degradations > 0:
+            grade = "B"
+            verdict = "DEGRADED"
         else:
-            verdict = "ACCEPTED"
             grade = "A"
+            verdict = "COMPLIANT"
 
         return {
             "verdict": verdict,
             "grade": grade,
-            "rejected": len(rejected),
-            "warned": len(warned),
-            "accepted": len(accepted),
-            "details": results,
+            "rejections": rejections,
+            "degradations": degradations,
+            "total_checked": len(results),
+            "results": [
+                {
+                    "constant": r.constant_name,
+                    "value": r.presented_value,
+                    "action": r.action.value,
+                    "reason": r.reason,
+                }
+                for r in results
+            ],
         }
-
-    def staple_to_receipt(self, agent_values: dict[str, float]) -> StapledTrustState:
-        """Create OCSP-stapled trust state for a receipt."""
-        evaluation = self.evaluate_agent(agent_values)
-        
-        # Hash the current state
-        state_str = json.dumps(agent_values, sort_keys=True)
-        state_hash = hashlib.sha256(state_str.encode()).hexdigest()[:16]
-
-        import time
-        return StapledTrustState(
-            verifier_table_hash=state_hash,
-            registry_hash="16eae196e8060d32",  # Current ATF registry
-            constants_version="v1.1.0",
-            enforcement_results=evaluation["details"],
-            timestamp=time.time(),
-        )
 
 
 def demo():
     print("=" * 60)
     print("ATF Enforcement Semantics Engine")
-    print("Constants without enforcement = recommendations")
+    print("TLS 1.3 model: REJECT not WARN")
     print("=" * 60)
 
     engine = EnforcementEngine()
 
-    # Scenario 1: Healthy agent
-    print("\n--- Scenario 1: Healthy agent (all above recommended) ---")
-    healthy = {
-        "MIN_TRUST_SCORE": 0.85,
-        "JS_DIVERGENCE_FLOOR": 0.35,
-        "CORRECTION_RATE_MIN": 0.22,
-        "MIN_COUNTERPARTIES": 7,
-        "MIGRATION_WINDOW_HOURS": 48,
-        "SIMPSON_DIVERSITY_INDEX": 0.75,
-    }
-    result = engine.evaluate_agent(healthy)
-    print(f"Verdict: {result['verdict']} (Grade {result['grade']})")
-    print(f"  Accepted: {result['accepted']}, Warned: {result['warned']}, Rejected: {result['rejected']}")
+    # Scenario 1: Compliant agent
+    print("\n--- Scenario 1: Fully compliant agent ---")
+    result = engine.audit_agent({
+        "MIN_WITNESSES": 5,
+        "SPEC_MINIMUM_WINDOW": 259200,
+        "JS_DIVERGENCE_FLOOR": 0.10,
+        "HASH_ALGORITHM": "sha256",
+        "CORRECTION_RANGE_MIN": 0.15,
+        "MAX_CHAIN_LENGTH": 3,
+    })
+    print(json.dumps(result, indent=2))
 
-    # Scenario 2: Agent below floor on trust score
-    print("\n--- Scenario 2: Agent below SPEC_FLOOR on trust ---")
-    untrusted = {
-        "MIN_TRUST_SCORE": 0.05,  # Below floor!
-        "JS_DIVERGENCE_FLOOR": 0.30,
-        "CORRECTION_RATE_MIN": 0.18,
-        "MIN_COUNTERPARTIES": 5,
-        "MIGRATION_WINDOW_HOURS": 24,
-        "SIMPSON_DIVERSITY_INDEX": 0.65,
-    }
-    result2 = engine.evaluate_agent(untrusted)
-    print(f"Verdict: {result2['verdict']} (Grade {result2['grade']})")
-    for d in result2["details"]:
-        if d["action"] == "REJECT":
-            print(f"  REJECT: {d['reason']}")
-            print(f"  Enforcement: {d['enforcement']}")
-            print(f"  TLS parallel: {d['tls_parallel']}")
+    # Scenario 2: Agent with soft-fail violations (OCSP pattern)
+    print("\n--- Scenario 2: Below RECOMMENDED but above FLOOR ---")
+    result2 = engine.audit_agent({
+        "MIN_WITNESSES": 3,  # At floor, not recommended
+        "SPEC_MINIMUM_WINDOW": 86400,  # At floor
+        "JS_DIVERGENCE_FLOOR": 0.20,  # Between floor and recommended
+        "HASH_ALGORITHM": "sha256",
+    })
+    print(json.dumps(result2, indent=2))
 
-    # Scenario 3: Monoculture oracle pool
-    print("\n--- Scenario 3: Monoculture (low diversity, zero corrections) ---")
-    monoculture = {
-        "MIN_TRUST_SCORE": 0.50,
-        "JS_DIVERGENCE_FLOOR": 0.25,  # Below recommended
-        "CORRECTION_RATE_MIN": 0.02,  # Below floor!
-        "MIN_COUNTERPARTIES": 3,
-        "MIGRATION_WINDOW_HOURS": 12,  # Below recommended
-        "SIMPSON_DIVERSITY_INDEX": 0.20,  # Below floor!
-    }
-    result3 = engine.evaluate_agent(monoculture)
-    print(f"Verdict: {result3['verdict']} (Grade {result3['grade']})")
-    for d in result3["details"]:
-        if d["action"] in ("REJECT", "WARN"):
-            print(f"  {d['action']}: {d['reason']}")
+    # Scenario 3: Hard rejection (DigiNotar pattern)
+    print("\n--- Scenario 3: Below SPEC_FLOOR — hard REJECT ---")
+    result3 = engine.audit_agent({
+        "MIN_WITNESSES": 1,  # Below floor!
+        "SPEC_MINIMUM_WINDOW": 3600,  # 1 hour — way below 24h floor
+        "HASH_ALGORITHM": "md5",  # Wrong algorithm!
+    })
+    print(json.dumps(result3, indent=2))
 
-    # Scenario 4: OCSP stapling demo
-    print("\n--- Scenario 4: OCSP stapling — trust state on receipt ---")
-    stapled = engine.staple_to_receipt(healthy)
-    print(f"Stapled state valid: {stapled.is_valid()}")
-    print(f"Stapled grade: {stapled.grade()}")
-    print(f"Verifier table hash: {stapled.verifier_table_hash}")
-    print(f"Registry hash: {stapled.registry_hash}")
-    print(f"Constants version: {stapled.constants_version}")
+    # Scenario 4: Delegation cascade
+    print("\n--- Scenario 4: Delegation cascade (chain too long) ---")
+    result4 = engine.audit_agent({
+        "MAX_CHAIN_LENGTH": 7,  # Above recommended, below hard reject
+        "MIN_WITNESSES": 5,
+        "HASH_ALGORITHM": "sha256",
+    })
+    print(json.dumps(result4, indent=2))
 
-    stapled_bad = engine.staple_to_receipt(monoculture)
-    print(f"\nMonoculture stapled valid: {stapled_bad.is_valid()}")
-    print(f"Monoculture stapled grade: {stapled_bad.grade()}")
+    # Scenario 5: Self-grading above cap
+    print("\n--- Scenario 5: Self-grade above cap ---")
+    r = engine.evaluate("SELF_GRADE_CAP", "A")  # Claiming A when cap is C
+    print(f"Self-grade 'A': {r.action.value} — {r.reason}")
 
     print("\n" + "=" * 60)
-    print("TLS killed SSL 3.0 — not warned, killed.")
-    print("ATF constants MUST define rejection behavior, not just thresholds.")
-    print("OCSP stapling: push trust state, don't make counterparties pull.")
+    print("OCSP lesson: soft-fail = no security.")
+    print("Chrome disabled OCSP in 2012. ATF must hard-fail on FLOOR.")
+    print("DigiNotar lesson: SHOULD became MUST 8 years too late.")
     print("=" * 60)
 
 
