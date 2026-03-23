@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-ocsp-staple-validator.py — OCSP-stapling model for ATF verifier table hot-swap.
+ocsp-staple-validator.py — OCSP-stapling model for ATF trust freshness.
 
-Per santaclawd: agent staples current verifier_table_hash into receipts.
-Counterparty rejects if stale (now > issued_at + max_age).
+Per Let's Encrypt killing OCSP (July 2024): phone-home = privacy leak.
+ATF solution: agent staples current verifier_table_hash to every receipt.
+Counterparty rejects if stale. No central oracle needed.
 
-Let's Encrypt killed OCSP Aug 2025 because CAs saw every connection.
-ATF sidesteps: counterparty holds hash, no CA, no privacy leak.
+Two TTLs (per santaclawd):
+  - HOT_SWAP max_age: 30d (verifier methods evolve monthly)
+  - Receipt max_age: 24h (TOCTOU window for trust state)
 
-Three SPEC_NORMATIVE fields per staple:
-  - table_hash: SHA-256 of current verifier table
-  - issued_at: ISO 8601 timestamp
-  - max_age: staleness tolerance (genesis constant)
-
-Design principles from OCSP death:
-  1. Pin format, not transport (CRL model)
-  2. Staleness is first-class signal (max_age = REJECT threshold)
-  3. Must-Staple failed because it needed server cooperation
-     ATF must-staple = genesis declaration, not server config
+Must-staple: genesis field declaring staleness tolerance.
 
 Usage:
     python3 ocsp-staple-validator.py
@@ -27,276 +20,265 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
 from typing import Optional
+from enum import Enum
+
+
+class StaleVerdict(Enum):
+    FRESH = "FRESH"
+    AGING = "AGING"          # >50% of max_age
+    STALE = "STALE"          # past max_age
+    MISSING = "MISSING"      # no staple present
+    HASH_MISMATCH = "HASH_MISMATCH"  # staple hash != current table
+
+
+# ATF-core constants (from atf-constants.py)
+HOT_SWAP_MAX_AGE = 30 * 86400    # 30 days in seconds
+RECEIPT_MAX_AGE = 24 * 3600      # 24 hours in seconds
+AGING_THRESHOLD = 0.5             # warn at 50% of max_age
 
 
 @dataclass
-class VerifierTableEntry:
-    """One verifier in the table."""
-    field_name: str
-    method: str  # DKIM, HASH_COMPARE, SELF_REPORT, etc.
-    operator: str
-    trust_weight: float
+class GenesisDeclaration:
+    """Agent's genesis with must-staple field."""
+    agent_id: str
+    genesis_hash: str
+    must_staple: bool              # like TLS must-staple extension
+    hot_swap_max_age: int = HOT_SWAP_MAX_AGE
+    receipt_max_age: int = RECEIPT_MAX_AGE
 
 
 @dataclass
-class VerifierTable:
-    """The evolving governance object — hot-swappable."""
-    entries: list[VerifierTableEntry]
-    version: str
-    
-    def table_hash(self) -> str:
-        canonical = "|".join(
-            f"{e.field_name}:{e.method}:{e.operator}:{e.trust_weight}"
-            for e in sorted(self.entries, key=lambda x: x.field_name)
-        )
-        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+class VerifierTableStaple:
+    """Stapled to every receipt — current verifier table state."""
+    table_hash: str                # SHA-256 of current verifier table
+    issued_at: float               # when this staple was created
+    max_age: int                   # TTL in seconds
+    agent_id: str                  # who issued the staple
 
+    @property
+    def expires_at(self) -> float:
+        return self.issued_at + self.max_age
 
-@dataclass  
-class Staple:
-    """OCSP-equivalent staple: verifier table state at receipt time."""
-    table_hash: str       # SHA-256 of verifier table
-    issued_at: float      # Unix timestamp
-    max_age: int          # Seconds (genesis constant)
-    agent_id: str         # Who stapled
-    
-    def is_stale(self, now: Optional[float] = None) -> bool:
-        now = now or time.time()
-        return now > self.issued_at + self.max_age
-    
-    def remaining_ttl(self, now: Optional[float] = None) -> float:
-        now = now or time.time()
-        return max(0, (self.issued_at + self.max_age) - now)
-    
-    def to_dict(self) -> dict:
-        return {
-            "table_hash": self.table_hash,
-            "issued_at": datetime.fromtimestamp(self.issued_at, tz=timezone.utc).isoformat(),
-            "max_age": self.max_age,
-            "agent_id": self.agent_id,
-        }
+    @property
+    def age(self) -> float:
+        return time.time() - self.issued_at
+
+    @property
+    def remaining(self) -> float:
+        return max(0, self.expires_at - time.time())
 
 
 @dataclass
-class GenesisConfig:
-    """Genesis-declared staleness tolerance."""
-    must_staple: bool          # Whether receipts MUST include staple
-    max_age_hot_swap: int      # Max age for verifier table staple (seconds)
-    max_age_receipt: int       # Max age for receipt-level staple (seconds)
-    pull_fallback: bool        # Allow CRL-equivalent pull if staple missing
+class Receipt:
+    """ATF receipt with optional staple."""
+    task_hash: str
+    deliverable_hash: str
+    evidence_grade: str
+    agent_id: str
+    timestamp: float = field(default_factory=time.time)
+    staple: Optional[VerifierTableStaple] = None
 
 
-class StapleValidator:
-    """Validate OCSP-style staples on ATF receipts."""
+class OCSPStapleValidator:
+    """Validate ATF receipt staples — OCSP model without the privacy leak."""
 
-    def __init__(self, genesis: GenesisConfig):
-        self.genesis = genesis
+    def __init__(self, current_table_hash: str):
+        self.current_table_hash = current_table_hash
 
     def validate_staple(
         self,
-        staple: Optional[Staple],
-        current_table: VerifierTable,
-        now: Optional[float] = None,
+        receipt: Receipt,
+        genesis: GenesisDeclaration,
     ) -> dict:
-        now = now or time.time()
-        issues = []
+        """Validate a receipt's staple against genesis requirements."""
 
-        # 1. Must-Staple check
-        if staple is None:
-            if self.genesis.must_staple:
-                if self.genesis.pull_fallback:
-                    issues.append("MISSING_STAPLE_PULL_FALLBACK")
-                    return {
-                        "verdict": "FALLBACK",
-                        "grade": "C",
-                        "issues": issues,
-                        "action": "PULL_CRL_EQUIVALENT",
-                        "reason": "Must-staple declared but staple missing. Pull fallback allowed.",
-                    }
-                else:
-                    issues.append("MISSING_STAPLE_NO_FALLBACK")
-                    return {
-                        "verdict": "REJECT",
-                        "grade": "F",
-                        "issues": issues,
-                        "action": "REJECT",
-                        "reason": "Must-staple declared, no staple, no fallback. LE lesson: reject hard.",
-                    }
-            else:
+        # No staple present
+        if receipt.staple is None:
+            if genesis.must_staple:
                 return {
-                    "verdict": "SKIP",
-                    "grade": "B",
-                    "issues": ["NO_MUST_STAPLE"],
-                    "action": "ACCEPT_WITHOUT_STAPLE",
-                    "reason": "Must-staple not declared. Accept but note absence.",
+                    "verdict": StaleVerdict.MISSING.value,
+                    "action": "REJECT",
+                    "reason": "must-staple declared in genesis but no staple present",
+                    "privacy_model": "NO_PHONE_HOME",
                 }
-
-        # 2. Staleness check
-        if staple.is_stale(now):
-            age = now - staple.issued_at
-            issues.append(f"STALE_STAPLE(age={age:.0f}s,max={staple.max_age}s)")
             return {
-                "verdict": "REJECT",
-                "grade": "F",
-                "issues": issues,
-                "action": "REJECT",
-                "reason": f"Staple expired {age - staple.max_age:.0f}s ago. Stale = REJECT, not WARN.",
-                "ttl_remaining": 0,
+                "verdict": StaleVerdict.MISSING.value,
+                "action": "WARN",
+                "reason": "no staple, but must-staple not required",
+                "privacy_model": "NO_PHONE_HOME",
             }
 
-        # 3. Hash mismatch (verifier table changed since staple)
-        current_hash = current_table.table_hash()
-        if staple.table_hash != current_hash:
-            issues.append(f"HASH_MISMATCH(stapled={staple.table_hash},current={current_hash})")
-            
-            # Within TTL but hash changed = HOT_SWAP happened
-            ttl = staple.remaining_ttl(now)
-            if ttl > 0:
-                issues.append("HOT_SWAP_DURING_TTL")
-                return {
-                    "verdict": "WARN",
-                    "grade": "C",
-                    "issues": issues,
-                    "action": "ACCEPT_WITH_WARNING",
-                    "reason": "Verifier table changed during staple TTL. Receipt valid but counterparty should refresh.",
-                    "ttl_remaining": ttl,
-                    "stapled_hash": staple.table_hash,
-                    "current_hash": current_hash,
-                }
-            else:
-                return {
-                    "verdict": "REJECT",
-                    "grade": "F",
-                    "issues": issues,
-                    "action": "REJECT",
-                    "reason": "Stale staple with wrong hash. Double failure.",
-                }
+        staple = receipt.staple
+        now = time.time()
 
-        # 4. All checks pass
-        ttl = staple.remaining_ttl(now)
+        # Hash mismatch — verifier table changed
+        if staple.table_hash != self.current_table_hash:
+            return {
+                "verdict": StaleVerdict.HASH_MISMATCH.value,
+                "action": "REJECT",
+                "reason": f"staple hash {staple.table_hash[:12]}... != current {self.current_table_hash[:12]}...",
+                "stale_by": "N/A (hash mismatch)",
+                "privacy_model": "NO_PHONE_HOME",
+                "le_parallel": "CRL supersedes — stapled status is outdated",
+            }
+
+        # Check TTL
+        age = now - staple.issued_at
+        max_age = staple.max_age
+
+        if age > max_age:
+            return {
+                "verdict": StaleVerdict.STALE.value,
+                "action": "REJECT",
+                "reason": f"staple expired: age={age:.0f}s > max_age={max_age}s",
+                "expired_by": f"{age - max_age:.0f}s",
+                "privacy_model": "NO_PHONE_HOME",
+                "le_parallel": "OCSP response expired — LE would soft-fail, ATF hard-rejects",
+            }
+
+        if age > max_age * AGING_THRESHOLD:
+            return {
+                "verdict": StaleVerdict.AGING.value,
+                "action": "ACCEPT_WITH_WARNING",
+                "reason": f"staple aging: {age/max_age*100:.0f}% of max_age consumed",
+                "remaining": f"{max_age - age:.0f}s",
+                "privacy_model": "NO_PHONE_HOME",
+            }
+
         return {
-            "verdict": "VALID",
-            "grade": "A",
-            "issues": [],
+            "verdict": StaleVerdict.FRESH.value,
             "action": "ACCEPT",
-            "reason": "Staple fresh, hash matches, must-staple satisfied.",
-            "ttl_remaining": ttl,
-            "table_hash": staple.table_hash,
+            "reason": f"staple fresh: {age/max_age*100:.1f}% of max_age consumed",
+            "remaining": f"{max_age - age:.0f}s",
+            "privacy_model": "NO_PHONE_HOME",
+            "le_parallel": "OCSP staple valid — no CA contact needed",
         }
 
     def validate_receipt_chain(
         self,
-        staples: list[Optional[Staple]],
-        tables: list[VerifierTable],
-        now: Optional[float] = None,
+        receipts: list[Receipt],
+        genesis: GenesisDeclaration,
     ) -> dict:
-        """Validate staples across a delegation chain (ARC-style)."""
+        """Validate a chain of receipts for staple freshness."""
         results = []
-        chain_valid = True
-        
-        for i, (staple, table) in enumerate(zip(staples, tables)):
-            result = self.validate_staple(staple, table, now)
-            result["hop"] = i + 1
+        for r in receipts:
+            result = self.validate_staple(r, genesis)
+            result["receipt_task"] = r.task_hash
+            result["agent"] = r.agent_id
             results.append(result)
-            if result["verdict"] in ("REJECT",):
-                chain_valid = False
 
-        # Chain grade = MIN(all hops)
-        grade_order = {"A": 5, "B": 4, "C": 3, "D": 2, "F": 1}
-        min_grade = min(grade_order.get(r["grade"], 0) for r in results) if results else 0
-        chain_grade = {5: "A", 4: "B", 3: "C", 2: "D", 1: "F"}.get(min_grade, "F")
-
+        verdicts = [r["verdict"] for r in results]
+        rejected = sum(1 for v in verdicts if v in ("STALE", "HASH_MISMATCH", "MISSING") and genesis.must_staple)
+        
+        chain_verdict = "CHAIN_VALID" if rejected == 0 else "CHAIN_BROKEN"
+        
         return {
-            "chain_valid": chain_valid,
-            "chain_grade": chain_grade,
-            "hops": len(results),
-            "results": results,
+            "chain_verdict": chain_verdict,
+            "total_receipts": len(receipts),
+            "fresh": sum(1 for v in verdicts if v == "FRESH"),
+            "aging": sum(1 for v in verdicts if v == "AGING"),
+            "stale": sum(1 for v in verdicts if v == "STALE"),
+            "missing": sum(1 for v in verdicts if v == "MISSING"),
+            "hash_mismatch": sum(1 for v in verdicts if v == "HASH_MISMATCH"),
+            "rejected": rejected,
+            "privacy_model": "NO_PHONE_HOME — all validation local",
+            "receipts": results,
         }
 
 
 def demo():
     print("=" * 60)
-    print("OCSP Staple Validator — LE lessons for ATF")
+    print("OCSP Staple Validator — LE lesson applied to ATF")
     print("=" * 60)
 
-    # Genesis config: must-staple with pull fallback
-    genesis = GenesisConfig(
-        must_staple=True,
-        max_age_hot_swap=30 * 86400,  # 30 days
-        max_age_receipt=86400,          # 24 hours
-        pull_fallback=True,
-    )
-    validator = StapleValidator(genesis)
+    current_hash = hashlib.sha256(b"verifier_table_v3").hexdigest()[:16]
+    validator = OCSPStapleValidator(current_hash)
 
-    # Current verifier table
-    table = VerifierTable(
-        entries=[
-            VerifierTableEntry("soul_hash", "HASH_COMPARE", "operator_a", 1.0),
-            VerifierTableEntry("genesis_hash", "HASH_COMPARE", "operator_a", 1.0),
-            VerifierTableEntry("evidence_grade", "DKIM", "operator_b", 0.8),
-        ],
-        version="v1.3.0",
+    genesis = GenesisDeclaration(
+        agent_id="kit_fox",
+        genesis_hash="abc123",
+        must_staple=True,
+        hot_swap_max_age=HOT_SWAP_MAX_AGE,
+        receipt_max_age=RECEIPT_MAX_AGE,
     )
 
     now = time.time()
 
-    # Scenario 1: Fresh valid staple
-    print("\n--- Scenario 1: Fresh staple, hash matches ---")
-    staple1 = Staple(
-        table_hash=table.table_hash(),
-        issued_at=now - 3600,  # 1 hour ago
-        max_age=86400,
-        agent_id="alice",
+    # Scenario 1: Fresh staple
+    print("\n--- Scenario 1: Fresh receipt (2 hours old) ---")
+    r1 = Receipt(
+        task_hash="task001", deliverable_hash="del001",
+        evidence_grade="A", agent_id="alice",
+        staple=VerifierTableStaple(
+            table_hash=current_hash, issued_at=now - 7200,
+            max_age=RECEIPT_MAX_AGE, agent_id="alice",
+        ),
     )
-    print(json.dumps(validator.validate_staple(staple1, table, now), indent=2))
+    print(json.dumps(validator.validate_staple(r1, genesis), indent=2))
 
-    # Scenario 2: Stale staple (expired)
-    print("\n--- Scenario 2: Stale staple (25h old, 24h max) ---")
-    staple2 = Staple(
-        table_hash=table.table_hash(),
-        issued_at=now - 90000,  # 25 hours ago
-        max_age=86400,
-        agent_id="bob",
+    # Scenario 2: Aging staple (14 hours)
+    print("\n--- Scenario 2: Aging receipt (14 hours old) ---")
+    r2 = Receipt(
+        task_hash="task002", deliverable_hash="del002",
+        evidence_grade="B", agent_id="bob",
+        staple=VerifierTableStaple(
+            table_hash=current_hash, issued_at=now - 50400,
+            max_age=RECEIPT_MAX_AGE, agent_id="bob",
+        ),
     )
-    print(json.dumps(validator.validate_staple(staple2, table, now), indent=2))
+    print(json.dumps(validator.validate_staple(r2, genesis), indent=2))
 
-    # Scenario 3: Missing staple with must-staple + fallback
-    print("\n--- Scenario 3: Missing staple (must-staple + pull fallback) ---")
-    print(json.dumps(validator.validate_staple(None, table, now), indent=2))
-
-    # Scenario 4: Missing staple, no fallback
-    print("\n--- Scenario 4: Missing staple, NO fallback (LE lesson: reject hard) ---")
-    strict_genesis = GenesisConfig(must_staple=True, max_age_hot_swap=30*86400, max_age_receipt=86400, pull_fallback=False)
-    strict = StapleValidator(strict_genesis)
-    print(json.dumps(strict.validate_staple(None, table, now), indent=2))
-
-    # Scenario 5: Hash mismatch (HOT_SWAP during TTL)
-    print("\n--- Scenario 5: Hash mismatch — HOT_SWAP during TTL ---")
-    staple5 = Staple(
-        table_hash="old_hash_abc123",  # Table changed since staple
-        issued_at=now - 7200,
-        max_age=86400,
-        agent_id="carol",
+    # Scenario 3: Stale staple (36 hours)
+    print("\n--- Scenario 3: Stale receipt (36 hours — past max_age) ---")
+    r3 = Receipt(
+        task_hash="task003", deliverable_hash="del003",
+        evidence_grade="B", agent_id="carol",
+        staple=VerifierTableStaple(
+            table_hash=current_hash, issued_at=now - 129600,
+            max_age=RECEIPT_MAX_AGE, agent_id="carol",
+        ),
     )
-    print(json.dumps(validator.validate_staple(staple5, table, now), indent=2))
+    print(json.dumps(validator.validate_staple(r3, genesis), indent=2))
 
-    # Scenario 6: Delegation chain with mixed staples
-    print("\n--- Scenario 6: 3-hop delegation chain ---")
-    staples = [
-        Staple(table_hash=table.table_hash(), issued_at=now - 3600, max_age=86400, agent_id="hop1"),
-        Staple(table_hash=table.table_hash(), issued_at=now - 7200, max_age=86400, agent_id="hop2"),
-        Staple(table_hash="stale_hash", issued_at=now - 100000, max_age=86400, agent_id="hop3"),  # Stale!
-    ]
-    tables = [table, table, table]
-    print(json.dumps(validator.validate_receipt_chain(staples, tables, now), indent=2))
+    # Scenario 4: Hash mismatch (table changed)
+    print("\n--- Scenario 4: Hash mismatch (verifier table updated) ---")
+    old_hash = hashlib.sha256(b"verifier_table_v2").hexdigest()[:16]
+    r4 = Receipt(
+        task_hash="task004", deliverable_hash="del004",
+        evidence_grade="A", agent_id="dave",
+        staple=VerifierTableStaple(
+            table_hash=old_hash, issued_at=now - 3600,
+            max_age=RECEIPT_MAX_AGE, agent_id="dave",
+        ),
+    )
+    print(json.dumps(validator.validate_staple(r4, genesis), indent=2))
+
+    # Scenario 5: Missing staple with must-staple
+    print("\n--- Scenario 5: Missing staple (must-staple = true) ---")
+    r5 = Receipt(
+        task_hash="task005", deliverable_hash="del005",
+        evidence_grade="C", agent_id="eve",
+    )
+    print(json.dumps(validator.validate_staple(r5, genesis), indent=2))
+
+    # Scenario 6: HOT_SWAP TTL (30 day verifier table)
+    print("\n--- Scenario 6: HOT_SWAP staple (20 days old, 30d max) ---")
+    r6 = Receipt(
+        task_hash="task006", deliverable_hash="del006",
+        evidence_grade="A", agent_id="frank",
+        staple=VerifierTableStaple(
+            table_hash=current_hash, issued_at=now - 20 * 86400,
+            max_age=HOT_SWAP_MAX_AGE, agent_id="frank",
+        ),
+    )
+    print(json.dumps(validator.validate_staple(r6, genesis), indent=2))
 
     print("\n" + "=" * 60)
-    print("LE killed OCSP because CA sees every connection.")
-    print("ATF: counterparty holds hash. No CA. No privacy leak.")
-    print("max_age = genesis constant. Stale = REJECT, not WARN.")
-    print("Must-Staple = genesis declaration, not server config.")
+    print("LE killed OCSP: CA sees every connection = privacy leak.")
+    print("ATF staples: agent carries own trust state. No phone-home.")
+    print("Two TTLs: HOT_SWAP=30d (methods), receipt=24h (TOCTOU).")
+    print("must-staple in genesis = hard-reject if missing.")
     print("=" * 60)
 
 
