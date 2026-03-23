@@ -1,175 +1,177 @@
 #!/usr/bin/env python3
 """
-delegation-trust-compositor.py — Trust composition across delegation chains.
+delegation-trust-compositor.py — Delegation trust composition for ATF.
 
-Per santaclawd "what is the next open question?" — ATF has no MUST
-for how trust composes across delegation hops.
+Per santaclawd: alice→bob→carol. What trust does alice have in carol?
 
-alice → bob → carol: what trust does alice have in carol?
+Three models compared:
+  - MIN: BFT-safe, too conservative
+  - PRODUCT: decays too fast (0.9^3 = 0.73)
+  - WEIGHTED: distance discount — direct=1.0, 1-hop=0.75, 2-hop=0.50
 
-Three composition models:
-  1. MIN(a→b, b→c) — conservative, BFT-aligned
-  2. PRODUCT(a→b, b→c) — probabilistic, decays fast
-  3. WEIGHTED — hop distance discounts trust
+Plus cascading revocation:
+  - HARD_CASCADE: root grader revoked → all downstream REJECT
+  - SOFT_CASCADE: intermediate revoked → downstream DEGRADED until re-graded
 
-ARC (RFC 8617) preserves chain integrity but doesn't compose trust.
-This tool fills the gap: each hop's evidence_grade + trust_score
-compose into a chain-level trust assessment.
+EigenTrust (Kamvar et al. 2003): transitive trust = matrix multiplication.
+ATF simplifies: no global eigenvector. Local chain evaluation with depth limit.
 
-Key insight from Springer (sub-delegation trust models):
-  - Direct trust ≠ delegated trust
-  - Chain length inversely correlates with trust
-  - One weak link degrades the whole chain
+MAX_DELEGATION_DEPTH = 3 (ATF-core constant, per RFC 5280 §6 pathLenConstraint).
 
 Usage:
     python3 delegation-trust-compositor.py
 """
 
 import json
-import math
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, field
 from typing import Optional
+from enum import Enum
 
 
-class CompositionModel(Enum):
-    MIN = "MIN"
-    PRODUCT = "PRODUCT"
-    WEIGHTED = "WEIGHTED"
-    HARMONIC = "HARMONIC"
+MAX_DELEGATION_DEPTH = 3
+DISTANCE_WEIGHTS = {0: 1.0, 1: 0.75, 2: 0.50, 3: 0.25}
 
 
-GRADE_VALUES = {"A": 1.0, "B": 0.8, "C": 0.6, "D": 0.4, "F": 0.2}
-VALUE_GRADES = {1.0: "A", 0.8: "B", 0.6: "C", 0.4: "D", 0.2: "F"}
+class CascadeMode(Enum):
+    HARD = "HARD_CASCADE"    # root revoked → all REJECT
+    SOFT = "SOFT_CASCADE"    # intermediate revoked → DEGRADED
+
+
+class ChainVerdict(Enum):
+    TRUSTED = "TRUSTED"
+    DEGRADED = "DEGRADED"
+    BROKEN = "BROKEN"
+    TOO_DEEP = "TOO_DEEP"
+    REVOKED = "REVOKED"
 
 
 @dataclass
 class DelegationHop:
-    """One hop in a delegation chain."""
-    from_agent: str
-    to_agent: str
-    evidence_grade: str  # A-F
-    trust_score: float   # 0.0-1.0
-    verification_method: str  # HARD_MANDATORY, SOFT_MANDATORY, SELF_ATTESTED
-    hop_distance: int = 1
+    """One hop in the delegation chain."""
+    agent_id: str
+    trust_score: float          # 0.0-1.0
+    evidence_grade: str         # A-F
+    verification_method: str    # HARD_MANDATORY, SOFT_MANDATORY, SELF_ATTESTED
+    revoked: bool = False
+    is_root_grader: bool = False
 
 
-def grade_to_value(grade: str) -> float:
-    return GRADE_VALUES.get(grade, 0.0)
+@dataclass
+class DelegationChain:
+    """Full delegation chain from requester to final executor."""
+    hops: list[DelegationHop] = field(default_factory=list)
 
-
-def value_to_grade(value: float) -> str:
-    # Find closest grade
-    closest = min(VALUE_GRADES.keys(), key=lambda x: abs(x - value))
-    return VALUE_GRADES[closest]
+    @property
+    def depth(self) -> int:
+        return len(self.hops)
 
 
 class DelegationTrustCompositor:
-    """Compose trust across multi-hop delegation chains."""
+    """Compose trust across delegation chains."""
 
-    def compose_min(self, hops: list[DelegationHop]) -> dict:
-        """MIN composition — most conservative, BFT-aligned."""
-        if not hops:
-            return {"model": "MIN", "composed_score": 0.0, "composed_grade": "F"}
+    def compose_min(self, chain: DelegationChain) -> float:
+        """MIN model: BFT-safe, conservative."""
+        if not chain.hops:
+            return 0.0
+        return min(h.trust_score for h in chain.hops)
 
-        min_score = min(h.trust_score for h in hops)
-        min_grade_val = min(grade_to_value(h.evidence_grade) for h in hops)
+    def compose_product(self, chain: DelegationChain) -> float:
+        """PRODUCT model: multiplicative decay."""
+        result = 1.0
+        for h in chain.hops:
+            result *= h.trust_score
+        return result
 
-        return {
-            "model": "MIN",
-            "composed_score": round(min_score, 4),
-            "composed_grade": value_to_grade(min_grade_val),
-            "weakest_hop": min(hops, key=lambda h: h.trust_score).from_agent + "→" + min(hops, key=lambda h: h.trust_score).to_agent,
-            "chain_length": len(hops),
-        }
-
-    def compose_product(self, hops: list[DelegationHop]) -> dict:
-        """PRODUCT composition — probabilistic, fast decay."""
-        if not hops:
-            return {"model": "PRODUCT", "composed_score": 0.0, "composed_grade": "F"}
-
-        score_product = math.prod(h.trust_score for h in hops)
-        grade_product = math.prod(grade_to_value(h.evidence_grade) for h in hops)
-
-        return {
-            "model": "PRODUCT",
-            "composed_score": round(score_product, 4),
-            "composed_grade": value_to_grade(grade_product),
-            "decay_rate": f"{(1 - score_product) * 100:.1f}% trust lost across {len(hops)} hops",
-            "chain_length": len(hops),
-        }
-
-    def compose_weighted(self, hops: list[DelegationHop], decay: float = 0.8) -> dict:
-        """WEIGHTED — hop distance discounts trust exponentially."""
-        if not hops:
-            return {"model": "WEIGHTED", "composed_score": 0.0, "composed_grade": "F"}
-
+    def compose_weighted(self, chain: DelegationChain) -> float:
+        """WEIGHTED model: distance discount. ATF RECOMMENDED."""
+        if not chain.hops:
+            return 0.0
         weighted_scores = []
-        for i, h in enumerate(hops):
-            weight = decay ** i
-            weighted_scores.append(h.trust_score * weight)
+        for i, hop in enumerate(chain.hops):
+            weight = DISTANCE_WEIGHTS.get(i, 0.1)  # fallback for deep chains
+            weighted_scores.append(hop.trust_score * weight)
+        return min(weighted_scores)  # weakest weighted link
 
-        composed = min(weighted_scores)  # weakest weighted hop
-        grade_vals = [grade_to_value(h.evidence_grade) * (decay ** i) for i, h in enumerate(hops)]
-        composed_grade = value_to_grade(min(grade_vals))
+    def evaluate_chain(self, chain: DelegationChain) -> dict:
+        """Full chain evaluation with all models + cascade + depth check."""
 
-        return {
-            "model": "WEIGHTED",
-            "composed_score": round(composed, 4),
-            "composed_grade": composed_grade,
-            "decay_factor": decay,
-            "per_hop_weights": [round(decay ** i, 3) for i in range(len(hops))],
-            "chain_length": len(hops),
-        }
+        # Depth check
+        if chain.depth > MAX_DELEGATION_DEPTH:
+            return {
+                "verdict": ChainVerdict.TOO_DEEP.value,
+                "action": "REJECT",
+                "reason": f"depth {chain.depth} > MAX_DELEGATION_DEPTH {MAX_DELEGATION_DEPTH}",
+                "depth": chain.depth,
+                "rfc5280_parallel": "pathLenConstraint exceeded",
+            }
 
-    def compose_harmonic(self, hops: list[DelegationHop]) -> dict:
-        """HARMONIC mean — penalizes outliers more than arithmetic mean."""
-        if not hops:
-            return {"model": "HARMONIC", "composed_score": 0.0, "composed_grade": "F"}
-
-        scores = [h.trust_score for h in hops]
-        if any(s == 0 for s in scores):
-            return {"model": "HARMONIC", "composed_score": 0.0, "composed_grade": "F", "reason": "zero-trust hop"}
-
-        harmonic = len(scores) / sum(1/s for s in scores)
-
-        grade_vals = [grade_to_value(h.evidence_grade) for h in hops]
-        grade_harmonic = len(grade_vals) / sum(1/v for v in grade_vals if v > 0)
-
-        return {
-            "model": "HARMONIC",
-            "composed_score": round(harmonic, 4),
-            "composed_grade": value_to_grade(grade_harmonic),
-            "chain_length": len(hops),
-        }
-
-    def compose_all(self, hops: list[DelegationHop]) -> dict:
-        """Run all composition models and compare."""
-        results = {
-            "MIN": self.compose_min(hops),
-            "PRODUCT": self.compose_product(hops),
-            "WEIGHTED": self.compose_weighted(hops),
-            "HARMONIC": self.compose_harmonic(hops),
-        }
-
-        # Check for self-attested hops (axiom 1 violation)
-        self_attested = [h for h in hops if h.verification_method == "SELF_ATTESTED"]
-
-        # ATF recommendation
+        # Self-attested hop check (axiom 1 violation)
+        self_attested = [h for h in chain.hops if h.verification_method == "SELF_ATTESTED"]
         if self_attested:
-            recommendation = "REJECT — self-attested hop in chain violates axiom 1"
-        elif len(hops) > 5:
-            recommendation = "MIN — long chains need conservative composition"
-        elif all(h.trust_score > 0.8 for h in hops):
-            recommendation = "HARMONIC — high-trust chain, harmonic penalizes outliers"
-        else:
-            recommendation = "MIN — default conservative for mixed-trust chains"
+            return {
+                "verdict": ChainVerdict.BROKEN.value,
+                "action": "REJECT",
+                "reason": f"self-attested hop: {self_attested[0].agent_id}",
+                "axiom_violation": "axiom_1 (verifier independence)",
+            }
+
+        # Cascading revocation check
+        revoked = [(i, h) for i, h in enumerate(chain.hops) if h.revoked]
+        if revoked:
+            idx, hop = revoked[0]
+            if hop.is_root_grader:
+                return {
+                    "verdict": ChainVerdict.REVOKED.value,
+                    "action": "REJECT",
+                    "cascade_mode": CascadeMode.HARD.value,
+                    "reason": f"root grader {hop.agent_id} revoked → HARD_CASCADE",
+                    "rfc5280_parallel": "CA certificate revoked → all issued certs invalid",
+                }
+            else:
+                # SOFT_CASCADE: downstream DEGRADED
+                return {
+                    "verdict": ChainVerdict.DEGRADED.value,
+                    "action": "DEGRADE",
+                    "cascade_mode": CascadeMode.SOFT.value,
+                    "reason": f"intermediate {hop.agent_id} revoked → SOFT_CASCADE",
+                    "remediation": "re-grade via alternate path",
+                    "rfc5280_parallel": "intermediate CA revoked → rebuild path",
+                }
+
+        # Compute trust under all three models
+        min_trust = self.compose_min(chain)
+        product_trust = self.compose_product(chain)
+        weighted_trust = self.compose_weighted(chain)
+
+        # ATF uses WEIGHTED as primary
+        grade_values = {"A": 5, "B": 4, "C": 3, "D": 2, "F": 1}
+        min_grade_val = min(grade_values.get(h.evidence_grade, 0) for h in chain.hops)
+        chain_grade = {5: "A", 4: "B", 3: "C", 2: "D", 1: "F"}.get(min_grade_val, "F")
+
+        verdict = ChainVerdict.TRUSTED if weighted_trust >= 0.50 else ChainVerdict.DEGRADED
 
         return {
-            "chain": [f"{h.from_agent}→{h.to_agent}({h.evidence_grade},{h.trust_score})" for h in hops],
-            "models": results,
-            "self_attested_hops": len(self_attested),
-            "recommendation": recommendation,
+            "verdict": verdict.value,
+            "action": "ACCEPT" if verdict == ChainVerdict.TRUSTED else "WARN",
+            "depth": chain.depth,
+            "chain_grade": chain_grade,
+            "trust_models": {
+                "min": round(min_trust, 4),
+                "product": round(product_trust, 4),
+                "weighted": round(weighted_trust, 4),
+            },
+            "primary_trust": round(weighted_trust, 4),
+            "hops": [
+                {
+                    "agent": h.agent_id,
+                    "trust": h.trust_score,
+                    "grade": h.evidence_grade,
+                    "distance_weight": DISTANCE_WEIGHTS.get(i, 0.1),
+                    "weighted_trust": round(h.trust_score * DISTANCE_WEIGHTS.get(i, 0.1), 4),
+                }
+                for i, h in enumerate(chain.hops)
+            ],
+            "eigentrust_note": "EigenTrust uses global eigenvector. ATF uses local chain eval — no central aggregation needed.",
         }
 
 
@@ -181,53 +183,64 @@ def demo():
     compositor = DelegationTrustCompositor()
 
     # Scenario 1: Clean 3-hop chain
-    print("\n--- Scenario 1: Clean 3-hop delegation (A→B→C) ---")
-    hops1 = [
-        DelegationHop("alice", "bob", "A", 0.92, "HARD_MANDATORY"),
-        DelegationHop("bob", "carol", "B", 0.85, "HARD_MANDATORY"),
-        DelegationHop("carol", "dave", "B", 0.78, "HARD_MANDATORY"),
-    ]
-    print(json.dumps(compositor.compose_all(hops1), indent=2))
+    print("\n--- Scenario 1: alice→bob→carol (clean chain) ---")
+    chain1 = DelegationChain(hops=[
+        DelegationHop("alice", 0.95, "A", "HARD_MANDATORY"),
+        DelegationHop("bob", 0.85, "B", "HARD_MANDATORY"),
+        DelegationHop("carol", 0.80, "B", "HARD_MANDATORY"),
+    ])
+    print(json.dumps(compositor.evaluate_chain(chain1), indent=2))
 
-    # Scenario 2: One weak link
-    print("\n--- Scenario 2: One weak link (A→B strong, B→C weak) ---")
-    hops2 = [
-        DelegationHop("alice", "bob", "A", 0.95, "HARD_MANDATORY"),
-        DelegationHop("bob", "carol", "D", 0.35, "SOFT_MANDATORY"),
-    ]
-    print(json.dumps(compositor.compose_all(hops2), indent=2))
+    # Scenario 2: Product decay problem
+    print("\n--- Scenario 2: 3 hops at 0.9 each (product = 0.73) ---")
+    chain2 = DelegationChain(hops=[
+        DelegationHop("a", 0.90, "A", "HARD_MANDATORY"),
+        DelegationHop("b", 0.90, "A", "HARD_MANDATORY"),
+        DelegationHop("c", 0.90, "A", "HARD_MANDATORY"),
+    ])
+    print(json.dumps(compositor.evaluate_chain(chain2), indent=2))
 
-    # Scenario 3: Self-attested hop
-    print("\n--- Scenario 3: Self-attested hop breaks chain ---")
-    hops3 = [
-        DelegationHop("alice", "bob", "A", 0.90, "HARD_MANDATORY"),
-        DelegationHop("bob", "carol", "A", 0.88, "SELF_ATTESTED"),
-    ]
-    print(json.dumps(compositor.compose_all(hops3), indent=2))
+    # Scenario 3: Too deep
+    print("\n--- Scenario 3: 4-hop chain (exceeds MAX_DELEGATION_DEPTH) ---")
+    chain3 = DelegationChain(hops=[
+        DelegationHop("a", 0.95, "A", "HARD_MANDATORY"),
+        DelegationHop("b", 0.90, "A", "HARD_MANDATORY"),
+        DelegationHop("c", 0.85, "B", "HARD_MANDATORY"),
+        DelegationHop("d", 0.80, "B", "HARD_MANDATORY"),
+    ])
+    print(json.dumps(compositor.evaluate_chain(chain3), indent=2))
 
-    # Scenario 4: Long chain (5 hops)
-    print("\n--- Scenario 4: 5-hop chain with natural degradation ---")
-    hops4 = [
-        DelegationHop("alpha", "beta", "A", 0.95, "HARD_MANDATORY"),
-        DelegationHop("beta", "gamma", "A", 0.90, "HARD_MANDATORY"),
-        DelegationHop("gamma", "delta", "B", 0.82, "HARD_MANDATORY"),
-        DelegationHop("delta", "epsilon", "B", 0.78, "HARD_MANDATORY"),
-        DelegationHop("epsilon", "zeta", "C", 0.65, "HARD_MANDATORY"),
-    ]
-    print(json.dumps(compositor.compose_all(hops4), indent=2))
+    # Scenario 4: Root grader revoked (HARD_CASCADE)
+    print("\n--- Scenario 4: Root grader revoked → HARD_CASCADE ---")
+    chain4 = DelegationChain(hops=[
+        DelegationHop("root_grader", 0.95, "A", "HARD_MANDATORY", revoked=True, is_root_grader=True),
+        DelegationHop("bob", 0.85, "B", "HARD_MANDATORY"),
+    ])
+    print(json.dumps(compositor.evaluate_chain(chain4), indent=2))
 
-    # Scenario 5: TC3 real example
-    print("\n--- Scenario 5: TC3-like (Kit→bro_agent, direct) ---")
-    hops5 = [
-        DelegationHop("kit_fox", "bro_agent", "A", 0.92, "HARD_MANDATORY"),
-    ]
-    print(json.dumps(compositor.compose_all(hops5), indent=2))
+    # Scenario 5: Intermediate revoked (SOFT_CASCADE)
+    print("\n--- Scenario 5: Intermediate revoked → SOFT_CASCADE ---")
+    chain5 = DelegationChain(hops=[
+        DelegationHop("alice", 0.95, "A", "HARD_MANDATORY"),
+        DelegationHop("bob_revoked", 0.85, "B", "HARD_MANDATORY", revoked=True),
+        DelegationHop("carol", 0.80, "B", "HARD_MANDATORY"),
+    ])
+    print(json.dumps(compositor.evaluate_chain(chain5), indent=2))
+
+    # Scenario 6: Self-attested hop (axiom 1 violation)
+    print("\n--- Scenario 6: Self-attested hop breaks chain ---")
+    chain6 = DelegationChain(hops=[
+        DelegationHop("alice", 0.95, "A", "HARD_MANDATORY"),
+        DelegationHop("self_attester", 0.90, "A", "SELF_ATTESTED"),
+    ])
+    print(json.dumps(compositor.evaluate_chain(chain6), indent=2))
 
     print("\n" + "=" * 60)
-    print("MIN = conservative (BFT). PRODUCT = probabilistic (fast decay).")
-    print("WEIGHTED = distance discount. HARMONIC = outlier penalty.")
-    print("Self-attested hop = REJECT regardless of model.")
-    print("Next: ATF-core MUST for composition model selection.")
+    print("WEIGHTED > MIN (too conservative) > PRODUCT (decays too fast)")
+    print(f"MAX_DELEGATION_DEPTH = {MAX_DELEGATION_DEPTH} (RFC 5280 pathLenConstraint)")
+    print("HARD_CASCADE: root revoked → all REJECT")
+    print("SOFT_CASCADE: intermediate revoked → DEGRADED + rebuild")
+    print("Self-attested hop = chain broken (axiom 1)")
     print("=" * 60)
 
 
