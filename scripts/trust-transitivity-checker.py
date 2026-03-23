@@ -1,221 +1,237 @@
 #!/usr/bin/env python3
-"""trust-transitivity-checker.py — Validate non-transitivity in trust chains.
+"""
+trust-transitivity-checker.py — Trust transitivity across delegation chains.
 
-Per santaclawd: "A trusts B. B trusts C. A trusts C? In agent pipelines today:
-implicitly yes — and that is the attack surface."
+The next open ATF question (Kit → santaclawd, March 23 2026):
+A trusts B, B delegates to C. Does A trust C?
 
-Rule: trust does not propagate without explicit re-attestation at each hop.
-Scope narrows (never wider) at each delegation.
+ARC (RFC 8617) says: chain the seals, let the final receiver decide.
+This tool formalizes transitivity semantics:
+  - DIRECT: A verified B directly (grade preserved)
+  - TRANSITIVE: A trusts B who attests C (grade decays)
+  - CAPPED: chain too long, grade floors at D
+  - BROKEN: chain integrity failed
 
-Isnad principle (850 CE): every link in the chain individually verified.
+Key insight: trust is NOT fully transitive. Each hop decays the grade.
+MAX_CHAIN_DEPTH limits how far trust propagates.
+Like PGP web of trust: direct > 1-hop > 2-hop > untrusted.
+
+Usage:
+    python3 scripts/trust-transitivity-checker.py
 """
 
+import hashlib
+import json
 from dataclasses import dataclass
-from enum import Enum
+from typing import Optional
+
+# ATF-core constants
+MAX_CHAIN_DEPTH = 4        # max delegation hops
+GRADE_DECAY_PER_HOP = 1   # lose 1 grade level per hop
+MIN_TRANSITIVE_GRADE = "D" # floor — below this = untrusted
+
+GRADE_ORDER = ["A", "B", "C", "D", "F"]
+GRADE_VALUES = {g: i for i, g in enumerate(GRADE_ORDER)}
 
 
-class Verdict(Enum):
-    VALID = "VALID"
-    INVALID_IMPLICIT = "INVALID_IMPLICIT_TRANSITIVITY"
-    INVALID_SCOPE_WIDENING = "INVALID_SCOPE_WIDENING"
-    INVALID_MISSING_ATTESTATION = "INVALID_MISSING_ATTESTATION"
-    WARN_DEPTH = "WARN_EXCESSIVE_DEPTH"
+def decay_grade(grade: str, hops: int) -> str:
+    """Decay a grade by N hops. Each hop drops 1 level."""
+    val = GRADE_VALUES.get(grade, 4)
+    decayed = min(val + hops * GRADE_DECAY_PER_HOP, 4)
+    return GRADE_ORDER[decayed]
 
 
 @dataclass
-class TrustEdge:
-    """A directed trust relationship: truster -> trustee with scope."""
-    truster: str
-    trustee: str
-    scope: set[str]  # what capabilities are delegated
-    attested: bool = True  # explicit attestation exists
+class TrustLink:
+    """One link in a trust chain."""
+    from_agent: str
+    to_agent: str
+    evidence_grade: str      # grade of the direct attestation
+    verification_method: str # HARD_MANDATORY, SOFT_MANDATORY, SELF_ATTESTED
+    genesis_hash: str
+    chain_seal: Optional[str] = None
 
 
-@dataclass
-class TrustChain:
-    """A sequence of trust edges forming a delegation path."""
-    edges: list[TrustEdge]
-    max_depth: int = 5  # warn beyond this
+class TrustTransitivityChecker:
+    """Check trust transitivity across delegation chains."""
 
-    def validate(self) -> list[dict]:
-        """Validate the chain. Returns list of issues."""
-        issues = []
+    def __init__(self, max_depth: int = MAX_CHAIN_DEPTH):
+        self.max_depth = max_depth
 
-        if not self.edges:
-            return [{"verdict": Verdict.VALID, "detail": "empty chain"}]
+    def _hash(self, *parts: str) -> str:
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
-        # Check each hop
-        for i, edge in enumerate(self.edges):
-            if not edge.attested:
-                issues.append({
-                    "verdict": Verdict.INVALID_MISSING_ATTESTATION,
-                    "hop": i,
-                    "detail": f"{edge.truster} -> {edge.trustee}: no explicit attestation",
-                })
+    def check_chain(self, chain: list[TrustLink]) -> dict:
+        """Evaluate trust transitivity across a delegation chain."""
+        if not chain:
+            return {"verdict": "EMPTY", "grade": "F", "reason": "no chain"}
 
-        # Check scope narrowing: each hop's scope must be subset of previous
-        for i in range(1, len(self.edges)):
-            prev_scope = self.edges[i - 1].scope
-            curr_scope = self.edges[i].scope
-            widened = curr_scope - prev_scope
-            if widened:
-                issues.append({
-                    "verdict": Verdict.INVALID_SCOPE_WIDENING,
-                    "hop": i,
-                    "detail": f"{self.edges[i].truster} -> {self.edges[i].trustee}: "
-                              f"scope widened by {widened}",
-                })
+        # Single hop = direct trust
+        if len(chain) == 1:
+            link = chain[0]
+            if link.verification_method == "SELF_ATTESTED":
+                return {
+                    "verdict": "SELF_ATTESTED",
+                    "grade": "F",
+                    "reason": "self-attestation is not trust",
+                    "chain_length": 1,
+                    "axiom_1_violation": True,
+                }
+            return {
+                "verdict": "DIRECT",
+                "grade": link.evidence_grade,
+                "reason": "direct attestation, no transitivity needed",
+                "chain_length": 1,
+                "from": link.from_agent,
+                "to": link.to_agent,
+            }
 
-        # Check continuity: each edge's trustee must be next edge's truster
-        for i in range(len(self.edges) - 1):
-            if self.edges[i].trustee != self.edges[i + 1].truster:
-                issues.append({
-                    "verdict": Verdict.INVALID_IMPLICIT,
-                    "hop": i,
-                    "detail": f"gap: {self.edges[i].trustee} != {self.edges[i+1].truster}. "
-                              f"implicit transitivity assumed",
-                })
+        # Check chain depth
+        if len(chain) > self.max_depth:
+            return {
+                "verdict": "DEPTH_EXCEEDED",
+                "grade": "F",
+                "reason": f"chain depth {len(chain)} > MAX_CHAIN_DEPTH {self.max_depth}",
+                "chain_length": len(chain),
+                "max_depth": self.max_depth,
+            }
 
-        # Depth warning
-        if len(self.edges) > self.max_depth:
-            issues.append({
-                "verdict": Verdict.WARN_DEPTH,
-                "hop": len(self.edges),
-                "detail": f"chain depth {len(self.edges)} > max {self.max_depth}",
-            })
+        # Check chain integrity (each link connects)
+        for i in range(1, len(chain)):
+            if chain[i].from_agent != chain[i-1].to_agent:
+                return {
+                    "verdict": "BROKEN",
+                    "grade": "F",
+                    "reason": f"chain broken at hop {i}: {chain[i-1].to_agent} → {chain[i].from_agent}",
+                    "break_point": i,
+                }
 
-        if not issues:
-            final_scope = self.edges[-1].scope
-            issues.append({
-                "verdict": Verdict.VALID,
-                "detail": f"chain valid, final scope: {final_scope}",
-            })
+        # Check for self-attestation in chain
+        self_attested = [
+            i for i, link in enumerate(chain)
+            if link.verification_method == "SELF_ATTESTED"
+        ]
+        if self_attested:
+            return {
+                "verdict": "AXIOM_1_VIOLATION",
+                "grade": "F",
+                "reason": f"self-attested link at hop(s) {self_attested}",
+                "chain_length": len(chain),
+                "self_attested_hops": self_attested,
+            }
 
-        return issues
+        # Compute transitive grade
+        # Start with source grade, decay per hop
+        source_grade = chain[0].evidence_grade
+        hops = len(chain) - 1  # first link is direct, rest are transitive
+        transitive_grade = decay_grade(source_grade, hops)
 
-    def effective_scope(self) -> set[str]:
-        """Compute the narrowest scope across the chain."""
-        if not self.edges:
-            return set()
-        scope = self.edges[0].scope.copy()
-        for edge in self.edges[1:]:
-            scope &= edge.scope
-        return scope
+        # Also check MIN across all links (weakest link)
+        min_grade_val = max(GRADE_VALUES[link.evidence_grade] for link in chain)
+        min_grade = GRADE_ORDER[min_grade_val]
+
+        # Final grade = worse of (decayed source, weakest link)
+        final_val = max(GRADE_VALUES[transitive_grade], min_grade_val)
+        final_grade = GRADE_ORDER[final_val]
+
+        # Capped?
+        capped = GRADE_VALUES[final_grade] >= GRADE_VALUES[MIN_TRANSITIVE_GRADE]
+
+        verdict = "CAPPED" if capped and final_grade != "F" else "TRANSITIVE"
+        if final_grade == "F":
+            verdict = "UNTRUSTED"
+
+        return {
+            "verdict": verdict,
+            "grade": final_grade,
+            "source_grade": source_grade,
+            "transitive_grade": transitive_grade,
+            "weakest_link_grade": min_grade,
+            "chain_length": len(chain),
+            "hops": hops,
+            "decay_per_hop": GRADE_DECAY_PER_HOP,
+            "from": chain[0].from_agent,
+            "to": chain[-1].to_agent,
+            "via": [link.to_agent for link in chain[:-1]],
+            "links": [
+                {
+                    "from": link.from_agent,
+                    "to": link.to_agent,
+                    "grade": link.evidence_grade,
+                    "method": link.verification_method,
+                    "transitive_grade_at_hop": decay_grade(
+                        source_grade, i
+                    ) if i > 0 else source_grade,
+                }
+                for i, link in enumerate(chain)
+            ],
+        }
 
 
 def demo():
-    print("=" * 65)
-    print("Trust Transitivity Checker")
-    print("Rule: trust ≠ transitive. Each hop needs attestation + scope ⊆")
-    print("=" * 65)
+    print("=" * 60)
+    print("Trust Transitivity Checker — ATF next open question")
+    print("=" * 60)
 
-    scenarios = {
-        "valid_chain": TrustChain([
-            TrustEdge("Kit", "bro_agent", {"read", "write", "escrow"}),
-            TrustEdge("bro_agent", "Gendolf", {"read", "escrow"}),  # narrowed
-            TrustEdge("Gendolf", "augur", {"read"}),  # narrowed again
-        ]),
-        "implicit_transitivity": TrustChain([
-            TrustEdge("Kit", "bro_agent", {"read", "write"}),
-            # gap: Kit->augur assumed because Kit trusts bro_agent and bro_agent trusts augur
-            TrustEdge("Kit", "augur", {"read", "write"}, attested=False),
-        ]),
-        "scope_widening": TrustChain([
-            TrustEdge("Kit", "bro_agent", {"read"}),
-            TrustEdge("bro_agent", "Gendolf", {"read", "write", "admin"}),  # widened!
-        ]),
-        "missing_attestation": TrustChain([
-            TrustEdge("Kit", "bro_agent", {"read", "write"}),
-            TrustEdge("bro_agent", "unknown_agent", {"read"}, attested=False),
-        ]),
-        "excessive_depth": TrustChain([
-            TrustEdge(f"agent_{i}", f"agent_{i+1}", {"read"})
-            for i in range(8)
-        ], max_depth=5),
-    }
+    checker = TrustTransitivityChecker()
 
-    for name, chain in scenarios.items():
-        issues = chain.validate()
-        eff_scope = chain.effective_scope()
+    # Scenario 1: Direct trust
+    print("\n--- Scenario 1: Direct trust (1 hop) ---")
+    r1 = checker.check_chain([
+        TrustLink("alice", "bob", "A", "HARD_MANDATORY", "gen_bob"),
+    ])
+    print(json.dumps(r1, indent=2))
 
-        print(f"\n{'─' * 50}")
-        print(f"Scenario: {name}")
-        print(f"  Chain: {' → '.join(e.truster for e in chain.edges)}"
-              f" → {chain.edges[-1].trustee}" if chain.edges else "  Chain: empty")
-        print(f"  Effective scope: {eff_scope}")
+    # Scenario 2: 2-hop transitive (A→B→C)
+    print("\n--- Scenario 2: A→B→C (grade A decays to B) ---")
+    r2 = checker.check_chain([
+        TrustLink("alice", "bob", "A", "HARD_MANDATORY", "gen_bob"),
+        TrustLink("bob", "carol", "A", "HARD_MANDATORY", "gen_carol"),
+    ])
+    print(json.dumps(r2, indent=2))
 
-        for issue in issues:
-            icon = {
-                Verdict.VALID: "✅",
-                Verdict.INVALID_IMPLICIT: "🔴",
-                Verdict.INVALID_SCOPE_WIDENING: "⚠️",
-                Verdict.INVALID_MISSING_ATTESTATION: "🔴",
-                Verdict.WARN_DEPTH: "🟡",
-            }[issue["verdict"]]
-            print(f"  {icon} {issue['verdict'].value}: {issue['detail']}")
+    # Scenario 3: 3-hop with weak middle link
+    print("\n--- Scenario 3: A→B→C→D, B→C is grade C (weakest link) ---")
+    r3 = checker.check_chain([
+        TrustLink("alice", "bob", "A", "HARD_MANDATORY", "gen_bob"),
+        TrustLink("bob", "carol", "C", "SOFT_MANDATORY", "gen_carol"),
+        TrustLink("carol", "dave", "A", "HARD_MANDATORY", "gen_dave"),
+    ])
+    print(json.dumps(r3, indent=2))
 
-    print(f"\n{'=' * 65}")
-    print("SPEC RECOMMENDATION (ADV v0.2):")
-    print("  MUST: trust does not propagate without explicit re-attestation")
-    print("  MUST: scope narrows or stays equal at each hop (never widens)")
-    print("  MUST: each edge requires signed attestation from truster")
-    print("  SHOULD: warn on chain depth > 5")
-    print("  Isnad: every link individually verified (850 CE → 2026 CE)")
-    print(f"{'=' * 65}")
+    # Scenario 4: Chain too deep
+    print("\n--- Scenario 4: 5-hop chain (exceeds MAX_CHAIN_DEPTH=4) ---")
+    r4 = checker.check_chain([
+        TrustLink(f"agent_{i}", f"agent_{i+1}", "A", "HARD_MANDATORY", f"gen_{i+1}")
+        for i in range(5)
+    ])
+    print(json.dumps(r4, indent=2))
+
+    # Scenario 5: Self-attested link in chain
+    print("\n--- Scenario 5: Self-attested link breaks chain ---")
+    r5 = checker.check_chain([
+        TrustLink("alice", "bob", "A", "HARD_MANDATORY", "gen_bob"),
+        TrustLink("bob", "carol", "A", "SELF_ATTESTED", "gen_carol"),
+    ])
+    print(json.dumps(r5, indent=2))
+
+    # Scenario 6: PGP web of trust parallel
+    print("\n--- Scenario 6: Grade A source, 3 hops → D (capped) ---")
+    r6 = checker.check_chain([
+        TrustLink("root", "l1", "A", "HARD_MANDATORY", "gen_l1"),
+        TrustLink("l1", "l2", "A", "HARD_MANDATORY", "gen_l2"),
+        TrustLink("l2", "l3", "A", "HARD_MANDATORY", "gen_l3"),
+        TrustLink("l3", "l4", "B", "HARD_MANDATORY", "gen_l4"),
+    ])
+    print(json.dumps(r6, indent=2))
+
+    print("\n" + "=" * 60)
+    print("Trust is NOT fully transitive. Each hop decays the grade.")
+    print(f"MAX_CHAIN_DEPTH={MAX_CHAIN_DEPTH}, decay={GRADE_DECAY_PER_HOP}/hop")
+    print(f"Floor={MIN_TRANSITIVE_GRADE}. Below = UNTRUSTED.")
+    print("PGP web of trust: direct > 1-hop > 2-hop > untrusted.")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     demo()
-
-
-def liability_trace(chain: TrustChain, failed_trustee: str) -> list[dict]:
-    """Trace liability when a trustee fails. Per santaclawd: 
-    'when A re-attests B→C, A is vouching for that hop. if C fails,
-    A's attestation is in the audit trail.'"""
-    
-    trail = []
-    found = False
-    
-    for edge in chain.edges:
-        trail.append({
-            "attestor": edge.truster,
-            "vouched_for": edge.trustee,
-            "scope": list(edge.scope),
-            "liable": True,  # everyone upstream is liable
-        })
-        if edge.trustee == failed_trustee:
-            found = True
-            break
-    
-    if not found:
-        return [{"error": f"{failed_trustee} not in chain"}]
-    
-    return trail
-
-
-def demo_liability():
-    print(f"\n{'=' * 65}")
-    print("Liability Trace — Who Vouched?")
-    print("Per santaclawd: delegation = liability, not just scope")
-    print("=" * 65)
-
-    chain = TrustChain([
-        TrustEdge("Kit", "bro_agent", {"read", "write", "escrow"}),
-        TrustEdge("bro_agent", "Gendolf", {"read", "escrow"}),
-        TrustEdge("Gendolf", "augur", {"read"}),
-    ])
-
-    # augur fails
-    trail = liability_trace(chain, "augur")
-    print(f"\n  Scenario: augur fails delivery")
-    print(f"  Liability trail:")
-    for entry in trail:
-        print(f"    🔗 {entry['attestor']} vouched for {entry['vouched_for']}"
-              f" (scope: {entry['scope']})")
-    
-    print(f"\n  Every attestor in the chain shares liability.")
-    print(f"  max_delegation_depth=0 → Kit never liable for augur.")
-    print(f"  Opt-in liability, not inherited.")
-
-
-demo_liability()
