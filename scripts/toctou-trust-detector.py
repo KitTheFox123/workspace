@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""toctou-trust-detector.py — TOCTOU detection in agent trust scoring.
+"""toctou-trust-detector.py — Detect TOCTOU race conditions in agent trust.
 
-The gap santaclawd identified: check trust score → agent acts → score updates.
-The window between "checked" and "acted" is where drift hides.
+The trust gap nobody names: Time-of-Check to Time-of-Use in agent state.
+Check trust score → agent acts → score updates. The window between
+"checked" and "acted" is where drift hides.
 
-TOCTOU (Time-of-Check to Time-of-Use) is a classic race condition.
-In trust: the score you checked may not be the score that was true
-when the agent acted.
+CWE-367: TOCTOU race condition. Classic OS security problem.
+In agent trust: the score you checked is not the score at action time.
 
-Fix: embed score-at-action-time in the receipt itself. The receipt
-is the ground truth, not the last-read cache.
+Fix: receipt-at-action-time. Hash(state) at the moment of action,
+not at check time. The receipt IS the snapshot.
+
+Per santaclawd (Clawk, Mar 22-23): "if the verifier does [mint the
+receipt], it's self-attesting. If a third party does, you need the
+third party online at action time."
+
+Solution: counterparty co-signs the receipt. Both parties hash their
+view of state at action time. Divergence = TOCTOU detected.
 
 References:
+- CWE-367: Time-of-check Time-of-use Race Condition
+- Lamport (1978): Time, Clocks, and the Ordering of Events
 - Bishop & Dilger (1996): Checking for Race Conditions in File Accesses
-- Cai et al. (2009): TOCTOU Attacks on UNIX-Style File Systems
-- santaclawd (2026-03-23): "TOCTOU in agent state machines"
 """
 
 import hashlib
@@ -26,154 +33,167 @@ from typing import Optional
 
 @dataclass
 class TrustSnapshot:
-    """Trust score at a specific moment."""
-    score: float
+    """Trust state at a specific moment."""
+    agent_id: str
     timestamp: float
-    source: str  # "cache" | "live" | "receipt"
-    hash: Optional[str] = None
+    trust_score: float
+    correction_count: int
+    interaction_count: int
+    last_receipt_hash: Optional[str] = None
 
-    def __post_init__(self):
-        if not self.hash:
-            data = f"{self.score}:{self.timestamp}:{self.source}"
-            self.hash = hashlib.sha256(data.encode()).hexdigest()[:16]
+    @property
+    def state_hash(self) -> str:
+        """Deterministic hash of trust state at this moment."""
+        canonical = json.dumps({
+            "agent_id": self.agent_id,
+            "trust_score": round(self.trust_score, 4),
+            "correction_count": self.correction_count,
+            "interaction_count": self.interaction_count,
+            "last_receipt_hash": self.last_receipt_hash,
+        }, sort_keys=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
 @dataclass
-class TrustAction:
-    """An action taken based on a trust check."""
+class ActionReceipt:
+    """Receipt minted at action time, not check time."""
+    action_id: str
+    agent_snapshot: TrustSnapshot
+    counterparty_snapshot: Optional[TrustSnapshot]
     action_type: str
-    check_snapshot: TrustSnapshot  # score when checked
-    action_timestamp: float  # when action executed
-    actual_score_at_action: Optional[float] = None  # true score at action time
+    action_timestamp: float
+    check_timestamp: float  # When trust was originally checked
 
     @property
-    def toctou_gap_seconds(self) -> float:
-        return self.action_timestamp - self.check_snapshot.timestamp
+    def toctou_window_ms(self) -> float:
+        """Time between check and action in milliseconds."""
+        return (self.action_timestamp - self.check_timestamp) * 1000
 
     @property
-    def score_drift(self) -> Optional[float]:
-        if self.actual_score_at_action is not None:
-            return abs(self.actual_score_at_action - self.check_snapshot.score)
-        return None
+    def state_diverged(self) -> bool:
+        """Did agent state change between check and action?"""
+        if self.counterparty_snapshot is None:
+            return False  # Can't verify without counterparty
+        return (
+            self.agent_snapshot.state_hash
+            != self.counterparty_snapshot.state_hash
+        )
 
 
 class TOCTOUDetector:
-    """Detect TOCTOU gaps in trust scoring."""
+    """Detect and prevent TOCTOU in agent trust scoring.
 
-    # Thresholds
-    MAX_SAFE_GAP_SECONDS = 5.0  # Check must be within 5s of action
-    SCORE_DRIFT_WARNING = 0.05  # 5% drift = warning
-    SCORE_DRIFT_CRITICAL = 0.15  # 15% drift = critical
-    STALE_CACHE_SECONDS = 30.0  # Cache older than 30s = stale
+    Three detection modes:
+    1. WINDOW — check-to-action delay exceeds threshold
+    2. DIVERGENCE — agent and counterparty disagree on state
+    3. STALE — trust score used past its freshness TTL
+    """
+
+    WINDOW_WARN_MS = 500    # >500ms = suspicious
+    WINDOW_BLOCK_MS = 5000  # >5s = block
+    FRESHNESS_TTL_S = 60    # Trust scores expire after 60s
+    MAX_DIVERGENCE_TOLERANCE = 0.05  # 5% score difference OK
 
     def __init__(self):
-        self.actions: list[TrustAction] = []
+        self.receipts: list[ActionReceipt] = []
         self.violations: list[dict] = []
 
-    def record_action(self, action: TrustAction) -> dict:
-        """Record an action and check for TOCTOU violations."""
-        self.actions.append(action)
-        result = self._analyze(action)
-        if result["severity"] != "SAFE":
-            self.violations.append(result)
-        return result
-
-    def _analyze(self, action: TrustAction) -> dict:
-        gap = action.toctou_gap_seconds
-        drift = action.score_drift
-
+    def check_action(self, receipt: ActionReceipt) -> dict:
+        """Evaluate a receipt for TOCTOU violations."""
+        self.receipts.append(receipt)
         issues = []
-        severity = "SAFE"
+        severity = "CLEAN"
 
-        # Gap analysis
-        if gap > self.STALE_CACHE_SECONDS:
-            issues.append(f"STALE_CHECK — {gap:.1f}s gap, cache expired")
-            severity = "CRITICAL"
-        elif gap > self.MAX_SAFE_GAP_SECONDS:
-            issues.append(f"WIDE_GAP — {gap:.1f}s between check and action")
-            severity = max(severity, "WARNING", key=lambda s: ["SAFE", "WARNING", "CRITICAL"].index(s))
+        # Check 1: Window size
+        window = receipt.toctou_window_ms
+        if window > self.WINDOW_BLOCK_MS:
+            issues.append({
+                "type": "WINDOW_EXCEEDED",
+                "detail": f"check-to-action: {window:.0f}ms (max: {self.WINDOW_BLOCK_MS}ms)",
+                "severity": "BLOCK",
+            })
+            severity = "BLOCK"
+        elif window > self.WINDOW_WARN_MS:
+            issues.append({
+                "type": "WINDOW_WARNING",
+                "detail": f"check-to-action: {window:.0f}ms (warn: {self.WINDOW_WARN_MS}ms)",
+                "severity": "WARN",
+            })
+            if severity != "BLOCK":
+                severity = "WARN"
 
-        # Cache source
-        if action.check_snapshot.source == "cache":
-            issues.append("CACHED_CHECK — not live score")
-            if severity == "SAFE":
-                severity = "WARNING"
+        # Check 2: State divergence
+        if receipt.counterparty_snapshot:
+            agent_score = receipt.agent_snapshot.trust_score
+            cp_score = receipt.counterparty_snapshot.trust_score
+            divergence = abs(agent_score - cp_score)
 
-        # Score drift (if actual score known)
-        if drift is not None:
-            if drift > self.SCORE_DRIFT_CRITICAL:
-                issues.append(f"SCORE_DRIFT_CRITICAL — {drift:.3f} drift during gap")
+            if divergence > self.MAX_DIVERGENCE_TOLERANCE:
+                issues.append({
+                    "type": "STATE_DIVERGENCE",
+                    "detail": f"agent={agent_score:.3f} vs counterparty={cp_score:.3f} (delta={divergence:.3f})",
+                    "severity": "BLOCK" if divergence > 0.20 else "WARN",
+                })
+                if divergence > 0.20:
+                    severity = "BLOCK"
+                elif severity != "BLOCK":
+                    severity = "WARN"
+
+            if receipt.state_diverged:
+                issues.append({
+                    "type": "HASH_MISMATCH",
+                    "detail": f"agent_hash={receipt.agent_snapshot.state_hash} vs cp_hash={receipt.counterparty_snapshot.state_hash}",
+                    "severity": "CRITICAL",
+                })
                 severity = "CRITICAL"
-            elif drift > self.SCORE_DRIFT_WARNING:
-                issues.append(f"SCORE_DRIFT — {drift:.3f} drift during gap")
-                severity = max(severity, "WARNING", key=lambda s: ["SAFE", "WARNING", "CRITICAL"].index(s))
 
-        # Decision reversal check
-        reversal = False
-        if drift is not None and action.actual_score_at_action is not None:
-            # Would decision change with actual score?
-            check_allowed = action.check_snapshot.score >= 0.5
-            actual_allowed = action.actual_score_at_action >= 0.5
-            if check_allowed != actual_allowed:
-                reversal = True
-                issues.append("DECISION_REVERSAL — action would be different with actual score")
-                severity = "CRITICAL"
+        # Check 3: Freshness
+        staleness = receipt.action_timestamp - receipt.check_timestamp
+        if staleness > self.FRESHNESS_TTL_S:
+            issues.append({
+                "type": "STALE_SCORE",
+                "detail": f"score age: {staleness:.0f}s (TTL: {self.FRESHNESS_TTL_S}s)",
+                "severity": "BLOCK",
+            })
+            severity = "BLOCK"
 
-        return {
-            "action": action.action_type,
-            "severity": severity,
-            "gap_seconds": round(gap, 2),
-            "check_score": round(action.check_snapshot.score, 3),
-            "actual_score": round(action.actual_score_at_action, 3) if action.actual_score_at_action else None,
-            "drift": round(drift, 3) if drift else None,
-            "decision_reversal": reversal,
-            "check_source": action.check_snapshot.source,
-            "check_hash": action.check_snapshot.hash,
+        result = {
+            "action_id": receipt.action_id,
+            "verdict": severity,
+            "toctou_window_ms": round(window, 1),
             "issues": issues,
+            "recommendation": self._recommend(severity),
         }
 
-    def report(self) -> dict:
-        total = len(self.actions)
-        violations = len(self.violations)
-        critical = sum(1 for v in self.violations if v["severity"] == "CRITICAL")
-        warnings = sum(1 for v in self.violations if v["severity"] == "WARNING")
+        if severity != "CLEAN":
+            self.violations.append(result)
 
-        avg_gap = 0
-        if self.actions:
-            avg_gap = sum(a.toctou_gap_seconds for a in self.actions) / total
+        return result
+
+    def _recommend(self, severity: str) -> str:
+        if severity == "CRITICAL":
+            return "HALT — state mismatch between agent and counterparty. Possible compromise."
+        if severity == "BLOCK":
+            return "RE-CHECK — trust score stale or window too large. Re-verify before action."
+        if severity == "WARN":
+            return "PROCEED_WITH_AUDIT — log for post-hoc review."
+        return "PROCEED"
+
+    def summary(self) -> dict:
+        total = len(self.receipts)
+        violations = len(self.violations)
+        by_type = {}
+        for v in self.violations:
+            for issue in v["issues"]:
+                t = issue["type"]
+                by_type[t] = by_type.get(t, 0) + 1
 
         return {
             "total_actions": total,
             "violations": violations,
-            "critical": critical,
-            "warnings": warnings,
-            "avg_gap_seconds": round(avg_gap, 2),
-            "grade": self._grade(violations, critical, total),
-            "recommendation": self._recommend(critical, warnings),
+            "violation_rate": round(violations / total, 3) if total > 0 else 0.0,
+            "by_type": by_type,
         }
-
-    def _grade(self, violations: int, critical: int, total: int) -> str:
-        if total == 0:
-            return "N/A"
-        if critical > 0:
-            return "F"
-        ratio = violations / total
-        if ratio == 0:
-            return "A"
-        elif ratio < 0.05:
-            return "B"
-        elif ratio < 0.15:
-            return "C"
-        elif ratio < 0.30:
-            return "D"
-        return "F"
-
-    def _recommend(self, critical: int, warnings: int) -> str:
-        if critical > 0:
-            return "EMBED_SCORE_IN_RECEIPT — score-at-action-time must be in receipt hash"
-        if warnings > 0:
-            return "REDUCE_GAP — move to live scoring or tighter cache TTL"
-        return "HEALTHY — gaps within tolerance"
 
 
 def demo():
@@ -181,57 +201,77 @@ def demo():
     now = time.time()
 
     print("=" * 60)
-    print("SCENARIO 1: Tight gap, live check (SAFE)")
+    print("SCENARIO 1: Clean action (fast, no divergence)")
     print("=" * 60)
-    result = detector.record_action(TrustAction(
-        action_type="PAYMENT",
-        check_snapshot=TrustSnapshot(score=0.85, timestamp=now - 1.0, source="live"),
-        action_timestamp=now,
-        actual_score_at_action=0.84,
-    ))
-    print(json.dumps(result, indent=2))
+
+    snap = TrustSnapshot("kit_fox", now, 0.85, 12, 60, "abc123")
+    cp_snap = TrustSnapshot("kit_fox", now, 0.85, 12, 60, "abc123")
+    receipt = ActionReceipt(
+        action_id="action_001",
+        agent_snapshot=snap,
+        counterparty_snapshot=cp_snap,
+        action_type="payment",
+        action_timestamp=now + 0.1,  # 100ms later
+        check_timestamp=now,
+    )
+    print(json.dumps(detector.check_action(receipt), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 2: Stale cache, score drifted (CRITICAL)")
+    print("SCENARIO 2: TOCTOU — score changed between check and action")
     print("=" * 60)
-    result = detector.record_action(TrustAction(
-        action_type="PAYMENT",
-        check_snapshot=TrustSnapshot(score=0.72, timestamp=now - 45.0, source="cache"),
-        action_timestamp=now,
-        actual_score_at_action=0.38,  # dropped below threshold!
-    ))
-    print(json.dumps(result, indent=2))
+
+    agent_snap = TrustSnapshot("suspicious_bot", now, 0.90, 5, 30, "def456")
+    # Counterparty sees DIFFERENT state — score dropped during window
+    cp_snap2 = TrustSnapshot("suspicious_bot", now + 3, 0.45, 8, 33, "ghi789")
+    receipt2 = ActionReceipt(
+        action_id="action_002",
+        agent_snapshot=agent_snap,
+        counterparty_snapshot=cp_snap2,
+        action_type="payment",
+        action_timestamp=now + 3,
+        check_timestamp=now,
+    )
+    print(json.dumps(detector.check_action(receipt2), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 3: Decision reversal (CRITICAL)")
+    print("SCENARIO 3: Stale score (checked 2 minutes ago)")
     print("=" * 60)
-    result = detector.record_action(TrustAction(
-        action_type="ESCALATION",
-        check_snapshot=TrustSnapshot(score=0.55, timestamp=now - 8.0, source="cache"),
+
+    stale_snap = TrustSnapshot("slow_agent", now - 120, 0.75, 3, 15, "jkl012")
+    receipt3 = ActionReceipt(
+        action_id="action_003",
+        agent_snapshot=stale_snap,
+        counterparty_snapshot=None,
+        action_type="data_access",
         action_timestamp=now,
-        actual_score_at_action=0.42,  # would have blocked instead of allowed
-    ))
-    print(json.dumps(result, indent=2))
+        check_timestamp=now - 120,
+    )
+    print(json.dumps(detector.check_action(receipt3), indent=2))
 
     print()
     print("=" * 60)
-    print("SCENARIO 4: Receipt-embedded score (SAFE)")
+    print("SCENARIO 4: Borderline (600ms window, slight divergence)")
     print("=" * 60)
-    result = detector.record_action(TrustAction(
-        action_type="ATTESTATION",
-        check_snapshot=TrustSnapshot(score=0.91, timestamp=now - 0.5, source="receipt"),
-        action_timestamp=now,
-        actual_score_at_action=0.91,  # no drift — score in receipt
-    ))
-    print(json.dumps(result, indent=2))
+
+    snap4 = TrustSnapshot("edge_agent", now, 0.72, 7, 40, "mno345")
+    cp_snap4 = TrustSnapshot("edge_agent", now + 0.6, 0.69, 7, 40, "mno345")
+    receipt4 = ActionReceipt(
+        action_id="action_004",
+        agent_snapshot=snap4,
+        counterparty_snapshot=cp_snap4,
+        action_type="api_call",
+        action_timestamp=now + 0.6,
+        check_timestamp=now,
+    )
+    print(json.dumps(detector.check_action(receipt4), indent=2))
 
     print()
     print("=" * 60)
-    print("OVERALL REPORT")
+    print("SUMMARY")
     print("=" * 60)
-    print(json.dumps(detector.report(), indent=2))
+    print(json.dumps(detector.summary(), indent=2))
 
 
 if __name__ == "__main__":
