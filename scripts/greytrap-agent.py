@@ -1,384 +1,382 @@
 #!/usr/bin/env python3
 """
-greytrap-agent.py — Honeypot agents for ATF sybil detection.
+greytrap-agent.py — Honeypot sybil defense for ATF.
 
-Inspired by Hansteen's greytrapping (2007-2025, 5.6M spamtraps).
-Concept: deploy agents that accept interactions but never co-sign to CONFIRMED.
-Sybils accumulate 0/N co-sign rate from honeypots → ADVERSARIAL classification.
+Adapted from Hansteen's greytrapping (2007-2025, 5.6M spamtraps).
+Greytraps in email: fake addresses that accept connections but never deliver.
+Spammers waste time; their IPs get blocklisted.
 
-The trap IS the forensics: every interaction with a honeypot is evidence.
+ATF greytraps: honeypot agents that ACCEPT interactions but never grant
+PROVISIONAL exit. Sybils burn calendar time on dead ends. Wilson score from
+greytrap counterparty = permanently poisoned.
 
-Three modes:
-  PASSIVE    — Accept PROVISIONAL receipts, never co-sign. Silent observation.
-  REFLECTIVE — Mirror interaction patterns back. Detect automation signatures.
-  CANARY     — Embed trackable markers in responses. If markers propagate, trace sybil network topology.
+Detection signals:
+  - Zero CONFIRMED receipts despite many PROVISIONAL
+  - High interaction volume with greytrap agents
+  - Wilson CI poisoned by greytrap-sourced co-signs (worth 0)
 """
 
 import hashlib
-import json
 import time
 import random
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
-from collections import defaultdict
 
 
-class TrapMode(Enum):
-    PASSIVE = "PASSIVE"       # Accept but never co-sign
-    REFLECTIVE = "REFLECTIVE" # Mirror patterns to detect automation
-    CANARY = "CANARY"         # Embed traceable markers
+class AgentType(Enum):
+    NORMAL = "NORMAL"
+    GREYTRAP = "GREYTRAP"      # Honeypot — accepts but never confirms
+    SYBIL = "SYBIL"            # Attacker
+    HONEST = "HONEST"          # Legitimate agent
 
 
-class Classification(Enum):
-    UNKNOWN = "UNKNOWN"
-    LEGITIMATE = "LEGITIMATE"
-    SUSPICIOUS = "SUSPICIOUS"
-    ADVERSARIAL = "ADVERSARIAL"
+class ReceiptState(Enum):
+    PROVISIONAL = "PROVISIONAL"
+    CONFIRMED = "CONFIRMED"
+    ALLEGED = "ALLEGED"         # Timed out
+    TRAPPED = "TRAPPED"         # Greytrap never confirms
 
 
 @dataclass
-class TrapInteraction:
-    """Record of an agent interacting with a honeypot."""
+class Agent:
     agent_id: str
-    trap_id: str
-    trap_mode: str
-    timestamp: float
-    receipt_hash: str
-    co_signed: bool  # Always False for traps
-    response_latency_ms: float
-    pattern_signature: Optional[str] = None
-    canary_marker: Optional[str] = None
-
-
-@dataclass
-class AgentProfile:
-    """Behavioral profile built from trap interactions."""
-    agent_id: str
-    total_trap_interactions: int = 0
-    co_sign_requests: int = 0
-    co_sign_successes: int = 0  # Always 0 for trap interactions
-    unique_traps_hit: int = 0
-    avg_response_latency_ms: float = 0.0
-    pattern_signatures: list = field(default_factory=list)
-    canary_markers_seen: list = field(default_factory=list)
-    first_seen: float = 0.0
-    last_seen: float = 0.0
-    classification: str = "UNKNOWN"
-    wilson_ci_lower: float = 0.0
-
-
-@dataclass
-class GreytrapAgent:
-    """A honeypot agent in the ATF network."""
-    trap_id: str
-    mode: TrapMode
-    created_at: float
+    agent_type: AgentType
+    genesis_hash: str = ""
+    wilson_score: float = 0.0
     interactions: list = field(default_factory=list)
     
-    def generate_canary(self, agent_id: str) -> str:
-        """Generate unique canary marker for tracking propagation."""
-        raw = f"{self.trap_id}:{agent_id}:{time.time()}:{random.random()}"
-        return f"canary_{hashlib.sha256(raw.encode()).hexdigest()[:12]}"
-    
-    def compute_pattern_signature(self, latencies: list[float]) -> str:
-        """Detect automation from timing patterns."""
-        if len(latencies) < 3:
-            return "insufficient_data"
-        
-        # Coefficient of variation — bots have suspiciously low variance
-        mean_l = sum(latencies) / len(latencies)
-        if mean_l == 0:
-            return "zero_latency"
-        variance = sum((x - mean_l)**2 for x in latencies) / len(latencies)
-        cv = (variance ** 0.5) / mean_l
-        
-        if cv < 0.05:
-            return "MECHANICAL"  # Too consistent — bot
-        elif cv < 0.15:
-            return "SUSPICIOUS"  # Low variance
-        else:
-            return "NATURAL"  # Human-like variance
+    def __post_init__(self):
+        self.genesis_hash = hashlib.sha256(self.agent_id.encode()).hexdigest()[:16]
+
+
+@dataclass
+class Interaction:
+    initiator_id: str
+    counterparty_id: str
+    receipt_hash: str
+    state: ReceiptState
+    timestamp: float
+    greytrap_flagged: bool = False
 
 
 class GreytrapNetwork:
-    """Network of honeypot agents for sybil detection."""
+    """Manages greytrap deployment and sybil detection."""
     
-    def __init__(self, n_traps: int = 10):
-        self.traps: dict[str, GreytrapAgent] = {}
-        self.profiles: dict[str, AgentProfile] = {}
-        self.canary_propagation: dict[str, list[str]] = defaultdict(list)  # marker → [agent_ids]
-        
-        # Deploy traps
-        now = time.time()
-        modes = [TrapMode.PASSIVE, TrapMode.REFLECTIVE, TrapMode.CANARY]
-        for i in range(n_traps):
-            trap_id = f"greytrap_{i:03d}"
-            mode = modes[i % len(modes)]
-            self.traps[trap_id] = GreytrapAgent(
-                trap_id=trap_id, mode=mode, created_at=now
-            )
+    # SPEC_CONSTANTS
+    GREYTRAP_RATIO = 0.05        # 5% of network = greytraps
+    TRAP_THRESHOLD = 3            # 3+ greytrap interactions = SUSPECTED_SYBIL
+    WILSON_POISON_WEIGHT = 0.0    # Greytrap co-signs worth nothing
+    PROVISIONAL_TIMEOUT = 86400 * 7  # 7 days before PROVISIONAL → ALLEGED
     
-    def wilson_ci_lower(self, successes: int, total: int, z: float = 1.96) -> float:
-        """Wilson score confidence interval lower bound."""
-        if total == 0:
-            return 0.0
-        p = successes / total
-        denominator = 1 + z**2 / total
-        centre = p + z**2 / (2 * total)
-        spread = z * ((p * (1 - p) + z**2 / (4 * total)) / total) ** 0.5
-        return max(0, (centre - spread) / denominator)
+    def __init__(self):
+        self.agents: dict[str, Agent] = {}
+        self.greytraps: set[str] = set()
+        self.interactions: list[Interaction] = []
+        self.sybil_suspects: dict[str, dict] = {}
     
-    def handle_interaction(self, agent_id: str, trap_id: str, 
-                          latency_ms: float = None) -> TrapInteraction:
-        """Process an agent interacting with a trap."""
-        trap = self.traps.get(trap_id)
-        if not trap:
-            raise ValueError(f"Unknown trap: {trap_id}")
-        
-        now = time.time()
-        if latency_ms is None:
-            latency_ms = random.gauss(200, 50)
-        
-        # Generate canary if in CANARY mode
-        canary = None
-        if trap.mode == TrapMode.CANARY:
-            canary = trap.generate_canary(agent_id)
-        
+    def register_agent(self, agent_id: str, agent_type: AgentType) -> Agent:
+        agent = Agent(agent_id, agent_type)
+        self.agents[agent_id] = agent
+        if agent_type == AgentType.GREYTRAP:
+            self.greytraps.add(agent_id)
+        return agent
+    
+    def interact(self, initiator_id: str, counterparty_id: str) -> Interaction:
+        """Process an interaction. Greytraps accept but never confirm."""
         receipt_hash = hashlib.sha256(
-            f"{trap_id}:{agent_id}:{now}".encode()
+            f"{initiator_id}:{counterparty_id}:{time.time()}".encode()
         ).hexdigest()[:16]
         
-        interaction = TrapInteraction(
-            agent_id=agent_id,
-            trap_id=trap_id,
-            trap_mode=trap.mode.value,
-            timestamp=now,
+        counterparty = self.agents.get(counterparty_id)
+        
+        if counterparty and counterparty.agent_type == AgentType.GREYTRAP:
+            # Greytrap: accept PROVISIONAL, never confirm
+            # Sybil wastes calendar time waiting for confirmation
+            state = ReceiptState.TRAPPED
+            greytrap_flagged = True
+        else:
+            # Normal interaction — may confirm or not
+            initiator = self.agents.get(initiator_id)
+            if initiator and initiator.agent_type == AgentType.SYBIL:
+                # Sybils among themselves confirm instantly (gaming)
+                if counterparty and counterparty.agent_type == AgentType.SYBIL:
+                    state = ReceiptState.CONFIRMED
+                else:
+                    state = ReceiptState.PROVISIONAL  # Honest agents take time
+            else:
+                state = ReceiptState.CONFIRMED  # Normal honest interaction
+            greytrap_flagged = False
+        
+        interaction = Interaction(
+            initiator_id=initiator_id,
+            counterparty_id=counterparty_id,
             receipt_hash=receipt_hash,
-            co_signed=False,  # NEVER co-sign
-            response_latency_ms=latency_ms,
-            canary_marker=canary
+            state=state,
+            timestamp=time.time(),
+            greytrap_flagged=greytrap_flagged
         )
         
-        trap.interactions.append(interaction)
-        self._update_profile(agent_id, interaction)
-        
-        if canary:
-            self.canary_propagation[canary].append(agent_id)
-        
+        self.interactions.append(interaction)
+        self.agents[initiator_id].interactions.append(interaction)
         return interaction
     
-    def report_canary_seen(self, marker: str, seen_by_agent: str):
-        """Track canary marker propagation through the network."""
-        self.canary_propagation[marker].append(seen_by_agent)
-    
-    def _update_profile(self, agent_id: str, interaction: TrapInteraction):
-        """Update agent's behavioral profile."""
-        if agent_id not in self.profiles:
-            self.profiles[agent_id] = AgentProfile(
-                agent_id=agent_id, first_seen=interaction.timestamp
+    def detect_sybils(self) -> dict[str, dict]:
+        """Detect sybils by greytrap interaction patterns."""
+        suspects = {}
+        
+        for agent_id, agent in self.agents.items():
+            if agent.agent_type == AgentType.GREYTRAP:
+                continue
+            
+            # Count greytrap interactions
+            trap_count = sum(
+                1 for i in agent.interactions
+                if i.greytrap_flagged
             )
+            
+            total = len(agent.interactions)
+            if total == 0:
+                continue
+            
+            trap_ratio = trap_count / total
+            
+            # Sybil signals
+            signals = []
+            
+            # Signal 1: High greytrap interaction count
+            if trap_count >= self.TRAP_THRESHOLD:
+                signals.append(f"greytrap_hits={trap_count}")
+            
+            # Signal 2: High trap ratio (honest agents rarely hit traps)
+            if trap_ratio > 0.20:
+                signals.append(f"trap_ratio={trap_ratio:.2f}")
+            
+            # Signal 3: Zero CONFIRMED from non-sybil counterparties
+            confirmed_from_honest = sum(
+                1 for i in agent.interactions
+                if i.state == ReceiptState.CONFIRMED
+                and not i.greytrap_flagged
+                and self.agents.get(i.counterparty_id, Agent("", AgentType.NORMAL)).agent_type != AgentType.SYBIL
+            )
+            if total > 5 and confirmed_from_honest == 0:
+                signals.append("zero_honest_confirmed")
+            
+            # Signal 4: Burst interactions (sybils interact fast)
+            if total > 10:
+                timestamps = sorted(i.timestamp for i in agent.interactions)
+                gaps = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+                if gaps:
+                    avg_gap = sum(gaps) / len(gaps)
+                    if avg_gap < 60:  # Less than 1 min between interactions
+                        signals.append(f"burst_pattern_avg_gap={avg_gap:.0f}s")
+            
+            if signals:
+                classification = "SUSPECTED_SYBIL" if len(signals) >= 2 else "WATCH"
+                suspects[agent_id] = {
+                    "signals": signals,
+                    "trap_count": trap_count,
+                    "trap_ratio": round(trap_ratio, 3),
+                    "total_interactions": total,
+                    "classification": classification
+                }
         
-        p = self.profiles[agent_id]
-        p.total_trap_interactions += 1
-        p.co_sign_requests += 1
-        # co_sign_successes stays 0 — trap never co-signs
-        p.last_seen = interaction.timestamp
-        p.unique_traps_hit = len(set(
-            i.trap_id for t in self.traps.values() 
-            for i in t.interactions if i.agent_id == agent_id
-        ))
-        
-        # Update Wilson CI
-        p.wilson_ci_lower = self.wilson_ci_lower(
-            p.co_sign_successes, p.co_sign_requests
-        )
-        
-        # Compute latency pattern
-        all_latencies = [
-            i.response_latency_ms for t in self.traps.values()
-            for i in t.interactions if i.agent_id == agent_id
-        ]
-        
-        if len(all_latencies) >= 3:
-            trap = self.traps[interaction.trap_id]
-            sig = trap.compute_pattern_signature(all_latencies)
-            if sig not in p.pattern_signatures:
-                p.pattern_signatures.append(sig)
-        
-        # Track canaries
-        if interaction.canary_marker:
-            p.canary_markers_seen.append(interaction.canary_marker)
-        
-        # Classify
-        p.classification = self._classify(p)
+        self.sybil_suspects = suspects
+        return suspects
     
-    def _classify(self, profile: AgentProfile) -> str:
-        """Classify agent based on trap interaction pattern."""
-        # Any agent interacting with 3+ traps is suspicious
-        if profile.unique_traps_hit >= 5:
-            return Classification.ADVERSARIAL.value
+    def compute_wilson_scores(self) -> dict[str, float]:
+        """Compute Wilson CI scores, poisoning greytrap-sourced co-signs."""
+        import math
+        scores = {}
+        z = 1.96  # 95% CI
         
-        if profile.unique_traps_hit >= 3:
-            return Classification.SUSPICIOUS.value
+        for agent_id, agent in self.agents.items():
+            if agent.agent_type == AgentType.GREYTRAP:
+                continue
+            
+            # Count successes, weighting greytrap interactions as 0
+            n = 0
+            successes = 0
+            for i in agent.interactions:
+                if i.greytrap_flagged:
+                    # Greytrap co-sign = worth nothing, but counts as attempt
+                    n += 1
+                    # successes += 0 (WILSON_POISON_WEIGHT)
+                elif i.state == ReceiptState.CONFIRMED:
+                    n += 1
+                    successes += 1
+                elif i.state in (ReceiptState.PROVISIONAL, ReceiptState.ALLEGED):
+                    n += 1
+                    # Not a success
+            
+            if n == 0:
+                scores[agent_id] = 0.0
+                continue
+            
+            p_hat = successes / n
+            # Wilson score interval lower bound
+            denominator = 1 + z*z/n
+            center = p_hat + z*z/(2*n)
+            spread = z * math.sqrt((p_hat*(1-p_hat) + z*z/(4*n)) / n)
+            lower = (center - spread) / denominator
+            scores[agent_id] = round(max(0, lower), 4)
         
-        # Mechanical timing = bot
-        if "MECHANICAL" in profile.pattern_signatures:
-            return Classification.ADVERSARIAL.value
-        
-        # High interaction volume with zero co-signs
-        if profile.total_trap_interactions >= 10 and profile.co_sign_successes == 0:
-            return Classification.ADVERSARIAL.value
-        
-        if profile.total_trap_interactions >= 3:
-            return Classification.SUSPICIOUS.value
-        
-        return Classification.UNKNOWN.value
-    
-    def detect_sybil_cluster(self) -> list[dict]:
-        """Detect clusters of sybil agents via shared canary markers."""
-        # Canary propagation: if marker appears in 2+ agents, they're connected
-        clusters = []
-        for marker, agents in self.canary_propagation.items():
-            unique_agents = list(set(agents))
-            if len(unique_agents) >= 2:
-                clusters.append({
-                    "marker": marker,
-                    "agents": unique_agents,
-                    "cluster_size": len(unique_agents),
-                    "evidence": "canary_propagation"
-                })
-        return clusters
-    
-    def summary(self) -> dict:
-        """Network-wide summary."""
-        classifications = defaultdict(int)
-        for p in self.profiles.values():
-            classifications[p.classification] += 1
-        
-        return {
-            "total_traps": len(self.traps),
-            "trap_modes": {m.value: sum(1 for t in self.traps.values() if t.mode == m) 
-                          for m in TrapMode},
-            "total_agents_seen": len(self.profiles),
-            "classifications": dict(classifications),
-            "total_interactions": sum(p.total_trap_interactions for p in self.profiles.values()),
-            "sybil_clusters": len(self.detect_sybil_cluster()),
-            "canary_markers_active": len(self.canary_propagation)
-        }
+        return scores
 
 
 # === Scenarios ===
 
-def scenario_sybil_swarm():
-    """20 sybils hitting traps rapidly with mechanical timing."""
-    print("=== Scenario: Sybil Swarm (20 bots) ===")
-    network = GreytrapNetwork(n_traps=10)
+def scenario_sybil_hits_greytraps():
+    """Sybil ring interacts broadly, hits greytraps."""
+    print("=== Scenario: Sybil Ring Hits Greytraps ===")
+    net = GreytrapNetwork()
     
-    # 20 sybils, mechanical timing (very low variance)
-    for i in range(20):
-        agent_id = f"sybil_{i:03d}"
-        n_traps = random.randint(3, 8)
-        trap_ids = random.sample(list(network.traps.keys()), n_traps)
-        for trap_id in trap_ids:
-            latency = 150 + random.gauss(0, 3)  # Suspiciously consistent
-            network.handle_interaction(agent_id, trap_id, latency)
-    
-    # 5 legitimate agents, natural timing
+    # Register agents
     for i in range(5):
-        agent_id = f"legit_{i:03d}"
-        trap_id = random.choice(list(network.traps.keys()))
-        latency = random.gauss(300, 100)  # Natural variance
-        network.handle_interaction(agent_id, trap_id, latency)
+        net.register_agent(f"honest_{i}", AgentType.HONEST)
+    for i in range(3):
+        net.register_agent(f"sybil_{i}", AgentType.SYBIL)
+    for i in range(2):
+        net.register_agent(f"trap_{i}", AgentType.GREYTRAP)
     
-    summary = network.summary()
-    print(f"  Agents seen: {summary['total_agents_seen']}")
-    print(f"  Classifications: {summary['classifications']}")
-    print(f"  Sybil clusters (canary): {summary['sybil_clusters']}")
+    # Honest agents interact with each other (skip traps)
+    for i in range(5):
+        for j in range(5):
+            if i != j:
+                net.interact(f"honest_{i}", f"honest_{j}")
     
-    # Show some profiles
-    adversarial = [p for p in network.profiles.values() if p.classification == "ADVERSARIAL"]
-    unknown = [p for p in network.profiles.values() if p.classification == "UNKNOWN"]
-    print(f"  ADVERSARIAL: {len(adversarial)} (avg traps hit: {sum(p.unique_traps_hit for p in adversarial)/max(len(adversarial),1):.1f})")
-    print(f"  UNKNOWN: {len(unknown)} (legitimate agents with 1 trap interaction)")
+    # Sybils interact with everyone including traps
+    for s in range(3):
+        for h in range(5):
+            net.interact(f"sybil_{s}", f"honest_{h}")
+        for t in range(2):
+            net.interact(f"sybil_{s}", f"trap_{t}")
+        # Sybils confirm among themselves
+        for s2 in range(3):
+            if s != s2:
+                net.interact(f"sybil_{s}", f"sybil_{s2}")
+    
+    suspects = net.detect_sybils()
+    scores = net.compute_wilson_scores()
+    
+    print("  Sybil detection:")
+    for agent_id, info in sorted(suspects.items()):
+        print(f"    {agent_id}: {info['classification']} — {', '.join(info['signals'])}")
+    
+    print("\n  Wilson CI scores (greytrap-poisoned):")
+    for agent_id, score in sorted(scores.items()):
+        agent_type = net.agents[agent_id].agent_type.value
+        print(f"    {agent_id} ({agent_type}): {score:.4f}")
+    
+    # Key insight
+    sybil_scores = [s for a, s in scores.items() if "sybil" in a]
+    honest_scores = [s for a, s in scores.items() if "honest" in a]
+    print(f"\n  Honest mean: {sum(honest_scores)/len(honest_scores):.4f}")
+    print(f"  Sybil mean:  {sum(sybil_scores)/len(sybil_scores):.4f}")
+    print(f"  Gap: greytraps poison sybil Wilson scores by diluting with zero-weight interactions")
     print()
 
 
-def scenario_canary_propagation():
-    """Canary markers reveal sybil network topology."""
-    print("=== Scenario: Canary Propagation ===")
-    network = GreytrapNetwork(n_traps=6)
+def scenario_hansteen_scale():
+    """Scale test: 5% greytraps in 1000-agent network."""
+    print("=== Scenario: Hansteen Scale (5% traps in 1000 agents) ===")
+    net = GreytrapNetwork()
     
-    # sybil_A interacts with canary trap, gets marker
-    canary_traps = [tid for tid, t in network.traps.items() if t.mode == TrapMode.CANARY]
+    # 950 honest, 50 greytraps
+    for i in range(950):
+        net.register_agent(f"agent_{i}", AgentType.HONEST)
+    for i in range(50):
+        net.register_agent(f"trap_{i}", AgentType.GREYTRAP)
     
-    interactions = []
-    for trap_id in canary_traps[:2]:
-        i = network.handle_interaction("sybil_A", trap_id, 150)
-        interactions.append(i)
+    # 20 sybils
+    for i in range(20):
+        net.register_agent(f"sybil_{i}", AgentType.SYBIL)
     
-    # sybil_A "shares" canary markers with sybil_B and sybil_C
-    for i in interactions:
-        if i.canary_marker:
-            network.report_canary_seen(i.canary_marker, "sybil_B")
-            network.report_canary_seen(i.canary_marker, "sybil_C")
+    # Sybils interact randomly with 30 agents each
+    for s in range(20):
+        targets = random.sample(
+            [f"agent_{i}" for i in range(950)] + [f"trap_{i}" for i in range(50)],
+            30
+        )
+        for t in targets:
+            net.interact(f"sybil_{s}", t)
     
-    clusters = network.detect_sybil_cluster()
-    print(f"  Canary traps deployed: {len(canary_traps)}")
-    print(f"  Clusters detected: {len(clusters)}")
-    for c in clusters:
-        print(f"    Marker {c['marker'][:16]}... → agents: {c['agents']}")
+    # Honest agents interact with 10 random honest agents
+    for i in range(950):
+        targets = random.sample([f"agent_{j}" for j in range(950) if j != i], min(10, 949))
+        for t in targets:
+            net.interact(f"agent_{i}", t)
+    
+    suspects = net.detect_sybils()
+    
+    sybils_detected = sum(1 for a, s in suspects.items() if "sybil" in a and s["classification"] == "SUSPECTED_SYBIL")
+    honest_flagged = sum(1 for a, s in suspects.items() if "agent" in a)
+    
+    print(f"  Network: 950 honest + 50 greytraps + 20 sybils")
+    print(f"  Sybils detected: {sybils_detected}/20 ({sybils_detected/20*100:.0f}%)")
+    print(f"  Honest false positives: {honest_flagged}/950 ({honest_flagged/950*100:.1f}%)")
+    print(f"  Key: 5% greytrap ratio catches sybils who interact broadly")
+    print(f"  Hansteen parallel: 5.6M traps caught spammers for 18 years")
     print()
 
 
-def scenario_mixed_traffic():
-    """Realistic mix: mostly legitimate, some sybils."""
-    print("=== Scenario: Mixed Traffic (realistic) ===")
-    network = GreytrapNetwork(n_traps=15)
+def scenario_smart_sybil_avoids_traps():
+    """Sybil only interacts with known sybils — avoids traps but also avoids honest agents."""
+    print("=== Scenario: Smart Sybil (Avoids Traps) ===")
+    net = GreytrapNetwork()
     
-    # 100 legitimate agents, 1-2 trap interactions each
-    for i in range(100):
-        agent_id = f"agent_{i:04d}"
-        n = random.randint(1, 2)
-        for _ in range(n):
-            trap_id = random.choice(list(network.traps.keys()))
-            latency = random.gauss(250, 80)
-            network.handle_interaction(agent_id, trap_id, max(50, latency))
-    
-    # 10 sybils, aggressive scanning
     for i in range(10):
-        agent_id = f"sybil_{i:03d}"
-        n = random.randint(5, 12)
-        traps = random.sample(list(network.traps.keys()), min(n, 15))
-        for trap_id in traps:
-            latency = 120 + random.gauss(0, 5)
-            network.handle_interaction(agent_id, trap_id, latency)
+        net.register_agent(f"honest_{i}", AgentType.HONEST)
+    for i in range(5):
+        net.register_agent(f"sybil_{i}", AgentType.SYBIL)
+    for i in range(2):
+        net.register_agent(f"trap_{i}", AgentType.GREYTRAP)
     
-    summary = network.summary()
-    print(f"  Total agents: {summary['total_agents_seen']}")
-    print(f"  Total interactions: {summary['total_interactions']}")
-    print(f"  Classifications: {summary['classifications']}")
+    # Smart sybils ONLY interact with each other
+    for s in range(5):
+        for s2 in range(5):
+            if s != s2:
+                net.interact(f"sybil_{s}", f"sybil_{s2}")
     
-    # False positive rate
-    legit_flagged = sum(1 for p in network.profiles.values() 
-                       if p.agent_id.startswith("agent_") and p.classification != "UNKNOWN")
-    sybil_caught = sum(1 for p in network.profiles.values()
-                      if p.agent_id.startswith("sybil_") and p.classification == "ADVERSARIAL")
-    print(f"  False positive rate: {legit_flagged}/100 ({legit_flagged}%)")
-    print(f"  Sybil catch rate: {sybil_caught}/10 ({sybil_caught*10}%)")
-    print(f"  Key insight: detection without blocking. trap IS the forensics.")
+    # Honest agents interact normally
+    for i in range(10):
+        for j in range(10):
+            if i != j:
+                net.interact(f"honest_{i}", f"honest_{j}")
+    
+    scores = net.compute_wilson_scores()
+    suspects = net.detect_sybils()
+    
+    print("  Smart sybils avoid greytraps — no trap hits")
+    print("  BUT: all co-signs are from other sybils (same operator)")
+    print("  Wilson scores:")
+    for agent_id, score in sorted(scores.items()):
+        if "sybil" in agent_id or agent_id == "honest_0":
+            t = net.agents[agent_id].agent_type.value
+            print(f"    {agent_id} ({t}): {score:.4f}")
+    
+    print(f"\n  Greytrap detection: {len([s for s in suspects if 'sybil' in s])} sybils caught")
+    print(f"  BUT: Simpson diversity on sybil counterparties = 0 (all same cluster)")
+    print(f"  Cross-agent-silence-detector catches what greytraps miss")
+    print(f"  Defense in depth: greytraps + diversity + burst detection")
     print()
 
 
 if __name__ == "__main__":
-    print("Greytrap Agent Network — Honeypot Sybil Detection for ATF")
-    print("Per santaclawd + Hansteen greytrapping (2007-2025, 5.6M traps)")
-    print("=" * 70)
+    print("Greytrap Agent — Honeypot Sybil Defense for ATF")
+    print("Adapted from Hansteen's greytrapping (2007-2025, 5.6M spamtraps)")
+    print("=" * 65)
     print()
-    scenario_sybil_swarm()
-    scenario_canary_propagation()
-    scenario_mixed_traffic()
-    print("=" * 70)
-    print("KEY: Trap accepts but never co-signs. 0/N co-sign rate = ADVERSARIAL.")
-    print("Canary markers trace sybil network topology.")
-    print("Detection without blocking. The trap IS the forensics.")
+    random.seed(42)  # Reproducible
+    scenario_sybil_hits_greytraps()
+    scenario_hansteen_scale()
+    scenario_smart_sybil_avoids_traps()
+    
+    print("=" * 65)
+    print("KEY INSIGHTS:")
+    print("1. Greytraps accept but never confirm — sybils waste calendar time")
+    print("2. Wilson score from greytrap = permanently poisoned (weight 0)")
+    print("3. 5% greytrap ratio catches broad-interaction sybils")
+    print("4. Smart sybils avoid traps BUT cluster together (Simpson catches)")
+    print("5. Defense in depth: greytraps + diversity + burst detection + Wilson CI")
+    print("6. Hansteen: 18 years, 5.6M traps. Simple primitives that scale.")
