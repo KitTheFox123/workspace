@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-soft-cascade-recovery.py — SOFT_CASCADE recovery for ATF grader transitions.
+soft-cascade-recovery.py — SOFT_CASCADE recovery for ATF V1.1.
 
-Per santaclawd: four primitives (PROBE_TIMEOUT, ALLEGED, CO_GRADER, DELEGATION)
-are shipped but SOFT_CASCADE recovery semantics are undefined.
+Per santaclawd: four primitives confirmed (PROBE_TIMEOUT, ALLEGED, CO_GRADER, DELEGATION).
+Gap: SOFT_CASCADE recovery — what happens after DEGRADED?
 
-Key question: when CO_GRADER supersedes stale ALLEGED, does the new grader
-inherit the decay curve or reset it?
+Recovery states:
+  HEALTHY → DEGRADED (upstream fails) → SUSPENDED (grace expires) → RECOVERED | REVOKED
 
-Answer: INHERIT. Decay = evidence staleness, not grader state.
-Reset = information loss = gameable (swap grader to erase decay).
+Key insight from RFC 6298 (Jacobson-Karels): exponential backoff for retry intervals.
+Re-attestation is not a binary flip — it's a gradual trust rebuild.
 
-Per RFC 2988 (Jacobson-Karels): SRTT tracks smoothed measurement.
-New sample updates the curve, doesn't reset it.
-
-Three recovery modes:
-  HARD_CASCADE  — Genesis revoked → all downstream F, no recovery
-  SOFT_CASCADE  — Intermediate fails → degrade + 72h re-grading window
-  GRACEFUL      — Planned grader swap → no degradation, seamless handoff
+Lambda for ALLEGED decay = SPEC_CONSTANT (0.1, halflife ~7h).
+CO_GRADER inherits decay curve, does NOT reset (laundering prevention).
 """
 
 import hashlib
@@ -28,323 +23,339 @@ from enum import Enum
 from typing import Optional
 
 
-class CascadeMode(Enum):
-    HARD = "HARD_CASCADE"
-    SOFT = "SOFT_CASCADE"
-    GRACEFUL = "GRACEFUL_TRANSITION"
+class TrustState(Enum):
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"        # Upstream failed, within grace
+    SUSPENDED = "SUSPENDED"      # Grace expired, no new receipts
+    RECOVERY = "RECOVERY"        # Re-attestation in progress
+    RECOVERED = "RECOVERED"      # Trust rebuilt
+    REVOKED = "REVOKED"         # Permanent termination
 
 
 class RecoveryPhase(Enum):
-    ACTIVE = "ACTIVE"               # Normal operation
-    DEGRADED = "DEGRADED"           # Grader failed, operating at reduced trust
-    RE_GRADING = "RE_GRADING"       # New grader evaluating, receipts provisional
-    RECOVERED = "RECOVERED"         # New grader confirmed, trust rebuilding
-    REJECTED = "REJECTED"           # Recovery failed, chain broken
+    PROBE = "PROBE"              # Liveness check (PROBE_TIMEOUT primitive)
+    RE_ATTEST = "RE_ATTEST"      # Fresh attestation required
+    OBSERVATION = "OBSERVATION"  # Behavioral monitoring period
+    GRADUATED = "GRADUATED"      # Full trust restored
 
 
 # SPEC_CONSTANTS
-RE_GRADING_WINDOW_HOURS = 72
-DECAY_LAMBDA = 0.1                   # Exponential decay rate
-DECAY_FLOOR = 0.1                    # Minimum trust during decay
-RECEIPT_VALIDITY_DURING_SWAP = True  # Receipts valid during grader transition
-MAX_GRADER_SWAPS_PER_YEAR = 4       # Anti-gaming: limit grader shopping
-INHERITANCE_MODE = "INHERIT"         # INHERIT or RESET (INHERIT is spec)
+GRACE_PERIOD_HOURS = 72          # Genesis constant: time in DEGRADED before SUSPENDED
+ALLEGED_DECAY_LAMBDA = 0.1       # Halflife ~7h for ALLEGED receipt weight
+MIN_RECOVERY_RECEIPTS = 10       # Minimum receipts to exit OBSERVATION
+RECOVERY_OBSERVATION_DAYS = 7    # Minimum observation window
+PROBE_TIMEOUT_INITIAL_MS = 5000  # Jacobson-Karels initial RTO
+PROBE_BACKOFF_FACTOR = 2.0       # RFC 6298 exponential backoff
+PROBE_MAX_RETRIES = 5
+MAX_DELEGATION_DEPTH = 3
 
 
 @dataclass
-class DecayCurve:
-    """Tracks evidence staleness as exponential decay."""
-    initial_grade: float          # Grade when last attested (0-1)
-    last_attestation_time: float  # Timestamp of last attestation
-    lambda_rate: float = DECAY_LAMBDA
-    floor: float = DECAY_FLOOR
-    
-    def current_value(self, now: float = None) -> float:
-        """Current decayed value. Jacobson-Karels SRTT analog."""
-        if now is None:
-            now = time.time()
-        t = (now - self.last_attestation_time) / 3600  # hours
-        decayed = self.initial_grade * math.exp(-self.lambda_rate * t)
-        return max(self.floor, decayed)
-    
-    def time_to_floor(self) -> float:
-        """Hours until decay reaches floor."""
-        if self.initial_grade <= self.floor:
-            return 0
-        return -math.log(self.floor / self.initial_grade) / self.lambda_rate
-    
-    def inherit(self, new_grade: float, now: float = None) -> 'DecayCurve':
-        """
-        New grader inherits decay curve.
-        New grade is bounded by current decayed value (can't inflate).
-        """
-        if now is None:
-            now = time.time()
-        current = self.current_value(now)
-        # New grade can't exceed current decayed value (no inflation via swap)
-        effective_grade = min(new_grade, current + 0.1)  # 0.1 grace for re-assessment
-        return DecayCurve(
-            initial_grade=effective_grade,
-            last_attestation_time=now,
-            lambda_rate=self.lambda_rate,
-            floor=self.floor
-        )
-    
-    def reset(self, new_grade: float, now: float = None) -> 'DecayCurve':
-        """Reset decay (GAMEABLE — not recommended)."""
-        if now is None:
-            now = time.time()
-        return DecayCurve(
-            initial_grade=new_grade,
-            last_attestation_time=now,
-            lambda_rate=self.lambda_rate,
-            floor=self.floor
-        )
-
-
-@dataclass
-class GraderState:
-    grader_id: str
-    status: str  # ACTIVE, REVOKED, SUSPENDED
-    grade_issued: float
-    attested_at: float
-
-
-@dataclass
-class AgentTrustState:
+class AgentTrustRecord:
     agent_id: str
-    current_grader: Optional[GraderState] = None
-    decay_curve: Optional[DecayCurve] = None
-    phase: RecoveryPhase = RecoveryPhase.ACTIVE
-    grader_history: list = field(default_factory=list)
-    receipts_during_swap: list = field(default_factory=list)
-    swap_count_this_year: int = 0
+    state: TrustState = TrustState.HEALTHY
+    grade: str = "B"
+    degraded_at: Optional[float] = None
+    suspended_at: Optional[float] = None
+    recovery_started_at: Optional[float] = None
+    recovery_phase: Optional[RecoveryPhase] = None
+    recovery_receipts: int = 0
+    grader_id: Optional[str] = None
+    grader_changed_at: Optional[float] = None
+    alleged_decay_start: Optional[float] = None  # When ALLEGED evidence began aging
+    delegation_depth: int = 0
+    probe_attempts: int = 0
+    last_probe_at: Optional[float] = None
 
 
-def soft_cascade_trigger(state: AgentTrustState, reason: str) -> AgentTrustState:
-    """Trigger SOFT_CASCADE when intermediate grader fails."""
-    state.phase = RecoveryPhase.DEGRADED
-    if state.current_grader:
-        state.current_grader.status = "REVOKED"
-        state.grader_history.append(state.current_grader)
-    return state
+@dataclass
+class RecoveryPlan:
+    agent_id: str
+    phases: list[dict]
+    estimated_days: float
+    grade_trajectory: list[str]
+    risk_factors: list[str]
 
 
-def begin_re_grading(state: AgentTrustState, new_grader_id: str, now: float = None) -> dict:
-    """Start re-grading window with new grader."""
-    if now is None:
-        now = time.time()
+def alleged_weight(t_elapsed_hours: float, lambda_: float = ALLEGED_DECAY_LAMBDA) -> float:
+    """
+    ALLEGED receipt weight decays exponentially.
     
-    # Anti-gaming check
-    if state.swap_count_this_year >= MAX_GRADER_SWAPS_PER_YEAR:
-        return {
-            "status": "REJECTED",
-            "reason": f"Max grader swaps ({MAX_GRADER_SWAPS_PER_YEAR}/year) exceeded",
-            "swap_count": state.swap_count_this_year
-        }
+    w = 0.5 * exp(-lambda * T)
+    At T=0: w=0.5 (starts at half weight — ALLEGED, not CONFIRMED)
+    At T=7h: w≈0.25 (halflife)
+    At T=24h: w≈0.045
     
-    state.phase = RecoveryPhase.RE_GRADING
-    state.swap_count_this_year += 1
-    
-    return {
-        "status": "RE_GRADING",
-        "new_grader": new_grader_id,
-        "window_hours": RE_GRADING_WINDOW_HOURS,
-        "receipts_valid_during_swap": RECEIPT_VALIDITY_DURING_SWAP,
-        "current_decayed_value": state.decay_curve.current_value(now) if state.decay_curve else 0,
-        "swap_count": state.swap_count_this_year
-    }
+    Lambda is SPEC_CONSTANT, NOT grader-defined.
+    """
+    return 0.5 * math.exp(-lambda_ * t_elapsed_hours)
 
 
-def complete_re_grading(state: AgentTrustState, new_grader_id: str, 
-                         new_grade: float, mode: str = INHERITANCE_MODE,
-                         now: float = None) -> dict:
-    """Complete re-grading and update trust state."""
-    if now is None:
-        now = time.time()
+def probe_timeout_ms(attempt: int) -> float:
+    """
+    Jacobson-Karels exponential backoff for probe timeouts.
     
-    old_value = state.decay_curve.current_value(now) if state.decay_curve else 0
+    RTO = initial * backoff^attempt
+    RFC 6298: RTO doubles on each retry.
+    """
+    return PROBE_TIMEOUT_INITIAL_MS * (PROBE_BACKOFF_FACTOR ** attempt)
+
+
+def co_grader_inherits_decay(record: AgentTrustRecord, new_grader_id: str, now: float) -> dict:
+    """
+    CO_GRADER inherits decay curve from previous grader.
     
-    if mode == "INHERIT":
-        new_curve = state.decay_curve.inherit(new_grade, now) if state.decay_curve else DecayCurve(new_grade, now)
+    Key insight (santaclawd): decay is evidence staleness, not grader state.
+    Resetting would let grader rotation launder stale evidence.
+    """
+    if record.alleged_decay_start:
+        elapsed_hours = (now - record.alleged_decay_start) / 3600
+        inherited_weight = alleged_weight(elapsed_hours)
     else:
-        new_curve = state.decay_curve.reset(new_grade, now) if state.decay_curve else DecayCurve(new_grade, now)
-    
-    effective_grade = new_curve.initial_grade
-    
-    state.current_grader = GraderState(
-        grader_id=new_grader_id,
-        status="ACTIVE",
-        grade_issued=effective_grade,
-        attested_at=now
-    )
-    state.decay_curve = new_curve
-    state.phase = RecoveryPhase.RECOVERED
-    
-    inflation_detected = new_grade > old_value + 0.15
+        elapsed_hours = 0
+        inherited_weight = 0.5
     
     return {
-        "status": "RECOVERED",
-        "old_decayed_value": round(old_value, 4),
-        "new_grade_requested": new_grade,
-        "effective_grade": round(effective_grade, 4),
-        "inflation_blocked": inflation_detected,
-        "mode": mode,
-        "grade_delta": round(effective_grade - old_value, 4)
+        "new_grader": new_grader_id,
+        "inherited_decay_start": record.alleged_decay_start,
+        "elapsed_hours": round(elapsed_hours, 2),
+        "inherited_weight": round(inherited_weight, 4),
+        "reset_prevented": True,
+        "reason": "decay tracks evidence staleness, not grader identity"
     }
+
+
+def delegation_double_decay(base_weight: float, delegation_depth: int) -> float:
+    """
+    ALLEGED + DELEGATION = compounding decay.
+    
+    Each delegation hop attenuates by 1 grade level.
+    Combined with time decay: double uncertainty.
+    """
+    hop_attenuation = max(0, 1.0 - (delegation_depth * 0.25))
+    return base_weight * hop_attenuation
+
+
+def transition_state(record: AgentTrustRecord, now: float) -> dict:
+    """Evaluate and transition trust state."""
+    actions = []
+    
+    if record.state == TrustState.HEALTHY:
+        return {"state": "HEALTHY", "actions": [], "next_check": "on_event"}
+    
+    if record.state == TrustState.DEGRADED:
+        if record.degraded_at:
+            elapsed_hours = (now - record.degraded_at) / 3600
+            remaining_hours = GRACE_PERIOD_HOURS - elapsed_hours
+            
+            if remaining_hours <= 0:
+                record.state = TrustState.SUSPENDED
+                record.suspended_at = now
+                actions.append("GRACE_EXPIRED → SUSPENDED")
+                actions.append("No new receipts accepted")
+                actions.append("Challenge window OPEN (72h)")
+            else:
+                actions.append(f"DEGRADED: {remaining_hours:.1f}h remaining in grace")
+                actions.append("Receipts accepted at DEGRADED weight")
+    
+    if record.state == TrustState.SUSPENDED:
+        actions.append("SUSPENDED: awaiting RE_ATTESTATION_REQUEST or REVOCATION")
+        actions.append("No new receipts")
+        actions.append("Existing receipts retain original grade")
+    
+    if record.state == TrustState.RECOVERY:
+        if record.recovery_phase == RecoveryPhase.PROBE:
+            rto = probe_timeout_ms(record.probe_attempts)
+            actions.append(f"PROBE phase: attempt {record.probe_attempts}, timeout {rto:.0f}ms")
+            if record.probe_attempts >= PROBE_MAX_RETRIES:
+                actions.append("PROBE_FAILED → candidate for REVOCATION")
+        
+        elif record.recovery_phase == RecoveryPhase.RE_ATTEST:
+            actions.append("RE_ATTEST: fresh attestation from independent grader required")
+        
+        elif record.recovery_phase == RecoveryPhase.OBSERVATION:
+            if record.recovery_started_at:
+                obs_days = (now - record.recovery_started_at) / 86400
+                actions.append(f"OBSERVATION: {record.recovery_receipts}/{MIN_RECOVERY_RECEIPTS} receipts, "
+                             f"{obs_days:.1f}/{RECOVERY_OBSERVATION_DAYS}d elapsed")
+                
+                if (record.recovery_receipts >= MIN_RECOVERY_RECEIPTS and 
+                    obs_days >= RECOVERY_OBSERVATION_DAYS):
+                    record.state = TrustState.RECOVERED
+                    record.recovery_phase = RecoveryPhase.GRADUATED
+                    actions.append("GRADUATED → RECOVERED")
+    
+    return {
+        "state": record.state.value,
+        "phase": record.recovery_phase.value if record.recovery_phase else None,
+        "actions": actions
+    }
+
+
+def build_recovery_plan(record: AgentTrustRecord) -> RecoveryPlan:
+    """Build phased recovery plan."""
+    phases = [
+        {
+            "phase": "PROBE",
+            "duration_hours": 1,
+            "description": "Liveness verification via Jacobson-Karels SRTT",
+            "success_criteria": "Response within RTO",
+            "max_retries": PROBE_MAX_RETRIES
+        },
+        {
+            "phase": "RE_ATTEST",
+            "duration_hours": 24,
+            "description": "Fresh attestation from independent grader",
+            "success_criteria": "New grader (different operator) issues grade",
+            "requirement": "Grader MUST NOT share operator with agent"
+        },
+        {
+            "phase": "OBSERVATION",
+            "duration_days": RECOVERY_OBSERVATION_DAYS,
+            "description": f"Behavioral monitoring: {MIN_RECOVERY_RECEIPTS}+ receipts",
+            "success_criteria": f"{MIN_RECOVERY_RECEIPTS} receipts over {RECOVERY_OBSERVATION_DAYS}d",
+            "grade_ceiling": "B"  # Cannot return to A immediately
+        },
+        {
+            "phase": "GRADUATED",
+            "description": "Full trust restored. Grade ceiling removed after 30d clean.",
+            "grade_ceiling_removed_after_days": 30
+        }
+    ]
+    
+    risk_factors = []
+    if record.delegation_depth > 0:
+        risk_factors.append(f"Delegation depth {record.delegation_depth}: double-decay applies")
+    if record.alleged_decay_start:
+        elapsed = (time.time() - record.alleged_decay_start) / 3600
+        if elapsed > 24:
+            risk_factors.append(f"ALLEGED evidence {elapsed:.0f}h old: weight={alleged_weight(elapsed):.4f}")
+    
+    grade_trajectory = ["SUSPENDED", "D", "C", "B", "B→A after 30d"]
+    
+    return RecoveryPlan(
+        agent_id=record.agent_id,
+        phases=phases,
+        estimated_days=RECOVERY_OBSERVATION_DAYS + 2,  # probe + re-attest + observation
+        grade_trajectory=grade_trajectory,
+        risk_factors=risk_factors
+    )
 
 
 # === Scenarios ===
 
-def scenario_graceful_handoff():
-    """Planned grader swap — no degradation."""
-    print("=== Scenario: Graceful Grader Handoff ===")
+def scenario_graceful_recovery():
+    """Normal SOFT_CASCADE: DEGRADED → SUSPENDED → RECOVERY → RECOVERED."""
+    print("=== Scenario: Graceful SOFT_CASCADE Recovery ===")
     now = time.time()
     
-    state = AgentTrustState(
-        agent_id="kit_fox",
-        current_grader=GraderState("grader_A", "ACTIVE", 0.92, now - 3600*24*10),
-        decay_curve=DecayCurve(0.92, now - 3600*24*10),
-        phase=RecoveryPhase.ACTIVE
+    record = AgentTrustRecord(
+        agent_id="recovering_agent",
+        state=TrustState.DEGRADED,
+        grade="B",
+        degraded_at=now - 3600 * 80,  # 80h ago (past grace)
+        grader_id="old_grader"
     )
     
-    current = state.decay_curve.current_value(now)
-    print(f"  Current trust: {current:.4f} (decayed from 0.92 over 10 days)")
+    # Transition: should move to SUSPENDED
+    result = transition_state(record, now)
+    print(f"  State: {result['state']}")
+    for a in result['actions']:
+        print(f"    → {a}")
     
-    # Begin re-grading
-    result = begin_re_grading(state, "grader_B", now)
-    print(f"  Re-grading: {result['status']}, window: {result['window_hours']}h")
+    # Start recovery
+    record.state = TrustState.RECOVERY
+    record.recovery_phase = RecoveryPhase.PROBE
+    record.recovery_started_at = now
     
-    # Complete with INHERIT
-    completion = complete_re_grading(state, "grader_B", 0.88, "INHERIT", now)
-    print(f"  Completed: effective={completion['effective_grade']}, delta={completion['grade_delta']}")
-    print(f"  Inflation blocked: {completion['inflation_blocked']}")
+    # Probe succeeds
+    print(f"  Probe timeout: {probe_timeout_ms(0):.0f}ms (attempt 0)")
+    print(f"  Probe timeout: {probe_timeout_ms(1):.0f}ms (attempt 1)")
+    
+    # Build recovery plan
+    plan = build_recovery_plan(record)
+    print(f"  Recovery plan: {plan.estimated_days:.0f} days")
+    print(f"  Grade trajectory: {' → '.join(plan.grade_trajectory)}")
     print()
 
 
-def scenario_soft_cascade_recovery():
-    """Grader revoked — SOFT_CASCADE with recovery."""
-    print("=== Scenario: SOFT_CASCADE Recovery ===")
-    now = time.time()
+def scenario_alleged_decay_curve():
+    """ALLEGED receipt weight decay over time."""
+    print("=== Scenario: ALLEGED Weight Decay ===")
+    hours = [0, 1, 3, 7, 12, 24, 48, 72]
+    for h in hours:
+        w = alleged_weight(h)
+        dw = delegation_double_decay(w, 2)  # 2-hop delegation
+        print(f"  T+{h:2d}h: weight={w:.4f}  with 2-hop delegation={dw:.4f}")
     
-    state = AgentTrustState(
-        agent_id="honest_agent",
-        current_grader=GraderState("grader_compromised", "ACTIVE", 0.85, now - 3600*48),
-        decay_curve=DecayCurve(0.85, now - 3600*48),
-        phase=RecoveryPhase.ACTIVE
-    )
-    
-    print(f"  Pre-cascade trust: {state.decay_curve.current_value(now):.4f}")
-    
-    # Grader gets revoked
-    state = soft_cascade_trigger(state, "audit_failure")
-    print(f"  Phase: {state.phase.value}")
-    
-    # Begin re-grading with new grader
-    result = begin_re_grading(state, "grader_replacement", now)
-    print(f"  Re-grading started: {result['status']}")
-    print(f"  Receipts valid during swap: {result['receipts_valid_during_swap']}")
-    
-    # Complete with INHERIT (decay inherited)
-    completion = complete_re_grading(state, "grader_replacement", 0.90, "INHERIT", now)
-    print(f"  Recovery: effective={completion['effective_grade']}")
-    print(f"  Requested 0.90 but got {completion['effective_grade']} (bounded by decay)")
-    print(f"  Inflation blocked: {completion['inflation_blocked']}")
+    print(f"\n  Halflife: ~{math.log(2) / ALLEGED_DECAY_LAMBDA:.1f}h")
+    print(f"  At 24h: weight={alleged_weight(24):.4f} (< 5% — effectively expired)")
     print()
 
 
-def scenario_inherit_vs_reset():
-    """Compare INHERIT vs RESET — RESET is gameable."""
-    print("=== Scenario: INHERIT vs RESET (Gaming Detection) ===")
+def scenario_co_grader_inheritance():
+    """CO_GRADER inherits decay, doesn't reset."""
+    print("=== Scenario: CO_GRADER Inherits Decay ===")
     now = time.time()
     
-    # Agent has been decaying for 30 days
-    state_inherit = AgentTrustState(
-        agent_id="agent_inherit",
-        decay_curve=DecayCurve(0.80, now - 3600*24*30),
-    )
-    state_reset = AgentTrustState(
-        agent_id="agent_reset",
-        decay_curve=DecayCurve(0.80, now - 3600*24*30),
+    record = AgentTrustRecord(
+        agent_id="test_agent",
+        state=TrustState.DEGRADED,
+        grade="C",
+        grader_id="grader_A",
+        alleged_decay_start=now - 3600 * 12  # 12h of decay
     )
     
-    current = state_inherit.decay_curve.current_value(now)
-    print(f"  Current decayed trust (30 days): {current:.4f}")
-    
-    # Both get new grader assigning 0.90
-    inherit_result = complete_re_grading(state_inherit, "new_grader", 0.90, "INHERIT", now)
-    reset_result = complete_re_grading(state_reset, "new_grader", 0.90, "RESET", now)
-    
-    print(f"  INHERIT: effective={inherit_result['effective_grade']} (bounded)")
-    print(f"  RESET:   effective={reset_result['effective_grade']} (unbounded = gameable!)")
-    print(f"  Gap: {reset_result['effective_grade'] - inherit_result['effective_grade']:.4f}")
-    print(f"  INHERIT blocks grade inflation via grader shopping")
+    # New grader takes over
+    inheritance = co_grader_inherits_decay(record, "grader_B", now)
+    print(f"  Previous grader: grader_A")
+    print(f"  New grader: {inheritance['new_grader']}")
+    print(f"  Elapsed: {inheritance['elapsed_hours']}h")
+    print(f"  Inherited weight: {inheritance['inherited_weight']}")
+    print(f"  Reset prevented: {inheritance['reset_prevented']}")
+    print(f"  Reason: {inheritance['reason']}")
     print()
 
 
-def scenario_anti_gaming_swap_limit():
-    """Agent tries to swap graders repeatedly — limit hit."""
-    print("=== Scenario: Anti-Gaming — Swap Limit ===")
-    now = time.time()
-    
-    state = AgentTrustState(
-        agent_id="grader_shopper",
-        decay_curve=DecayCurve(0.50, now),
-        swap_count_this_year=3  # Already swapped 3 times
-    )
-    
-    # Try 4th swap
-    result = begin_re_grading(state, "grader_4", now)
-    print(f"  Swap attempt #4: {result['status']}")
-    
-    # Try 5th swap (over limit)
-    state.swap_count_this_year = 4
-    result = begin_re_grading(state, "grader_5", now)
-    print(f"  Swap attempt #5: {result['status']} — {result.get('reason', '')}")
+def scenario_probe_backoff():
+    """Jacobson-Karels exponential backoff for probes."""
+    print("=== Scenario: Probe Backoff (RFC 6298) ===")
+    for i in range(PROBE_MAX_RETRIES + 1):
+        rto = probe_timeout_ms(i)
+        print(f"  Attempt {i}: RTO = {rto:.0f}ms ({rto/1000:.1f}s)")
+    print(f"\n  Max retries: {PROBE_MAX_RETRIES}")
+    print(f"  Total worst-case: {sum(probe_timeout_ms(i) for i in range(PROBE_MAX_RETRIES+1))/1000:.1f}s")
     print()
 
 
-def scenario_decay_curve_evolution():
-    """Show decay curve over time with grader swap."""
-    print("=== Scenario: Decay Curve Evolution ===")
-    now = time.time()
-    
-    curve = DecayCurve(0.92, now)
-    
-    print(f"  t=0h:   {curve.current_value(now):.4f}")
-    print(f"  t=12h:  {curve.current_value(now + 3600*12):.4f}")
-    print(f"  t=24h:  {curve.current_value(now + 3600*24):.4f}")
-    print(f"  t=48h:  {curve.current_value(now + 3600*48):.4f}")
-    print(f"  t=72h:  {curve.current_value(now + 3600*72):.4f}")
-    print(f"  Floor reached at: {curve.time_to_floor():.1f}h")
-    
-    # Grader swap at t=48h with INHERIT
-    new_curve = curve.inherit(0.88, now + 3600*48)
-    print(f"\n  Grader swap at t=48h (requested 0.88):")
-    print(f"  Effective: {new_curve.initial_grade:.4f} (bounded by decay + 0.1 grace)")
-    print(f"  t=48h+12h: {new_curve.current_value(now + 3600*60):.4f}")
-    print(f"  t=48h+24h: {new_curve.current_value(now + 3600*72):.4f}")
+def scenario_delegation_double_decay():
+    """ALLEGED + DELEGATION = compounding uncertainty."""
+    print("=== Scenario: Double Decay (ALLEGED × DELEGATION) ===")
+    for depth in range(MAX_DELEGATION_DEPTH + 1):
+        w_fresh = delegation_double_decay(alleged_weight(0), depth)
+        w_12h = delegation_double_decay(alleged_weight(12), depth)
+        w_24h = delegation_double_decay(alleged_weight(24), depth)
+        print(f"  Depth {depth}: fresh={w_fresh:.4f}  12h={w_12h:.4f}  24h={w_24h:.4f}")
+    print(f"\n  Key: depth 3 + 24h = {delegation_double_decay(alleged_weight(24), 3):.6f} (negligible)")
     print()
 
 
 if __name__ == "__main__":
-    print("SOFT_CASCADE Recovery — Grader Transition Semantics for ATF")
-    print("Per santaclawd + RFC 2988 (Jacobson-Karels SRTT)")
+    print("SOFT_CASCADE Recovery — ATF V1.1 Trust State Machine")
+    print("Per santaclawd: four primitives + SOFT_CASCADE = complete surface")
     print("=" * 70)
     print()
-    print("Key principle: decay = evidence staleness, not grader state.")
-    print("New grader INHERITS decay curve. RESET = gameable.")
-    print()
     
-    scenario_graceful_handoff()
-    scenario_soft_cascade_recovery()
-    scenario_inherit_vs_reset()
-    scenario_anti_gaming_swap_limit()
-    scenario_decay_curve_evolution()
+    scenario_graceful_recovery()
+    scenario_alleged_decay_curve()
+    scenario_co_grader_inheritance()
+    scenario_probe_backoff()
+    scenario_delegation_double_decay()
     
     print("=" * 70)
     print("KEY INSIGHTS:")
-    print("1. INHERIT not RESET — decay is evidence staleness, grader swap is authority change")
-    print("2. Anti-gaming: max 4 swaps/year, new grade bounded by current decay + 0.1 grace")
-    print("3. Receipts VALID during re-grading window (72h) — continuity > precision")
-    print("4. SOFT_CASCADE ≠ failure. It's planned degradation with recovery path.")
+    print("1. Lambda = SPEC_CONSTANT (0.1). Graders don't set their own decay rate.")
+    print("2. CO_GRADER inherits decay. Reset = evidence laundering.")
+    print("3. ALLEGED+DELEGATION = compounding uncertainty. Double-decay by design.")
+    print("4. Recovery is graduated: PROBE → RE_ATTEST → OBSERVATION → GRADUATED.")
+    print("5. Grade ceiling B during recovery. A requires 30d clean post-graduation.")
