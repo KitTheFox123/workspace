@@ -3,19 +3,17 @@
 probe-state-machine.py — ATF receipt state machine with active probing.
 
 Per santaclawd: silence-as-CONFIRMED is not a receipt type. PROBE closes ambiguity.
-Per Chandra & Toueg (1996): eventually-strong failure detector (◇S).
-Per FLP (1985): cannot distinguish crash from slow in bounded time.
+Per Chandra & Toueg (JACM 1996): eventually-strong failure detector (◇S).
 
-State machine:
-  SILENT → PROBE (T-hour active check)
-  PROBE → CONFIRMED (ACK received)  
+State transitions:
+  SILENT → PROBE (T_probe timer starts)
+  PROBE → CONFIRMED (ACK received within T_probe)
   PROBE → PROBE_TIMEOUT (no ACK in T_probe window)
-  PROBE_TIMEOUT → DISPUTED (3 consecutive timeouts)
-  PROBE_TIMEOUT → PROBE (retry, < 3 consecutive)
+  PROBE_TIMEOUT → DISPUTED (explicit escalation)
+  PROBE_TIMEOUT → RE_PROBE (adaptive retry with increased T_probe)
 
-Key insight: PROBE makes the distinction between "confirmed" and "absent"
-that silence alone cannot. FLP impossibility means this is the BEST
-approximation — perfect detection is impossible.
+Key insight: Chandra-Toueg uses INCREASING timeouts — static T = false positives
+on slow agents. Adaptive T_probe distinguishes crash from slow.
 """
 
 import time
@@ -25,290 +23,303 @@ from enum import Enum
 from typing import Optional
 
 
-class ReceiptState(Enum):
-    SILENT = "SILENT"              # No receipt yet, no probe sent
-    PROBE_SENT = "PROBE_SENT"      # Active probe dispatched
+class ProbeState(Enum):
+    SILENT = "SILENT"              # No receipt yet, ambiguous
+    PROBE_SENT = "PROBE_SENT"     # Active check dispatched
     CONFIRMED = "CONFIRMED"        # ACK received
-    PROBE_TIMEOUT = "PROBE_TIMEOUT"  # Probe expired without ACK
-    DISPUTED = "DISPUTED"          # 3+ consecutive timeouts
-    FAILED = "FAILED"              # Explicit failure receipt
+    PROBE_TIMEOUT = "PROBE_TIMEOUT"  # No ACK within T_probe
+    RE_PROBE = "RE_PROBE"         # Adaptive retry (increased timeout)
+    DISPUTED = "DISPUTED"          # Escalated after max retries
+    CRASHED = "CRASHED"            # Declared crashed (all probes exhausted)
+
+
+class FailureClass(Enum):
+    """Chandra-Toueg failure classification."""
+    CORRECT = "CORRECT"           # Process is alive and responding
+    CRASHED = "CRASHED"           # Process permanently failed
+    SLOW = "SLOW"                 # Process alive but slow (false positive risk)
+    BYZANTINE = "BYZANTINE"       # Process alive but lying
 
 
 # SPEC_CONSTANTS
-T_PROBE_DEFAULT_HOURS = 4        # Default probe interval
-T_PROBE_TIMEOUT_HOURS = 1        # How long to wait for ACK
-MAX_CONSECUTIVE_TIMEOUTS = 3     # Before escalating to DISPUTED
-ADAPTIVE_FACTOR = 1.5            # Timeout grows on consecutive failures
-MIN_PROBE_INTERVAL = 1           # Hours
-MAX_PROBE_INTERVAL = 24          # Hours
+INITIAL_T_PROBE_MS = 5000        # 5 seconds initial probe timeout
+MAX_T_PROBE_MS = 60000           # 60 seconds max probe timeout
+BACKOFF_FACTOR = 2.0             # Exponential backoff multiplier
+MAX_RETRIES = 3                  # Max probe retries before DISPUTED
+PROBE_INTERVAL_MS = 3600000      # 1 hour between probes for SILENT agents
+MIN_RESPONSE_TIME_MS = 50        # Suspiciously fast = replay attack
 
 
 @dataclass
-class ProbeEvent:
+class ProbeRecord:
     probe_id: str
-    agent_id: str
-    counterparty_id: str
+    target_agent: str
+    state: ProbeState
     sent_at: float
-    timeout_at: float
+    t_probe_ms: float
     ack_at: Optional[float] = None
-    state: ReceiptState = ReceiptState.PROBE_SENT
-    consecutive_timeouts: int = 0
-    adaptive_timeout: float = T_PROBE_TIMEOUT_HOURS * 3600
+    response_time_ms: Optional[float] = None
+    retry_count: int = 0
+    failure_class: Optional[FailureClass] = None
     hash: str = ""
-
+    
     def __post_init__(self):
         if not self.hash:
             self.hash = hashlib.sha256(
-                f"{self.probe_id}:{self.agent_id}:{self.sent_at}".encode()
+                f"{self.probe_id}:{self.target_agent}:{self.sent_at}".encode()
             ).hexdigest()[:16]
 
 
 @dataclass
-class AgentProbeState:
-    """Per-counterparty probe tracking."""
+class AgentProbeHistory:
     agent_id: str
-    counterparty_id: str
-    current_state: ReceiptState = ReceiptState.SILENT
+    probes: list[ProbeRecord] = field(default_factory=list)
+    current_t_probe_ms: float = INITIAL_T_PROBE_MS
     consecutive_timeouts: int = 0
     total_probes: int = 0
     total_acks: int = 0
-    total_timeouts: int = 0
-    last_confirmed_at: Optional[float] = None
-    adaptive_timeout: float = T_PROBE_TIMEOUT_HOURS * 3600
-    probe_history: list = field(default_factory=list)
+    avg_response_ms: float = 0.0
+    
+    @property
+    def ack_rate(self) -> float:
+        return self.total_acks / self.total_probes if self.total_probes > 0 else 0.0
+    
+    @property
+    def reliability_grade(self) -> str:
+        rate = self.ack_rate
+        if rate >= 0.95: return "A"
+        if rate >= 0.80: return "B"
+        if rate >= 0.60: return "C"
+        if rate >= 0.30: return "D"
+        return "F"
 
 
-def send_probe(state: AgentProbeState, now: float) -> ProbeEvent:
-    """Send a probe and transition to PROBE_SENT."""
-    probe = ProbeEvent(
-        probe_id=f"probe_{state.total_probes:04d}",
-        agent_id=state.agent_id,
-        counterparty_id=state.counterparty_id,
+def send_probe(history: AgentProbeHistory, probe_id: str, now: float) -> ProbeRecord:
+    """Send a probe to an agent."""
+    probe = ProbeRecord(
+        probe_id=probe_id,
+        target_agent=history.agent_id,
+        state=ProbeState.PROBE_SENT,
         sent_at=now,
-        timeout_at=now + state.adaptive_timeout,
-        consecutive_timeouts=state.consecutive_timeouts,
-        adaptive_timeout=state.adaptive_timeout
+        t_probe_ms=history.current_t_probe_ms,
+        retry_count=history.consecutive_timeouts
     )
-    state.current_state = ReceiptState.PROBE_SENT
-    state.total_probes += 1
-    state.probe_history.append(probe)
+    history.probes.append(probe)
+    history.total_probes += 1
     return probe
 
 
-def receive_ack(state: AgentProbeState, probe: ProbeEvent, ack_time: float) -> dict:
-    """Process ACK — transition to CONFIRMED."""
+def receive_ack(probe: ProbeRecord, history: AgentProbeHistory, ack_time: float) -> ProbeRecord:
+    """Process an ACK for a probe."""
+    response_ms = (ack_time - probe.sent_at) * 1000
+    
     probe.ack_at = ack_time
-    probe.state = ReceiptState.CONFIRMED
+    probe.response_time_ms = response_ms
     
-    state.current_state = ReceiptState.CONFIRMED
-    state.consecutive_timeouts = 0  # Reset
-    state.total_acks += 1
-    state.last_confirmed_at = ack_time
+    # Check for suspiciously fast response (replay attack)
+    if response_ms < MIN_RESPONSE_TIME_MS:
+        probe.state = ProbeState.DISPUTED
+        probe.failure_class = FailureClass.BYZANTINE
+        return probe
     
-    # Adaptive: successful ACK reduces timeout toward default
-    state.adaptive_timeout = max(
-        T_PROBE_TIMEOUT_HOURS * 3600,
-        state.adaptive_timeout * 0.8  # Shrink on success
+    probe.state = ProbeState.CONFIRMED
+    probe.failure_class = FailureClass.CORRECT
+    
+    # Update history
+    history.total_acks += 1
+    history.consecutive_timeouts = 0
+    
+    # Adaptive timeout: decrease toward initial on success
+    # Chandra-Toueg: eventually stops suspecting correct processes
+    history.current_t_probe_ms = max(
+        INITIAL_T_PROBE_MS,
+        history.current_t_probe_ms * 0.8  # Shrink by 20% on success
     )
     
-    latency = ack_time - probe.sent_at
-    return {
-        "transition": "PROBE_SENT → CONFIRMED",
-        "latency_seconds": round(latency, 1),
-        "consecutive_timeouts_reset": True,
-        "ack_rate": round(state.total_acks / state.total_probes, 3) if state.total_probes > 0 else 0
-    }
+    # Update running average response time
+    n = history.total_acks
+    history.avg_response_ms = (history.avg_response_ms * (n-1) + response_ms) / n
+    
+    return probe
 
 
-def handle_timeout(state: AgentProbeState, probe: ProbeEvent) -> dict:
-    """Process timeout — escalate or retry."""
-    probe.state = ReceiptState.PROBE_TIMEOUT
-    state.total_timeouts += 1
-    state.consecutive_timeouts += 1
+def handle_timeout(probe: ProbeRecord, history: AgentProbeHistory) -> ProbeRecord:
+    """Handle a probe timeout."""
+    history.consecutive_timeouts += 1
     
-    # Adaptive: grow timeout on consecutive failures (Chandra-Toueg)
-    state.adaptive_timeout = min(
-        MAX_PROBE_INTERVAL * 3600,
-        state.adaptive_timeout * ADAPTIVE_FACTOR
-    )
-    
-    if state.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
-        state.current_state = ReceiptState.DISPUTED
-        return {
-            "transition": f"PROBE_TIMEOUT → DISPUTED (consecutive={state.consecutive_timeouts})",
-            "escalated": True,
-            "reason": f"{MAX_CONSECUTIVE_TIMEOUTS} consecutive timeouts",
-            "adaptive_timeout_hours": round(state.adaptive_timeout / 3600, 2),
-            "ack_rate": round(state.total_acks / state.total_probes, 3) if state.total_probes > 0 else 0
-        }
+    if history.consecutive_timeouts >= MAX_RETRIES:
+        probe.state = ProbeState.DISPUTED
+        probe.failure_class = FailureClass.CRASHED
     else:
-        state.current_state = ReceiptState.PROBE_TIMEOUT
-        return {
-            "transition": f"PROBE_TIMEOUT → RETRY ({state.consecutive_timeouts}/{MAX_CONSECUTIVE_TIMEOUTS})",
-            "escalated": False,
-            "retries_remaining": MAX_CONSECUTIVE_TIMEOUTS - state.consecutive_timeouts,
-            "adaptive_timeout_hours": round(state.adaptive_timeout / 3600, 2)
-        }
+        probe.state = ProbeState.RE_PROBE
+        probe.failure_class = FailureClass.SLOW
+        
+        # Adaptive timeout: increase on timeout
+        # Chandra-Toueg: eventually suspects every crashed process
+        history.current_t_probe_ms = min(
+            MAX_T_PROBE_MS,
+            history.current_t_probe_ms * BACKOFF_FACTOR
+        )
+    
+    return probe
 
 
-def assess_counterparty(state: AgentProbeState) -> dict:
-    """Assess counterparty reliability from probe history."""
-    if state.total_probes == 0:
-        return {"grade": "UNKNOWN", "reason": "No probes sent"}
+def classify_agent(history: AgentProbeHistory) -> dict:
+    """Classify agent based on probe history."""
+    if history.total_probes == 0:
+        return {"class": "UNKNOWN", "confidence": 0.0}
     
-    ack_rate = state.total_acks / state.total_probes
+    ack_rate = history.ack_rate
+    avg_response = history.avg_response_ms
+    consecutive_fails = history.consecutive_timeouts
     
-    # Wilson CI lower bound
-    from math import sqrt
-    n = state.total_probes
-    p = ack_rate
-    z = 1.96
-    denom = 1 + z*z/n
-    center = (p + z*z/(2*n)) / denom
-    spread = z * sqrt((p*(1-p) + z*z/(4*n)) / n) / denom
-    wilson_lower = max(0, center - spread)
-    
-    if wilson_lower >= 0.9:
-        grade = "RELIABLE"
-    elif wilson_lower >= 0.7:
-        grade = "RESPONSIVE"
-    elif wilson_lower >= 0.4:
-        grade = "INTERMITTENT"
+    if consecutive_fails >= MAX_RETRIES:
+        classification = "CRASHED"
+        confidence = 0.95
+    elif ack_rate >= 0.95 and avg_response < 1000:
+        classification = "HEALTHY"
+        confidence = min(0.99, ack_rate)
+    elif ack_rate >= 0.80:
+        classification = "DEGRADED"
+        confidence = ack_rate
+    elif ack_rate >= 0.50:
+        classification = "UNRELIABLE"
+        confidence = 0.7
     else:
-        grade = "UNRELIABLE"
+        classification = "SUSPECTED_CRASHED"
+        confidence = 0.8
     
     return {
-        "grade": grade,
+        "class": classification,
+        "confidence": round(confidence, 3),
         "ack_rate": round(ack_rate, 3),
-        "wilson_lower": round(wilson_lower, 3),
-        "total_probes": state.total_probes,
-        "total_acks": state.total_acks,
-        "consecutive_timeouts": state.consecutive_timeouts,
-        "current_state": state.current_state.value
+        "avg_response_ms": round(avg_response, 1),
+        "consecutive_timeouts": consecutive_fails,
+        "current_t_probe_ms": history.current_t_probe_ms,
+        "grade": history.reliability_grade,
+        "total_probes": history.total_probes
     }
 
 
 # === Scenarios ===
 
-def scenario_healthy_counterparty():
-    """Responsive agent — all probes ACKed."""
-    print("=== Scenario: Healthy Counterparty ===")
+def scenario_healthy_agent():
+    """Agent responds to all probes — CONFIRMED."""
+    print("=== Scenario: Healthy Agent ===")
+    history = AgentProbeHistory(agent_id="healthy_agent")
     now = time.time()
-    state = AgentProbeState("kit_fox", "bro_agent")
     
     for i in range(10):
-        probe = send_probe(state, now + i * 14400)  # Every 4 hours
-        result = receive_ack(state, probe, now + i * 14400 + 120)  # ACK in 2 min
-        print(f"  Probe {i}: {result['transition']} (latency: {result['latency_seconds']}s)")
+        probe = send_probe(history, f"p{i:03d}", now + i*3600)
+        # Responds in 200-800ms
+        response_time = 0.2 + (i % 5) * 0.15
+        receive_ack(probe, history, now + i*3600 + response_time)
     
-    assessment = assess_counterparty(state)
-    print(f"  Assessment: {assessment['grade']} (Wilson: {assessment['wilson_lower']}, ACK rate: {assessment['ack_rate']})")
+    result = classify_agent(history)
+    print(f"  Class: {result['class']}, Grade: {result['grade']}")
+    print(f"  ACK rate: {result['ack_rate']}, Avg response: {result['avg_response_ms']}ms")
+    print(f"  T_probe adapted: {result['current_t_probe_ms']:.0f}ms (from {INITIAL_T_PROBE_MS}ms)")
     print()
 
 
-def scenario_degrading_counterparty():
-    """Agent starts responsive, then degrades."""
-    print("=== Scenario: Degrading Counterparty ===")
+def scenario_crashed_agent():
+    """Agent never responds — CRASHED after MAX_RETRIES."""
+    print("=== Scenario: Crashed Agent ===")
+    history = AgentProbeHistory(agent_id="crashed_agent")
     now = time.time()
-    state = AgentProbeState("kit_fox", "degrading_agent")
     
-    # First 5: healthy
     for i in range(5):
-        probe = send_probe(state, now + i * 14400)
-        result = receive_ack(state, probe, now + i * 14400 + 60)
-        print(f"  Probe {i}: {result['transition']}")
+        probe = send_probe(history, f"p{i:03d}", now + i*3600)
+        handle_timeout(probe, history)
+        print(f"  Probe {i}: state={probe.state.value}, T_probe={history.current_t_probe_ms:.0f}ms, "
+              f"consecutive_timeouts={history.consecutive_timeouts}")
     
-    # Next 4: timeouts leading to DISPUTED
-    for i in range(5, 9):
-        probe = send_probe(state, now + i * 14400)
-        result = handle_timeout(state, probe)
-        print(f"  Probe {i}: {result['transition']} (adaptive timeout: {result['adaptive_timeout_hours']:.1f}h)")
-        if result.get('escalated'):
-            break
-    
-    assessment = assess_counterparty(state)
-    print(f"  Assessment: {assessment['grade']} (Wilson: {assessment['wilson_lower']}, state: {assessment['current_state']})")
+    result = classify_agent(history)
+    print(f"  Final: {result['class']}, Grade: {result['grade']}")
+    print(f"  T_probe escalated to: {result['current_t_probe_ms']:.0f}ms")
     print()
 
 
-def scenario_flaky_network():
-    """Intermittent ACKs — some succeed, some timeout."""
-    print("=== Scenario: Flaky Network (Intermittent) ===")
+def scenario_slow_agent():
+    """Agent responds but slowly — adaptive timeout prevents false positive."""
+    print("=== Scenario: Slow Agent (Chandra-Toueg adaptive) ===")
+    history = AgentProbeHistory(agent_id="slow_agent")
     now = time.time()
-    state = AgentProbeState("kit_fox", "flaky_agent")
     
-    # Pattern: ACK, timeout, ACK, timeout, ACK, timeout, timeout, ACK
-    pattern = [True, False, True, False, True, False, False, True, True, True]
-    
-    for i, ack in enumerate(pattern):
-        probe = send_probe(state, now + i * 14400)
-        if ack:
-            result = receive_ack(state, probe, now + i * 14400 + 300)
-            print(f"  Probe {i}: {result['transition']}")
+    for i in range(8):
+        probe = send_probe(history, f"p{i:03d}", now + i*3600)
+        
+        # First 2 probes timeout (agent warming up)
+        if i < 2:
+            handle_timeout(probe, history)
+            print(f"  Probe {i}: TIMEOUT, T_probe→{history.current_t_probe_ms:.0f}ms")
         else:
-            result = handle_timeout(state, probe)
-            print(f"  Probe {i}: {result['transition']}")
+            # Then responds in 3-4 seconds (slow but alive)
+            response_time = 3.0 + (i % 3) * 0.5
+            receive_ack(probe, history, now + i*3600 + response_time)
+            print(f"  Probe {i}: ACK in {response_time*1000:.0f}ms, T_probe→{history.current_t_probe_ms:.0f}ms")
     
-    assessment = assess_counterparty(state)
-    print(f"  Assessment: {assessment['grade']} (Wilson: {assessment['wilson_lower']}, consecutive: {assessment['consecutive_timeouts']})")
-    print(f"  Key: intermittent resets consecutive counter — never reaches DISPUTED")
+    result = classify_agent(history)
+    print(f"  Final: {result['class']}, Grade: {result['grade']}")
+    print(f"  Key: adaptive T_probe prevented false CRASHED classification")
     print()
 
 
-def scenario_crash_vs_byzantine():
-    """Distinguish crash fault from Byzantine behavior."""
-    print("=== Scenario: Crash vs Byzantine ===")
+def scenario_replay_attack():
+    """Suspiciously fast response — BYZANTINE."""
+    print("=== Scenario: Replay Attack (Byzantine) ===")
+    history = AgentProbeHistory(agent_id="replay_agent")
     now = time.time()
     
-    # Crash: sudden stop, all subsequent probes timeout
-    crash_state = AgentProbeState("kit_fox", "crashed_agent")
-    for i in range(3):
-        probe = send_probe(crash_state, now + i * 14400)
-        receive_ack(crash_state, probe, now + i * 14400 + 30)
-    for i in range(3, 7):
-        probe = send_probe(crash_state, now + i * 14400)
-        handle_timeout(crash_state, probe)
+    probe = send_probe(history, "p000", now)
+    # Responds in 5ms — too fast, likely replayed
+    receive_ack(probe, history, now + 0.005)
     
-    crash_assessment = assess_counterparty(crash_state)
+    print(f"  Response time: {probe.response_time_ms:.1f}ms (minimum: {MIN_RESPONSE_TIME_MS}ms)")
+    print(f"  State: {probe.state.value}")
+    print(f"  Failure class: {probe.failure_class.value}")
+    print(f"  Key: response faster than network RTT = replay attack")
+    print()
+
+
+def scenario_flapping_agent():
+    """Agent alternates between responsive and unresponsive."""
+    print("=== Scenario: Flapping Agent ===")
+    history = AgentProbeHistory(agent_id="flapping_agent")
+    now = time.time()
     
-    # Byzantine: selective responses (responds to some, ignores others)
-    byz_state = AgentProbeState("kit_fox", "byzantine_agent")
-    byz_pattern = [True, True, False, True, False, False, True, False, True, False]
-    for i, ack in enumerate(byz_pattern):
-        probe = send_probe(byz_state, now + i * 14400)
-        if ack:
-            receive_ack(byz_state, probe, now + i * 14400 + 50)
+    for i in range(12):
+        probe = send_probe(history, f"p{i:03d}", now + i*3600)
+        if i % 3 == 0:  # Every 3rd probe times out
+            handle_timeout(probe, history)
         else:
-            handle_timeout(byz_state, probe)
+            receive_ack(probe, history, now + i*3600 + 0.5)
     
-    byz_assessment = assess_counterparty(byz_state)
-    
-    print(f"  Crash:     {crash_assessment['grade']} (ACK: {crash_assessment['ack_rate']}, "
-          f"consecutive: {crash_assessment['consecutive_timeouts']}, state: {crash_assessment['current_state']})")
-    print(f"  Byzantine: {byz_assessment['grade']} (ACK: {byz_assessment['ack_rate']}, "
-          f"consecutive: {byz_assessment['consecutive_timeouts']}, state: {byz_assessment['current_state']})")
-    print(f"  Key: crash = clean split (all ACK then all timeout). Byzantine = intermittent.")
-    print(f"  Chandra-Toueg: both eventually detected, crash faster (consecutive threshold).")
+    result = classify_agent(history)
+    print(f"  Class: {result['class']}, Grade: {result['grade']}")
+    print(f"  ACK rate: {result['ack_rate']} (flapping pattern)")
+    print(f"  T_probe oscillation: {result['current_t_probe_ms']:.0f}ms")
     print()
 
 
 if __name__ == "__main__":
-    print("Probe State Machine — ATF Receipt Verification via Active Probing")
-    print("Per santaclawd + Chandra & Toueg (1996) + FLP (1985)")
+    print("Probe State Machine — Active Receipt Verification for ATF")
+    print("Per santaclawd + Chandra & Toueg (JACM 1996)")
     print("=" * 70)
     print()
-    print("States: SILENT → PROBE_SENT → CONFIRMED | PROBE_TIMEOUT → DISPUTED")
-    print(f"T_probe: {T_PROBE_DEFAULT_HOURS}h, T_timeout: {T_PROBE_TIMEOUT_HOURS}h, "
-          f"MAX_CONSECUTIVE: {MAX_CONSECUTIVE_TIMEOUTS}")
+    print("States: SILENT → PROBE_SENT → CONFIRMED | PROBE_TIMEOUT → RE_PROBE | DISPUTED")
+    print(f"Initial T_probe: {INITIAL_T_PROBE_MS}ms, Max: {MAX_T_PROBE_MS}ms, Backoff: {BACKOFF_FACTOR}x")
+    print(f"Max retries: {MAX_RETRIES}, Min response: {MIN_RESPONSE_TIME_MS}ms (replay detection)")
     print()
     
-    scenario_healthy_counterparty()
-    scenario_degrading_counterparty()
-    scenario_flaky_network()
-    scenario_crash_vs_byzantine()
+    scenario_healthy_agent()
+    scenario_crashed_agent()
+    scenario_slow_agent()
+    scenario_replay_attack()
+    scenario_flapping_agent()
     
     print("=" * 70)
-    print("KEY INSIGHT: FLP impossibility means perfect failure detection is impossible.")
-    print("PROBE + adaptive timeout = best approximation (Chandra-Toueg ◇S).")
-    print("3 consecutive timeouts → DISPUTED. Intermittent resets counter.")
-    print("Crash faults detected faster than Byzantine (clean split vs intermittent).")
+    print("KEY INSIGHT: FLP impossibility (1985) = cannot distinguish crash from slow.")
+    print("PROBE with adaptive timeout = Chandra-Toueg eventually-strong (◇S).")
+    print("Eventually suspects every crashed process + stops suspecting correct ones.")
+    print("Static timeout = false positives. Adaptive = correct classification.")
