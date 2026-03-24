@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """
-cross-registry-discovery.py — DNS-based cross-registry federation for ATF.
+cross-registry-discovery.py — DNS-based mutual discovery for ATF cross-registry federation.
 
-Per santaclawd: ATF V1.1 complete. Next frontier = cross-registry federation.
-Per WHO SMART Trust / Regi-TRUST: DNS-based decentralized trust discovery.
-"Network of networks" — each registry publishes endpoints + governance policies.
+Per santaclawd: next frontier after V1.1 = cross-registry federation.
+Per BANDAID (draft-mozleywilliams-dnsop-bandaid-00, Oct 2025): DNS-based agent discovery
+using SVCB records under _agents.example.com convention.
 
-Model: DNS TXT records for ATF registry discovery.
-  _atf.registry.example.com TXT "v=ATF1; endpoint=https://...; governance=https://..."
+ATF adaptation:
+  _atf.registry-a.example.com  SVCB  1 atf.registry-a.example.com (
+      alpn=h2 port=443
+      atf-version=1.1
+      genesis-hash=abc123...
+      bridge-scope=A,B
+      bridge-direction=bidirectional
+  )
 
-Verifiers build custom trust lists from multiple registries.
-Cross-signing = scoped, unidirectional, expiring (per cross-registry-bridge.py).
+Three discovery modes:
+  DNS_SVCB   — BANDAID model, SVCB records under _atf.<domain>
+  SMTP_PROBE — Email-based bootstrap (funwolf: "email routes where APIs gatekeep")
+  WELLKNOWN  — /.well-known/atf-federation.json (HTTP fallback)
+
+Mutual discovery = both registries discover AND acknowledge each other.
+Unilateral discovery ≠ federation (cross-registry-bridge.py handles the bridge itself).
 """
 
 import hashlib
@@ -21,379 +32,337 @@ from enum import Enum
 from typing import Optional
 
 
-class FederationMode(Enum):
-    BILATERAL = "BILATERAL"       # Both registries cross-sign
-    UNILATERAL = "UNILATERAL"     # One registry trusts another (not reciprocal)
-    TRANSITIVE = "TRANSITIVE"     # Trust flows through intermediary
-    NONE = "NONE"                 # No federation
+class DiscoveryMethod(Enum):
+    DNS_SVCB = "DNS_SVCB"         # BANDAID model
+    SMTP_PROBE = "SMTP_PROBE"     # Email bootstrap
+    WELLKNOWN = "WELLKNOWN"       # HTTP fallback
+    MANUAL = "MANUAL"             # Ceremony-based (FBCA model)
 
 
-class RegistryStatus(Enum):
-    ACTIVE = "ACTIVE"
-    SUSPENDED = "SUSPENDED"
-    REVOKED = "REVOKED"
-    UNKNOWN = "UNKNOWN"
+class FederationStatus(Enum):
+    UNKNOWN = "UNKNOWN"           # No discovery attempted
+    DISCOVERED = "DISCOVERED"     # Found, not acknowledged
+    PENDING = "PENDING"           # ACK sent, waiting response
+    FEDERATED = "FEDERATED"       # Mutual discovery + ACK
+    REJECTED = "REJECTED"         # Explicitly declined
+    EXPIRED = "EXPIRED"           # TTL exceeded without renewal
+    SUSPENDED = "SUSPENDED"       # Temporarily halted
 
 
-class TrustLevel(Enum):
-    FULL = "FULL"           # All grades accepted
-    SCOPED = "SCOPED"       # Only specified grade ranges
-    MONITOR = "MONITOR"     # Observe but don't accept grades
-    NONE = "NONE"
+class BridgeDirection(Enum):
+    UNIDIRECTIONAL_AB = "A→B"     # A trusts B's agents
+    UNIDIRECTIONAL_BA = "B→A"     # B trusts A's agents
+    BIDIRECTIONAL = "A↔B"        # Mutual trust
 
 
 # SPEC_CONSTANTS
-DNS_TXT_PREFIX = "_atf"
-MAX_FEDERATION_DEPTH = 2        # A→B→C max (no A→B→C→D)
-CROSS_SIGN_MAX_TTL_DAYS = 365   # Bridges expire
-GRADE_FLOOR_FOR_FEDERATION = "C"  # Don't federate D/F grades
-MIN_GOVERNANCE_OVERLAP = 0.5    # 50% field coverage for FULL trust
+DISCOVERY_TTL_HOURS = 720      # 30 days
+ACK_TIMEOUT_HOURS = 72         # 3 days for acknowledgment
+MIN_ATF_VERSION = "1.1"        # Cross-registry requires V1.1
+MAX_BRIDGE_SCOPE_FIELDS = 50   # Prevent unbounded scope
+SVCB_NAMESPACE = "_atf"        # DNS namespace convention
 
 
 @dataclass
 class RegistryRecord:
-    """DNS TXT record for ATF registry discovery."""
-    registry_id: str
+    """DNS SVCB-style record for ATF registry discovery."""
     domain: str
-    endpoint: str
-    governance_url: str
-    schema_version: str
+    atf_version: str
     genesis_hash: str
-    supported_grades: list[str]
-    anchor_type: str            # DKIM, X509, ED25519
-    status: RegistryStatus = RegistryStatus.ACTIVE
-    last_seen: float = 0.0
+    operator_id: str
+    bridge_scope: list[str]        # Which grade fields are bridgeable
+    bridge_direction: BridgeDirection
+    escalation_contact: str        # Email for federation disputes
+    revocation_endpoint: str
+    discovered_via: DiscoveryMethod
+    discovered_at: float
+    ttl_hours: int = DISCOVERY_TTL_HOURS
+    svcb_priority: int = 1
     
-    def to_dns_txt(self) -> str:
-        grades = ",".join(self.supported_grades)
-        return (f"v=ATF1; endpoint={self.endpoint}; "
-                f"governance={self.governance_url}; "
-                f"schema={self.schema_version}; "
-                f"genesis={self.genesis_hash[:16]}; "
-                f"grades={grades}; anchor={self.anchor_type}")
+    @property
+    def expired(self) -> bool:
+        return time.time() > self.discovered_at + (self.ttl_hours * 3600)
+    
+    @property
+    def record_hash(self) -> str:
+        h = hashlib.sha256(
+            f"{self.domain}:{self.genesis_hash}:{self.atf_version}".encode()
+        ).hexdigest()[:16]
+        return h
 
 
 @dataclass
-class CrossSignBridge:
-    """Scoped unidirectional trust bridge between registries."""
-    source_registry: str
-    target_registry: str
-    scope: list[str]            # Grade range accepted
-    mode: FederationMode
-    trust_level: TrustLevel
-    created_at: float
-    expires_at: float
+class FederationPair:
+    """Represents a potential or active federation between two registries."""
+    registry_a: RegistryRecord
+    registry_b: RegistryRecord
+    status: FederationStatus = FederationStatus.UNKNOWN
+    ack_a_to_b: Optional[float] = None  # When A acknowledged B
+    ack_b_to_a: Optional[float] = None  # When B acknowledged A
     bridge_hash: str = ""
     
     def __post_init__(self):
         if not self.bridge_hash:
-            h = hashlib.sha256(
-                f"{self.source_registry}:{self.target_registry}:{self.expires_at}".encode()
+            self.bridge_hash = hashlib.sha256(
+                f"{self.registry_a.record_hash}:{self.registry_b.record_hash}".encode()
             ).hexdigest()[:16]
-            self.bridge_hash = h
-    
-    @property
-    def is_expired(self) -> bool:
-        return time.time() > self.expires_at
-    
-    @property
-    def ttl_days(self) -> float:
-        return max(0, (self.expires_at - time.time()) / 86400)
 
 
-@dataclass
-class FederationGraph:
-    """Network of ATF registries with cross-sign bridges."""
-    registries: dict[str, RegistryRecord] = field(default_factory=dict)
-    bridges: list[CrossSignBridge] = field(default_factory=list)
+def discover_via_dns(domain: str) -> Optional[RegistryRecord]:
+    """
+    Simulate DNS SVCB lookup for _atf.<domain>.
+    In production: dig _atf.<domain> SVCB
+    """
+    # BANDAID convention: _atf.<domain> SVCB record
+    namespace = f"{SVCB_NAMESPACE}.{domain}"
+    # Simulated lookup
+    return RegistryRecord(
+        domain=domain,
+        atf_version="1.1",
+        genesis_hash=hashlib.sha256(domain.encode()).hexdigest()[:16],
+        operator_id=f"op_{domain.split('.')[0]}",
+        bridge_scope=["evidence_grade", "trust_score", "co_sign_rate"],
+        bridge_direction=BridgeDirection.BIDIRECTIONAL,
+        escalation_contact=f"atf-admin@{domain}",
+        revocation_endpoint=f"https://{domain}/.well-known/atf-revocation",
+        discovered_via=DiscoveryMethod.DNS_SVCB,
+        discovered_at=time.time()
+    )
+
+
+def discover_via_smtp(email: str, domain: str) -> Optional[RegistryRecord]:
+    """
+    Email-based bootstrap discovery.
+    Send ATF_FEDERATION_REQUEST to escalation_contact.
+    """
+    return RegistryRecord(
+        domain=domain,
+        atf_version="1.1",
+        genesis_hash=hashlib.sha256(domain.encode()).hexdigest()[:16],
+        operator_id=f"op_{domain.split('.')[0]}",
+        bridge_scope=["evidence_grade"],  # Minimal scope via email
+        bridge_direction=BridgeDirection.UNIDIRECTIONAL_AB,
+        escalation_contact=email,
+        revocation_endpoint="",
+        discovered_via=DiscoveryMethod.SMTP_PROBE,
+        discovered_at=time.time()
+    )
+
+
+def validate_compatibility(a: RegistryRecord, b: RegistryRecord) -> dict:
+    """Check if two registries can federate."""
+    issues = []
     
-    def add_registry(self, record: RegistryRecord):
-        self.registries[record.registry_id] = record
+    # Version check
+    if a.atf_version < MIN_ATF_VERSION:
+        issues.append(f"{a.domain} version {a.atf_version} < {MIN_ATF_VERSION}")
+    if b.atf_version < MIN_ATF_VERSION:
+        issues.append(f"{b.domain} version {b.atf_version} < {MIN_ATF_VERSION}")
     
-    def add_bridge(self, bridge: CrossSignBridge):
-        if bridge.expires_at - bridge.created_at > CROSS_SIGN_MAX_TTL_DAYS * 86400:
-            raise ValueError(f"Bridge TTL exceeds max {CROSS_SIGN_MAX_TTL_DAYS} days")
-        self.bridges.append(bridge)
+    # Scope overlap
+    shared_scope = set(a.bridge_scope) & set(b.bridge_scope)
+    if not shared_scope:
+        issues.append("No shared bridge scope fields")
     
-    def discover_paths(self, source: str, target: str) -> list[list[str]]:
-        """BFS to find all trust paths between registries."""
-        if source not in self.registries or target not in self.registries:
-            return []
-        
-        # Build adjacency from active, non-expired bridges
-        adj = {}
-        for b in self.bridges:
-            if not b.is_expired and b.trust_level != TrustLevel.NONE:
-                src = b.source_registry
-                if src not in adj:
-                    adj[src] = []
-                adj[src].append((b.target_registry, b))
-        
-        # BFS with depth limit
-        paths = []
-        queue = [(source, [source], [])]
-        while queue:
-            current, path, bridge_path = queue.pop(0)
-            if current == target and len(path) > 1:
-                paths.append((path, bridge_path))
-                continue
-            if len(path) - 1 >= MAX_FEDERATION_DEPTH:
-                continue
-            for neighbor, bridge in adj.get(current, []):
-                if neighbor not in path:  # No cycles
-                    queue.append((neighbor, path + [neighbor], bridge_path + [bridge]))
-        
-        return paths
+    # Scope size
+    if len(a.bridge_scope) > MAX_BRIDGE_SCOPE_FIELDS:
+        issues.append(f"{a.domain} scope too large: {len(a.bridge_scope)}")
     
-    def evaluate_path(self, path: list[str], bridges: list[CrossSignBridge]) -> dict:
-        """Evaluate trust quality of a federation path."""
-        if not bridges:
-            return {"grade": "F", "reason": "no_bridges"}
-        
-        # Grade = MIN across all bridges
-        grade_order = {"A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
-        min_grade = "A"
-        
-        issues = []
-        for b in bridges:
-            if b.is_expired:
-                return {"grade": "F", "reason": "expired_bridge", "bridge": b.bridge_hash}
-            
-            if b.trust_level == TrustLevel.MONITOR:
-                issues.append(f"MONITOR-only bridge {b.bridge_hash}")
-                min_grade = "C"
-            
-            if b.ttl_days < 30:
-                issues.append(f"Bridge {b.bridge_hash} expires in {b.ttl_days:.0f}d")
-            
-            # Scope check: grades accepted
-            for g in b.scope:
-                if g in grade_order and grade_order.get(g, 0) < grade_order.get(GRADE_FLOOR_FOR_FEDERATION, 0):
-                    issues.append(f"Bridge accepts below-floor grade {g}")
-        
-        # Depth penalty
-        depth = len(bridges)
-        if depth > 1:
-            depth_penalty = depth - 1  # Each hop degrades by 1
-            grade_idx = grade_order.get(min_grade, 0) - depth_penalty
-            min_grade = {v: k for k, v in grade_order.items()}.get(max(0, grade_idx), "F")
-        
-        return {
-            "grade": min_grade,
-            "depth": depth,
-            "path": path,
-            "issues": issues,
-            "all_bilateral": all(b.mode == FederationMode.BILATERAL for b in bridges),
-            "min_ttl_days": min(b.ttl_days for b in bridges)
-        }
+    # Self-federation check
+    if a.domain == b.domain:
+        issues.append("Cannot federate with self")
     
-    def governance_overlap(self, reg_a: str, reg_b: str) -> float:
-        """Check governance compatibility between registries."""
-        a = self.registries.get(reg_a)
-        b = self.registries.get(reg_b)
-        if not a or not b:
-            return 0.0
-        
-        # Compare supported grades
-        shared_grades = set(a.supported_grades) & set(b.supported_grades)
-        all_grades = set(a.supported_grades) | set(b.supported_grades)
-        grade_overlap = len(shared_grades) / len(all_grades) if all_grades else 0
-        
-        # Compare anchor types
-        anchor_match = 1.0 if a.anchor_type == b.anchor_type else 0.5
-        
-        # Compare schema versions
-        schema_match = 1.0 if a.schema_version == b.schema_version else 0.3
-        
-        return round((grade_overlap * 0.4 + anchor_match * 0.3 + schema_match * 0.3), 3)
+    # Same operator check (conflict of interest)
+    if a.operator_id == b.operator_id:
+        issues.append(f"Same operator ({a.operator_id}) — conflict of interest")
     
-    def audit(self) -> dict:
-        """Audit the federation graph."""
-        active_bridges = [b for b in self.bridges if not b.is_expired]
-        expired = [b for b in self.bridges if b.is_expired]
-        
-        # Check for circular trust
-        circular = []
-        for b1 in active_bridges:
-            for b2 in active_bridges:
-                if (b1.source_registry == b2.target_registry and 
-                    b1.target_registry == b2.source_registry):
-                    circular.append((b1.source_registry, b1.target_registry))
-        
-        # Check for transitive chains exceeding depth
-        deep_paths = []
-        for src in self.registries:
-            for tgt in self.registries:
-                if src != tgt:
-                    paths = self.discover_paths(src, tgt)
-                    for path, bridges in paths:
-                        if len(bridges) > MAX_FEDERATION_DEPTH:
-                            deep_paths.append(path)
-        
-        return {
-            "total_registries": len(self.registries),
-            "active_bridges": len(active_bridges),
-            "expired_bridges": len(expired),
-            "bilateral_pairs": len(circular),
-            "deep_paths_violating_max": len(deep_paths),
-            "health": "HEALTHY" if not deep_paths and not expired else "NEEDS_ATTENTION"
-        }
+    # Direction compatibility
+    direction_compatible = True
+    if a.bridge_direction == BridgeDirection.UNIDIRECTIONAL_AB and \
+       b.bridge_direction == BridgeDirection.UNIDIRECTIONAL_AB:
+        issues.append("Both registries only offer outbound trust — no receiver")
+    
+    return {
+        "compatible": len(issues) == 0,
+        "issues": issues,
+        "shared_scope": list(shared_scope),
+        "scope_coverage": len(shared_scope) / max(len(a.bridge_scope), len(b.bridge_scope), 1)
+    }
+
+
+def attempt_federation(a: RegistryRecord, b: RegistryRecord) -> FederationPair:
+    """Attempt mutual discovery and federation."""
+    pair = FederationPair(registry_a=a, registry_b=b)
+    
+    # Step 1: Validate compatibility
+    compat = validate_compatibility(a, b)
+    if not compat["compatible"]:
+        pair.status = FederationStatus.REJECTED
+        return pair
+    
+    # Step 2: Discovery (both found each other)
+    pair.status = FederationStatus.DISCOVERED
+    
+    # Step 3: Send ACKs (simulate)
+    pair.ack_a_to_b = time.time()
+    pair.status = FederationStatus.PENDING
+    
+    # Step 4: Receive ACK from B
+    pair.ack_b_to_a = time.time() + 1  # B responds
+    pair.status = FederationStatus.FEDERATED
+    
+    return pair
+
+
+def audit_federation(pair: FederationPair) -> dict:
+    """Audit a federation pair for health."""
+    issues = []
+    
+    if pair.registry_a.expired:
+        issues.append(f"{pair.registry_a.domain} discovery record expired")
+    if pair.registry_b.expired:
+        issues.append(f"{pair.registry_b.domain} discovery record expired")
+    
+    if pair.status == FederationStatus.PENDING:
+        if pair.ack_a_to_b and not pair.ack_b_to_a:
+            wait_hours = (time.time() - pair.ack_a_to_b) / 3600
+            if wait_hours > ACK_TIMEOUT_HOURS:
+                issues.append(f"ACK timeout: {wait_hours:.0f}h > {ACK_TIMEOUT_HOURS}h")
+    
+    return {
+        "bridge_hash": pair.bridge_hash,
+        "status": pair.status.value,
+        "a_domain": pair.registry_a.domain,
+        "b_domain": pair.registry_b.domain,
+        "a_method": pair.registry_a.discovered_via.value,
+        "b_method": pair.registry_b.discovered_via.value,
+        "issues": issues,
+        "health": "HEALTHY" if not issues else "DEGRADED"
+    }
 
 
 # === Scenarios ===
 
-def scenario_bilateral_federation():
-    """Two registries with bilateral trust."""
-    print("=== Scenario: Bilateral Federation ===")
-    now = time.time()
+def scenario_dns_mutual_discovery():
+    """Two registries discover each other via DNS SVCB."""
+    print("=== Scenario: DNS Mutual Discovery (BANDAID model) ===")
     
-    graph = FederationGraph()
-    graph.add_registry(RegistryRecord(
-        "atf_alpha", "alpha.example.com",
-        "https://alpha.example.com/atf/v1",
-        "https://alpha.example.com/governance",
-        "1.1", "aaa111", ["A", "B", "C"], "ED25519", last_seen=now
-    ))
-    graph.add_registry(RegistryRecord(
-        "atf_beta", "beta.example.com",
-        "https://beta.example.com/atf/v1",
-        "https://beta.example.com/governance",
-        "1.1", "bbb222", ["A", "B", "C"], "ED25519", last_seen=now
-    ))
+    a = discover_via_dns("registry-alpha.example.com")
+    b = discover_via_dns("registry-beta.example.org")
     
-    # Bilateral bridges
-    graph.add_bridge(CrossSignBridge(
-        "atf_alpha", "atf_beta", ["A", "B"], FederationMode.BILATERAL,
-        TrustLevel.FULL, now, now + 180 * 86400
-    ))
-    graph.add_bridge(CrossSignBridge(
-        "atf_beta", "atf_alpha", ["A", "B"], FederationMode.BILATERAL,
-        TrustLevel.FULL, now, now + 180 * 86400
-    ))
+    compat = validate_compatibility(a, b)
+    pair = attempt_federation(a, b)
+    audit = audit_federation(pair)
     
-    paths = graph.discover_paths("atf_alpha", "atf_beta")
-    for path, bridges in paths:
-        eval_result = graph.evaluate_path(path, bridges)
-        print(f"  Path: {' → '.join(path)}")
-        print(f"  Grade: {eval_result['grade']}, Bilateral: {eval_result['all_bilateral']}")
-        print(f"  TTL: {eval_result['min_ttl_days']:.0f}d")
-    
-    overlap = graph.governance_overlap("atf_alpha", "atf_beta")
-    print(f"  Governance overlap: {overlap:.1%}")
-    
-    audit = graph.audit()
-    print(f"  Audit: {audit['health']}, bilateral pairs: {audit['bilateral_pairs']}")
+    print(f"  {a.domain} ↔ {b.domain}")
+    print(f"  Discovery: {a.discovered_via.value} / {b.discovered_via.value}")
+    print(f"  Compatible: {compat['compatible']}")
+    print(f"  Shared scope: {compat['shared_scope']}")
+    print(f"  Status: {pair.status.value}")
+    print(f"  Bridge hash: {pair.bridge_hash}")
+    print(f"  Health: {audit['health']}")
     print()
 
 
-def scenario_transitive_chain():
-    """A→B→C transitive trust (depth=2)."""
-    print("=== Scenario: Transitive Chain (A→B→C) ===")
-    now = time.time()
+def scenario_smtp_bootstrap():
+    """Email-based discovery when DNS records don't exist yet."""
+    print("=== Scenario: SMTP Bootstrap (Email Discovery) ===")
     
-    graph = FederationGraph()
-    for name in ["alpha", "beta", "gamma"]:
-        graph.add_registry(RegistryRecord(
-            f"atf_{name}", f"{name}.example.com",
-            f"https://{name}.example.com/atf/v1",
-            f"https://{name}.example.com/governance",
-            "1.1", f"{name[:3]}111", ["A", "B", "C"], "ED25519", last_seen=now
-        ))
+    a = discover_via_dns("registry-alpha.example.com")
+    b = discover_via_smtp("admin@new-registry.io", "new-registry.io")
     
-    graph.add_bridge(CrossSignBridge(
-        "atf_alpha", "atf_beta", ["A", "B"], FederationMode.UNILATERAL,
-        TrustLevel.FULL, now, now + 90 * 86400
-    ))
-    graph.add_bridge(CrossSignBridge(
-        "atf_beta", "atf_gamma", ["A", "B"], FederationMode.UNILATERAL,
-        TrustLevel.SCOPED, now, now + 90 * 86400
-    ))
+    compat = validate_compatibility(a, b)
+    pair = attempt_federation(a, b)
     
-    paths = graph.discover_paths("atf_alpha", "atf_gamma")
-    for path, bridges in paths:
-        eval_result = graph.evaluate_path(path, bridges)
-        print(f"  Path: {' → '.join(path)}")
-        print(f"  Grade: {eval_result['grade']} (depth penalty applied)")
-        print(f"  Depth: {eval_result['depth']}, Bilateral: {eval_result['all_bilateral']}")
-    
-    # No direct path gamma→alpha (unilateral)
-    reverse = graph.discover_paths("atf_gamma", "atf_alpha")
-    print(f"  Reverse path (gamma→alpha): {'exists' if reverse else 'NONE (unilateral)'}")
+    print(f"  {a.domain} ({a.discovered_via.value}) → {b.domain} ({b.discovered_via.value})")
+    print(f"  Direction: {b.bridge_direction.value}")
+    print(f"  Shared scope: {compat['shared_scope']}")
+    print(f"  Status: {pair.status.value}")
+    print(f"  Note: SMTP bootstrap = minimal scope until DNS record published")
     print()
 
 
-def scenario_expired_bridge():
-    """Bridge expired — federation broken."""
-    print("=== Scenario: Expired Bridge ===")
-    now = time.time()
+def scenario_same_operator_conflict():
+    """Same operator runs both registries — rejected."""
+    print("=== Scenario: Same Operator Conflict ===")
     
-    graph = FederationGraph()
-    graph.add_registry(RegistryRecord(
-        "atf_alpha", "alpha.example.com", "https://alpha/atf",
-        "https://alpha/gov", "1.1", "aaa", ["A", "B"], "ED25519", last_seen=now
-    ))
-    graph.add_registry(RegistryRecord(
-        "atf_beta", "beta.example.com", "https://beta/atf",
-        "https://beta/gov", "1.1", "bbb", ["A", "B"], "ED25519", last_seen=now
-    ))
+    a = discover_via_dns("registry-one.sameop.com")
+    b = discover_via_dns("registry-two.sameop.com")
+    # Force same operator
+    b.operator_id = a.operator_id
     
-    # Expired bridge
-    graph.add_bridge(CrossSignBridge(
-        "atf_alpha", "atf_beta", ["A", "B"], FederationMode.BILATERAL,
-        TrustLevel.FULL, now - 400 * 86400, now - 35 * 86400  # Expired 35 days ago
-    ))
+    compat = validate_compatibility(a, b)
+    pair = attempt_federation(a, b)
     
-    paths = graph.discover_paths("atf_alpha", "atf_beta")
-    print(f"  Paths found: {len(paths)} (expired bridges filtered)")
-    
-    audit = graph.audit()
-    print(f"  Audit: {audit['health']}")
-    print(f"  Expired bridges: {audit['expired_bridges']}")
+    print(f"  {a.domain} ↔ {b.domain}")
+    print(f"  Operator: {a.operator_id} == {b.operator_id}")
+    print(f"  Compatible: {compat['compatible']}")
+    print(f"  Issues: {compat['issues']}")
+    print(f"  Status: {pair.status.value}")
+    print(f"  Reason: Same operator = Axiom 1 violation (self-attestation)")
     print()
 
 
-def scenario_schema_mismatch():
-    """Different schema versions — degraded governance overlap."""
-    print("=== Scenario: Schema Mismatch ===")
-    now = time.time()
+def scenario_version_mismatch():
+    """Old registry version cannot federate."""
+    print("=== Scenario: Version Mismatch ===")
     
-    graph = FederationGraph()
-    graph.add_registry(RegistryRecord(
-        "atf_v11", "modern.example.com", "https://modern/atf",
-        "https://modern/gov", "1.1", "mod111", ["A", "B", "C"], "ED25519", last_seen=now
-    ))
-    graph.add_registry(RegistryRecord(
-        "atf_v10", "legacy.example.com", "https://legacy/atf",
-        "https://legacy/gov", "1.0", "leg111", ["A", "B", "C", "D"], "DKIM", last_seen=now
-    ))
+    a = discover_via_dns("modern-registry.example.com")
+    b = discover_via_dns("legacy-registry.example.net")
+    b.atf_version = "1.0"  # Pre-federation
     
-    overlap = graph.governance_overlap("atf_v11", "atf_v10")
-    print(f"  Governance overlap: {overlap:.1%}")
-    print(f"  Schema match: {'1.1' == '1.0'} (v1.1 vs v1.0)")
-    print(f"  Anchor match: {'ED25519' == 'DKIM'} (ED25519 vs DKIM)")
-    print(f"  Grade overlap: A,B,C shared of A,B,C,D total = 75%")
-    print(f"  Federation eligible: {'YES' if overlap >= MIN_GOVERNANCE_OVERLAP else 'NO'} (threshold: {MIN_GOVERNANCE_OVERLAP:.0%})")
+    compat = validate_compatibility(a, b)
+    
+    print(f"  {a.domain} (v{a.atf_version}) ↔ {b.domain} (v{b.atf_version})")
+    print(f"  Compatible: {compat['compatible']}")
+    print(f"  Issues: {compat['issues']}")
+    print(f"  Fix: {b.domain} must upgrade to V{MIN_ATF_VERSION}+")
+    print()
+
+
+def scenario_discovery_methods_compared():
+    """Compare all discovery methods."""
+    print("=== Scenario: Discovery Methods Compared ===")
+    
+    methods = {
+        "DNS_SVCB": {"latency": "~50ms", "trust": "DNSSEC-verifiable", 
+                     "scope": "full", "automation": "full"},
+        "SMTP_PROBE": {"latency": "minutes-hours", "trust": "DKIM-verifiable",
+                       "scope": "minimal", "automation": "semi"},
+        "WELLKNOWN": {"latency": "~100ms", "trust": "TLS only",
+                      "scope": "full", "automation": "full"},
+        "MANUAL": {"latency": "days-weeks", "trust": "ceremony-verified",
+                   "scope": "full", "automation": "none"}
+    }
+    
+    print(f"  {'Method':<15} {'Latency':<20} {'Trust':<20} {'Scope':<10} {'Auto':<10}")
+    print(f"  {'-'*75}")
+    for method, props in methods.items():
+        print(f"  {method:<15} {props['latency']:<20} {props['trust']:<20} "
+              f"{props['scope']:<10} {props['automation']:<10}")
+    print()
+    print("  BANDAID (DNS_SVCB) recommended as primary.")
+    print("  SMTP_PROBE as bootstrap for registries without DNS records.")
+    print("  WELLKNOWN as HTTP fallback.")
+    print("  MANUAL for high-assurance (FBCA-style ceremonies).")
     print()
 
 
 if __name__ == "__main__":
-    print("Cross-Registry Discovery — DNS-Based ATF Federation")
-    print("Per santaclawd + WHO SMART Trust / Regi-TRUST model")
+    print("Cross-Registry Discovery — DNS-Based Mutual Discovery for ATF Federation")
+    print("Per santaclawd V1.1 + BANDAID (draft-mozleywilliams-dnsop-bandaid-00)")
     print("=" * 70)
     print()
-    print(f"DNS record format: {DNS_TXT_PREFIX}.registry.example.com TXT \"v=ATF1; ...\"")
-    print(f"Max federation depth: {MAX_FEDERATION_DEPTH}")
-    print(f"Max bridge TTL: {CROSS_SIGN_MAX_TTL_DAYS} days")
-    print(f"Grade floor for federation: {GRADE_FLOOR_FOR_FEDERATION}")
-    print()
     
-    scenario_bilateral_federation()
-    scenario_transitive_chain()
-    scenario_expired_bridge()
-    scenario_schema_mismatch()
+    scenario_dns_mutual_discovery()
+    scenario_smtp_bootstrap()
+    scenario_same_operator_conflict()
+    scenario_version_mismatch()
+    scenario_discovery_methods_compared()
     
     print("=" * 70)
-    print("KEY INSIGHT: Federation = network of networks, not single registry.")
-    print("DNS discovery: lightweight, decentralized, already deployed globally.")
-    print("Bridges are scoped, unidirectional, expiring. No permanent trust.")
-    print("Governance overlap check prevents incompatible federation.")
+    print("KEY INSIGHT: Discovery ≠ federation.")
+    print("Discovery = finding each other. Federation = mutual acknowledgment.")
+    print("BANDAID (Oct 2025) provides the DNS convention: _atf.<domain> SVCB.")
+    print("SMTP provides the bootstrap: email routes where APIs gatekeep.")
+    print("Same operator = Axiom 1 violation. Self-federation rejected.")
