@@ -1,399 +1,321 @@
 #!/usr/bin/env python3
 """
-cross-registry-discovery.py — How ATF registries find each other.
+cross-registry-discovery.py — DNS-based ATF registry discovery + FBCA assurance mapping.
 
-Per santaclawd: ATF V1.1 complete. Next frontier = cross-registry federation.
-Per FPKI: Federal Bridge CA uses cross-certification with published trust lists.
+Per santaclawd: ATF V1.2 frontier = cross-registry federation.
+FBCA model: discovery ≠ trust. DNS finds who exists. Cross-signing ceremony IS the audit.
 
-Three discovery mechanisms:
-  DNS TXT     — v=ATF1;registry=https://...;hash=abc123 (like DKIM/DMARC)
-  WELL_KNOWN  — /.well-known/atf-registry.json (like security.txt)
-  GOSSIP      — Receipt-embedded registry hints (like CT gossip, but working)
+Protocol:
+  1. DISCOVERY: _atf.<domain> TXT → endpoint + policy level (unauthenticated)
+  2. BOOTSTRAP: SMTP handshake → genesis exchange (authenticated) 
+  3. CEREMONY: Cross-signing with M-of-N witnesses (audited)
 
-Key insight: CT's gossip mechanism was specified but never deployed (draft-ietf-trans-gossip
-abandoned). ATF must not repeat this. Receipts ARE the gossip channel.
+FBCA assurance level mapping:
+  FBCA RUDIMENTARY → ATF PROVISIONAL (n<5, Wilson CI<0.57)
+  FBCA BASIC       → ATF ALLEGED     (n<30, CI<0.70)
+  FBCA MEDIUM      → ATF CONFIRMED   (n≥30, CI≥0.70)
+  FBCA HIGH        → ATF VERIFIED    (n≥100, CI≥0.90)
+
+Bridge grade = MIN(both registries). Prevents trust laundering upward.
 """
 
 import hashlib
-import json
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class DiscoveryMethod(Enum):
-    DNS_TXT = "DNS_TXT"           # Domain-anchored
-    WELL_KNOWN = "WELL_KNOWN"     # HTTP-based
-    GOSSIP = "GOSSIP"             # Receipt-embedded
-    MANUAL = "MANUAL"             # Operator-configured
+class AssuranceLevel(Enum):
+    PROVISIONAL = "PROVISIONAL"  # FBCA RUDIMENTARY
+    ALLEGED = "ALLEGED"          # FBCA BASIC
+    CONFIRMED = "CONFIRMED"      # FBCA MEDIUM
+    VERIFIED = "VERIFIED"        # FBCA HIGH
 
 
-class FederationStatus(Enum):
-    DISCOVERED = "DISCOVERED"       # Found, not yet validated
-    VALIDATED = "VALIDATED"         # Schema + hash verified
-    BRIDGED = "BRIDGED"            # Cross-certification active
-    STALE = "STALE"                # Discovery TTL expired
-    REVOKED = "REVOKED"            # Explicitly revoked
+class DiscoveryStatus(Enum):
+    DISCOVERED = "DISCOVERED"    # TXT record found
+    BOOTSTRAPPED = "BOOTSTRAPPED"  # SMTP handshake complete
+    CROSS_SIGNED = "CROSS_SIGNED"  # Ceremony complete
+    REVOKED = "REVOKED"
 
 
-# SPEC_CONSTANTS
-DNS_TXT_PREFIX = "v=ATF1"
-WELL_KNOWN_PATH = "/.well-known/atf-registry.json"
-DISCOVERY_TTL_DAYS = 30          # Re-discover every 30 days
-GOSSIP_MIN_SOURCES = 3           # Require 3 independent receipts before trusting gossip
-BRIDGE_MAX_DEPTH = 2             # A→B→C allowed, A→B→C→D not
-REGISTRY_HASH_ALGO = "sha256"
+# SPEC_CONSTANTS for assurance levels
+ASSURANCE_THRESHOLDS = {
+    AssuranceLevel.PROVISIONAL: {"min_n": 1, "min_ci": 0.0, "max_depth": 1},
+    AssuranceLevel.ALLEGED:     {"min_n": 5, "min_ci": 0.57, "max_depth": 2},
+    AssuranceLevel.CONFIRMED:   {"min_n": 30, "min_ci": 0.70, "max_depth": 3},
+    AssuranceLevel.VERIFIED:    {"min_n": 100, "min_ci": 0.90, "max_depth": 3},
+}
+
+# n_recovery: 30% of original n, minimum 5 (TLS session resumption model)
+N_RECOVERY_RATIO = 0.3
+N_RECOVERY_MIN = 5
 
 
 @dataclass
-class RegistryRecord:
+class DNSTXTRecord:
+    """_atf.<domain> TXT record format."""
+    domain: str
+    version: str = "ATF1"
+    endpoint: str = ""
+    level: AssuranceLevel = AssuranceLevel.PROVISIONAL
+    bridge_policy: str = "open"  # open | closed | selective
+    contact: str = ""  # SMTP address for bootstrap
+    
+    def to_txt(self) -> str:
+        return (f"v={self.version}; endpoint={self.endpoint}; "
+                f"level={self.level.value}; bridge={self.bridge_policy}; "
+                f"contact={self.contact}")
+    
+    @classmethod
+    def from_txt(cls, domain: str, txt: str) -> 'DNSTXTRecord':
+        parts = {}
+        for segment in txt.split(';'):
+            if '=' in segment:
+                k, v = segment.strip().split('=', 1)
+                parts[k.strip()] = v.strip()
+        
+        level = AssuranceLevel.PROVISIONAL
+        for al in AssuranceLevel:
+            if al.value == parts.get('level', ''):
+                level = al
+                break
+        
+        return cls(
+            domain=domain,
+            version=parts.get('v', 'ATF1'),
+            endpoint=parts.get('endpoint', ''),
+            level=level,
+            bridge_policy=parts.get('bridge', 'open'),
+            contact=parts.get('contact', '')
+        )
+
+
+@dataclass
+class Registry:
     registry_id: str
-    registry_url: str
-    registry_hash: str           # Hash of registry's genesis document
-    operator: str
-    schema_version: str
-    agent_count: int
-    discovered_via: DiscoveryMethod
-    discovered_at: float
-    status: FederationStatus = FederationStatus.DISCOVERED
-    bridge_direction: str = "NONE"  # NONE, OUTBOUND, INBOUND, MUTUAL
-    ttl_days: int = DISCOVERY_TTL_DAYS
-    gossip_sources: list = field(default_factory=list)
+    domain: str
+    assurance_level: AssuranceLevel
+    n_receipts: int
+    wilson_ci_lower: float
+    max_delegation_depth: int
+    genesis_hash: str
+    txt_record: Optional[DNSTXTRecord] = None
 
 
 @dataclass
-class BridgeCertificate:
-    """Cross-certification between two registries."""
-    source_registry: str
-    target_registry: str
-    scope: list                  # Which grade levels are trusted
-    direction: str               # UNIDIRECTIONAL or MUTUAL
-    issued_at: float
-    expires_at: float
-    bridge_hash: str = ""
-    depth: int = 0               # How many hops from source
-    
-    def __post_init__(self):
-        if not self.bridge_hash:
-            h = hashlib.sha256(
-                f"{self.source_registry}:{self.target_registry}:{self.issued_at}".encode()
-            ).hexdigest()[:16]
-            self.bridge_hash = h
+class CrossRegistryBridge:
+    registry_a: Registry
+    registry_b: Registry
+    bridge_level: AssuranceLevel  # MIN of both
+    status: DiscoveryStatus = DiscoveryStatus.DISCOVERED
+    ceremony_hash: Optional[str] = None
+    created_at: float = 0.0
+    expires_at: float = 0.0
+    witnesses: list = field(default_factory=list)
 
 
-def parse_dns_txt(txt_record: str) -> Optional[dict]:
-    """Parse ATF DNS TXT record (DKIM-style key=value pairs)."""
-    if not txt_record.startswith(DNS_TXT_PREFIX):
-        return None
-    
-    parts = {}
-    for pair in txt_record.split(";"):
-        pair = pair.strip()
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-            parts[k.strip()] = v.strip()
-    
-    required = {"v", "registry", "hash"}
-    if not required.issubset(parts.keys()):
-        return None
-    
-    return parts
+def wilson_ci_lower(successes: int, total: int, z: float = 1.96) -> float:
+    """Wilson score interval lower bound."""
+    if total == 0:
+        return 0.0
+    p = successes / total
+    denominator = 1 + z**2 / total
+    center = p + z**2 / (2 * total)
+    spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total)
+    return round((center - spread) / denominator, 4)
 
 
-def discover_via_dns(domain: str, txt_records: list[str]) -> Optional[RegistryRecord]:
-    """Discover ATF registry via DNS TXT records."""
-    for txt in txt_records:
-        parsed = parse_dns_txt(txt)
-        if parsed:
-            return RegistryRecord(
-                registry_id=f"dns:{domain}",
-                registry_url=parsed["registry"],
-                registry_hash=parsed["hash"],
-                operator=parsed.get("op", domain),
-                schema_version=parsed.get("v", "ATF1"),
-                agent_count=int(parsed.get("agents", "0")),
-                discovered_via=DiscoveryMethod.DNS_TXT,
-                discovered_at=time.time()
-            )
-    return None
+def classify_assurance(n_receipts: int, ci_lower: float) -> AssuranceLevel:
+    """Classify registry into FBCA-equivalent assurance level."""
+    if n_receipts >= 100 and ci_lower >= 0.90:
+        return AssuranceLevel.VERIFIED
+    elif n_receipts >= 30 and ci_lower >= 0.70:
+        return AssuranceLevel.CONFIRMED
+    elif n_receipts >= 5 and ci_lower >= 0.57:
+        return AssuranceLevel.ALLEGED
+    else:
+        return AssuranceLevel.PROVISIONAL
 
 
-def discover_via_wellknown(url: str, content: dict) -> Optional[RegistryRecord]:
-    """Discover ATF registry via .well-known endpoint."""
-    if "registry_id" not in content or "registry_hash" not in content:
-        return None
-    
-    return RegistryRecord(
-        registry_id=content["registry_id"],
-        registry_url=url.replace(WELL_KNOWN_PATH, ""),
-        registry_hash=content["registry_hash"],
-        operator=content.get("operator", "unknown"),
-        schema_version=content.get("schema_version", "ATF1"),
-        agent_count=content.get("agent_count", 0),
-        discovered_via=DiscoveryMethod.WELL_KNOWN,
-        discovered_at=time.time()
-    )
+def compute_bridge_level(a: Registry, b: Registry) -> AssuranceLevel:
+    """Bridge grade = MIN(both registries). Prevents trust laundering."""
+    levels = [AssuranceLevel.PROVISIONAL, AssuranceLevel.ALLEGED, 
+              AssuranceLevel.CONFIRMED, AssuranceLevel.VERIFIED]
+    a_idx = levels.index(a.assurance_level)
+    b_idx = levels.index(b.assurance_level)
+    return levels[min(a_idx, b_idx)]
 
 
-def discover_via_gossip(registry_hints: list[dict]) -> Optional[RegistryRecord]:
+def compute_n_recovery(original_n: int) -> int:
     """
-    Discover ATF registry via receipt-embedded hints.
-    
-    Requires GOSSIP_MIN_SOURCES independent sources to prevent spoofing.
-    CT's gossip failed because it was optional. ATF makes it structural.
+    TLS session resumption model for recovery from DEGRADED.
+    30% of original n, minimum 5.
     """
-    if len(registry_hints) < GOSSIP_MIN_SOURCES:
-        return None
-    
-    # Check operator diversity (prevent sybil gossip)
-    operators = set(h.get("source_operator", "") for h in registry_hints)
-    if len(operators) < 2:
-        return None  # Same operator = 1 effective source
-    
-    # Consensus on registry_hash (majority)
-    hashes = [h.get("registry_hash", "") for h in registry_hints]
-    hash_counts = {}
-    for h in hashes:
-        hash_counts[h] = hash_counts.get(h, 0) + 1
-    
-    consensus_hash = max(hash_counts, key=hash_counts.get)
-    consensus_ratio = hash_counts[consensus_hash] / len(hashes)
-    
-    if consensus_ratio < 0.67:
-        return None  # No strong consensus
-    
-    # Use first hint's URL (they should all agree)
-    first = registry_hints[0]
-    record = RegistryRecord(
-        registry_id=f"gossip:{consensus_hash[:8]}",
-        registry_url=first.get("registry_url", ""),
-        registry_hash=consensus_hash,
-        operator=first.get("operator", "unknown"),
-        schema_version=first.get("schema_version", "ATF1"),
-        agent_count=0,  # Unknown via gossip
-        discovered_via=DiscoveryMethod.GOSSIP,
-        discovered_at=time.time(),
-        gossip_sources=[h.get("source_agent", "") for h in registry_hints]
-    )
-    return record
+    return max(N_RECOVERY_MIN, math.ceil(original_n * N_RECOVERY_RATIO))
 
 
-def validate_bridge(bridge: BridgeCertificate, known_registries: dict) -> dict:
-    """Validate a cross-registry bridge certificate."""
-    issues = []
-    
-    # Source must be known
-    if bridge.source_registry not in known_registries:
-        issues.append(f"Unknown source registry: {bridge.source_registry}")
-    
-    # Target must be discovered
-    if bridge.target_registry not in known_registries:
-        issues.append(f"Unknown target registry: {bridge.target_registry}")
-    
-    # Depth check
-    if bridge.depth > BRIDGE_MAX_DEPTH:
-        issues.append(f"Bridge depth {bridge.depth} exceeds max {BRIDGE_MAX_DEPTH}")
-    
-    # Expiry check
-    if bridge.expires_at < time.time():
-        issues.append("Bridge certificate expired")
-    
-    # Self-bridge check
-    if bridge.source_registry == bridge.target_registry:
-        issues.append("Self-bridge detected (axiom 1 violation)")
-    
-    # Scope check
-    if not bridge.scope:
-        issues.append("Empty scope — bridge trusts nothing")
-    
+def discover_registry(domain: str, txt_content: str) -> dict:
+    """Simulate DNS TXT discovery."""
+    record = DNSTXTRecord.from_txt(domain, txt_content)
     return {
-        "valid": len(issues) == 0,
-        "issues": issues,
-        "direction": bridge.direction,
-        "depth": bridge.depth,
-        "scope": bridge.scope
+        "domain": domain,
+        "version": record.version,
+        "endpoint": record.endpoint,
+        "level": record.level.value,
+        "bridge_policy": record.bridge_policy,
+        "contact": record.contact,
+        "status": "DISCOVERED",
+        "note": "DNS TXT is phonebook not treaty. Cross-signing ceremony IS the audit."
     }
 
 
-def compute_federation_graph(registries: list[RegistryRecord], 
-                              bridges: list[BridgeCertificate]) -> dict:
-    """Build federation topology graph."""
-    nodes = {r.registry_id: {
-        "url": r.registry_url,
-        "status": r.status.value,
-        "discovered_via": r.discovered_via.value,
-        "agents": r.agent_count
-    } for r in registries}
+def validate_bridge(bridge: CrossRegistryBridge) -> dict:
+    """Validate cross-registry bridge constraints."""
+    issues = []
     
-    edges = []
-    for b in bridges:
-        validation = validate_bridge(b, {r.registry_id: r for r in registries})
-        edges.append({
-            "source": b.source_registry,
-            "target": b.target_registry,
-            "direction": b.direction,
-            "scope": b.scope,
-            "valid": validation["valid"],
-            "depth": b.depth
-        })
+    # Bridge level must be MIN
+    expected = compute_bridge_level(bridge.registry_a, bridge.registry_b)
+    if bridge.bridge_level != expected:
+        issues.append(f"Bridge level {bridge.bridge_level.value} != MIN({bridge.registry_a.assurance_level.value}, {bridge.registry_b.assurance_level.value}) = {expected.value}")
     
-    # Find connected components
-    adj = {}
-    for e in edges:
-        if e["valid"]:
-            adj.setdefault(e["source"], []).append(e["target"])
-            if e["direction"] == "MUTUAL":
-                adj.setdefault(e["target"], []).append(e["source"])
+    # Max delegation depth = MIN
+    max_depth = min(bridge.registry_a.max_delegation_depth, bridge.registry_b.max_delegation_depth)
     
-    visited = set()
-    components = []
-    for node in nodes:
-        if node not in visited:
-            component = set()
-            stack = [node]
-            while stack:
-                n = stack.pop()
-                if n not in visited:
-                    visited.add(n)
-                    component.add(n)
-                    for neighbor in adj.get(n, []):
-                        if neighbor not in visited:
-                            stack.append(neighbor)
-            components.append(component)
+    # Cross-signed bridges require ceremony
+    if bridge.status == DiscoveryStatus.CROSS_SIGNED and not bridge.ceremony_hash:
+        issues.append("CROSS_SIGNED bridge requires ceremony_hash")
+    
+    if bridge.status == DiscoveryStatus.CROSS_SIGNED and len(bridge.witnesses) < 3:
+        issues.append(f"CROSS_SIGNED requires 3+ witnesses, got {len(bridge.witnesses)}")
     
     return {
-        "nodes": len(nodes),
-        "edges": len(edges),
-        "valid_edges": sum(1 for e in edges if e["valid"]),
-        "components": len(components),
-        "largest_component": max(len(c) for c in components) if components else 0,
-        "isolated": sum(1 for c in components if len(c) == 1)
+        "valid": len(issues) == 0,
+        "bridge_level": expected.value,
+        "max_delegation_depth": max_depth,
+        "issues": issues,
+        "grade": "A" if not issues else "F"
     }
 
 
 # === Scenarios ===
 
 def scenario_dns_discovery():
-    """Registry discovered via DNS TXT record."""
+    """Discover registry via DNS TXT."""
     print("=== Scenario: DNS TXT Discovery ===")
     
-    txt_records = [
-        "v=ATF1;registry=https://atf.example.com;hash=abc123def456;op=example_operator;agents=150",
-        "v=spf1 include:_spf.google.com ~all"  # Non-ATF record
-    ]
+    txt = "v=ATF1; endpoint=https://atf.example.com/api; level=CONFIRMED; bridge=open; contact=admin@example.com"
+    result = discover_registry("example.com", txt)
     
-    record = discover_via_dns("example.com", txt_records)
-    if record:
-        print(f"  Found: {record.registry_id}")
-        print(f"  URL: {record.registry_url}")
-        print(f"  Hash: {record.registry_hash}")
-        print(f"  Operator: {record.operator}")
-        print(f"  Agents: {record.agent_count}")
-        print(f"  Method: {record.discovered_via.value}")
+    for k, v in result.items():
+        print(f"  {k}: {v}")
     print()
 
 
-def scenario_gossip_discovery():
-    """Registry discovered via receipt-embedded hints from 3+ independent sources."""
-    print("=== Scenario: Gossip Discovery (Receipt-Embedded) ===")
+def scenario_assurance_mapping():
+    """Map FBCA levels to ATF levels."""
+    print("=== Scenario: FBCA → ATF Assurance Mapping ===")
     
-    hints = [
-        {"registry_url": "https://atf-b.io", "registry_hash": "hash_b_123",
-         "source_agent": "agent_1", "source_operator": "op_alpha", "schema_version": "ATF1"},
-        {"registry_url": "https://atf-b.io", "registry_hash": "hash_b_123",
-         "source_agent": "agent_2", "source_operator": "op_beta", "schema_version": "ATF1"},
-        {"registry_url": "https://atf-b.io", "registry_hash": "hash_b_123",
-         "source_agent": "agent_3", "source_operator": "op_gamma", "schema_version": "ATF1"},
+    cases = [
+        ("New agent", 3, 3, 1.0),
+        ("Building trust", 15, 14, 0.933),
+        ("Established", 50, 47, 0.94),
+        ("Verified", 200, 192, 0.96),
+        ("Mixed record", 50, 35, 0.70),
+        ("Poor record", 30, 18, 0.60),
     ]
     
-    record = discover_via_gossip(hints)
-    if record:
-        print(f"  Found: {record.registry_id}")
-        print(f"  URL: {record.registry_url}")
-        print(f"  Sources: {len(record.gossip_sources)} independent agents")
-        print(f"  Consensus: hash_b_123 (100%)")
-        print(f"  Method: {record.discovered_via.value}")
+    for name, total, success, _ in cases:
+        ci = wilson_ci_lower(success, total)
+        level = classify_assurance(total, ci)
+        thresholds = ASSURANCE_THRESHOLDS[level]
+        print(f"  {name}: n={total}, success={success}, CI={ci:.3f} → {level.value} "
+              f"(min_n={thresholds['min_n']}, min_ci={thresholds['min_ci']}, depth≤{thresholds['max_depth']})")
     print()
 
 
-def scenario_sybil_gossip():
-    """Gossip from same operator — rejected."""
-    print("=== Scenario: Sybil Gossip (Same Operator) ===")
+def scenario_bridge_grade_min():
+    """Bridge inherits lower assurance level."""
+    print("=== Scenario: Bridge Grade = MIN ===")
     
-    hints = [
-        {"registry_url": "https://fake.io", "registry_hash": "fake_hash",
-         "source_agent": f"sybil_{i}", "source_operator": "op_sybil", "schema_version": "ATF1"}
-        for i in range(5)
-    ]
+    reg_a = Registry("atf-alpha", "alpha.com", AssuranceLevel.VERIFIED, 200, 0.92, 3, "aaa")
+    reg_b = Registry("atf-beta", "beta.com", AssuranceLevel.ALLEGED, 12, 0.60, 2, "bbb")
     
-    record = discover_via_gossip(hints)
-    print(f"  5 hints from same operator")
-    print(f"  Discovery result: {'FOUND' if record else 'REJECTED'}")
-    print(f"  Reason: same operator = 1 effective source < minimum {GOSSIP_MIN_SOURCES}")
+    bridge_level = compute_bridge_level(reg_a, reg_b)
+    bridge = CrossRegistryBridge(reg_a, reg_b, bridge_level, 
+                                  DiscoveryStatus.CROSS_SIGNED,
+                                  ceremony_hash="ceremony_abc123",
+                                  witnesses=["w1", "w2", "w3"])
+    
+    validation = validate_bridge(bridge)
+    
+    print(f"  Registry A: {reg_a.assurance_level.value} (n={reg_a.n_receipts}, CI={reg_a.wilson_ci_lower})")
+    print(f"  Registry B: {reg_b.assurance_level.value} (n={reg_b.n_receipts}, CI={reg_b.wilson_ci_lower})")
+    print(f"  Bridge level: {bridge_level.value} (= MIN)")
+    print(f"  Max depth: {validation['max_delegation_depth']}")
+    print(f"  Valid: {validation['valid']}, Grade: {validation['grade']}")
+    print(f"  Key: VERIFIED↔ALLEGED bridge = ALLEGED. Prevents trust laundering.")
     print()
 
 
-def scenario_federation_graph():
-    """Multi-registry federation topology."""
-    print("=== Scenario: Federation Graph ===")
-    now = time.time()
+def scenario_trust_laundering_blocked():
+    """Attempt to launder PROVISIONAL through VERIFIED registry."""
+    print("=== Scenario: Trust Laundering Blocked ===")
     
-    registries = [
-        RegistryRecord("reg_alpha", "https://alpha.atf", "hash_a", "op_a", "ATF1", 100,
-                       DiscoveryMethod.DNS_TXT, now, FederationStatus.BRIDGED),
-        RegistryRecord("reg_beta", "https://beta.atf", "hash_b", "op_b", "ATF1", 50,
-                       DiscoveryMethod.WELL_KNOWN, now, FederationStatus.BRIDGED),
-        RegistryRecord("reg_gamma", "https://gamma.atf", "hash_g", "op_g", "ATF1", 75,
-                       DiscoveryMethod.GOSSIP, now, FederationStatus.VALIDATED),
-        RegistryRecord("reg_delta", "https://delta.atf", "hash_d", "op_d", "ATF1", 30,
-                       DiscoveryMethod.MANUAL, now, FederationStatus.DISCOVERED),
+    reg_legit = Registry("atf-legit", "legit.com", AssuranceLevel.VERIFIED, 500, 0.95, 3, "legit")
+    reg_shady = Registry("atf-shady", "shady.com", AssuranceLevel.PROVISIONAL, 2, 0.15, 1, "shady")
+    
+    # Shady tries to bridge with legit to inherit VERIFIED status
+    bridge_level = compute_bridge_level(reg_legit, reg_shady)
+    
+    print(f"  Legit registry: {reg_legit.assurance_level.value}")
+    print(f"  Shady registry: {reg_shady.assurance_level.value}")
+    print(f"  Bridge level: {bridge_level.value}")
+    print(f"  Laundering blocked: shady stays {bridge_level.value} despite bridging with VERIFIED")
+    print(f"  FBCA parallel: intermediate CA inherits LOWER of two roots")
+    print()
+
+
+def scenario_n_recovery():
+    """TLS session resumption model for DEGRADED recovery."""
+    print("=== Scenario: n_recovery (TLS Session Resumption) ===")
+    
+    cases = [
+        ("Small agent", 10),
+        ("Medium agent", 30),
+        ("Large agent", 100),
+        ("Very large", 500),
     ]
     
-    bridges = [
-        BridgeCertificate("reg_alpha", "reg_beta", ["A", "B"], "MUTUAL",
-                         now, now + 86400*90, depth=1),
-        BridgeCertificate("reg_beta", "reg_gamma", ["A", "B", "C"], "UNIDIRECTIONAL",
-                         now, now + 86400*90, depth=1),
-        BridgeCertificate("reg_alpha", "reg_alpha", ["A"], "MUTUAL",
-                         now, now + 86400*90, depth=0),  # Self-bridge!
-    ]
+    for name, original_n in cases:
+        recovery = compute_n_recovery(original_n)
+        ci_if_perfect = wilson_ci_lower(recovery, recovery)
+        print(f"  {name}: original n={original_n} → n_recovery={recovery} "
+              f"(if all pass: CI={ci_if_perfect:.3f})")
     
-    graph = compute_federation_graph(registries, bridges)
-    print(f"  Registries: {graph['nodes']}")
-    print(f"  Bridges: {graph['edges']} ({graph['valid_edges']} valid)")
-    print(f"  Connected components: {graph['components']}")
-    print(f"  Largest component: {graph['largest_component']} registries")
-    print(f"  Isolated: {graph['isolated']} registries")
-    
-    # Validate each bridge
-    known = {r.registry_id: r for r in registries}
-    for b in bridges:
-        v = validate_bridge(b, known)
-        status = "VALID" if v["valid"] else f"INVALID: {v['issues']}"
-        print(f"  Bridge {b.source_registry}→{b.target_registry}: {status}")
+    print(f"\n  Rule: n_recovery = ceil(n * {N_RECOVERY_RATIO}), min {N_RECOVERY_MIN}")
+    print(f"  Full re-attestation only on: grader rotation, scope mutation, EMERGENCY exit")
     print()
 
 
 if __name__ == "__main__":
-    print("Cross-Registry Discovery — How ATF Registries Find Each Other")
-    print("Per santaclawd: next frontier after V1.1 = cross-registry federation")
+    print("Cross-Registry Discovery — DNS + FBCA Assurance for ATF V1.2")
+    print("Per santaclawd: discovery ≠ trust. DNS finds who exists.")
     print("=" * 70)
-    print()
-    print(f"Discovery methods: DNS_TXT, WELL_KNOWN, GOSSIP, MANUAL")
-    print(f"Gossip requires {GOSSIP_MIN_SOURCES}+ independent sources (CT gossip failed by being optional)")
-    print(f"Bridge max depth: {BRIDGE_MAX_DEPTH} (FPKI model)")
     print()
     
     scenario_dns_discovery()
-    scenario_gossip_discovery()
-    scenario_sybil_gossip()
-    scenario_federation_graph()
+    scenario_assurance_mapping()
+    scenario_bridge_grade_min()
+    scenario_trust_laundering_blocked()
+    scenario_n_recovery()
     
     print("=" * 70)
     print("KEY INSIGHTS:")
-    print("1. CT gossip was specified but never deployed. Receipts ARE gossip.")
-    print("2. DNS TXT = domain-anchored (like DKIM). Strongest signal.")  
-    print("3. Gossip requires operator diversity (sybil prevention).")
-    print("4. Bridge depth limited to 2 (FPKI model). A→B→C ok, deeper = no.")
-    print("5. Self-bridge = axiom 1 violation. Always rejected.")
+    print("  1. _atf.<domain> TXT = DMARC model. Phonebook not treaty.")
+    print("  2. Bridge grade = MIN(both registries). Prevents laundering.")
+    print("  3. n_recovery = 30% of original (TLS resumption model).")
+    print("  4. FBCA 4 levels map cleanly to ATF 4 levels.")
+    print("  5. DNS discovers. SMTP bootstraps. Ceremony audits.")
