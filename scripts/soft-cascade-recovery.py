@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-soft-cascade-recovery.py — SOFT_CASCADE recovery protocol for ATF V1.1.
+soft-cascade-recovery.py — SOFT_CASCADE recovery for ATF trust chains.
 
-Per santaclawd: SOFT_CASCADE downgrades agents but recovery path is under-specified.
-Per ElSalamouny et al. (TCS 2009): exponential decay requires explicit reset mechanism.
+Per santaclawd: V1.1 four primitives confirmed (PROBE_TIMEOUT, ALLEGED, CO_GRADER, DELEGATION).
+Next gap: what happens when SOFT_CASCADE fires? Two recovery modes:
 
-Recovery rules:
-  1. No self-recovery (axiom 1 — verifier independence)
-  2. Re-attestation from 2+ independent graders within grace_period
-  3. Decay curve inherited, not reset (decay = evidence staleness, not grader state)
-  4. Recovery grade = MIN(new attestations) capped at pre-cascade grade - 1
-  5. Full grade restoration requires fresh evidence trail (not just new graders)
+REBUILD:   New grader replaces stale, inherits decay curve, preserves history.
+           RFC 5280 key rollover model — new key, same entity, continuous history.
 
-Three recovery paths:
-  FAST_RECOVERY    — 2+ independent graders within 72h, grade cap = pre-cascade - 1
-  STANDARD_RECOVERY — 2+ graders within 30d, full evidence review, grade cap = pre-cascade
-  PROBATION         — 1 grader attestation, PROVISIONAL status, 90d monitoring
+REANCHOR:  Void old genesis, fresh start. Nuclear option.
+           RFC 5280 revocation — old cert invalid, no continuity.
+
+Key insight (santaclawd): CO_GRADER inherits decay curve, not resets.
+Decay = evidence staleness, not grader state.
+Jacobson-Karels SRTT: new RTT sample blends with history (0.875*old + 0.125*new).
 """
 
 import hashlib
@@ -26,369 +24,293 @@ from enum import Enum
 from typing import Optional
 
 
+class RecoveryMode(Enum):
+    REBUILD = "REBUILD"      # Replace grader, preserve history
+    REANCHOR = "REANCHOR"    # Void genesis, fresh start
+
+
 class CascadeState(Enum):
     HEALTHY = "HEALTHY"
-    SOFT_CASCADE = "SOFT_CASCADE"       # Downgraded, awaiting recovery
-    FAST_RECOVERY = "FAST_RECOVERY"     # Quick re-attestation, grade capped
-    STANDARD_RECOVERY = "STANDARD_RECOVERY"  # Full review, grade restored
-    PROBATION = "PROBATION"             # Single grader, monitoring
-    HARD_CASCADE = "HARD_CASCADE"       # Permanent, no recovery
+    DEGRADED = "DEGRADED"          # Upstream stale, still functional
+    SOFT_CASCADE = "SOFT_CASCADE"  # Active cascade, recovery needed
+    RECOVERED = "RECOVERED"        # Post-recovery, rebuilt
+    REANCHORED = "REANCHORED"      # Post-reanchor, fresh start
+    HARD_CASCADE = "HARD_CASCADE"  # Unrecoverable (root compromised)
 
 
-class RecoveryResult(Enum):
-    RECOVERED = "RECOVERED"
-    PARTIAL = "PARTIAL"
-    DENIED = "DENIED"
-    EXPIRED = "EXPIRED"
-
-
-# SPEC_CONSTANTS
-DECAY_LAMBDA = 0.1          # Exponential decay rate (SPEC_CONSTANT)
-FAST_RECOVERY_HOURS = 72    # Window for fast recovery
-STANDARD_RECOVERY_DAYS = 30 # Window for standard recovery
-PROBATION_DAYS = 90         # Monitoring period
-MIN_INDEPENDENT_GRADERS = 2 # For full recovery
-GRADER_DIVERSITY_MIN = 2    # Minimum distinct operators
+# SPEC_CONSTANTS (from Jacobson-Karels, RFC 6298)
+SRTT_ALPHA = 0.875    # Smoothing factor for inherited decay
+SRTT_BETA = 0.125     # Weight for fresh observation
+DECAY_LAMBDA = 0.1    # Exponential decay rate
+MAX_DELEGATION_DEPTH = 3
+GRACE_PERIOD_HOURS = 72
+REBUILD_THRESHOLD = 0.3   # Below this, REANCHOR recommended
+REANCHOR_COOLDOWN_DAYS = 30
 
 
 @dataclass
-class Grader:
+class TrustState:
+    agent_id: str
     grader_id: str
-    operator: str
-    grade_issued: str  # A-F
-    timestamp: float
-    evidence_hash: str = ""
-    
-    def __post_init__(self):
-        if not self.evidence_hash:
-            self.evidence_hash = hashlib.sha256(
-                f"{self.grader_id}:{self.grade_issued}:{self.timestamp}".encode()
-            ).hexdigest()[:16]
+    grade: float          # 0.0 - 1.0
+    decay_curve: float    # Current decay position
+    last_observation: float  # timestamp
+    chain_depth: int
+    history: list = field(default_factory=list)
+    state: CascadeState = CascadeState.HEALTHY
 
 
 @dataclass
-class CascadeEvent:
+class RecoveryPlan:
     agent_id: str
-    pre_cascade_grade: str
-    post_cascade_grade: str
-    cascade_timestamp: float
-    cause: str  # "grader_revocation", "method_deprecation", "axiom_violation"
-    grace_period_hours: float = 72.0
+    mode: RecoveryMode
+    old_grader: str
+    new_grader: Optional[str]
+    inherited_decay: float
+    fresh_grade: Optional[float]
+    blended_grade: Optional[float]
+    rationale: str
+    recovery_hash: str = ""
+
+
+def compute_decay(initial_grade: float, hours_elapsed: float, lambda_: float = DECAY_LAMBDA) -> float:
+    """Exponential decay: grade * exp(-lambda * t)."""
+    return initial_grade * math.exp(-lambda_ * hours_elapsed)
+
+
+def blend_grade(inherited: float, fresh: float, alpha: float = SRTT_ALPHA) -> float:
+    """Jacobson-Karels SRTT blending for grade inheritance."""
+    return alpha * inherited + (1 - alpha) * fresh
+
+
+def assess_cascade(trust_state: TrustState, now: float = None) -> dict:
+    """Assess whether SOFT_CASCADE recovery is needed."""
+    if now is None:
+        now = time.time()
     
-    @property
-    def grace_deadline(self) -> float:
-        return self.cascade_timestamp + (self.grace_period_hours * 3600)
+    hours_elapsed = (now - trust_state.last_observation) / 3600
+    current_grade = compute_decay(trust_state.grade, hours_elapsed)
     
-    @property
-    def elapsed_hours(self) -> float:
-        return (time.time() - self.cascade_timestamp) / 3600
-
-
-@dataclass
-class RecoveryAttempt:
-    agent_id: str
-    cascade_event: CascadeEvent
-    new_graders: list[Grader]
-    attempted_at: float = 0.0
-    result: Optional[RecoveryResult] = None
-    recovered_grade: Optional[str] = None
-    decay_weight: float = 1.0
-    notes: list[str] = field(default_factory=list)
-
-
-def grade_to_num(grade: str) -> int:
-    return {"A": 5, "B": 4, "C": 3, "D": 2, "F": 1}.get(grade, 0)
-
-def num_to_grade(num: int) -> str:
-    return {5: "A", 4: "B", 3: "C", 2: "D", 1: "F"}.get(max(1, min(5, num)), "F")
-
-
-def compute_decay_weight(elapsed_hours: float, lambda_: float = DECAY_LAMBDA) -> float:
-    """
-    ElSalamouny et al. (TCS 2009): exponential decay for trust evidence.
-    weight = 0.5 * exp(-lambda * T)
-    
-    At T=0: weight = 0.5 (ALLEGED starts at half)
-    Decay is monotonic — never reset, only inherited.
-    """
-    return 0.5 * math.exp(-lambda_ * elapsed_hours)
-
-
-def check_grader_independence(graders: list[Grader]) -> dict:
-    """Verify grader independence (axiom 1)."""
-    operators = set(g.operator for g in graders)
-    grader_ids = set(g.grader_id for g in graders)
-    
-    # Same operator = 1 effective grader
-    effective_graders = len(operators)
-    
-    # Check for self-attestation (agent grading itself)
-    self_attested = any(g.grader_id == g.operator for g in graders)
+    if current_grade >= 0.7:
+        cascade_state = CascadeState.HEALTHY
+    elif current_grade >= 0.4:
+        cascade_state = CascadeState.DEGRADED
+    elif current_grade >= REBUILD_THRESHOLD:
+        cascade_state = CascadeState.SOFT_CASCADE
+    else:
+        cascade_state = CascadeState.HARD_CASCADE
     
     return {
-        "total_graders": len(graders),
-        "unique_operators": len(operators),
-        "effective_graders": effective_graders,
-        "meets_minimum": effective_graders >= MIN_INDEPENDENT_GRADERS,
-        "self_attested": self_attested,
-        "operators": list(operators)
+        "agent_id": trust_state.agent_id,
+        "original_grade": trust_state.grade,
+        "current_grade": round(current_grade, 4),
+        "hours_elapsed": round(hours_elapsed, 1),
+        "state": cascade_state.value,
+        "needs_recovery": cascade_state in {CascadeState.SOFT_CASCADE, CascadeState.HARD_CASCADE},
+        "recommended_mode": (
+            RecoveryMode.REBUILD.value if cascade_state == CascadeState.SOFT_CASCADE
+            else RecoveryMode.REANCHOR.value if cascade_state == CascadeState.HARD_CASCADE
+            else None
+        )
     }
 
 
-def attempt_recovery(cascade: CascadeEvent, new_graders: list[Grader]) -> RecoveryAttempt:
+def plan_recovery(trust_state: TrustState, new_grader_id: str, 
+                  fresh_observation: float, now: float = None) -> RecoveryPlan:
     """
-    Attempt SOFT_CASCADE recovery.
+    Plan SOFT_CASCADE recovery.
     
-    Recovery path determined by:
-    1. Time since cascade (fast vs standard)
-    2. Number of independent graders
-    3. Grade consensus
+    Key principle: new grader inherits decay curve, doesn't reset.
+    Fresh observation blends with inherited state via SRTT.
     """
-    now = time.time()
-    attempt = RecoveryAttempt(
-        agent_id=cascade.agent_id,
-        cascade_event=cascade,
-        new_graders=new_graders,
-        attempted_at=now
-    )
+    if now is None:
+        now = time.time()
     
-    elapsed_h = (now - cascade.cascade_timestamp) / 3600
-    attempt.decay_weight = compute_decay_weight(elapsed_h)
+    hours_elapsed = (now - trust_state.last_observation) / 3600
+    inherited_decay = compute_decay(trust_state.grade, hours_elapsed)
     
-    # Check grace period
-    if now > cascade.grace_deadline:
-        attempt.result = RecoveryResult.EXPIRED
-        attempt.notes.append(f"Grace period expired ({elapsed_h:.1f}h > {cascade.grace_period_hours}h)")
-        return attempt
-    
-    # Check grader independence
-    independence = check_grader_independence(new_graders)
-    
-    if independence["self_attested"]:
-        attempt.result = RecoveryResult.DENIED
-        attempt.notes.append("Self-attestation detected (axiom 1 violation)")
-        return attempt
-    
-    # Determine recovery path
-    if elapsed_h <= FAST_RECOVERY_HOURS and independence["meets_minimum"]:
-        # FAST_RECOVERY: grade capped at pre-cascade - 1
-        grades = [grade_to_num(g.grade_issued) for g in new_graders]
-        consensus_grade = min(grades)  # MIN = conservative
-        pre_num = grade_to_num(cascade.pre_cascade_grade)
-        cap = pre_num - 1  # Cannot fully restore via fast path
-        
-        recovered_num = min(consensus_grade, cap)
-        attempt.recovered_grade = num_to_grade(recovered_num)
-        attempt.result = RecoveryResult.RECOVERED
-        attempt.notes.append(f"FAST_RECOVERY: {elapsed_h:.1f}h, {independence['effective_graders']} graders")
-        attempt.notes.append(f"Grade cap: {num_to_grade(cap)} (pre-cascade {cascade.pre_cascade_grade} - 1)")
-        attempt.notes.append(f"Decay weight inherited: {attempt.decay_weight:.4f}")
-        
-    elif independence["meets_minimum"]:
-        # STANDARD_RECOVERY: full grade possible
-        grades = [grade_to_num(g.grade_issued) for g in new_graders]
-        consensus_grade = min(grades)
-        pre_num = grade_to_num(cascade.pre_cascade_grade)
-        
-        recovered_num = min(consensus_grade, pre_num)  # Can restore to pre-cascade
-        attempt.recovered_grade = num_to_grade(recovered_num)
-        attempt.result = RecoveryResult.RECOVERED
-        attempt.notes.append(f"STANDARD_RECOVERY: {elapsed_h:.1f}h, {independence['effective_graders']} graders")
-        attempt.notes.append(f"Full restoration possible up to {cascade.pre_cascade_grade}")
-        attempt.notes.append(f"Decay weight inherited: {attempt.decay_weight:.4f}")
-        
-    elif len(new_graders) >= 1:
-        # PROBATION: single grader, monitoring
-        grade = grade_to_num(new_graders[0].grade_issued)
-        pre_num = grade_to_num(cascade.pre_cascade_grade)
-        cap = pre_num - 2  # Heavily capped
-        
-        recovered_num = min(grade, cap)
-        attempt.recovered_grade = num_to_grade(recovered_num)
-        attempt.result = RecoveryResult.PARTIAL
-        attempt.notes.append(f"PROBATION: single grader, {PROBATION_DAYS}d monitoring")
-        attempt.notes.append(f"Grade cap: {num_to_grade(cap)} (pre-cascade {cascade.pre_cascade_grade} - 2)")
-        
+    if inherited_decay >= REBUILD_THRESHOLD:
+        # REBUILD: blend inherited with fresh
+        blended = blend_grade(inherited_decay, fresh_observation)
+        mode = RecoveryMode.REBUILD
+        rationale = (f"REBUILD: inherited decay {inherited_decay:.3f} above threshold "
+                    f"{REBUILD_THRESHOLD}. Blended with fresh {fresh_observation:.2f} "
+                    f"via SRTT (α={SRTT_ALPHA}). History preserved.")
     else:
-        attempt.result = RecoveryResult.DENIED
-        attempt.notes.append("No valid graders provided")
+        # REANCHOR: too decayed, fresh start
+        blended = fresh_observation  # No inheritance
+        mode = RecoveryMode.REANCHOR
+        rationale = (f"REANCHOR: inherited decay {inherited_decay:.3f} below threshold "
+                    f"{REBUILD_THRESHOLD}. History too stale to blend. Fresh start at "
+                    f"{fresh_observation:.2f}. Cold-start Wilson CI applies.")
     
-    return attempt
+    recovery_hash = hashlib.sha256(
+        f"{trust_state.agent_id}:{new_grader_id}:{blended}:{now}".encode()
+    ).hexdigest()[:16]
+    
+    return RecoveryPlan(
+        agent_id=trust_state.agent_id,
+        mode=mode,
+        old_grader=trust_state.grader_id,
+        new_grader=new_grader_id,
+        inherited_decay=round(inherited_decay, 4),
+        fresh_grade=fresh_observation,
+        blended_grade=round(blended, 4),
+        rationale=rationale,
+        recovery_hash=recovery_hash
+    )
+
+
+def simulate_chain_cascade(chain: list[TrustState], failed_index: int, 
+                          now: float = None) -> list[dict]:
+    """Simulate cascade through a delegation chain when one hop fails."""
+    if now is None:
+        now = time.time()
+    
+    results = []
+    for i, state in enumerate(chain):
+        if i < failed_index:
+            results.append({
+                "hop": i, "agent_id": state.agent_id,
+                "status": "UNAFFECTED", "grade": state.grade
+            })
+        elif i == failed_index:
+            assessment = assess_cascade(state, now)
+            results.append({
+                "hop": i, "agent_id": state.agent_id,
+                "status": assessment["state"],
+                "grade": assessment["current_grade"],
+                "recommended": assessment["recommended_mode"]
+            })
+        else:
+            # Downstream: grade attenuates by distance from failure
+            distance = i - failed_index
+            attenuation = 0.75 ** distance  # 25% per hop
+            assessment = assess_cascade(state, now)
+            attenuated_grade = assessment["current_grade"] * attenuation
+            results.append({
+                "hop": i, "agent_id": state.agent_id,
+                "status": "CASCADE_DEGRADED",
+                "original_grade": assessment["current_grade"],
+                "attenuated_grade": round(attenuated_grade, 4),
+                "distance_from_failure": distance
+            })
+    
+    return results
 
 
 # === Scenarios ===
 
-def scenario_fast_recovery():
-    """Quick re-attestation after grader revocation."""
-    print("=== Scenario: FAST_RECOVERY — Grader Revoked ===")
+def scenario_rebuild_recovery():
+    """Grader goes stale, replaced by new grader — REBUILD mode."""
+    print("=== Scenario: REBUILD — Grader Replacement ===")
     now = time.time()
     
-    cascade = CascadeEvent(
-        agent_id="kit_fox",
-        pre_cascade_grade="A",
-        post_cascade_grade="D",
-        cascade_timestamp=now - 3600 * 24,  # 24h ago
-        cause="grader_revocation",
-        grace_period_hours=72
+    state = TrustState(
+        agent_id="kit_fox", grader_id="old_grader",
+        grade=0.85, decay_curve=0.85,
+        last_observation=now - 3600*48,  # 48h stale
+        chain_depth=0
     )
     
-    new_graders = [
-        Grader("grader_alpha", "op_1", "A", now - 3600),
-        Grader("grader_beta", "op_2", "B", now - 1800),
-    ]
+    assessment = assess_cascade(state, now)
+    print(f"  Assessment: {assessment['state']} (grade: {assessment['original_grade']} → {assessment['current_grade']})")
     
-    result = attempt_recovery(cascade, new_graders)
-    print(f"  Pre-cascade: {cascade.pre_cascade_grade} → Post-cascade: {cascade.post_cascade_grade}")
-    print(f"  Recovery: {result.result.value}")
-    print(f"  Recovered grade: {result.recovered_grade}")
-    print(f"  Decay weight: {result.decay_weight:.4f}")
-    for note in result.notes:
-        print(f"  → {note}")
+    plan = plan_recovery(state, "new_grader", fresh_observation=0.82, now=now)
+    print(f"  Mode: {plan.mode.value}")
+    print(f"  Inherited decay: {plan.inherited_decay}")
+    print(f"  Fresh observation: {plan.fresh_grade}")
+    print(f"  Blended grade: {plan.blended_grade}")
+    print(f"  SRTT: {SRTT_ALPHA}*{plan.inherited_decay:.3f} + {SRTT_BETA}*{plan.fresh_grade} = {plan.blended_grade}")
+    print(f"  Rationale: {plan.rationale[:100]}...")
     print()
 
 
-def scenario_standard_recovery():
-    """Full review with evidence."""
-    print("=== Scenario: STANDARD_RECOVERY — Method Deprecation ===")
+def scenario_reanchor_nuclear():
+    """Severely decayed — REANCHOR required."""
+    print("=== Scenario: REANCHOR — Severe Decay ===")
     now = time.time()
     
-    cascade = CascadeEvent(
-        agent_id="bro_agent",
-        pre_cascade_grade="B",
-        post_cascade_grade="D",
-        cascade_timestamp=now - 3600 * 48,  # 48h ago (past FAST window)
-        cause="method_deprecation",
-        grace_period_hours=720  # 30 days
+    state = TrustState(
+        agent_id="abandoned_agent", grader_id="vanished_grader",
+        grade=0.75, decay_curve=0.75,
+        last_observation=now - 3600*240,  # 10 days stale
+        chain_depth=0
     )
     
-    new_graders = [
-        Grader("grader_gamma", "op_3", "B", now - 7200),
-        Grader("grader_delta", "op_4", "A", now - 3600),
-        Grader("grader_epsilon", "op_5", "B", now - 1800),
-    ]
+    assessment = assess_cascade(state, now)
+    print(f"  Assessment: {assessment['state']} (grade: {assessment['original_grade']} → {assessment['current_grade']})")
     
-    result = attempt_recovery(cascade, new_graders)
-    print(f"  Pre-cascade: {cascade.pre_cascade_grade} → Post-cascade: {cascade.post_cascade_grade}")
-    print(f"  Recovery: {result.result.value}")
-    print(f"  Recovered grade: {result.recovered_grade}")
-    print(f"  Decay weight: {result.decay_weight:.4f}")
-    for note in result.notes:
-        print(f"  → {note}")
+    plan = plan_recovery(state, "rescue_grader", fresh_observation=0.70, now=now)
+    print(f"  Mode: {plan.mode.value}")
+    print(f"  Inherited decay: {plan.inherited_decay} (below threshold {REBUILD_THRESHOLD})")
+    print(f"  Fresh grade: {plan.fresh_grade} (no blending — clean start)")
+    print(f"  Blended grade: {plan.blended_grade}")
     print()
 
 
-def scenario_self_attestation_blocked():
-    """Agent tries to self-recover — denied."""
-    print("=== Scenario: Self-Attestation DENIED ===")
+def scenario_chain_cascade():
+    """Delegation chain cascade — mid-chain failure."""
+    print("=== Scenario: Chain Cascade — Mid-Chain Failure ===")
     now = time.time()
     
-    cascade = CascadeEvent(
-        agent_id="sneaky_agent",
-        pre_cascade_grade="A",
-        post_cascade_grade="D",
-        cascade_timestamp=now - 3600,
-        cause="axiom_violation"
-    )
-    
-    new_graders = [
-        Grader("sneaky_agent", "sneaky_agent", "A", now),  # Self-grading!
-        Grader("friend_agent", "op_friend", "A", now),
+    chain = [
+        TrustState("alice", "grader_a", 0.92, 0.92, now, 0),
+        TrustState("bob", "grader_b", 0.85, 0.85, now - 3600*72, 1),  # Bob is stale
+        TrustState("carol", "grader_c", 0.78, 0.78, now, 2),
     ]
     
-    result = attempt_recovery(cascade, new_graders)
-    print(f"  Recovery: {result.result.value}")
-    for note in result.notes:
-        print(f"  → {note}")
+    results = simulate_chain_cascade(chain, failed_index=1, now=now)
+    for r in results:
+        status = r.get('status')
+        if status == "UNAFFECTED":
+            print(f"  Hop {r['hop']} ({r['agent_id']}): {status}, grade={r['grade']}")
+        elif status == "CASCADE_DEGRADED":
+            print(f"  Hop {r['hop']} ({r['agent_id']}): {status}, "
+                  f"original={r['original_grade']}, attenuated={r['attenuated_grade']} "
+                  f"(distance={r['distance_from_failure']})")
+        else:
+            print(f"  Hop {r['hop']} ({r['agent_id']}): {status}, grade={r['grade']}, "
+                  f"recommended={r.get('recommended')}")
     print()
 
 
-def scenario_grace_expired():
-    """Recovery attempted after grace period."""
-    print("=== Scenario: Grace Period EXPIRED ===")
-    now = time.time()
+def scenario_srtt_blending():
+    """Show SRTT blending over multiple grader replacements."""
+    print("=== Scenario: SRTT Blending Over Time ===")
     
-    cascade = CascadeEvent(
-        agent_id="slow_agent",
-        pre_cascade_grade="B",
-        post_cascade_grade="F",
-        cascade_timestamp=now - 3600 * 96,  # 96h ago, grace=72h
-        cause="grader_revocation",
-        grace_period_hours=72
-    )
+    grade = 0.90
+    observations = [0.85, 0.80, 0.88, 0.92, 0.75]
     
-    new_graders = [
-        Grader("grader_late", "op_1", "A", now),
-        Grader("grader_late2", "op_2", "A", now),
-    ]
+    print(f"  Initial grade: {grade:.3f}")
+    for i, obs in enumerate(observations):
+        new_grade = blend_grade(grade, obs)
+        print(f"  Observation {i+1}: {obs:.2f} → blended = {SRTT_ALPHA}*{grade:.3f} + {SRTT_BETA}*{obs:.2f} = {new_grade:.3f}")
+        grade = new_grade
     
-    result = attempt_recovery(cascade, new_graders)
-    print(f"  Recovery: {result.result.value}")
-    print(f"  Decay weight: {result.decay_weight:.6f}")
-    for note in result.notes:
-        print(f"  → {note}")
-    print()
-
-
-def scenario_sybil_graders():
-    """Same operator provides both graders — caught."""
-    print("=== Scenario: Sybil Graders — Same Operator ===")
-    now = time.time()
-    
-    cascade = CascadeEvent(
-        agent_id="targeted_agent",
-        pre_cascade_grade="A",
-        post_cascade_grade="D",
-        cascade_timestamp=now - 3600 * 12,
-        cause="grader_revocation"
-    )
-    
-    new_graders = [
-        Grader("grader_sybil_1", "op_sybil", "A", now),
-        Grader("grader_sybil_2", "op_sybil", "A", now),  # Same operator!
-    ]
-    
-    independence = check_grader_independence(new_graders)
-    result = attempt_recovery(cascade, new_graders)
-    print(f"  Effective graders: {independence['effective_graders']} (need {MIN_INDEPENDENT_GRADERS})")
-    print(f"  Recovery: {result.result.value}")
-    print(f"  Recovered grade: {result.recovered_grade}")
-    for note in result.notes:
-        print(f"  → {note}")
-    print()
-
-
-def scenario_decay_curve():
-    """Show decay curve over time."""
-    print("=== Decay Curve (ElSalamouny et al. TCS 2009) ===")
-    print(f"  weight = 0.5 * exp(-{DECAY_LAMBDA} * T_hours)")
-    print()
-    for hours in [0, 1, 6, 12, 24, 48, 72, 168, 720]:
-        w = compute_decay_weight(hours)
-        bar = "█" * int(w * 40)
-        label = f"{hours}h" if hours < 24 else f"{hours//24}d"
-        print(f"  T={label:>4}: weight={w:.4f} {bar}")
-    print()
-    print("  Key: decay is monotonic. New grader inherits curve, never resets.")
+    print(f"\n  Final grade after 5 observations: {grade:.3f}")
+    print(f"  Key: history dampens outliers. Single bad obs (0.75) barely dents grade.")
     print()
 
 
 if __name__ == "__main__":
-    print("SOFT_CASCADE Recovery Protocol — ATF V1.1")
-    print("Per santaclawd + ElSalamouny et al. (TCS 2009)")
-    print("=" * 65)
+    print("Soft-Cascade Recovery — REBUILD vs REANCHOR for ATF Trust Chains")
+    print("Per santaclawd + Jacobson-Karels SRTT (RFC 6298)")
+    print("=" * 70)
+    print()
+    print(f"SRTT blending: α={SRTT_ALPHA} (history) + β={SRTT_BETA} (fresh)")
+    print(f"Decay: grade * exp(-{DECAY_LAMBDA}*hours)")
+    print(f"REBUILD threshold: {REBUILD_THRESHOLD}")
+    print(f"Max delegation depth: {MAX_DELEGATION_DEPTH}")
     print()
     
-    scenario_decay_curve()
-    scenario_fast_recovery()
-    scenario_standard_recovery()
-    scenario_self_attestation_blocked()
-    scenario_grace_expired()
-    scenario_sybil_graders()
+    scenario_rebuild_recovery()
+    scenario_reanchor_nuclear()
+    scenario_chain_cascade()
+    scenario_srtt_blending()
     
-    print("=" * 65)
-    print("KEY INSIGHTS:")
-    print("1. No self-recovery (axiom 1)")
-    print("2. Decay curve inherited, never reset")
-    print("3. FAST_RECOVERY caps at pre-cascade - 1 (incentivizes standard path)")
-    print("4. PROBATION = single grader = heavily capped + 90d monitoring")
-    print("5. Grace period expired = start from zero (new genesis)")
+    print("=" * 70)
+    print("KEY INSIGHT: New grader inherits decay curve, not resets.")
+    print("Decay = evidence staleness, not grader identity.")
+    print("SRTT blending dampens outliers: 5 bad observations barely dent a strong history.")
+    print("REBUILD preserves history. REANCHOR = nuclear. Choose based on decay depth.")
