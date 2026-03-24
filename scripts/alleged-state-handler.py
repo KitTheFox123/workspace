@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-alleged-state-handler.py — ALLEGED as 5th receipt state for ATF amendments.
+alleged-state-handler.py — ALLEGED receipt state for ATF amendment lifecycle.
 
-Per santaclawd: PROPOSED → ALLEGED (T_sign expired, payer silent) is NOT rejection.
-OCSP "unknown" ≠ "revoked" — same principle.
+Per santaclawd: ALLEGED ≠ REJECTED. Timeout silence ≠ explicit refusal.
+Per RFC 6960 OCSP: good/revoked/unknown are three distinct states.
 
-State machine:
-  PROPOSED → CONFIRMED (payer signs within T_sign)
-  PROPOSED → REJECTED (payer explicitly rejects)
-  PROPOSED → ALLEGED (T_sign expires, payer silent)
-  ALLEGED  → CONFIRMED (late sign)
-  ALLEGED  → DISPUTED (grader adjudicates)
-  ALLEGED  → EXPIRED (T_alleged expires, no action)
+Five-state amendment lifecycle:
+  PROPOSED   → initial, awaiting payer signature
+  CONFIRMED  → payer signed within T_sign window
+  ALLEGED    → T_sign expired, payer silent (NOT rejected!)
+  DISPUTED   → explicit disagreement from either party
+  REJECTED   → adjudicated against (terminal)
 
-ALLEGED has disputable weight: 0.5x in Wilson CI calculations.
+Key insight: ALLEGED scope has disputable weight (0.5x) in resolution.
+Late payer sign can upgrade ALLEGED → CONFIRMED retroactively.
 """
 
 import hashlib
@@ -24,286 +24,290 @@ from typing import Optional
 
 
 class AmendmentState(Enum):
-    PROPOSED = "PROPOSED"
-    CONFIRMED = "CONFIRMED"
-    REJECTED = "REJECTED"
-    ALLEGED = "ALLEGED"
-    DISPUTED = "DISPUTED"
-    EXPIRED = "EXPIRED"
+    PROPOSED = "PROPOSED"       # Awaiting payer signature
+    CONFIRMED = "CONFIRMED"     # Bilateral agreement
+    ALLEGED = "ALLEGED"         # Timeout, payer silent
+    DISPUTED = "DISPUTED"       # Explicit disagreement
+    REJECTED = "REJECTED"       # Terminal, adjudicated against
+
+
+class TransitionReason(Enum):
+    PAYER_SIGNED = "payer_signed"
+    T_SIGN_EXPIRED = "t_sign_expired"
+    PAYER_DISPUTES = "payer_disputes"
+    GRADER_ADJUDICATES = "grader_adjudicates"
+    LATE_SIGN = "late_sign"           # ALLEGED → CONFIRMED
+    WITHDRAWAL = "withdrawal"         # Proposer withdraws
 
 
 # SPEC_CONSTANTS
-T_SIGN_DEFAULT = 24 * 3600      # 24h signing window (genesis constant)
-T_ALLEGED_DEFAULT = 72 * 3600   # 72h alleged window before expiry
-ALLEGED_WEIGHT = 0.5             # Weight in Wilson CI calculations
-CONFIRMED_WEIGHT = 1.0
-REJECTED_WEIGHT = 0.0
-DISPUTED_WEIGHT = 0.0
+T_SIGN_DEFAULT_HOURS = 24        # Default signing window
+T_SIGN_MAX_HOURS = 72            # Maximum allowed
+T_SIGN_MIN_HOURS = 4             # Minimum (prevent instant timeout)
+ALLEGED_WEIGHT = 0.5             # Dispute resolution weight for ALLEGED scope
+CONFIRMED_WEIGHT = 1.0           # Full weight
+PROPOSED_WEIGHT = 0.0            # No weight until signed/alleged
+LATE_SIGN_WINDOW_HOURS = 168     # 7 days to late-sign an ALLEGED receipt
+ALLEGED_DECAY_DAYS = 90          # After 90d, ALLEGED auto-expires
 
 
 @dataclass
-class AmendmentReceipt:
-    receipt_id: str
-    amendment_hash: str
-    proposer: str
-    payer: str
-    grader: str
+class Amendment:
+    amendment_id: str
     scope_hash: str
+    proposer_id: str
+    payer_id: str
+    grader_id: str
     state: AmendmentState = AmendmentState.PROPOSED
     proposed_at: float = 0.0
-    t_sign: float = T_SIGN_DEFAULT
-    t_alleged: float = T_ALLEGED_DEFAULT
+    t_sign_hours: float = T_SIGN_DEFAULT_HOURS
     signed_at: Optional[float] = None
     alleged_at: Optional[float] = None
+    disputed_at: Optional[float] = None
     resolved_at: Optional[float] = None
-    resolution_reason: str = ""
+    transition_log: list = field(default_factory=list)
+    dispute_weight: float = 0.0
+
+
+@dataclass
+class Transition:
+    from_state: str
+    to_state: str
+    reason: str
+    timestamp: float
+    actor: str
+    receipt_hash: str = ""
+
+
+def compute_receipt_hash(amendment: Amendment, state: str, timestamp: float) -> str:
+    """Deterministic receipt hash for state transition."""
+    data = f"{amendment.amendment_id}:{state}:{timestamp}:{amendment.scope_hash}"
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+def transition(amendment: Amendment, new_state: AmendmentState, 
+               reason: TransitionReason, actor: str) -> dict:
+    """Execute state transition with validation."""
+    now = time.time()
+    old_state = amendment.state
     
-    @property
-    def receipt_hash(self) -> str:
-        h = hashlib.sha256(
-            f"{self.receipt_id}:{self.amendment_hash}:{self.state.value}".encode()
-        ).hexdigest()[:16]
-        return h
-
-
-def transition(receipt: AmendmentReceipt, now: float) -> AmendmentReceipt:
-    """Apply time-based state transitions."""
-    if receipt.state == AmendmentState.PROPOSED:
-        if now > receipt.proposed_at + receipt.t_sign:
-            receipt.state = AmendmentState.ALLEGED
-            receipt.alleged_at = receipt.proposed_at + receipt.t_sign
-            receipt.resolution_reason = "T_sign expired, payer silent"
+    # Validate transition
+    valid_transitions = {
+        AmendmentState.PROPOSED: {AmendmentState.CONFIRMED, AmendmentState.ALLEGED, 
+                                   AmendmentState.DISPUTED},
+        AmendmentState.ALLEGED: {AmendmentState.CONFIRMED, AmendmentState.DISPUTED,
+                                  AmendmentState.REJECTED},
+        AmendmentState.CONFIRMED: {AmendmentState.DISPUTED},
+        AmendmentState.DISPUTED: {AmendmentState.CONFIRMED, AmendmentState.REJECTED},
+        AmendmentState.REJECTED: set()  # Terminal
+    }
     
-    elif receipt.state == AmendmentState.ALLEGED:
-        if now > receipt.alleged_at + receipt.t_alleged:
-            receipt.state = AmendmentState.EXPIRED
-            receipt.resolved_at = receipt.alleged_at + receipt.t_alleged
-            receipt.resolution_reason = "T_alleged expired, no action"
+    if new_state not in valid_transitions.get(old_state, set()):
+        return {
+            "success": False,
+            "error": f"Invalid transition: {old_state.value} → {new_state.value}",
+            "valid_targets": [s.value for s in valid_transitions.get(old_state, set())]
+        }
     
-    return receipt
-
-
-def payer_sign(receipt: AmendmentReceipt, now: float) -> AmendmentReceipt:
-    """Payer signs the amendment (possibly late)."""
-    if receipt.state == AmendmentState.PROPOSED:
-        receipt.state = AmendmentState.CONFIRMED
-        receipt.signed_at = now
-        receipt.resolved_at = now
-        receipt.resolution_reason = "Payer signed within T_sign"
-    elif receipt.state == AmendmentState.ALLEGED:
-        receipt.state = AmendmentState.CONFIRMED
-        receipt.signed_at = now
-        receipt.resolved_at = now
-        receipt.resolution_reason = "Late sign: ALLEGED → CONFIRMED"
-    return receipt
-
-
-def payer_reject(receipt: AmendmentReceipt, now: float) -> AmendmentReceipt:
-    """Payer explicitly rejects."""
-    if receipt.state in (AmendmentState.PROPOSED, AmendmentState.ALLEGED):
-        receipt.state = AmendmentState.REJECTED
-        receipt.resolved_at = now
-        receipt.resolution_reason = "Payer explicitly rejected"
-    return receipt
-
-
-def grader_adjudicate(receipt: AmendmentReceipt, now: float, 
-                      finding: str) -> AmendmentReceipt:
-    """Grader adjudicates an ALLEGED receipt."""
-    if receipt.state == AmendmentState.ALLEGED:
-        receipt.state = AmendmentState.DISPUTED
-        receipt.resolved_at = now
-        receipt.resolution_reason = f"Grader adjudication: {finding}"
-    return receipt
-
-
-def wilson_ci_with_alleged(receipts: list[AmendmentReceipt], z: float = 1.96) -> dict:
-    """
-    Wilson CI incorporating ALLEGED receipts at reduced weight.
+    # Additional validation
+    if new_state == AmendmentState.ALLEGED and reason == TransitionReason.T_SIGN_EXPIRED:
+        elapsed_hours = (now - amendment.proposed_at) / 3600
+        if elapsed_hours < amendment.t_sign_hours:
+            return {
+                "success": False,
+                "error": f"T_sign not yet expired ({elapsed_hours:.1f}h < {amendment.t_sign_hours}h)"
+            }
     
-    CONFIRMED = 1.0 success
-    ALLEGED = 0.5 success (partial evidence)
-    REJECTED/DISPUTED = 0.0 success
-    EXPIRED = excluded (no signal)
-    """
-    weighted_successes = 0.0
-    total_weight = 0.0
+    if new_state == AmendmentState.CONFIRMED and old_state == AmendmentState.ALLEGED:
+        # Late sign — check within window
+        if amendment.alleged_at:
+            late_hours = (now - amendment.alleged_at) / 3600
+            if late_hours > LATE_SIGN_WINDOW_HOURS:
+                return {
+                    "success": False,
+                    "error": f"Late sign window expired ({late_hours:.1f}h > {LATE_SIGN_WINDOW_HOURS}h)"
+                }
     
-    state_counts = {}
-    for r in receipts:
-        state_counts[r.state.value] = state_counts.get(r.state.value, 0) + 1
-        
-        if r.state == AmendmentState.CONFIRMED:
-            weighted_successes += CONFIRMED_WEIGHT
-            total_weight += 1.0
-        elif r.state == AmendmentState.ALLEGED:
-            weighted_successes += ALLEGED_WEIGHT
-            total_weight += 1.0
-        elif r.state in (AmendmentState.REJECTED, AmendmentState.DISPUTED):
-            weighted_successes += 0.0
-            total_weight += 1.0
-        # EXPIRED and PROPOSED excluded
+    # Execute transition
+    receipt_hash = compute_receipt_hash(amendment, new_state.value, now)
     
-    if total_weight == 0:
-        return {"wilson_lower": 0.0, "wilson_upper": 1.0, "n_effective": 0,
-                "state_counts": state_counts}
+    t = Transition(
+        from_state=old_state.value,
+        to_state=new_state.value,
+        reason=reason.value,
+        timestamp=now,
+        actor=actor,
+        receipt_hash=receipt_hash
+    )
+    amendment.transition_log.append(t)
+    amendment.state = new_state
     
-    p_hat = weighted_successes / total_weight
-    n = total_weight
-    
-    denominator = 1 + z**2 / n
-    center = (p_hat + z**2 / (2*n)) / denominator
-    spread = z * ((p_hat * (1 - p_hat) / n + z**2 / (4 * n**2)) ** 0.5) / denominator
-    
-    lower = max(0, center - spread)
-    upper = min(1, center + spread)
+    # Update timestamps
+    if new_state == AmendmentState.CONFIRMED:
+        amendment.signed_at = now
+        amendment.dispute_weight = CONFIRMED_WEIGHT
+    elif new_state == AmendmentState.ALLEGED:
+        amendment.alleged_at = now
+        amendment.dispute_weight = ALLEGED_WEIGHT
+    elif new_state == AmendmentState.DISPUTED:
+        amendment.disputed_at = now
+    elif new_state == AmendmentState.REJECTED:
+        amendment.resolved_at = now
+        amendment.dispute_weight = 0.0
     
     return {
-        "wilson_lower": round(lower, 4),
-        "wilson_upper": round(upper, 4),
-        "p_hat": round(p_hat, 4),
-        "n_effective": round(n, 1),
-        "weighted_successes": round(weighted_successes, 1),
-        "state_counts": state_counts,
-        "alleged_impact": "ALLEGED receipts counted at 0.5x weight"
+        "success": True,
+        "transition": f"{old_state.value} → {new_state.value}",
+        "reason": reason.value,
+        "receipt_hash": receipt_hash,
+        "dispute_weight": amendment.dispute_weight
+    }
+
+
+def compute_dispute_resolution(amendments: list[Amendment]) -> dict:
+    """Resolve dispute using weighted amendment states.
+    
+    CONFIRMED = 1.0x weight, ALLEGED = 0.5x weight.
+    Per OCSP: unknown ≠ revoked, but carries information.
+    """
+    total_weight = 0.0
+    confirmed_weight = 0.0
+    alleged_weight = 0.0
+    
+    for a in amendments:
+        if a.state == AmendmentState.CONFIRMED:
+            confirmed_weight += CONFIRMED_WEIGHT
+            total_weight += CONFIRMED_WEIGHT
+        elif a.state == AmendmentState.ALLEGED:
+            alleged_weight += ALLEGED_WEIGHT
+            total_weight += ALLEGED_WEIGHT
+    
+    confirmed_ratio = confirmed_weight / total_weight if total_weight > 0 else 0
+    
+    return {
+        "total_amendments": len(amendments),
+        "confirmed_count": sum(1 for a in amendments if a.state == AmendmentState.CONFIRMED),
+        "alleged_count": sum(1 for a in amendments if a.state == AmendmentState.ALLEGED),
+        "disputed_count": sum(1 for a in amendments if a.state == AmendmentState.DISPUTED),
+        "total_weight": round(total_weight, 2),
+        "confirmed_weight": round(confirmed_weight, 2),
+        "alleged_weight": round(alleged_weight, 2),
+        "confirmed_ratio": round(confirmed_ratio, 3),
+        "resolution": "UPHELD" if confirmed_ratio >= 0.6 else "CONTESTED" if confirmed_ratio >= 0.4 else "OVERTURNED"
     }
 
 
 # === Scenarios ===
 
-def scenario_normal_flow():
-    """Amendment proposed, signed within window."""
-    print("=== Scenario: Normal Flow — Signed Within T_sign ===")
-    now = time.time()
+def scenario_normal_lifecycle():
+    """Standard: PROPOSED → CONFIRMED."""
+    print("=== Scenario: Normal Lifecycle ===")
+    a = Amendment("amend_001", "scope_abc", "kit_fox", "bro_agent", "grader_1",
+                  proposed_at=time.time() - 86400)
     
-    r = AmendmentReceipt("amend_001", "hash_abc", "grader_a", "payer_b", 
-                         "grader_a", "scope_xyz", proposed_at=now)
-    print(f"  State: {r.state.value}")
-    
-    r = payer_sign(r, now + 3600)  # Sign after 1 hour
-    print(f"  After payer sign: {r.state.value}")
-    print(f"  Reason: {r.resolution_reason}")
+    result = transition(a, AmendmentState.CONFIRMED, TransitionReason.PAYER_SIGNED, "bro_agent")
+    print(f"  PROPOSED → CONFIRMED: {result['success']}")
+    print(f"  Weight: {result['dispute_weight']}")
+    print(f"  Receipt: {result['receipt_hash']}")
     print()
 
 
-def scenario_alleged_then_late_sign():
-    """Payer misses T_sign, signs late."""
-    print("=== Scenario: ALLEGED → Late Sign ===")
-    now = time.time()
+def scenario_alleged_timeout():
+    """Payer silent → ALLEGED, then late sign → CONFIRMED."""
+    print("=== Scenario: ALLEGED → Late Sign → CONFIRMED ===")
+    a = Amendment("amend_002", "scope_def", "kit_fox", "silent_payer", "grader_1",
+                  proposed_at=time.time() - 100000)  # Well past T_sign
     
-    r = AmendmentReceipt("amend_002", "hash_def", "grader_a", "payer_b",
-                         "grader_a", "scope_xyz", proposed_at=now)
+    result1 = transition(a, AmendmentState.ALLEGED, TransitionReason.T_SIGN_EXPIRED, "system")
+    print(f"  PROPOSED → ALLEGED: {result1['success']}")
+    print(f"  Weight: {result1['dispute_weight']} (reduced)")
     
-    # Time passes beyond T_sign
-    r = transition(r, now + T_SIGN_DEFAULT + 1)
-    print(f"  After T_sign expires: {r.state.value}")
-    print(f"  Reason: {r.resolution_reason}")
-    
-    # Payer signs late
-    r = payer_sign(r, now + T_SIGN_DEFAULT + 3600)
-    print(f"  After late sign: {r.state.value}")
-    print(f"  Reason: {r.resolution_reason}")
+    result2 = transition(a, AmendmentState.CONFIRMED, TransitionReason.LATE_SIGN, "silent_payer")
+    print(f"  ALLEGED → CONFIRMED (late sign): {result2['success']}")
+    print(f"  Weight: {result2['dispute_weight']} (restored)")
     print()
 
 
-def scenario_alleged_then_disputed():
-    """Payer silent, grader adjudicates."""
-    print("=== Scenario: ALLEGED → Grader Adjudication ===")
-    now = time.time()
+def scenario_alleged_to_disputed():
+    """ALLEGED scope gets disputed by grader."""
+    print("=== Scenario: ALLEGED → DISPUTED → REJECTED ===")
+    a = Amendment("amend_003", "scope_ghi", "kit_fox", "bad_payer", "grader_1",
+                  proposed_at=time.time() - 200000)
     
-    r = AmendmentReceipt("amend_003", "hash_ghi", "grader_a", "payer_b",
-                         "grader_a", "scope_xyz", proposed_at=now)
+    r1 = transition(a, AmendmentState.ALLEGED, TransitionReason.T_SIGN_EXPIRED, "system")
+    print(f"  PROPOSED → ALLEGED: {r1['success']}")
     
-    r = transition(r, now + T_SIGN_DEFAULT + 1)
-    print(f"  After T_sign expires: {r.state.value}")
+    r2 = transition(a, AmendmentState.DISPUTED, TransitionReason.GRADER_ADJUDICATES, "grader_1")
+    print(f"  ALLEGED → DISPUTED: {r2['success']}")
     
-    r = grader_adjudicate(r, now + T_SIGN_DEFAULT + 7200, 
-                          "Scope delivered but payer unresponsive")
-    print(f"  After adjudication: {r.state.value}")
-    print(f"  Reason: {r.resolution_reason}")
+    r3 = transition(a, AmendmentState.REJECTED, TransitionReason.GRADER_ADJUDICATES, "grader_1")
+    print(f"  DISPUTED → REJECTED: {r3['success']}")
+    print(f"  Terminal weight: {a.dispute_weight}")
     print()
 
 
-def scenario_alleged_expires():
-    """Nobody acts — ALLEGED expires."""
-    print("=== Scenario: ALLEGED → EXPIRED (No Action) ===")
+def scenario_dispute_resolution_mixed():
+    """Mixed CONFIRMED + ALLEGED amendments in dispute."""
+    print("=== Scenario: Mixed Dispute Resolution ===")
     now = time.time()
     
-    r = AmendmentReceipt("amend_004", "hash_jkl", "grader_a", "payer_b",
-                         "grader_a", "scope_xyz", proposed_at=now)
+    amendments = []
+    # 3 confirmed milestones
+    for i in range(3):
+        a = Amendment(f"m_{i}", f"scope_{i}", "kit_fox", "payer", "grader",
+                      proposed_at=now-86400, state=AmendmentState.CONFIRMED,
+                      dispute_weight=CONFIRMED_WEIGHT)
+        amendments.append(a)
     
-    r = transition(r, now + T_SIGN_DEFAULT + 1)
-    print(f"  After T_sign: {r.state.value}")
+    # 2 alleged milestones (payer went silent)
+    for i in range(3, 5):
+        a = Amendment(f"m_{i}", f"scope_{i}", "kit_fox", "payer", "grader",
+                      proposed_at=now-86400, state=AmendmentState.ALLEGED,
+                      dispute_weight=ALLEGED_WEIGHT)
+        amendments.append(a)
     
-    r = transition(r, now + T_SIGN_DEFAULT + T_ALLEGED_DEFAULT + 1)
-    print(f"  After T_alleged: {r.state.value}")
-    print(f"  Reason: {r.resolution_reason}")
+    result = compute_dispute_resolution(amendments)
+    print(f"  Confirmed: {result['confirmed_count']} ({result['confirmed_weight']}w)")
+    print(f"  Alleged: {result['alleged_count']} ({result['alleged_weight']}w)")
+    print(f"  Total weight: {result['total_weight']}")
+    print(f"  Confirmed ratio: {result['confirmed_ratio']}")
+    print(f"  Resolution: {result['resolution']}")
+    print(f"  (OCSP parallel: unknown ≠ revoked, but carries reduced information)")
     print()
 
 
-def scenario_wilson_ci_with_alleged():
-    """Wilson CI calculations with mixed states including ALLEGED."""
-    print("=== Scenario: Wilson CI With ALLEGED Weight ===")
-    now = time.time()
+def scenario_invalid_transition():
+    """Try invalid transition — REJECTED is terminal."""
+    print("=== Scenario: Invalid Transition (Terminal State) ===")
+    a = Amendment("amend_004", "scope_jkl", "kit_fox", "payer", "grader",
+                  state=AmendmentState.REJECTED)
     
-    receipts = []
-    # 15 CONFIRMED
-    for i in range(15):
-        r = AmendmentReceipt(f"r{i:03d}", f"h{i}", "g", "p", "g", "s",
-                            proposed_at=now)
-        r.state = AmendmentState.CONFIRMED
-        receipts.append(r)
-    
-    # 5 ALLEGED
-    for i in range(15, 20):
-        r = AmendmentReceipt(f"r{i:03d}", f"h{i}", "g", "p", "g", "s",
-                            proposed_at=now)
-        r.state = AmendmentState.ALLEGED
-        receipts.append(r)
-    
-    # 3 REJECTED
-    for i in range(20, 23):
-        r = AmendmentReceipt(f"r{i:03d}", f"h{i}", "g", "p", "g", "s",
-                            proposed_at=now)
-        r.state = AmendmentState.REJECTED
-        receipts.append(r)
-    
-    result = wilson_ci_with_alleged(receipts)
-    print(f"  States: {result['state_counts']}")
-    print(f"  Weighted successes: {result['weighted_successes']} / {result['n_effective']}")
-    print(f"  p_hat: {result['p_hat']}")
-    print(f"  Wilson CI: [{result['wilson_lower']}, {result['wilson_upper']}]")
-    print(f"  Note: {result['alleged_impact']}")
-    
-    # Compare: what if ALLEGED counted as CONFIRMED?
-    for r in receipts:
-        if r.state == AmendmentState.ALLEGED:
-            r.state = AmendmentState.CONFIRMED
-    result_inflated = wilson_ci_with_alleged(receipts)
-    print(f"\n  If ALLEGED=CONFIRMED: Wilson CI [{result_inflated['wilson_lower']}, {result_inflated['wilson_upper']}]")
-    print(f"  Difference: {result_inflated['wilson_lower'] - result['wilson_lower']:.4f} lower bound inflation")
+    result = transition(a, AmendmentState.CONFIRMED, TransitionReason.PAYER_SIGNED, "payer")
+    print(f"  REJECTED → CONFIRMED: {result['success']}")
+    print(f"  Error: {result.get('error', 'none')}")
+    print(f"  Valid targets: {result.get('valid_targets', [])}")
     print()
 
 
 if __name__ == "__main__":
-    print("Alleged State Handler — 5th Receipt State for ATF Amendments")
-    print("Per santaclawd: ALLEGED ≠ REJECTED. OCSP unknown ≠ revoked.")
-    print("=" * 65)
+    print("ALLEGED State Handler — Five-State Amendment Lifecycle for ATF")
+    print("Per santaclawd + RFC 6960 OCSP (good/revoked/unknown)")
+    print("=" * 70)
     print()
-    print("State machine:")
-    print("  PROPOSED → CONFIRMED (signed) | REJECTED (explicit) | ALLEGED (timeout)")
-    print("  ALLEGED  → CONFIRMED (late sign) | DISPUTED (adjudicated) | EXPIRED (no action)")
-    print(f"  T_sign: {T_SIGN_DEFAULT//3600}h | T_alleged: {T_ALLEGED_DEFAULT//3600}h")
-    print(f"  ALLEGED weight in Wilson CI: {ALLEGED_WEIGHT}")
+    print("States: PROPOSED → CONFIRMED | ALLEGED | DISPUTED → REJECTED")
+    print(f"  CONFIRMED weight: {CONFIRMED_WEIGHT}x")
+    print(f"  ALLEGED weight:   {ALLEGED_WEIGHT}x (reduced but non-zero)")
+    print(f"  T_sign default:   {T_SIGN_DEFAULT_HOURS}h")
+    print(f"  Late sign window: {LATE_SIGN_WINDOW_HOURS}h")
     print()
     
-    scenario_normal_flow()
-    scenario_alleged_then_late_sign()
-    scenario_alleged_then_disputed()
-    scenario_alleged_expires()
-    scenario_wilson_ci_with_alleged()
+    scenario_normal_lifecycle()
+    scenario_alleged_timeout()
+    scenario_alleged_to_disputed()
+    scenario_dispute_resolution_mixed()
+    scenario_invalid_transition()
     
-    print("=" * 65)
-    print("KEY INSIGHT: Silence is information, not absence.")
-    print("ALLEGED preserves the claim while acknowledging uncertainty.")
-    print("0.5x weight = honest CI, not inflated or discarded.")
+    print("=" * 70)
+    print("KEY: ALLEGED ≠ REJECTED. Silence ≠ refusal.")
+    print("OCSP 'unknown' carries information — insufficient, not negative.")
+    print("Late sign preserves bilateral trust. Timeout is state, not verdict.")
