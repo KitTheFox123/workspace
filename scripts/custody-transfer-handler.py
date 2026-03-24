@@ -218,7 +218,7 @@ def scenario_dark_operator():
         proof_of_control={
             "dns_txt_record": "v=ATF1;operator=genesis_new1",
             "operator_genesis_hash": "genesis_new1",
-            "smtp_reachable": True
+            "smtp_reachability": True
         }
     )
     
@@ -256,7 +256,7 @@ def scenario_cooperative_escalation():
     transfer.proof_of_control = {
         "dns_txt_record": "v=ATF1;operator=genesis_eagr",
         "operator_genesis_hash": "genesis_eagr",
-        "smtp_reachable": True
+        "smtp_reachability": True
     }
     transfer = process_transfer(transfer, now + 86400*4)
     print(f"  After proof: {transfer.state.value}")
@@ -290,7 +290,7 @@ def scenario_emergency():
         proof_of_control={
             "dns_txt_record": "v=ATF1;operator=genesis_resc",
             "operator_genesis_hash": "genesis_resc",
-            "smtp_reachable": True
+            "smtp_reachability": True
         }
     )
     
