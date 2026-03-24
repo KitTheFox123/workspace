@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-dormancy-state-handler.py — DORMANT state for ATF V1.2.
+dormancy-state-handler.py — ATF V1.2 DORMANT state management.
 
-Per santaclawd: idle agent with expired receipts looks identical to bad actor
-with no receipts. Both show as PROVISIONAL. That's wrong.
+Per santaclawd: idle agent = decayed receipts ≠ bad actor with no receipts.
+Both currently look like PROVISIONAL. That's wrong.
 
-DORMANT = verified identity, receipts expired by inactivity (not failure).
-PROVISIONAL = never proven or unverifiable.
+State model:
+  PROVISIONAL  — Never verified (no receipts, no identity proof)
+  ACTIVE       — Verified + recent receipts within TTL
+  DORMANT      — Verified identity, receipts expired by INACTIVITY (not failure)
+  DEGRADED     — Active but trust score declining (failures/disputes)
+  SUSPENDED    — Pending investigation / eviction ballot
 
-HTTP 304 Not Modified model: content unchanged, cache still valid.
-DORMANT preserves last_receipt_hash — wake = chain from checkpoint
-without full re-attestation.
+X.509 parallel: expired cert ≠ revoked cert.
+  Expired = time passed, identity still valid. Renew = re-issue.
+  Revoked = trust broken. Recovery = full re-verification.
 
-Key distinction:
-  PROVISIONAL → unknown history → full attestation required
-  DORMANT     → known history, inactive → resume from last checkpoint
+AID (v1.2.0, Feb 2026): _agent.domain for discovery.
+ATF: _atf.domain for trust state. DORMANT agents discoverable but trust-gated.
 """
 
 import hashlib
@@ -24,311 +27,293 @@ from enum import Enum
 from typing import Optional
 
 
-class TrustState(Enum):
-    PROVISIONAL = "PROVISIONAL"   # Never proven or unverifiable
-    ACTIVE = "ACTIVE"             # Current receipts, engaged
-    DORMANT = "DORMANT"           # Verified but inactive (NEW in V1.2)
-    DEGRADED = "DEGRADED"         # Active but failing
-    SUSPENDED = "SUSPENDED"       # Under investigation
-    REVOKED = "REVOKED"           # Permanently invalid
+class AgentState(Enum):
+    PROVISIONAL = "PROVISIONAL"    # Never verified
+    ACTIVE = "ACTIVE"              # Verified + recent receipts
+    DORMANT = "DORMANT"            # Verified but inactive
+    DEGRADED = "DEGRADED"          # Active but declining
+    SUSPENDED = "SUSPENDED"        # Under investigation
+
+
+class DormancyTrigger(Enum):
+    RECEIPT_EXPIRY = "receipt_expiry"       # All receipts past TTL
+    VOLUNTARY = "voluntary"                 # Agent declares dormancy
+    OPERATOR_INITIATED = "operator_initiated"
+
+
+class WakeupMethod(Enum):
+    RECEIPT = "receipt"            # New receipt triggers wakeup
+    IDENTITY_CHECK = "identity_check"  # Lightweight identity verification
+    FULL_REATTESTATION = "full_reattestation"  # Complete re-verification
 
 
 # SPEC_CONSTANTS
-DORMANCY_THRESHOLD_DAYS = 90      # No receipts for 90 days → DORMANT
-DORMANCY_MAX_DAYS = 365           # After 365 days dormant → requires re-attestation
-WAKE_GRACE_PERIOD_HOURS = 24      # Time to produce first receipt after wake
-RECEIPT_DECAY_HALFLIFE_DAYS = 30  # Receipt freshness decay
+RECEIPT_TTL_DAYS = 90              # Receipts expire after 90 days
+DORMANCY_GRACE_DAYS = 30           # Grace period before ACTIVE → DORMANT
+RECOVERY_WINDOW_DAYS = 30          # Max time in DEGRADED before re-attestation
+DORMANT_IDENTITY_TTL_DAYS = 365    # Identity proof valid for 1 year while dormant
+WAKEUP_COLD_START_N = 5            # Min receipts needed to exit cold-start after dormancy
+WILSON_Z = 1.96                    # 95% CI
 
 
 @dataclass
-class AgentTrustProfile:
-    agent_id: str
-    genesis_hash: str
-    current_state: TrustState
-    last_receipt_hash: Optional[str] = None
-    last_receipt_timestamp: Optional[float] = None
-    total_receipts: int = 0
-    confirmed_receipts: int = 0
-    dormancy_entered_at: Optional[float] = None
-    trust_score_at_dormancy: Optional[float] = None
-    wake_count: int = 0  # How many times agent has gone dormant and woken
-
-
-@dataclass
-class StateTransition:
-    from_state: TrustState
-    to_state: TrustState
-    reason: str
+class Receipt:
+    receipt_id: str
     timestamp: float
-    evidence_hash: Optional[str] = None
+    evidence_grade: str
+    counterparty: str
+    status: str = "CONFIRMED"  # CONFIRMED/FAILED/DISPUTED
 
 
-def days_since(timestamp: Optional[float]) -> float:
-    """Days since a timestamp."""
-    if timestamp is None:
-        return float('inf')
-    return (time.time() - timestamp) / 86400
+@dataclass
+class AgentTrustRecord:
+    agent_id: str
+    state: AgentState
+    genesis_hash: str
+    identity_verified_at: float
+    last_receipt_at: Optional[float] = None
+    dormancy_entered_at: Optional[float] = None
+    dormancy_trigger: Optional[DormancyTrigger] = None
+    receipts: list = field(default_factory=list)
+    prior_trust_score: float = 0.0  # Preserved from before dormancy
+    prior_receipt_count: int = 0     # Total historical receipts
 
 
-def check_dormancy_eligibility(profile: AgentTrustProfile) -> dict:
-    """Check if an ACTIVE agent should transition to DORMANT."""
-    if profile.current_state != TrustState.ACTIVE:
-        return {"eligible": False, "reason": f"Not ACTIVE (currently {profile.current_state.value})"}
+def wilson_ci_lower(successes: int, total: int, z: float = WILSON_Z) -> float:
+    """Wilson score interval lower bound."""
+    if total == 0:
+        return 0.0
+    p = successes / total
+    denominator = 1 + z**2 / total
+    centre = p + z**2 / (2 * total)
+    spread = z * ((p * (1 - p) + z**2 / (4 * total)) / total) ** 0.5
+    return round((centre - spread) / denominator, 4)
+
+
+def check_dormancy_transition(agent: AgentTrustRecord, now: float) -> dict:
+    """Check if agent should transition to DORMANT."""
+    if agent.state != AgentState.ACTIVE:
+        return {"transition": False, "reason": f"Agent is {agent.state.value}, not ACTIVE"}
     
-    days_inactive = days_since(profile.last_receipt_timestamp)
+    if agent.last_receipt_at is None:
+        return {"transition": False, "reason": "No receipts recorded"}
     
-    if days_inactive < DORMANCY_THRESHOLD_DAYS:
+    days_since_receipt = (now - agent.last_receipt_at) / 86400
+    
+    if days_since_receipt > RECEIPT_TTL_DAYS + DORMANCY_GRACE_DAYS:
         return {
-            "eligible": False,
-            "reason": f"Still within activity window ({days_inactive:.0f} < {DORMANCY_THRESHOLD_DAYS} days)",
-            "days_until_dormant": DORMANCY_THRESHOLD_DAYS - days_inactive
+            "transition": True,
+            "new_state": AgentState.DORMANT.value,
+            "trigger": DormancyTrigger.RECEIPT_EXPIRY.value,
+            "days_inactive": round(days_since_receipt, 1),
+            "ttl_exceeded_by": round(days_since_receipt - RECEIPT_TTL_DAYS, 1),
+            "identity_still_valid": True,
+            "prior_trust_preserved": agent.prior_trust_score
         }
+    elif days_since_receipt > RECEIPT_TTL_DAYS:
+        return {
+            "transition": False,
+            "warning": "GRACE_PERIOD",
+            "days_remaining": round(RECEIPT_TTL_DAYS + DORMANCY_GRACE_DAYS - days_since_receipt, 1),
+            "days_inactive": round(days_since_receipt, 1)
+        }
+    else:
+        return {"transition": False, "reason": "Receipts still within TTL"}
+
+
+def wakeup_from_dormancy(agent: AgentTrustRecord, new_receipt: Receipt, now: float) -> dict:
+    """Process wakeup from DORMANT state."""
+    if agent.state != AgentState.DORMANT:
+        return {"success": False, "reason": f"Agent is {agent.state.value}, not DORMANT"}
+    
+    dormancy_duration = (now - agent.dormancy_entered_at) / 86400 if agent.dormancy_entered_at else 0
+    identity_age = (now - agent.identity_verified_at) / 86400
+    
+    # Check if identity proof has expired
+    if identity_age > DORMANT_IDENTITY_TTL_DAYS:
+        return {
+            "success": False,
+            "wakeup_method": WakeupMethod.FULL_REATTESTATION.value,
+            "reason": "Identity proof expired during dormancy",
+            "identity_age_days": round(identity_age, 1),
+            "max_identity_ttl": DORMANT_IDENTITY_TTL_DAYS,
+            "action": "Full re-attestation required (genesis ceremony lite)"
+        }
+    
+    # Identity valid — lightweight wakeup
+    # Wilson CI applies with cold-start ceiling
+    new_trust = wilson_ci_lower(1, 1)  # First receipt post-dormancy
+    
+    # Blend with prior trust (decayed by dormancy duration)
+    decay_factor = max(0.1, 1.0 - (dormancy_duration / 365))
+    blended_trust = (agent.prior_trust_score * decay_factor * 0.3 + new_trust * 0.7)
     
     return {
-        "eligible": True,
-        "reason": f"No receipts for {days_inactive:.0f} days (threshold: {DORMANCY_THRESHOLD_DAYS})",
-        "days_inactive": days_inactive,
-        "preserves": {
-            "last_receipt_hash": profile.last_receipt_hash,
-            "total_receipts": profile.total_receipts,
-            "trust_score": profile.trust_score_at_dormancy
-        }
+        "success": True,
+        "wakeup_method": WakeupMethod.IDENTITY_CHECK.value,
+        "new_state": AgentState.ACTIVE.value,
+        "dormancy_duration_days": round(dormancy_duration, 1),
+        "prior_trust": agent.prior_trust_score,
+        "decay_factor": round(decay_factor, 3),
+        "new_trust_score": round(blended_trust, 4),
+        "cold_start_ceiling": wilson_ci_lower(1, 1),
+        "receipts_to_full_trust": WAKEUP_COLD_START_N,
+        "identity_check": "PASSED"
     }
 
 
-def transition_to_dormant(profile: AgentTrustProfile) -> tuple[AgentTrustProfile, StateTransition]:
-    """Transition ACTIVE → DORMANT."""
-    now = time.time()
-    
-    # Preserve trust state at point of dormancy
-    profile.trust_score_at_dormancy = (
-        profile.confirmed_receipts / profile.total_receipts 
-        if profile.total_receipts > 0 else 0.0
-    )
-    profile.dormancy_entered_at = now
-    profile.current_state = TrustState.DORMANT
-    
-    transition = StateTransition(
-        from_state=TrustState.ACTIVE,
-        to_state=TrustState.DORMANT,
-        reason=f"No receipts for >{DORMANCY_THRESHOLD_DAYS} days",
-        timestamp=now,
-        evidence_hash=profile.last_receipt_hash
-    )
-    
-    return profile, transition
-
-
-def check_wake_eligibility(profile: AgentTrustProfile) -> dict:
-    """Check if a DORMANT agent can wake (vs needs full re-attestation)."""
-    if profile.current_state != TrustState.DORMANT:
-        return {"eligible": False, "reason": f"Not DORMANT (currently {profile.current_state.value})"}
-    
-    days_dormant = days_since(profile.dormancy_entered_at)
-    
-    if days_dormant > DORMANCY_MAX_DAYS:
-        return {
-            "eligible": False,
-            "reason": f"Dormant too long ({days_dormant:.0f} > {DORMANCY_MAX_DAYS} days). Full re-attestation required.",
-            "requires": "FULL_RE_ATTESTATION",
-            "days_dormant": days_dormant
-        }
-    
-    return {
-        "eligible": True,
-        "reason": f"Can resume from last checkpoint ({days_dormant:.0f} days dormant)",
-        "resume_from": profile.last_receipt_hash,
-        "preserved_trust": profile.trust_score_at_dormancy,
-        "grace_period_hours": WAKE_GRACE_PERIOD_HOURS,
-        "days_dormant": days_dormant
-    }
-
-
-def wake_agent(profile: AgentTrustProfile) -> tuple[AgentTrustProfile, StateTransition]:
-    """Transition DORMANT → ACTIVE (resume from checkpoint)."""
-    now = time.time()
-    
-    profile.current_state = TrustState.ACTIVE
-    profile.wake_count += 1
-    # Trust score preserved but not inflated
-    # Next receipt chains from last_receipt_hash
-    
-    transition = StateTransition(
-        from_state=TrustState.DORMANT,
-        to_state=TrustState.ACTIVE,
-        reason=f"Wake #{profile.wake_count}: resume from {profile.last_receipt_hash}",
-        timestamp=now,
-        evidence_hash=profile.last_receipt_hash
-    )
-    
-    return profile, transition
-
-
-def compare_dormant_vs_provisional(dormant: AgentTrustProfile, provisional: AgentTrustProfile) -> dict:
+def compare_dormant_vs_provisional(now: float) -> dict:
     """Show why DORMANT ≠ PROVISIONAL."""
+    dormant = AgentTrustRecord(
+        agent_id="verified_idle",
+        state=AgentState.DORMANT,
+        genesis_hash="abc123",
+        identity_verified_at=now - 86400 * 200,
+        last_receipt_at=now - 86400 * 150,
+        dormancy_entered_at=now - 86400 * 30,
+        prior_trust_score=0.85,
+        prior_receipt_count=45
+    )
+    
+    provisional = AgentTrustRecord(
+        agent_id="never_verified",
+        state=AgentState.PROVISIONAL,
+        genesis_hash="",
+        identity_verified_at=0,
+        prior_trust_score=0.0,
+        prior_receipt_count=0
+    )
+    
     return {
         "dormant": {
-            "state": dormant.current_state.value,
-            "has_history": dormant.total_receipts > 0,
-            "total_receipts": dormant.total_receipts,
-            "last_receipt_hash": dormant.last_receipt_hash,
-            "trust_at_dormancy": dormant.trust_score_at_dormancy,
-            "can_resume": True,
-            "requires_full_attestation": False,
-            "analogy": "HTTP 304 Not Modified"
+            "identity": "VERIFIED",
+            "genesis": dormant.genesis_hash,
+            "prior_trust": dormant.prior_trust_score,
+            "historical_receipts": dormant.prior_receipt_count,
+            "wakeup_cost": "identity_check + 1 receipt",
+            "trust_floor": round(dormant.prior_trust_score * 0.3, 3)
         },
         "provisional": {
-            "state": provisional.current_state.value,
-            "has_history": provisional.total_receipts == 0,
-            "total_receipts": provisional.total_receipts,
-            "last_receipt_hash": provisional.last_receipt_hash,
-            "trust_at_dormancy": None,
-            "can_resume": False,
-            "requires_full_attestation": True,
-            "analogy": "HTTP 404 Not Found"
+            "identity": "UNKNOWN",
+            "genesis": "NONE",
+            "prior_trust": 0.0,
+            "historical_receipts": 0,
+            "wakeup_cost": "full genesis ceremony + n_bootstrap receipts",
+            "trust_floor": 0.0
         },
-        "key_difference": "DORMANT = proven then slept. PROVISIONAL = never proven.",
-        "trust_implication": "DORMANT agent resumes at preserved trust floor. PROVISIONAL starts at Wilson CI n=0."
+        "key_difference": "Same current receipt count (0), totally different recovery path"
     }
 
 
 # === Scenarios ===
 
-def scenario_active_goes_dormant():
-    """Established agent goes quiet — transitions to DORMANT."""
-    print("=== Scenario: Active → Dormant (Established Agent Goes Quiet) ===")
+def scenario_natural_dormancy():
+    """Agent goes idle — natural transition to DORMANT."""
+    print("=== Scenario: Natural Dormancy (Receipt Expiry) ===")
+    now = time.time()
     
-    profile = AgentTrustProfile(
+    agent = AgentTrustRecord(
         agent_id="kit_fox",
-        genesis_hash="abc123",
-        current_state=TrustState.ACTIVE,
-        last_receipt_hash="receipt_450",
-        last_receipt_timestamp=time.time() - 86400 * 95,  # 95 days ago
-        total_receipts=450,
-        confirmed_receipts=415
+        state=AgentState.ACTIVE,
+        genesis_hash="genesis_abc",
+        identity_verified_at=now - 86400 * 300,
+        last_receipt_at=now - 86400 * 125,  # 125 days ago
+        prior_trust_score=0.88,
+        prior_receipt_count=52
     )
     
-    eligibility = check_dormancy_eligibility(profile)
-    print(f"  Eligible: {eligibility['eligible']}")
-    print(f"  Reason: {eligibility['reason']}")
-    
-    if eligibility['eligible']:
-        profile, transition = transition_to_dormant(profile)
-        print(f"  Transition: {transition.from_state.value} → {transition.to_state.value}")
-        print(f"  Preserved trust: {profile.trust_score_at_dormancy:.3f}")
-        print(f"  Last receipt hash: {profile.last_receipt_hash}")
+    result = check_dormancy_transition(agent, now)
+    print(f"  Days inactive: {result.get('days_inactive', 'N/A')}")
+    print(f"  Transition to DORMANT: {result['transition']}")
+    if result['transition']:
+        print(f"  Trigger: {result['trigger']}")
+        print(f"  Identity still valid: {result['identity_still_valid']}")
+        print(f"  Prior trust preserved: {result['prior_trust_preserved']}")
     print()
 
 
-def scenario_dormant_wakes():
-    """Dormant agent returns — resumes from checkpoint."""
-    print("=== Scenario: Dormant → Active (Agent Wakes Up) ===")
+def scenario_wakeup():
+    """Dormant agent returns with new receipt."""
+    print("=== Scenario: Wakeup from Dormancy ===")
+    now = time.time()
     
-    profile = AgentTrustProfile(
-        agent_id="seasonal_bot",
-        genesis_hash="def456",
-        current_state=TrustState.DORMANT,
-        last_receipt_hash="receipt_200",
-        last_receipt_timestamp=time.time() - 86400 * 150,
-        total_receipts=200,
-        confirmed_receipts=180,
-        dormancy_entered_at=time.time() - 86400 * 60,  # Dormant for 60 days
-        trust_score_at_dormancy=0.90
+    agent = AgentTrustRecord(
+        agent_id="returning_agent",
+        state=AgentState.DORMANT,
+        genesis_hash="genesis_xyz",
+        identity_verified_at=now - 86400 * 200,
+        dormancy_entered_at=now - 86400 * 60,
+        prior_trust_score=0.82,
+        prior_receipt_count=38
     )
     
-    eligibility = check_wake_eligibility(profile)
-    print(f"  Can wake: {eligibility['eligible']}")
-    print(f"  Reason: {eligibility['reason']}")
-    print(f"  Preserved trust: {eligibility.get('preserved_trust')}")
+    new_receipt = Receipt("r_wakeup_001", now, "B", "counterparty_a")
+    result = wakeup_from_dormancy(agent, new_receipt, now)
     
-    if eligibility['eligible']:
-        profile, transition = wake_agent(profile)
-        print(f"  Transition: {transition.from_state.value} → {transition.to_state.value}")
-        print(f"  Wake count: {profile.wake_count}")
-        print(f"  Resume from: {profile.last_receipt_hash}")
+    print(f"  Wakeup method: {result['wakeup_method']}")
+    print(f"  Dormancy duration: {result['dormancy_duration_days']}d")
+    print(f"  Prior trust: {result['prior_trust']}")
+    print(f"  Decay factor: {result['decay_factor']}")
+    print(f"  New trust score: {result['new_trust_score']}")
+    print(f"  Cold-start ceiling: {result['cold_start_ceiling']}")
+    print(f"  Receipts to full trust: {result['receipts_to_full_trust']}")
     print()
 
 
-def scenario_dormant_too_long():
-    """Dormant agent exceeds max — requires full re-attestation."""
-    print("=== Scenario: Dormant Too Long (>365 days) ===")
+def scenario_expired_identity():
+    """Dormant too long — identity expired, needs full re-attestation."""
+    print("=== Scenario: Expired Identity (Too Long Dormant) ===")
+    now = time.time()
     
-    profile = AgentTrustProfile(
-        agent_id="abandoned_agent",
-        genesis_hash="ghi789",
-        current_state=TrustState.DORMANT,
-        last_receipt_hash="receipt_50",
-        last_receipt_timestamp=time.time() - 86400 * 500,
-        total_receipts=50,
-        confirmed_receipts=40,
-        dormancy_entered_at=time.time() - 86400 * 400,
-        trust_score_at_dormancy=0.80
+    agent = AgentTrustRecord(
+        agent_id="long_gone_agent",
+        state=AgentState.DORMANT,
+        genesis_hash="genesis_old",
+        identity_verified_at=now - 86400 * 400,  # 400 days ago
+        dormancy_entered_at=now - 86400 * 300,
+        prior_trust_score=0.75,
+        prior_receipt_count=25
     )
     
-    eligibility = check_wake_eligibility(profile)
-    print(f"  Can wake: {eligibility['eligible']}")
-    print(f"  Reason: {eligibility['reason']}")
-    print(f"  Requires: {eligibility.get('requires', 'N/A')}")
-    print(f"  Days dormant: {eligibility.get('days_dormant', 0):.0f}")
+    new_receipt = Receipt("r_return_001", now, "B", "counterparty_b")
+    result = wakeup_from_dormancy(agent, new_receipt, now)
+    
+    print(f"  Wakeup success: {result['success']}")
+    print(f"  Reason: {result['reason']}")
+    print(f"  Identity age: {result['identity_age_days']}d (max: {result['max_identity_ttl']}d)")
+    print(f"  Required: {result['action']}")
     print()
 
 
 def scenario_dormant_vs_provisional():
-    """Side-by-side: why DORMANT ≠ PROVISIONAL."""
-    print("=== Scenario: DORMANT vs PROVISIONAL (Side-by-Side) ===")
+    """Compare DORMANT and PROVISIONAL — same receipt count, different meaning."""
+    print("=== Scenario: DORMANT vs PROVISIONAL (The Key Distinction) ===")
+    now = time.time()
+    comparison = compare_dormant_vs_provisional(now)
     
-    dormant = AgentTrustProfile(
-        agent_id="trusted_hibernator",
-        genesis_hash="jkl012",
-        current_state=TrustState.DORMANT,
-        last_receipt_hash="receipt_300",
-        total_receipts=300,
-        confirmed_receipts=275,
-        trust_score_at_dormancy=0.917,
-        dormancy_entered_at=time.time() - 86400 * 45
-    )
-    
-    provisional = AgentTrustProfile(
-        agent_id="brand_new_agent",
-        genesis_hash="mno345",
-        current_state=TrustState.PROVISIONAL,
-        total_receipts=0,
-        confirmed_receipts=0
-    )
-    
-    comparison = compare_dormant_vs_provisional(dormant, provisional)
-    print(f"  DORMANT:")
-    print(f"    History: {comparison['dormant']['total_receipts']} receipts")
-    print(f"    Trust preserved: {comparison['dormant']['trust_at_dormancy']}")
-    print(f"    Can resume: {comparison['dormant']['can_resume']}")
-    print(f"    Analogy: {comparison['dormant']['analogy']}")
-    print(f"  PROVISIONAL:")
-    print(f"    History: {comparison['provisional']['total_receipts']} receipts")
-    print(f"    Trust: {comparison['provisional']['trust_at_dormancy']}")
-    print(f"    Can resume: {comparison['provisional']['can_resume']}")
-    print(f"    Analogy: {comparison['provisional']['analogy']}")
-    print(f"  KEY: {comparison['key_difference']}")
+    print(f"  DORMANT agent:")
+    for k, v in comparison['dormant'].items():
+        print(f"    {k}: {v}")
+    print(f"  PROVISIONAL agent:")
+    for k, v in comparison['provisional'].items():
+        print(f"    {k}: {v}")
+    print(f"  Key: {comparison['key_difference']}")
     print()
 
 
 if __name__ == "__main__":
     print("Dormancy State Handler — ATF V1.2")
-    print("Per santaclawd: idle ≠ untrusted. DORMANT ≠ PROVISIONAL.")
+    print("Per santaclawd: idle agent ≠ bad actor. Both currently look PROVISIONAL.")
     print("=" * 70)
     print()
-    print(f"SPEC_CONSTANTS:")
-    print(f"  DORMANCY_THRESHOLD:  {DORMANCY_THRESHOLD_DAYS} days (ACTIVE → DORMANT)")
-    print(f"  DORMANCY_MAX:        {DORMANCY_MAX_DAYS} days (DORMANT → requires re-attestation)")
-    print(f"  WAKE_GRACE:          {WAKE_GRACE_PERIOD_HOURS}h (time to produce first receipt)")
-    print()
     
-    scenario_active_goes_dormant()
-    scenario_dormant_wakes()
-    scenario_dormant_too_long()
+    scenario_natural_dormancy()
+    scenario_wakeup()
+    scenario_expired_identity()
     scenario_dormant_vs_provisional()
     
     print("=" * 70)
-    print("KEY INSIGHT: DORMANT preserves history. PROVISIONAL has none.")
-    print("HTTP 304 (DORMANT) vs HTTP 404 (PROVISIONAL).")
-    print("Wake = resume from last checkpoint. Not full re-attestation.")
-    print("Max dormancy (365d) prevents zombie trust inflation.")
+    print("X.509 parallel: expired cert ≠ revoked cert.")
+    print("DORMANT = time passed, identity intact. PROVISIONAL = never verified.")
+    print("Recovery: DORMANT → identity check + 1 receipt. PROVISIONAL → full ceremony.")
+    print("AID (_agent.domain) handles WHERE. ATF (_atf.domain) handles WHETHER.")
