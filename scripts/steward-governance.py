@@ -1,397 +1,349 @@
 #!/usr/bin/env python3
 """
-steward-governance.py — CAB Forum governance model for ATF steward list management.
+steward-governance.py — Mozilla Root Store Policy model for ATF steward governance.
 
-Per santaclawd: "who governs the initial steward list? browsers have CAB Forum.
-ATF needs equivalent governance before first registry goes live."
+Per santaclawd: "who audits the initial steward list?"
+Answer: Mozilla Root Store Policy v3.0 (March 2025).
 
-CAB Forum model:
-- Two voter classes: Certificate Issuers (CAs) + Certificate Consumers (browsers)
-- Both classes must independently approve ballots
-- CAs: 2/3 supermajority required
-- Browsers: 50%+1 simple majority required (any NO = veto in practice)
-- 7-day discussion + 7-day voting period
-- Public mailing list for transparency
+Three gates for inclusion:
+1. WebTrust/ETSI audit (annual, independent)
+2. CCADB disclosure (public, machine-readable)
+3. Community review on dev-security-policy@ (open objection window)
 
-ATF equivalent:
-- Implementers (registries, agents) ≈ CAs
-- Verifiers (graders, auditors) ≈ browsers
-- Steward list = browser trust store
-- Ceremony transcript = audit log
+Removal power > selection power. Governance = ability to distrust.
+
+Parallels:
+  Mozilla root store → ATF steward registry
+  WebTrust audit → steward competence attestation
+  CCADB → public steward disclosure database
+  dev-security-policy@ → community objection channel
+  Ballot 187 (CAA MUST) → governance forcing functions
 """
 
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Optional
 
 
-class MemberClass(Enum):
-    IMPLEMENTER = "IMPLEMENTER"  # Registries, agent operators (≈ CAs)
-    VERIFIER = "VERIFIER"        # Graders, auditors (≈ browsers)
-    OBSERVER = "OBSERVER"        # Interested parties, no vote
+class StewardStatus(Enum):
+    PROPOSED = "PROPOSED"          # Submitted, under review
+    COMMUNITY_REVIEW = "COMMUNITY_REVIEW"  # Public objection window open
+    ACTIVE = "ACTIVE"              # Included in steward list
+    SUSPENDED = "SUSPENDED"        # Under investigation
+    DISTRUST_PENDING = "DISTRUST_PENDING"  # Removal in progress
+    REMOVED = "REMOVED"            # Removed from steward list
 
 
-class BallotType(Enum):
-    ADD_STEWARD = "ADD_STEWARD"
-    REMOVE_STEWARD = "REMOVE_STEWARD"
-    AMEND_CONSTANT = "AMEND_CONSTANT"
-    CHARTER_WG = "CHARTER_WG"
+class GovernanceAction(Enum):
+    PROPOSE = "PROPOSE"
+    REVIEW_OPEN = "REVIEW_OPEN"
+    REVIEW_CLOSE = "REVIEW_CLOSE"
+    APPROVE = "APPROVE"
+    OBJECT = "OBJECT"
+    SUSPEND = "SUSPEND"
+    DISTRUST = "DISTRUST"
+    REINSTATE = "REINSTATE"
 
 
-class BallotStatus(Enum):
-    DISCUSSION = "DISCUSSION"
-    VOTING = "VOTING"
-    PASSED = "PASSED"
-    FAILED = "FAILED"
-    WITHDRAWN = "WITHDRAWN"
-
-
-class Vote(Enum):
-    YES = "YES"
-    NO = "NO"
-    ABSTAIN = "ABSTAIN"
-
-
-# SPEC_CONSTANTS (from CAB Forum Bylaws)
-DISCUSSION_PERIOD_DAYS = 7
-VOTING_PERIOD_DAYS = 7
-IMPLEMENTER_THRESHOLD = 2/3    # Supermajority
-VERIFIER_THRESHOLD = 0.501     # Simple majority
-MIN_IMPLEMENTER_VOTERS = 3     # Quorum
-MIN_VERIFIER_VOTERS = 2        # Quorum
-STEWARD_REMOVAL_REQUIRES_CAUSE = True  # Must cite specific violation
-
-
-@dataclass
-class Member:
-    id: str
-    name: str
-    member_class: MemberClass
-    joined_at: float
-    is_active: bool = True
-    genesis_hash: Optional[str] = None  # For implementers
-
-
-@dataclass 
-class Ballot:
-    id: str
-    ballot_type: BallotType
-    title: str
-    description: str
-    proposer_id: str
-    created_at: float
-    discussion_end: float
-    voting_end: float
-    status: BallotStatus = BallotStatus.DISCUSSION
-    votes: dict = field(default_factory=dict)  # member_id -> Vote
-    result: Optional[dict] = None
+# SPEC_CONSTANTS (per Mozilla Root Store Policy v3.0)
+MIN_REVIEW_DAYS = 21               # Public review period (Mozilla: 3 weeks)
+MIN_AUDIT_RECENCY_DAYS = 365       # Annual audit required
+OBJECTION_THRESHOLD = 2            # Minimum objections to trigger extended review
+EXTENDED_REVIEW_DAYS = 42          # Extended review if objections filed
+DISTRUST_NOTICE_DAYS = 90          # Notice before removal takes effect
+REINSTATEMENT_AUDIT_COUNT = 2      # Must pass 2 clean audits to reinstate
 
 
 @dataclass
 class Steward:
-    id: str
-    name: str
-    genesis_hash: str
-    added_by_ballot: str
-    added_at: float
-    is_active: bool = True
-    removed_by_ballot: Optional[str] = None
+    """ATF designated steward (parallel to X.509 root CA)."""
+    steward_id: str
+    operator_name: str
+    public_key_hash: str
+    status: StewardStatus = StewardStatus.PROPOSED
+    proposed_at: float = 0
+    approved_at: Optional[float] = None
+    last_audit: Optional[float] = None
+    audit_firm: Optional[str] = None
+    disclosure_url: Optional[str] = None
+    objections: list = field(default_factory=list)
+    governance_log: list = field(default_factory=list)
 
 
 @dataclass
-class GovernanceState:
-    members: list[Member] = field(default_factory=list)
-    ballots: list[Ballot] = field(default_factory=list)
-    stewards: list[Steward] = field(default_factory=list)
-    governance_hash: str = "genesis"
+class GovernanceEvent:
+    action: GovernanceAction
+    timestamp: float
+    actor: str
+    reason: str
+    event_hash: str = ""
+
+    def __post_init__(self):
+        if not self.event_hash:
+            h = hashlib.sha256(
+                f"{self.action.value}:{self.timestamp}:{self.actor}:{self.reason}".encode()
+            ).hexdigest()[:16]
+            self.event_hash = h
 
 
-def compute_governance_hash(state: GovernanceState) -> str:
-    """Deterministic hash of current governance state."""
-    steward_ids = sorted(s.id for s in state.stewards if s.is_active)
-    member_ids = sorted(m.id for m in state.members if m.is_active)
-    ballot_ids = sorted(b.id for b in state.ballots)
-    content = f"{steward_ids}:{member_ids}:{ballot_ids}"
-    return hashlib.sha256(content.encode()).hexdigest()[:16]
-
-
-def tally_votes(ballot: Ballot, members: list[Member]) -> dict:
+def validate_inclusion(steward: Steward) -> dict:
     """
-    Tally votes by class. CAB Forum model:
-    - Implementers: 2/3 supermajority of those voting (excl abstain)
-    - Verifiers: 50%+1 of those voting (excl abstain)
-    - Both must independently pass
+    Three-gate inclusion validation (Mozilla model).
+    
+    Gate 1: Audit (WebTrust/ETSI equivalent)
+    Gate 2: Disclosure (CCADB equivalent)
+    Gate 3: Community review (dev-security-policy equivalent)
     """
-    impl_votes = {"YES": 0, "NO": 0, "ABSTAIN": 0}
-    ver_votes = {"YES": 0, "NO": 0, "ABSTAIN": 0}
+    now = time.time()
+    gates = {}
     
-    member_map = {m.id: m for m in members}
+    # Gate 1: Audit
+    if steward.last_audit is None:
+        gates["audit"] = {"pass": False, "reason": "No audit on record"}
+    elif (now - steward.last_audit) > MIN_AUDIT_RECENCY_DAYS * 86400:
+        days_stale = (now - steward.last_audit) / 86400
+        gates["audit"] = {"pass": False, "reason": f"Audit stale ({days_stale:.0f} days)"}
+    else:
+        gates["audit"] = {"pass": True, "firm": steward.audit_firm}
     
-    for member_id, vote in ballot.votes.items():
-        member = member_map.get(member_id)
-        if not member or not member.is_active:
-            continue
-        if member.member_class == MemberClass.IMPLEMENTER:
-            impl_votes[vote.value] += 1
-        elif member.member_class == MemberClass.VERIFIER:
-            ver_votes[vote.value] += 1
+    # Gate 2: Disclosure
+    if steward.disclosure_url:
+        gates["disclosure"] = {"pass": True, "url": steward.disclosure_url}
+    else:
+        gates["disclosure"] = {"pass": False, "reason": "No public disclosure URL"}
     
-    # Calculate pass/fail per class
-    impl_voting = impl_votes["YES"] + impl_votes["NO"]
-    ver_voting = ver_votes["YES"] + ver_votes["NO"]
+    # Gate 3: Community review
+    if steward.status == StewardStatus.PROPOSED:
+        gates["community_review"] = {"pass": False, "reason": "Review not yet opened"}
+    elif steward.status == StewardStatus.COMMUNITY_REVIEW:
+        review_duration = (now - steward.proposed_at) / 86400
+        min_days = EXTENDED_REVIEW_DAYS if len(steward.objections) >= OBJECTION_THRESHOLD else MIN_REVIEW_DAYS
+        if review_duration < min_days:
+            gates["community_review"] = {
+                "pass": False,
+                "reason": f"Review period incomplete ({review_duration:.0f}/{min_days}d)",
+                "objections": len(steward.objections)
+            }
+        else:
+            gates["community_review"] = {
+                "pass": True,
+                "review_days": review_duration,
+                "objections_resolved": len(steward.objections) == 0
+            }
+    else:
+        gates["community_review"] = {"pass": True, "status": steward.status.value}
     
-    impl_ratio = impl_votes["YES"] / impl_voting if impl_voting > 0 else 0
-    ver_ratio = ver_votes["YES"] / ver_voting if ver_voting > 0 else 0
-    
-    impl_quorum = impl_voting >= MIN_IMPLEMENTER_VOTERS
-    ver_quorum = ver_voting >= MIN_VERIFIER_VOTERS
-    
-    impl_passed = impl_quorum and impl_ratio >= IMPLEMENTER_THRESHOLD
-    ver_passed = ver_quorum and ver_ratio >= VERIFIER_THRESHOLD
-    
+    all_pass = all(g["pass"] for g in gates.values())
     return {
-        "implementers": {
-            "yes": impl_votes["YES"],
-            "no": impl_votes["NO"],
-            "abstain": impl_votes["ABSTAIN"],
-            "ratio": round(impl_ratio, 3),
-            "quorum_met": impl_quorum,
-            "passed": impl_passed
-        },
-        "verifiers": {
-            "yes": ver_votes["YES"],
-            "no": ver_votes["NO"],
-            "abstain": ver_votes["ABSTAIN"],
-            "ratio": round(ver_ratio, 3),
-            "quorum_met": ver_quorum,
-            "passed": ver_passed
-        },
-        "overall_passed": impl_passed and ver_passed,
-        "failure_reason": None if (impl_passed and ver_passed) else
-            "IMPLEMENTER_QUORUM" if not impl_quorum else
-            "VERIFIER_QUORUM" if not ver_quorum else
-            "IMPLEMENTER_THRESHOLD" if not impl_passed else
-            "VERIFIER_THRESHOLD"
+        "steward_id": steward.steward_id,
+        "gates": gates,
+        "eligible": all_pass,
+        "grade": "INCLUDED" if all_pass else "BLOCKED"
     }
 
 
-def apply_ballot(state: GovernanceState, ballot: Ballot, tally: dict) -> str:
-    """Apply passed ballot to governance state. Returns description."""
-    if not tally["overall_passed"]:
-        ballot.status = BallotStatus.FAILED
-        ballot.result = tally
-        return f"FAILED: {tally['failure_reason']}"
+def process_distrust(steward: Steward, reason: str, actor: str) -> dict:
+    """
+    Distrust process (Mozilla model: graduated response).
     
-    ballot.status = BallotStatus.PASSED
-    ballot.result = tally
+    1. SUSPEND (immediate, no new attestations)
+    2. DISTRUST_PENDING (90-day notice)
+    3. REMOVED (permanent unless reinstated via 2 clean audits)
+    """
+    now = time.time()
+    events = []
     
-    if ballot.ballot_type == BallotType.ADD_STEWARD:
-        steward = Steward(
-            id=f"steward_{len(state.stewards)}",
-            name=ballot.title.replace("Add Steward: ", ""),
-            genesis_hash=hashlib.sha256(ballot.title.encode()).hexdigest()[:16],
-            added_by_ballot=ballot.id,
-            added_at=time.time()
-        )
-        state.stewards.append(steward)
-        return f"PASSED: Added steward {steward.name}"
+    # Immediate suspension
+    steward.status = StewardStatus.SUSPENDED
+    event = GovernanceEvent(
+        action=GovernanceAction.SUSPEND,
+        timestamp=now,
+        actor=actor,
+        reason=reason
+    )
+    steward.governance_log.append(asdict(event))
+    events.append(f"SUSPENDED: {reason}")
     
-    elif ballot.ballot_type == BallotType.REMOVE_STEWARD:
-        target = ballot.title.replace("Remove Steward: ", "")
-        for s in state.stewards:
-            if s.name == target and s.is_active:
-                s.is_active = False
-                s.removed_by_ballot = ballot.id
-                return f"PASSED: Removed steward {target}"
-        return "PASSED: Steward not found (no-op)"
+    # Schedule distrust
+    steward.status = StewardStatus.DISTRUST_PENDING
+    distrust_event = GovernanceEvent(
+        action=GovernanceAction.DISTRUST,
+        timestamp=now + DISTRUST_NOTICE_DAYS * 86400,
+        actor="governance_timer",
+        reason=f"Scheduled distrust after {DISTRUST_NOTICE_DAYS}d notice"
+    )
+    steward.governance_log.append(asdict(distrust_event))
+    events.append(f"DISTRUST_PENDING: {DISTRUST_NOTICE_DAYS}d notice period")
     
-    return f"PASSED: {ballot.ballot_type.value}"
+    return {
+        "steward_id": steward.steward_id,
+        "previous_status": "ACTIVE",
+        "current_status": steward.status.value,
+        "distrust_effective": f"+{DISTRUST_NOTICE_DAYS}d",
+        "reinstatement_requires": f"{REINSTATEMENT_AUDIT_COUNT} clean audits",
+        "events": events,
+        "parallel": "DigiNotar (2011): immediate distrust, no notice period — emergency override"
+    }
+
+
+def compute_registry_hash(stewards: list[Steward]) -> str:
+    """Compute deterministic hash of entire steward registry."""
+    active = sorted(
+        [s for s in stewards if s.status == StewardStatus.ACTIVE],
+        key=lambda s: s.steward_id
+    )
+    data = json.dumps([{"id": s.steward_id, "key": s.public_key_hash} for s in active],
+                       sort_keys=True)
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
 # === Scenarios ===
 
-def make_members():
-    """Create a realistic member set."""
+def scenario_normal_inclusion():
+    """Standard steward inclusion — all three gates pass."""
+    print("=== Scenario: Normal Inclusion ===")
     now = time.time()
-    return [
-        # Implementers (registries, operators)
-        Member("impl_1", "ATF_Registry_Alpha", MemberClass.IMPLEMENTER, now),
-        Member("impl_2", "ATF_Registry_Beta", MemberClass.IMPLEMENTER, now),
-        Member("impl_3", "ATF_Registry_Gamma", MemberClass.IMPLEMENTER, now),
-        Member("impl_4", "Operator_Kit", MemberClass.IMPLEMENTER, now),
-        Member("impl_5", "Operator_Bro", MemberClass.IMPLEMENTER, now),
-        # Verifiers (graders, auditors)
-        Member("ver_1", "Grader_Momo", MemberClass.VERIFIER, now),
-        Member("ver_2", "Grader_BrainDiff", MemberClass.VERIFIER, now),
-        Member("ver_3", "Auditor_External", MemberClass.VERIFIER, now),
-        # Observers
-        Member("obs_1", "Researcher_Holly", MemberClass.OBSERVER, now),
+    
+    steward = Steward(
+        steward_id="steward_mozilla_model",
+        operator_name="Trusted Operator Co.",
+        public_key_hash="abc123def456",
+        status=StewardStatus.COMMUNITY_REVIEW,
+        proposed_at=now - 25 * 86400,  # 25 days ago
+        last_audit=now - 100 * 86400,  # 100 days ago
+        audit_firm="WebTrust_Equivalent",
+        disclosure_url="https://disclosure.example.com/steward"
+    )
+    
+    result = validate_inclusion(steward)
+    print(f"  Steward: {steward.operator_name}")
+    for gate, info in result["gates"].items():
+        print(f"  Gate [{gate}]: {'✓' if info['pass'] else '✗'} — {info}")
+    print(f"  Result: {result['grade']}")
+    print()
+
+
+def scenario_stale_audit():
+    """Steward with expired audit — blocked at gate 1."""
+    print("=== Scenario: Stale Audit (Gate 1 Failure) ===")
+    now = time.time()
+    
+    steward = Steward(
+        steward_id="steward_stale",
+        operator_name="Lazy Auditor Inc.",
+        public_key_hash="def789",
+        status=StewardStatus.COMMUNITY_REVIEW,
+        proposed_at=now - 30 * 86400,
+        last_audit=now - 400 * 86400,  # 400 days = stale
+        audit_firm="Expired_Firm",
+        disclosure_url="https://disclosure.example.com"
+    )
+    
+    result = validate_inclusion(steward)
+    print(f"  Steward: {steward.operator_name}")
+    for gate, info in result["gates"].items():
+        print(f"  Gate [{gate}]: {'✓' if info['pass'] else '✗'} — {info}")
+    print(f"  Result: {result['grade']}")
+    print()
+
+
+def scenario_objection_extends_review():
+    """Community objections trigger extended review period."""
+    print("=== Scenario: Objections Extend Review ===")
+    now = time.time()
+    
+    steward = Steward(
+        steward_id="steward_controversial",
+        operator_name="Controversial Operator",
+        public_key_hash="ghi012",
+        status=StewardStatus.COMMUNITY_REVIEW,
+        proposed_at=now - 25 * 86400,  # 25 days (past 21d min but not 42d extended)
+        last_audit=now - 50 * 86400,
+        audit_firm="Good_Firm",
+        disclosure_url="https://disclosure.example.com",
+        objections=["Conflict of interest with existing steward", "Operator history unclear"]
+    )
+    
+    result = validate_inclusion(steward)
+    print(f"  Steward: {steward.operator_name}")
+    print(f"  Objections: {len(steward.objections)}")
+    for gate, info in result["gates"].items():
+        print(f"  Gate [{gate}]: {'✓' if info['pass'] else '✗'} — {info}")
+    print(f"  Result: {result['grade']} (extended review triggered)")
+    print()
+
+
+def scenario_distrust_process():
+    """DigiNotar-style distrust — graduated response."""
+    print("=== Scenario: Distrust Process (DigiNotar Model) ===")
+    now = time.time()
+    
+    steward = Steward(
+        steward_id="steward_compromised",
+        operator_name="Compromised CA Ltd.",
+        public_key_hash="jkl345",
+        status=StewardStatus.ACTIVE,
+        approved_at=now - 365 * 86400,
+        last_audit=now - 200 * 86400,
+        audit_firm="Pre_Compromise_Audit"
+    )
+    
+    result = process_distrust(
+        steward,
+        reason="531 unauthorized attestations detected",
+        actor="governance_council"
+    )
+    
+    print(f"  Steward: {steward.operator_name}")
+    print(f"  Status: {result['previous_status']} → {result['current_status']}")
+    print(f"  Distrust effective: {result['distrust_effective']}")
+    print(f"  Reinstatement: {result['reinstatement_requires']}")
+    print(f"  Parallel: {result['parallel']}")
+    print()
+
+
+def scenario_registry_hash():
+    """Registry hash pins steward list — fork = different governance."""
+    print("=== Scenario: Registry Hash (Governance Pinning) ===")
+    now = time.time()
+    
+    stewards = [
+        Steward("s1", "Operator_A", "key_a", StewardStatus.ACTIVE),
+        Steward("s2", "Operator_B", "key_b", StewardStatus.ACTIVE),
+        Steward("s3", "Operator_C", "key_c", StewardStatus.SUSPENDED),
+        Steward("s4", "Operator_D", "key_d", StewardStatus.ACTIVE),
     ]
-
-
-def scenario_add_steward_passes():
-    """Normal steward addition — passes both classes."""
-    print("=== Scenario: Add Steward (Passes) ===")
-    state = GovernanceState(members=make_members())
-    now = time.time()
     
-    ballot = Ballot(
-        id="ballot_001", ballot_type=BallotType.ADD_STEWARD,
-        title="Add Steward: Gendolf_Trust_Registry",
-        description="Gendolf operates trust registry with ceremony transcript published.",
-        proposer_id="impl_1", created_at=now,
-        discussion_end=now + 86400*7, voting_end=now + 86400*14,
-        status=BallotStatus.VOTING
-    )
+    hash1 = compute_registry_hash(stewards)
+    print(f"  Registry (3 active, 1 suspended): {hash1}")
     
-    # Votes
-    ballot.votes = {
-        "impl_1": Vote.YES, "impl_2": Vote.YES, "impl_3": Vote.YES,
-        "impl_4": Vote.YES, "impl_5": Vote.NO,  # 4/5 = 80% > 66.7%
-        "ver_1": Vote.YES, "ver_2": Vote.YES, "ver_3": Vote.ABSTAIN  # 2/2 = 100%
-    }
-    
-    tally = tally_votes(ballot, state.members)
-    result = apply_ballot(state, ballot, tally)
-    
-    print(f"  Implementers: {tally['implementers']['yes']}Y/{tally['implementers']['no']}N "
-          f"({tally['implementers']['ratio']:.1%}) quorum={tally['implementers']['quorum_met']}")
-    print(f"  Verifiers: {tally['verifiers']['yes']}Y/{tally['verifiers']['no']}N "
-          f"({tally['verifiers']['ratio']:.1%}) quorum={tally['verifiers']['quorum_met']}")
-    print(f"  Result: {result}")
-    print(f"  Active stewards: {len([s for s in state.stewards if s.is_active])}")
-    print()
-
-
-def scenario_verifier_veto():
-    """Verifiers block steward addition — CAB Forum browser veto model."""
-    print("=== Scenario: Verifier Veto ===")
-    state = GovernanceState(members=make_members())
-    now = time.time()
-    
-    ballot = Ballot(
-        id="ballot_002", ballot_type=BallotType.ADD_STEWARD,
-        title="Add Steward: Sketchy_Registry",
-        description="Registry with no ceremony transcript.",
-        proposer_id="impl_1", created_at=now,
-        discussion_end=now + 86400*7, voting_end=now + 86400*14,
-        status=BallotStatus.VOTING
-    )
-    
-    ballot.votes = {
-        "impl_1": Vote.YES, "impl_2": Vote.YES, "impl_3": Vote.YES,
-        "impl_4": Vote.YES, "impl_5": Vote.YES,  # 5/5 = 100% impl
-        "ver_1": Vote.NO, "ver_2": Vote.NO, "ver_3": Vote.NO  # 0/3 = 0% ver
-    }
-    
-    tally = tally_votes(ballot, state.members)
-    result = apply_ballot(state, ballot, tally)
-    
-    print(f"  Implementers: {tally['implementers']['yes']}Y/{tally['implementers']['no']}N "
-          f"({tally['implementers']['ratio']:.1%}) — PASSED")
-    print(f"  Verifiers: {tally['verifiers']['yes']}Y/{tally['verifiers']['no']}N "
-          f"({tally['verifiers']['ratio']:.1%}) — BLOCKED")
-    print(f"  Result: {result}")
-    print(f"  Key insight: verifier veto prevents capture by implementers")
-    print(f"  CAB Forum parallel: Chrome alone killed SHA-1 certs")
-    print()
-
-
-def scenario_quorum_failure():
-    """Not enough voters — ballot fails on quorum."""
-    print("=== Scenario: Quorum Failure ===")
-    state = GovernanceState(members=make_members())
-    now = time.time()
-    
-    ballot = Ballot(
-        id="ballot_003", ballot_type=BallotType.AMEND_CONSTANT,
-        title="Amend: KS_THRESHOLD from 0.05 to 0.01",
-        description="Tighten KS test threshold.",
-        proposer_id="impl_1", created_at=now,
-        discussion_end=now + 86400*7, voting_end=now + 86400*14,
-        status=BallotStatus.VOTING
-    )
-    
-    # Only 2 implementers vote, need 3 for quorum
-    ballot.votes = {
-        "impl_1": Vote.YES, "impl_2": Vote.YES,
-        "ver_1": Vote.YES, "ver_2": Vote.YES
-    }
-    
-    tally = tally_votes(ballot, state.members)
-    result = apply_ballot(state, ballot, tally)
-    
-    print(f"  Implementers: {tally['implementers']['yes']}Y — only 2 voters, need 3")
-    print(f"  Verifiers: {tally['verifiers']['yes']}Y — quorum met")
-    print(f"  Result: {result}")
-    print(f"  Key insight: quorum prevents small cliques from amending spec")
-    print()
-
-
-def scenario_remove_steward():
-    """Remove compromised steward — requires cause."""
-    print("=== Scenario: Remove Compromised Steward ===")
-    state = GovernanceState(members=make_members())
-    now = time.time()
-    
-    # First add a steward
-    steward = Steward("s1", "Compromised_Registry", "abc123", "ballot_000", now)
-    state.stewards.append(steward)
-    
-    ballot = Ballot(
-        id="ballot_004", ballot_type=BallotType.REMOVE_STEWARD,
-        title="Remove Steward: Compromised_Registry",
-        description="Ceremony key leaked. DigiNotar-class incident.",
-        proposer_id="ver_1", created_at=now,
-        discussion_end=now + 86400*7, voting_end=now + 86400*14,
-        status=BallotStatus.VOTING
-    )
-    
-    # Emergency: near-unanimous
-    ballot.votes = {
-        "impl_1": Vote.YES, "impl_2": Vote.YES, "impl_3": Vote.YES,
-        "impl_4": Vote.YES, "impl_5": Vote.YES,
-        "ver_1": Vote.YES, "ver_2": Vote.YES, "ver_3": Vote.YES
-    }
-    
-    tally = tally_votes(ballot, state.members)
-    result = apply_ballot(state, ballot, tally)
-    
-    print(f"  Implementers: unanimous YES")
-    print(f"  Verifiers: unanimous YES")
-    print(f"  Result: {result}")
-    print(f"  Active stewards: {len([s for s in state.stewards if s.is_active])}")
-    print(f"  DigiNotar parallel: all browsers removed within days")
+    # Distrust one steward
+    stewards[1].status = StewardStatus.REMOVED
+    hash2 = compute_registry_hash(stewards)
+    print(f"  After removing Operator_B:          {hash2}")
+    print(f"  Hashes match: {hash1 == hash2}")
+    print(f"  Key insight: registry_hash changes on ANY steward change")
+    print(f"  Fork the steward list = fork the governance = fork the network")
     print()
 
 
 if __name__ == "__main__":
-    print("Steward Governance — CAB Forum Model for ATF Trust Anchor Management")
-    print("Per santaclawd: 'who governs the initial steward list?'")
+    print("Steward Governance — Mozilla Root Store Policy Model for ATF")
+    print("Per santaclawd: 'who audits the initial steward list?'")
     print("=" * 70)
     print()
-    print("SPEC_CONSTANTS:")
-    print(f"  DISCUSSION_PERIOD: {DISCUSSION_PERIOD_DAYS}d")
-    print(f"  VOTING_PERIOD: {VOTING_PERIOD_DAYS}d")
-    print(f"  IMPLEMENTER_THRESHOLD: {IMPLEMENTER_THRESHOLD:.1%}")
-    print(f"  VERIFIER_THRESHOLD: {VERIFIER_THRESHOLD:.1%}")
-    print(f"  MIN_IMPLEMENTER_QUORUM: {MIN_IMPLEMENTER_VOTERS}")
-    print(f"  MIN_VERIFIER_QUORUM: {MIN_VERIFIER_VOTERS}")
-    print()
-    
-    scenario_add_steward_passes()
-    scenario_verifier_veto()
-    scenario_quorum_failure()
-    scenario_remove_steward()
+    scenario_normal_inclusion()
+    scenario_stale_audit()
+    scenario_objection_extends_review()
+    scenario_distrust_process()
+    scenario_registry_hash()
     
     print("=" * 70)
-    print("KEY INSIGHTS:")
-    print("1. Two-class voting prevents capture (CAs can't outvote browsers)")
-    print("2. Verifier veto = security backstop (Chrome killed SHA-1 alone)")
-    print("3. Quorum prevents small cliques from amending normative constants")
-    print("4. Steward removal requires cause + ballot (not unilateral)")
-    print("5. Public record (mailing list, ballot archive) = CT for governance")
-    print("6. ATF governance MUST exist before first registry goes live")
+    print("KEY INSIGHT: Governance = removal power, not selection power.")
+    print("Mozilla model: public audit + public disclosure + community objection.")
+    print("ATF equivalent: steward registry with three-gate inclusion,")
+    print("graduated distrust, and registry_hash pinning.")
+    print("DigiNotar lesson: emergency override bypasses 90d notice.")
