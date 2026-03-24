@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-probe-receipt-handler.py — PROBE receipt type for ATF sparse receipt model.
+probe-receipt-handler.py — Liveness probing for ATF sparse receipt model.
 
-Per santaclawd: silence-as-CONFIRMED fails on network partition.
-Cannot distinguish "delivered + confirmed" from "delivery failed."
+Per santaclawd: silence-as-CONFIRMED fails on network partition. Cannot 
+distinguish "delivered + confirmed" from "delivery failed."
 
-PROBE = Chandra-Toueg failure detector applied to receipts.
-- Sent at T-hour mark if no FAILED/DISPUTED received
-- Custodian ACKs → CONFIRMED
-- Silence past 2T → DISPUTED (not CONFIRMED)
+Per Aguilera, Chen, Toueg (1997): heartbeat failure detector — timeout-free
+liveness via monotonic counters.
 
-Key insight: PROBE cost must be < receipt cost or you reinvent polling.
-Sparse tier hash checkpoint IS the probe (from value-tiered-logger.py).
+PROBE receipt: sent at T-hour mark if no CONFIRMED/FAILED/DISPUTED received.
+  - ACK → CONFIRMED
+  - Silence after PROBE → UNCONFIRMED (not DISPUTED — can't prove intent from absence)
+  - NACK → DISPUTED (explicit rejection)
+
+Three states: CONFIRMED, UNCONFIRMED, DISPUTED
+  UNCONFIRMED is new — weaker than DISPUTED, stronger than CONFIRMED.
+  Chandra-Toueg: eventually strong accuracy distinguishes crash from Byzantine.
 """
 
 import hashlib
@@ -22,285 +26,337 @@ from typing import Optional
 
 
 class ProbeStatus(Enum):
-    PENDING = "PENDING"           # Probe sent, awaiting ACK
-    CONFIRMED = "CONFIRMED"       # ACK received within window
-    TIMEOUT = "TIMEOUT"           # No ACK within 2T
-    DISPUTED = "DISPUTED"         # Explicit rejection
-    PARTITION = "PARTITION"        # Suspected network partition
+    PENDING = "PENDING"           # Probe sent, awaiting response
+    ACK = "ACK"                   # Liveness confirmed
+    SILENCE = "SILENCE"           # No response within window
+    NACK = "NACK"                 # Explicit rejection
 
 
-class ReceiptState(Enum):
-    SILENT = "SILENT"             # No receipt yet (sparse model default)
-    CONFIRMED = "CONFIRMED"       # Explicit or probe-confirmed
-    FAILED = "FAILED"             # Explicit failure receipt
-    DISPUTED = "DISPUTED"         # Explicit dispute or probe timeout
-    PROBE_PENDING = "PROBE_PENDING"  # Probe sent, waiting
+class MilestoneStatus(Enum):
+    CONFIRMED = "CONFIRMED"       # Receipt received OR probe ACK'd
+    UNCONFIRMED = "UNCONFIRMED"   # Probe sent, silence — partition or crash?
+    DISPUTED = "DISPUTED"         # Explicit FAILED/DISPUTED receipt OR probe NACK
+    PENDING = "PENDING"           # Not yet due
 
 
 # SPEC_CONSTANTS
-PROBE_INTERVAL_HOURS = 24         # T: probe sent after T hours of silence
-PROBE_TIMEOUT_HOURS = 48          # 2T: silence past this = DISPUTED
-MAX_PROBES_BEFORE_ESCALATION = 3  # 3 unanswered probes = escalation
-PARTITION_DETECTION_THRESHOLD = 3  # 3+ agents unresponsive = suspected partition
-PROBE_COST_RATIO = 0.1           # PROBE must cost ≤ 10% of full receipt
+PROBE_WINDOW_HOURS = 24           # Send probe after this silence
+PROBE_TIMEOUT_HOURS = 12          # Wait for ACK after probe
+MAX_PROBES_PER_MILESTONE = 3      # Escalate after 3 unanswered
+UNCONFIRMED_THRESHOLD = 2         # 2+ UNCONFIRMED → escalate to grader
+PROBE_BACKOFF_MULTIPLIER = 1.5    # Exponential backoff between probes
 
 
 @dataclass
 class Probe:
     probe_id: str
-    target_agent: str
-    milestone_hash: str
+    milestone_id: str
+    agent_id: str
+    counterparty_id: str
     sent_at: float
     timeout_at: float
     status: ProbeStatus = ProbeStatus.PENDING
-    ack_at: Optional[float] = None
-    ack_hash: Optional[str] = None
+    response_at: Optional[float] = None
+    probe_number: int = 1  # 1st, 2nd, 3rd probe
+    probe_hash: str = ""
     
-    def is_expired(self, now: float = None) -> bool:
-        now = now or time.time()
-        return now > self.timeout_at
+    def __post_init__(self):
+        if not self.probe_hash:
+            h = hashlib.sha256(
+                f"{self.probe_id}:{self.milestone_id}:{self.sent_at}".encode()
+            ).hexdigest()[:16]
+            self.probe_hash = h
 
 
 @dataclass
-class MilestoneState:
-    milestone_hash: str
-    agent_id: str
-    receipt_state: ReceiptState = ReceiptState.SILENT
-    probes_sent: int = 0
-    last_probe_at: Optional[float] = None
-    confirmed_at: Optional[float] = None
+class Milestone:
+    milestone_id: str
+    scope_hash: str
+    due_at: float
+    status: MilestoneStatus = MilestoneStatus.PENDING
+    last_receipt_at: Optional[float] = None
+    probes: list[Probe] = field(default_factory=list)
     escalated: bool = False
 
 
-@dataclass 
-class PartitionDetector:
-    """Detect network partitions from correlated probe failures."""
-    unresponsive_agents: list = field(default_factory=list)
-    detection_window_hours: float = 4.0
+@dataclass
+class Contract:
+    contract_id: str
+    agent_id: str
+    counterparty_id: str
+    milestones: list[Milestone]
+    probe_window_hours: float = PROBE_WINDOW_HOURS
+    probe_timeout_hours: float = PROBE_TIMEOUT_HOURS
+    max_probes: int = MAX_PROBES_PER_MILESTONE
+
+
+def should_probe(milestone: Milestone, now: float, contract: Contract) -> bool:
+    """Determine if a probe should be sent for this milestone."""
+    if milestone.status in (MilestoneStatus.CONFIRMED, MilestoneStatus.DISPUTED):
+        return False
     
-    def check_partition(self, failed_probes: list[Probe]) -> dict:
-        """Correlated failures suggest partition, not individual failure."""
-        recent = [p for p in failed_probes 
-                  if p.status == ProbeStatus.TIMEOUT]
-        
-        if len(recent) < PARTITION_DETECTION_THRESHOLD:
-            return {"partition_suspected": False, "unresponsive": len(recent)}
-        
-        # Check temporal correlation
-        if recent:
-            times = [p.sent_at for p in recent]
-            time_span = max(times) - min(times) if len(times) > 1 else 0
-            window = self.detection_window_hours * 3600
-            correlated = time_span < window
-        else:
-            correlated = False
-        
-        agents = list(set(p.target_agent for p in recent))
-        
-        return {
-            "partition_suspected": correlated and len(agents) >= PARTITION_DETECTION_THRESHOLD,
-            "unresponsive": len(agents),
-            "correlated": correlated,
-            "agents": agents,
-            "recommendation": "PARTITION" if correlated else "INDIVIDUAL_FAILURES"
-        }
+    if milestone.escalated:
+        return False
+    
+    if len(milestone.probes) >= contract.max_probes:
+        return False
+    
+    # Check if past due + silence window
+    silence_start = milestone.last_receipt_at or milestone.due_at
+    silence_hours = (now - silence_start) / 3600
+    
+    # Apply backoff for subsequent probes
+    probe_num = len(milestone.probes)
+    effective_window = contract.probe_window_hours * (PROBE_BACKOFF_MULTIPLIER ** probe_num)
+    
+    if silence_hours >= effective_window:
+        # Check last probe isn't still pending
+        if milestone.probes and milestone.probes[-1].status == ProbeStatus.PENDING:
+            return False
+        return True
+    
+    return False
 
 
-def send_probe(milestone: MilestoneState, now: float = None) -> Probe:
-    """Send PROBE receipt to silent milestone."""
-    now = now or time.time()
-    probe_id = hashlib.sha256(
-        f"{milestone.milestone_hash}:{milestone.probes_sent}:{now}".encode()
-    ).hexdigest()[:16]
+def send_probe(milestone: Milestone, contract: Contract, now: float) -> Probe:
+    """Create and send a probe for a milestone."""
+    probe_num = len(milestone.probes) + 1
+    timeout = now + (contract.probe_timeout_hours * 3600)
     
     probe = Probe(
-        probe_id=probe_id,
-        target_agent=milestone.agent_id,
-        milestone_hash=milestone.milestone_hash,
+        probe_id=f"probe_{milestone.milestone_id}_{probe_num}",
+        milestone_id=milestone.milestone_id,
+        agent_id=contract.agent_id,
+        counterparty_id=contract.counterparty_id,
         sent_at=now,
-        timeout_at=now + (PROBE_TIMEOUT_HOURS * 3600)
+        timeout_at=timeout,
+        probe_number=probe_num
     )
     
-    milestone.probes_sent += 1
-    milestone.last_probe_at = now
-    milestone.receipt_state = ReceiptState.PROBE_PENDING
-    
+    milestone.probes.append(probe)
     return probe
 
 
-def process_ack(probe: Probe, milestone: MilestoneState, ack_hash: str, 
-                now: float = None) -> dict:
-    """Process ACK response to PROBE."""
-    now = now or time.time()
+def process_probe_response(probe: Probe, response: ProbeStatus, now: float) -> str:
+    """Process a probe response and return milestone status update."""
+    probe.status = response
+    probe.response_at = now
     
-    if probe.is_expired(now):
-        return {"status": "EXPIRED", "message": "ACK received after timeout"}
+    if response == ProbeStatus.ACK:
+        return "CONFIRMED"
+    elif response == ProbeStatus.NACK:
+        return "DISPUTED"
+    elif response == ProbeStatus.SILENCE:
+        return "UNCONFIRMED"
+    return "PENDING"
+
+
+def check_probe_timeouts(contract: Contract, now: float) -> list[dict]:
+    """Check all pending probes for timeouts."""
+    events = []
     
-    probe.status = ProbeStatus.CONFIRMED
-    probe.ack_at = now
-    probe.ack_hash = ack_hash
-    milestone.receipt_state = ReceiptState.CONFIRMED
-    milestone.confirmed_at = now
+    for milestone in contract.milestones:
+        for probe in milestone.probes:
+            if probe.status == ProbeStatus.PENDING and now >= probe.timeout_at:
+                probe.status = ProbeStatus.SILENCE
+                probe.response_at = now
+                
+                # Count unconfirmed probes
+                silence_count = sum(1 for p in milestone.probes if p.status == ProbeStatus.SILENCE)
+                
+                if silence_count >= UNCONFIRMED_THRESHOLD:
+                    milestone.status = MilestoneStatus.UNCONFIRMED
+                    milestone.escalated = True
+                    events.append({
+                        "type": "ESCALATION",
+                        "milestone": milestone.milestone_id,
+                        "reason": f"{silence_count} unanswered probes",
+                        "action": "GRADER_REVIEW"
+                    })
+                else:
+                    events.append({
+                        "type": "PROBE_TIMEOUT",
+                        "milestone": milestone.milestone_id,
+                        "probe": probe.probe_id,
+                        "silence_count": silence_count,
+                        "action": "RETRY" if len(milestone.probes) < contract.max_probes else "ESCALATE"
+                    })
     
-    latency = now - probe.sent_at
+    return events
+
+
+def contract_health(contract: Contract) -> dict:
+    """Assess contract health based on probe results."""
+    statuses = {}
+    for m in contract.milestones:
+        s = m.status.value
+        statuses[s] = statuses.get(s, 0) + 1
+    
+    total = len(contract.milestones)
+    confirmed = statuses.get("CONFIRMED", 0)
+    unconfirmed = statuses.get("UNCONFIRMED", 0)
+    disputed = statuses.get("DISPUTED", 0)
+    
+    health = "HEALTHY"
+    if disputed > 0:
+        health = "DISPUTED"
+    elif unconfirmed > total * 0.3:
+        health = "DEGRADED"
+    elif unconfirmed > 0:
+        health = "MONITORING"
+    
+    total_probes = sum(len(m.probes) for m in contract.milestones)
+    acked_probes = sum(1 for m in contract.milestones for p in m.probes if p.status == ProbeStatus.ACK)
     
     return {
-        "status": "CONFIRMED",
-        "latency_seconds": round(latency, 2),
-        "probe_id": probe.probe_id,
-        "ack_hash": ack_hash
+        "contract_id": contract.contract_id,
+        "health": health,
+        "milestone_statuses": statuses,
+        "total_probes_sent": total_probes,
+        "probe_ack_rate": round(acked_probes / total_probes, 3) if total_probes > 0 else 0,
+        "escalated_milestones": sum(1 for m in contract.milestones if m.escalated)
     }
-
-
-def process_timeout(probe: Probe, milestone: MilestoneState) -> dict:
-    """Handle probe timeout — silence past 2T."""
-    probe.status = ProbeStatus.TIMEOUT
-    
-    if milestone.probes_sent >= MAX_PROBES_BEFORE_ESCALATION:
-        milestone.receipt_state = ReceiptState.DISPUTED
-        milestone.escalated = True
-        return {
-            "status": "ESCALATED",
-            "probes_sent": milestone.probes_sent,
-            "message": f"{MAX_PROBES_BEFORE_ESCALATION} unanswered probes → DISPUTED + escalation"
-        }
-    else:
-        return {
-            "status": "TIMEOUT",
-            "probes_sent": milestone.probes_sent,
-            "remaining_before_escalation": MAX_PROBES_BEFORE_ESCALATION - milestone.probes_sent,
-            "message": "Retrying probe"
-        }
 
 
 # === Scenarios ===
 
-def scenario_healthy_probe():
-    """Normal probe → ACK flow."""
-    print("=== Scenario: Healthy Probe-ACK ===")
+def scenario_healthy_delivery():
+    """All milestones delivered, probes ACK'd."""
+    print("=== Scenario: Healthy Delivery ===")
     now = time.time()
     
-    ms = MilestoneState("milestone_001", "bro_agent")
-    probe = send_probe(ms, now)
+    milestones = [
+        Milestone(f"m{i}", f"hash_{i}", now - 86400*(5-i), 
+                  MilestoneStatus.CONFIRMED, now - 86400*(4-i))
+        for i in range(5)
+    ]
     
-    # ACK after 2 hours
-    ack_time = now + 7200
-    result = process_ack(probe, ms, "ack_hash_001", ack_time)
-    
-    print(f"  Probe sent → ACK in {result['latency_seconds']}s")
-    print(f"  Status: {result['status']}")
-    print(f"  Milestone: {ms.receipt_state.value}")
+    contract = Contract("c001", "kit_fox", "bro_agent", milestones)
+    health = contract_health(contract)
+    print(f"  Health: {health['health']}")
+    print(f"  Statuses: {health['milestone_statuses']}")
+    print(f"  Probes sent: {health['total_probes_sent']}")
     print()
 
 
-def scenario_timeout_escalation():
-    """3 unanswered probes → DISPUTED + escalation."""
-    print("=== Scenario: Timeout → Escalation ===")
+def scenario_network_partition():
+    """Milestones go silent — probes detect partition."""
+    print("=== Scenario: Network Partition (Probes Detect Silence) ===")
     now = time.time()
     
-    ms = MilestoneState("milestone_002", "silent_agent")
+    milestones = [
+        Milestone("m0", "hash_0", now - 86400*3, MilestoneStatus.CONFIRMED, now - 86400*2),
+        Milestone("m1", "hash_1", now - 86400*2, MilestoneStatus.PENDING, None),
+        Milestone("m2", "hash_2", now - 86400*1, MilestoneStatus.PENDING, None),
+    ]
     
-    for i in range(3):
-        probe = send_probe(ms, now + i * PROBE_TIMEOUT_HOURS * 3600)
-        result = process_timeout(probe, ms)
-        print(f"  Probe {i+1}: {result['status']} (sent={ms.probes_sent})")
+    contract = Contract("c002", "kit_fox", "silent_agent", milestones)
     
-    print(f"  Final state: {ms.receipt_state.value}")
-    print(f"  Escalated: {ms.escalated}")
+    # Simulate probing
+    for m in milestones[1:]:
+        if should_probe(m, now, contract):
+            probe = send_probe(m, contract, now - 3600*15)  # Sent 15h ago
+            print(f"  Probe sent for {m.milestone_id}: {probe.probe_id}")
+    
+    # Check timeouts
+    events = check_probe_timeouts(contract, now)
+    for e in events:
+        print(f"  Event: {e['type']} — {e['milestone']} — {e.get('reason', e.get('action'))}")
+    
+    # Send second round of probes
+    for m in milestones[1:]:
+        if should_probe(m, now + 3600, contract):
+            probe = send_probe(m, contract, now)
+    
+    events2 = check_probe_timeouts(contract, now + 3600*13)
+    for e in events2:
+        print(f"  Event: {e['type']} — {e['milestone']} — {e.get('reason', e.get('action'))}")
+    
+    health = contract_health(contract)
+    print(f"  Health: {health['health']}")
+    print(f"  Escalated: {health['escalated_milestones']}")
     print()
 
 
-def scenario_partition_detection():
-    """Multiple agents timeout simultaneously → partition suspected."""
-    print("=== Scenario: Network Partition Detection ===")
+def scenario_explicit_dispute():
+    """Counterparty NACKs probe — explicit dispute."""
+    print("=== Scenario: Explicit Dispute (NACK) ===")
     now = time.time()
     
-    # 5 agents all timeout within 1 hour
-    failed_probes = []
-    for i in range(5):
-        probe = Probe(
-            probe_id=f"probe_{i}",
-            target_agent=f"agent_{i}",
-            milestone_hash=f"ms_{i}",
-            sent_at=now + i * 600,  # 10min apart
-            timeout_at=now + PROBE_TIMEOUT_HOURS * 3600
-        )
-        probe.status = ProbeStatus.TIMEOUT
-        failed_probes.append(probe)
+    milestones = [
+        Milestone("m0", "hash_0", now - 86400, MilestoneStatus.PENDING, None),
+    ]
     
-    detector = PartitionDetector()
-    result = detector.check_partition(failed_probes)
+    contract = Contract("c003", "kit_fox", "adversary", milestones)
     
-    print(f"  Unresponsive agents: {result['unresponsive']}")
-    print(f"  Correlated: {result['correlated']}")
-    print(f"  Partition suspected: {result['partition_suspected']}")
-    print(f"  Recommendation: {result['recommendation']}")
+    # Send probe
+    probe = send_probe(milestones[0], contract, now - 3600*10)
+    
+    # Counterparty NACKs
+    result = process_probe_response(probe, ProbeStatus.NACK, now - 3600*5)
+    milestones[0].status = MilestoneStatus.DISPUTED
+    
+    print(f"  Probe response: {probe.status.value}")
+    print(f"  Milestone status: {milestones[0].status.value}")
+    print(f"  Result: {result}")
+    
+    health = contract_health(contract)
+    print(f"  Contract health: {health['health']}")
     print()
 
 
-def scenario_late_ack():
-    """ACK arrives after probe timeout — recorded but state already escalated."""
-    print("=== Scenario: Late ACK (After Timeout) ===")
+def scenario_intermittent_availability():
+    """Some probes ACK, some silence — monitoring state."""
+    print("=== Scenario: Intermittent Availability ===")
     now = time.time()
     
-    ms = MilestoneState("milestone_003", "slow_agent")
-    probe = send_probe(ms, now)
+    milestones = [
+        Milestone(f"m{i}", f"hash_{i}", now - 86400*(5-i), MilestoneStatus.PENDING, None)
+        for i in range(5)
+    ]
     
-    # Timeout occurs
-    process_timeout(probe, ms)
+    contract = Contract("c004", "kit_fox", "flaky_agent", milestones)
     
-    # Late ACK arrives 72 hours later
-    late_ack = now + 72 * 3600
-    result = process_ack(probe, ms, "late_ack_hash", late_ack)
+    # Simulate mixed responses
+    responses = [ProbeStatus.ACK, ProbeStatus.SILENCE, ProbeStatus.ACK, 
+                 ProbeStatus.SILENCE, ProbeStatus.ACK]
     
-    print(f"  Probe timeout → state: {ms.receipt_state.value}")
-    print(f"  Late ACK result: {result['status']}")
-    print(f"  Key: late ACK is recorded but does not override DISPUTED")
-    print()
-
-
-def scenario_sparse_tier_probe():
-    """Sparse tier hash checkpoint serves as probe."""
-    print("=== Scenario: Sparse Tier Checkpoint = Implicit Probe ===")
-    now = time.time()
+    for m, resp in zip(milestones, responses):
+        probe = send_probe(m, contract, now - 3600*15)
+        result = process_probe_response(probe, resp, now - 3600*3)
+        if resp == ProbeStatus.ACK:
+            m.status = MilestoneStatus.CONFIRMED
+        elif resp == ProbeStatus.SILENCE:
+            m.status = MilestoneStatus.UNCONFIRMED
     
-    # In sparse tier, periodic hash checkpoints serve dual purpose:
-    # 1. Audit trail continuity (value-tiered-logger)
-    # 2. Liveness probe (this module)
-    
-    ms = MilestoneState("milestone_004", "dormant_agent")
-    
-    # Sparse checkpoint arrives → implicit ACK
-    probe = send_probe(ms, now)
-    checkpoint_hash = hashlib.sha256(b"sparse_checkpoint_100").hexdigest()[:16]
-    result = process_ack(probe, ms, checkpoint_hash, now + 3600)
-    
-    print(f"  Sparse checkpoint serves as implicit probe ACK")
-    print(f"  Status: {result['status']}")
-    print(f"  PROBE cost = hash checkpoint cost ≈ 0 (already in logging layer)")
-    print(f"  No additional bandwidth for liveness detection")
+    health = contract_health(contract)
+    print(f"  Health: {health['health']}")
+    print(f"  Statuses: {health['milestone_statuses']}")
+    print(f"  Probe ACK rate: {health['probe_ack_rate']}")
+    print(f"  Key: UNCONFIRMED != DISPUTED. Absence of proof != proof of absence.")
     print()
 
 
 if __name__ == "__main__":
     print("PROBE Receipt Handler — Liveness Detection for ATF Sparse Receipts")
-    print("Per santaclawd + Chandra-Toueg failure detectors")
+    print("Per santaclawd + Aguilera, Chen, Toueg (1997)")
     print("=" * 70)
     print()
-    print(f"PROBE_INTERVAL:   {PROBE_INTERVAL_HOURS}h (T)")
-    print(f"PROBE_TIMEOUT:    {PROBE_TIMEOUT_HOURS}h (2T)")
-    print(f"MAX_PROBES:       {MAX_PROBES_BEFORE_ESCALATION} before escalation")
-    print(f"PARTITION_DETECT: {PARTITION_DETECTION_THRESHOLD}+ correlated timeouts")
+    print(f"PROBE_WINDOW:  {PROBE_WINDOW_HOURS}h (silence before first probe)")
+    print(f"PROBE_TIMEOUT: {PROBE_TIMEOUT_HOURS}h (wait for ACK)")
+    print(f"MAX_PROBES:    {MAX_PROBES_PER_MILESTONE} (then escalate)")
+    print(f"BACKOFF:       {PROBE_BACKOFF_MULTIPLIER}x between probes")
     print()
     
-    scenario_healthy_probe()
-    scenario_timeout_escalation()
-    scenario_partition_detection()
-    scenario_late_ack()
-    scenario_sparse_tier_probe()
+    scenario_healthy_delivery()
+    scenario_network_partition()
+    scenario_explicit_dispute()
+    scenario_intermittent_availability()
     
     print("=" * 70)
-    print("KEY INSIGHT: PROBE = failure detector, not polling.")
-    print("Sparse tier hash checkpoint IS the probe — zero extra cost.")
-    print("Partition detection distinguishes crash from Byzantine from network.")
-    print("Late ACK recorded but does not override DISPUTED.")
+    print("KEY INSIGHTS:")
+    print("1. UNCONFIRMED is a new state — weaker than DISPUTED, NOT CONFIRMED")
+    print("2. Probes are monotonic counters (Aguilera 1997), not timeouts")
+    print("3. Silence after PROBE = crash fault. NACK = Byzantine fault.")
+    print("4. Chandra-Toueg: eventually strong accuracy from repeated probes")
+    print("5. Exponential backoff prevents probe storms")
