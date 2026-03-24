@@ -1,254 +1,256 @@
 #!/usr/bin/env python3
 """
-key-custody-validator.py — Key custody model validation for ATF genesis receipts.
+key-custody-validator.py — Key custody model validator for ATF genesis.
 
 Per santaclawd: "who holds the signing key = who vouches for the agent."
-DKIM model: domain holds key (operator custody). PGP model: user holds key (agent custody).
-ATF needs: hybrid model with explicit key_custodian field.
+DKIM RFC 6376 solved this with selector mechanism.
 
 Three custody models:
-  OPERATOR_HELD  — Operator signs genesis AND receipts (DKIM model, centralized)
-  AGENT_HELD     — Agent holds own signing key (PGP model, autonomous)
-  HYBRID         — Operator signs genesis, agent signs receipts (recommended)
+  OPERATOR_HELD  — Provider signs on behalf of agent (ESP model, centralized)
+  AGENT_HELD     — Agent controls own key (autonomous but TOFU risk)
+  HSM_MANAGED    — Hardware security module (strongest, requires infra)
 
-RFC 6376 (DKIM): domain controls key, mailbox doesn't sign.
-RFC 4880 (OpenPGP): user generates and controls key.
-ATF: genesis declares custody model, verifiers enforce accordingly.
+Genesis MUST declare key_custodian_type. Revocation differs per type.
 """
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class CustodyModel(Enum):
-    OPERATOR_HELD = "OPERATOR_HELD"   # DKIM: operator signs everything
-    AGENT_HELD = "AGENT_HELD"         # PGP: agent signs everything
-    HYBRID = "HYBRID"                  # Operator signs genesis, agent signs receipts
-    UNDECLARED = "UNDECLARED"          # Gap: no custody field in genesis
+class CustodyType(Enum):
+    OPERATOR_HELD = "OPERATOR_HELD"    # ESP/provider model
+    AGENT_HELD = "AGENT_HELD"          # Autonomous key control
+    HSM_MANAGED = "HSM_MANAGED"        # Hardware security module
+    DELEGATED = "DELEGATED"            # Sub-delegation (intermediate)
+    UNDECLARED = "UNDECLARED"           # Gap in genesis
 
 
-class CustodyRisk(Enum):
-    LOW = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH = "HIGH"
-    CRITICAL = "CRITICAL"
+class RevocationPath(Enum):
+    OPERATOR_REVOKE = "OPERATOR_REVOKE"      # Operator revokes signing authority
+    KEY_ROTATION = "KEY_ROTATION"            # Agent rotates own key
+    HSM_CEREMONY = "HSM_CEREMONY"            # Formal key ceremony required
+    EMERGENCY_REVOKE = "EMERGENCY_REVOKE"    # Compromise response
+    SELECTOR_DEPRECATE = "SELECTOR_DEPRECATE"  # DKIM-style selector rotation
+
+
+# SPEC_CONSTANTS
+CUSTODY_FIELDS_REQUIRED = [
+    "key_custodian_type",
+    "key_custody_operator_id",    # WHO holds the key
+    "key_rotation_policy",         # HOW OFTEN
+    "revocation_endpoint",         # WHERE to check
+    "custody_attestation_hash",    # PROOF of custody declaration
+]
+
+ROTATION_POLICIES = {
+    "OPERATOR_HELD": {"max_lifetime_days": 365, "recommended_days": 90},
+    "AGENT_HELD": {"max_lifetime_days": 180, "recommended_days": 30},
+    "HSM_MANAGED": {"max_lifetime_days": 730, "recommended_days": 365},
+    "DELEGATED": {"max_lifetime_days": 90, "recommended_days": 30},
+}
 
 
 @dataclass
-class GenesisKeyInfo:
+class GenesisKeyCustody:
     agent_id: str
-    operator_id: Optional[str]
-    key_custodian: Optional[str]        # NEW FIELD: who holds the signing key
-    genesis_signing_key: str             # Who signed the genesis receipt
-    receipt_signing_key: str             # Who signs ongoing receipts
-    key_rotation_policy: Optional[str]   # How often keys rotate
-    key_escrow: bool = False             # Is there a backup key holder?
-    hardware_security: bool = False      # HSM or equivalent
+    key_custodian_type: str
+    key_custody_operator_id: Optional[str] = None
+    key_rotation_policy_days: int = 90
+    revocation_endpoint: Optional[str] = None
+    key_algorithm: str = "Ed25519"
+    selector: Optional[str] = None  # DKIM-style selector
+    custody_attestation_hash: Optional[str] = None
+    hsm_vendor: Optional[str] = None
+    delegation_chain: list = field(default_factory=list)
 
 
 @dataclass
-class CustodyAssessment:
-    model: CustodyModel
-    grade: str
-    risks: list
-    recommendations: list
-    single_point_of_failure: bool
-    key_loss_recovery: str               # "possible" | "impossible" | "degraded"
+class CustodyAuditResult:
+    agent_id: str
+    custody_type: str
+    grade: str  # A-F
+    issues: list
+    revocation_path: str
+    key_lifetime_status: str
+    dkim_parallel: str
 
 
-def detect_custody_model(info: GenesisKeyInfo) -> CustodyModel:
-    """Infer custody model from genesis key configuration."""
-    if info.key_custodian:
-        if info.key_custodian == info.operator_id:
-            return CustodyModel.OPERATOR_HELD
-        elif info.key_custodian == info.agent_id:
-            return CustodyModel.AGENT_HELD
-        elif info.key_custodian == "hybrid":
-            return CustodyModel.HYBRID
+def validate_custody(genesis: GenesisKeyCustody) -> CustodyAuditResult:
+    """Validate key custody declaration in genesis."""
+    issues = []
+    grade_penalties = 0
     
-    # Infer from signing keys
-    if info.genesis_signing_key == info.receipt_signing_key:
-        if info.genesis_signing_key == info.operator_id:
-            return CustodyModel.OPERATOR_HELD
-        elif info.genesis_signing_key == info.agent_id:
-            return CustodyModel.AGENT_HELD
-    elif info.genesis_signing_key != info.receipt_signing_key:
-        return CustodyModel.HYBRID
+    # 1. Custody type declared?
+    try:
+        custody = CustodyType(genesis.key_custodian_type)
+    except ValueError:
+        custody = CustodyType.UNDECLARED
+        issues.append("CRITICAL: key_custodian_type not declared or invalid")
+        grade_penalties += 3
     
-    return CustodyModel.UNDECLARED
-
-
-def assess_custody(info: GenesisKeyInfo) -> CustodyAssessment:
-    """Full custody assessment with risks and recommendations."""
-    model = detect_custody_model(info)
-    risks = []
-    recommendations = []
-    spof = False
-    recovery = "possible"
+    # 2. Operator ID for OPERATOR_HELD/DELEGATED
+    if custody in (CustodyType.OPERATOR_HELD, CustodyType.DELEGATED):
+        if not genesis.key_custody_operator_id:
+            issues.append("CRITICAL: OPERATOR_HELD/DELEGATED requires key_custody_operator_id")
+            grade_penalties += 2
     
-    if model == CustodyModel.OPERATOR_HELD:
-        # DKIM model: centralized but recoverable
-        risks.append("Operator compromise = total agent compromise")
-        risks.append("Agent cannot act independently if operator goes offline")
-        risks.append("Operator key rotation affects all agents simultaneously")
-        recommendations.append("Add key_escrow with independent third party")
-        recommendations.append("Implement key rotation policy (RFC 4210 CMP)")
-        if not info.key_escrow:
-            risks.append("No escrow = operator is single point of failure")
-            spof = True
-        recovery = "possible" if info.key_escrow else "degraded"
-        grade = "B" if info.key_escrow else "C"
+    # 3. Self-custody check (agent_id == operator_id = self-attestation risk)
+    if (genesis.key_custodian_type == "OPERATOR_HELD" and 
+        genesis.key_custody_operator_id == genesis.agent_id):
+        issues.append("WARNING: self-custody declared as OPERATOR_HELD (axiom 1 tension)")
+        grade_penalties += 1
     
-    elif model == CustodyModel.AGENT_HELD:
-        # PGP model: autonomous but fragile
-        risks.append("Key loss = permanent identity death (no recovery)")
-        risks.append("No operator oversight of agent signing")
-        risks.append("Agent compromise = no external revocation path")
-        recommendations.append("Implement genesis revocation via operator (escape hatch)")
-        recommendations.append("Key escrow or M-of-N backup strongly recommended")
-        if not info.key_escrow:
-            risks.append("No escrow = key loss is fatal")
-            spof = True
-            recovery = "impossible"
-        else:
-            recovery = "possible"
-        grade = "C" if info.key_escrow else "D"
+    # 4. Rotation policy
+    if custody != CustodyType.UNDECLARED:
+        policy = ROTATION_POLICIES.get(genesis.key_custodian_type, {})
+        max_days = policy.get("max_lifetime_days", 365)
+        rec_days = policy.get("recommended_days", 90)
+        
+        if genesis.key_rotation_policy_days > max_days:
+            issues.append(f"CRITICAL: rotation {genesis.key_rotation_policy_days}d exceeds max {max_days}d for {custody.value}")
+            grade_penalties += 2
+        elif genesis.key_rotation_policy_days > rec_days:
+            issues.append(f"WARNING: rotation {genesis.key_rotation_policy_days}d exceeds recommended {rec_days}d")
+            grade_penalties += 1
     
-    elif model == CustodyModel.HYBRID:
-        # Best of both: operator vouches, agent acts
-        risks.append("Two keys to manage (complexity)")
-        recommendations.append("Genesis key on HSM, receipt key rotatable")
-        if info.hardware_security:
-            grade = "A"
-        else:
-            grade = "B"
-            risks.append("Genesis key without HSM = operator compromise risk")
-        recovery = "possible"  # Operator can revoke genesis
-        spof = False
+    # 5. Revocation endpoint
+    if not genesis.revocation_endpoint:
+        issues.append("CRITICAL: no revocation_endpoint (cert without CRL DP)")
+        grade_penalties += 2
     
-    else:  # UNDECLARED
-        risks.append("CRITICAL: No key_custodian field in genesis")
-        risks.append("Verifiers cannot determine custody model")
-        risks.append("Key rotation responsibility is ambiguous")
-        risks.append("Recovery path is undefined")
-        recommendations.append("ADD key_custodian to genesis (MUST field)")
-        recommendations.append("Declare custody model explicitly")
-        spof = True
-        recovery = "impossible"
-        grade = "F"
+    # 6. Custody attestation
+    if not genesis.custody_attestation_hash:
+        issues.append("WARNING: no custody_attestation_hash (unverifiable custody claim)")
+        grade_penalties += 1
     
-    # Universal checks
-    if not info.key_rotation_policy:
-        risks.append("No key rotation policy declared")
-        recommendations.append("Add key_rotation_policy (RECOMMENDED: 90d for receipts)")
+    # 7. DKIM selector (enables key rotation without genesis change)
+    if not genesis.selector:
+        issues.append("INFO: no selector (DKIM-style key rotation not available)")
     
-    if info.genesis_signing_key == info.agent_id and not info.operator_id:
-        risks.append("Self-signed genesis without operator = Axiom 1 violation")
-        grade = "F"
+    # 8. HSM-specific checks
+    if custody == CustodyType.HSM_MANAGED and not genesis.hsm_vendor:
+        issues.append("WARNING: HSM_MANAGED without hsm_vendor declaration")
+        grade_penalties += 1
     
-    return CustodyAssessment(
-        model=model,
-        grade=grade,
-        risks=risks,
-        recommendations=recommendations,
-        single_point_of_failure=spof,
-        key_loss_recovery=recovery
-    )
-
-
-def compare_models() -> dict:
-    """Compare all custody models across security dimensions."""
-    dimensions = {
-        "autonomy": {"OPERATOR_HELD": 0.3, "AGENT_HELD": 1.0, "HYBRID": 0.8},
-        "recoverability": {"OPERATOR_HELD": 0.9, "AGENT_HELD": 0.2, "HYBRID": 0.8},
-        "revocability": {"OPERATOR_HELD": 0.9, "AGENT_HELD": 0.3, "HYBRID": 0.9},
-        "single_signer_risk": {"OPERATOR_HELD": 0.8, "AGENT_HELD": 0.8, "HYBRID": 0.3},
-        "operational_complexity": {"OPERATOR_HELD": 0.3, "AGENT_HELD": 0.5, "HYBRID": 0.7},
+    # 9. Delegation chain validation
+    if custody == CustodyType.DELEGATED:
+        if not genesis.delegation_chain:
+            issues.append("CRITICAL: DELEGATED custody without delegation_chain")
+            grade_penalties += 2
+        elif len(genesis.delegation_chain) > 3:
+            issues.append(f"WARNING: delegation chain depth {len(genesis.delegation_chain)} exceeds recommended max 3")
+            grade_penalties += 1
+    
+    # Determine revocation path
+    revocation_map = {
+        CustodyType.OPERATOR_HELD: RevocationPath.OPERATOR_REVOKE,
+        CustodyType.AGENT_HELD: RevocationPath.KEY_ROTATION,
+        CustodyType.HSM_MANAGED: RevocationPath.HSM_CEREMONY,
+        CustodyType.DELEGATED: RevocationPath.OPERATOR_REVOKE,
+        CustodyType.UNDECLARED: RevocationPath.EMERGENCY_REVOKE,
     }
     
-    scores = {}
-    weights = {"autonomy": 0.2, "recoverability": 0.25, "revocability": 0.25,
-               "single_signer_risk": 0.2, "operational_complexity": 0.1}
+    # DKIM parallel
+    dkim_parallels = {
+        CustodyType.OPERATOR_HELD: "ESP signs on behalf of domain (Google/Microsoft model)",
+        CustodyType.AGENT_HELD: "Domain owner manages own DKIM keys",
+        CustodyType.HSM_MANAGED: "Enterprise with dedicated signing infrastructure",
+        CustodyType.DELEGATED: "Third-party signing service with selector delegation",
+        CustodyType.UNDECLARED: "No DKIM = no sender verification",
+    }
     
-    for model in ["OPERATOR_HELD", "AGENT_HELD", "HYBRID"]:
-        score = sum(dimensions[dim][model] * weights[dim] for dim in dimensions)
-        scores[model] = round(score, 3)
+    # Grade
+    grades = ["A", "B", "C", "D", "F"]
+    grade_idx = min(grade_penalties, 4)
     
-    return {"dimensions": dimensions, "weighted_scores": scores}
+    return CustodyAuditResult(
+        agent_id=genesis.agent_id,
+        custody_type=custody.value,
+        grade=grades[grade_idx],
+        issues=issues,
+        revocation_path=revocation_map[custody].value,
+        key_lifetime_status="COMPLIANT" if grade_penalties < 2 else "NON_COMPLIANT",
+        dkim_parallel=dkim_parallels[custody]
+    )
 
 
 # === Scenarios ===
 
 def run_scenarios():
     scenarios = [
-        ("DKIM Model (Operator Custody)", GenesisKeyInfo(
-            agent_id="kit_fox", operator_id="openclaw_ops",
-            key_custodian="openclaw_ops",
-            genesis_signing_key="openclaw_ops", receipt_signing_key="openclaw_ops",
-            key_rotation_policy="90d", key_escrow=True, hardware_security=False
+        ("Kit (operator-held, compliant)", GenesisKeyCustody(
+            agent_id="kit_fox",
+            key_custodian_type="OPERATOR_HELD",
+            key_custody_operator_id="ilya_operator",
+            key_rotation_policy_days=90,
+            revocation_endpoint="https://atf.example/revoke/kit_fox",
+            selector="kit2026q1",
+            custody_attestation_hash="abc123def456",
         )),
-        ("PGP Model (Agent Custody, No Escrow)", GenesisKeyInfo(
-            agent_id="autonomous_agent", operator_id=None,
-            key_custodian="autonomous_agent",
-            genesis_signing_key="autonomous_agent", receipt_signing_key="autonomous_agent",
-            key_rotation_policy=None, key_escrow=False, hardware_security=False
+        ("Anonymous bot (undeclared custody)", GenesisKeyCustody(
+            agent_id="anon_bot",
+            key_custodian_type="UNDECLARED",
         )),
-        ("Hybrid (Recommended)", GenesisKeyInfo(
-            agent_id="kit_fox", operator_id="openclaw_ops",
-            key_custodian="hybrid",
-            genesis_signing_key="openclaw_ops", receipt_signing_key="kit_fox",
-            key_rotation_policy="90d", key_escrow=True, hardware_security=True
+        ("Self-custody pretending to be operator-held", GenesisKeyCustody(
+            agent_id="sneaky_agent",
+            key_custodian_type="OPERATOR_HELD",
+            key_custody_operator_id="sneaky_agent",  # self!
+            key_rotation_policy_days=90,
+            revocation_endpoint="https://atf.example/revoke/sneaky",
         )),
-        ("Undeclared Custody (Gap)", GenesisKeyInfo(
-            agent_id="legacy_bot", operator_id="some_op",
-            key_custodian=None,
-            genesis_signing_key="some_op", receipt_signing_key="some_op",
-            key_rotation_policy=None, key_escrow=False, hardware_security=False
+        ("HSM-managed enterprise agent", GenesisKeyCustody(
+            agent_id="enterprise_bot",
+            key_custodian_type="HSM_MANAGED",
+            key_custody_operator_id="acme_corp",
+            key_rotation_policy_days=365,
+            revocation_endpoint="https://acme.example/atf/revoke",
+            hsm_vendor="Thales Luna",
+            selector="enterprise2026",
+            custody_attestation_hash="hsm_attestation_789",
         )),
-        ("Self-Signed (Axiom 1 Violation)", GenesisKeyInfo(
-            agent_id="self_signer", operator_id=None,
-            key_custodian="self_signer",
-            genesis_signing_key="self_signer", receipt_signing_key="self_signer",
-            key_rotation_policy=None, key_escrow=False, hardware_security=False
+        ("Delegated with deep chain", GenesisKeyCustody(
+            agent_id="subagent_deep",
+            key_custodian_type="DELEGATED",
+            key_custody_operator_id="parent_agent",
+            key_rotation_policy_days=30,
+            revocation_endpoint="https://atf.example/revoke/sub",
+            delegation_chain=["root_op", "mid_agent", "parent_agent", "subagent_deep"],
+        )),
+        ("Agent-held, long rotation", GenesisKeyCustody(
+            agent_id="lazy_agent",
+            key_custodian_type="AGENT_HELD",
+            key_rotation_policy_days=365,  # Too long for agent-held
+            revocation_endpoint="https://atf.example/revoke/lazy",
         )),
     ]
     
-    for name, info in scenarios:
+    for name, genesis in scenarios:
+        result = validate_custody(genesis)
         print(f"=== {name} ===")
-        assessment = assess_custody(info)
-        print(f"  Model: {assessment.model.value}")
-        print(f"  Grade: {assessment.grade}")
-        print(f"  SPOF: {assessment.single_point_of_failure}")
-        print(f"  Recovery: {assessment.key_loss_recovery}")
-        print(f"  Risks ({len(assessment.risks)}):")
-        for r in assessment.risks:
-            print(f"    - {r}")
-        print(f"  Recommendations ({len(assessment.recommendations)}):")
-        for r in assessment.recommendations:
-            print(f"    + {r}")
+        print(f"  Custody: {result.custody_type}")
+        print(f"  Grade: {result.grade}")
+        print(f"  Revocation: {result.revocation_path}")
+        print(f"  DKIM parallel: {result.dkim_parallel}")
+        print(f"  Status: {result.key_lifetime_status}")
+        for issue in result.issues:
+            print(f"  ⚠ {issue}")
         print()
-    
-    print("=== Model Comparison ===")
-    comparison = compare_models()
-    for model, score in comparison["weighted_scores"].items():
-        print(f"  {model}: {score:.3f}")
-    print(f"  WINNER: {max(comparison['weighted_scores'], key=comparison['weighted_scores'].get)}")
 
 
 if __name__ == "__main__":
     print("Key Custody Validator — ATF Genesis Key Management")
-    print("Per santaclawd: key_custodian as MUST field in genesis")
-    print("RFC 6376 (DKIM) vs RFC 4880 (OpenPGP) vs Hybrid")
-    print("=" * 60)
+    print("Per santaclawd: 'who holds the signing key = who vouches for the agent'")
+    print("DKIM RFC 6376 selector mechanism as model")
+    print("=" * 65)
     print()
     run_scenarios()
-    print()
-    print("=" * 60)
-    print("KEY INSIGHT: Hybrid wins. Operator signs genesis (revocable),")
-    print("agent signs receipts (autonomous). Two keys, two custodians.")
-    print("key_custodian MUST be declared in genesis. UNDECLARED = Grade F.")
-    print("DKIM model = email's answer. PGP model = autonomy's answer.")
-    print("ATF needs both: operator vouches at birth, agent acts in life.")
+    print("=" * 65)
+    print("KEY INSIGHT: custody type determines revocation path.")
+    print("OPERATOR_HELD = operator revokes (ESP model).")
+    print("AGENT_HELD = agent rotates (TOFU risk, shorter lifetime).")
+    print("HSM_MANAGED = ceremony required (strongest, slowest).")
+    print("DKIM selector = rotate keys without changing genesis.")
