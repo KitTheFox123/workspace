@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-recovery-time-cap.py — Time-bounded recovery for ATF DEGRADED agents.
+recovery-time-cap.py — Time-bounded DEGRADED recovery for ATF V1.2.
 
-Per santaclawd: n_recovery = max(ceil(n*0.3), 8) but no time bound.
-An agent DEGRADED for 6 months ≠ 48h. Stale ALLEGED receipts accumulate
-misleading recovery signals.
+Per santaclawd: n_recovery = max(ceil(n*0.3), 8) has no time bound.
+An agent DEGRADED for 6 months ≠ agent DEGRADED for 48h.
 
-RFC 5280 Section 3.3: CRL nextUpdate = time bound on validity.
-Same principle: DEGRADED state must expire.
+Three recovery phases:
+  ACTIVE_RECOVERY  — 0 to recovery_deadline (earning fresh receipts)
+  GRACE            — recovery_deadline to grace_period (last chance)  
+  EXPIRED          — past grace → SUSPENDED (full re-attestation)
 
-Three phases:
-  DEGRADED_ACTIVE  — 0-30d, recovery possible via n_recovery receipts
-  DEGRADED_STALE   — 30-90d, recovery requires 2x n_recovery + audit
-  DEGRADED_EXPIRED — >90d, full re-attestation from BOOTSTRAP_REQUEST
+SPEC_CONSTANTS:
+  RECOVERY_DEADLINE_DEFAULT = 30 days (genesis constant, operator stricter not looser)
+  GRACE_PERIOD = 7 days (after deadline, before SUSPENDED)
+  STALE_RECEIPT_HALFLIFE = 7 days (exponential decay on old receipts)
+
+Per RFC 6960: OCSP responses have nextUpdate = expiry. Same pattern.
+Per Chandra-Toueg: timeouts must be adaptive not fixed.
 """
 
 import hashlib
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -23,249 +28,300 @@ from typing import Optional
 
 
 class RecoveryPhase(Enum):
-    DEGRADED_ACTIVE = "DEGRADED_ACTIVE"     # Fresh, recovery straightforward
-    DEGRADED_STALE = "DEGRADED_STALE"       # Aging, harder recovery
-    DEGRADED_EXPIRED = "DEGRADED_EXPIRED"   # Must re-bootstrap
-    RECOVERED = "RECOVERED"
-    BOOTSTRAPPING = "BOOTSTRAPPING"
+    ACTIVE_RECOVERY = "ACTIVE_RECOVERY"   # Earning fresh receipts
+    GRACE = "GRACE"                        # Past deadline, last chance
+    EXPIRED = "EXPIRED"                    # → SUSPENDED
+    RECOVERED = "RECOVERED"                # Successfully recovered
+    NOT_DEGRADED = "NOT_DEGRADED"          # Was never degraded
+
+
+class ReceiptFreshness(Enum):
+    FRESH = "FRESH"       # Within 7 days
+    AGING = "AGING"       # 7-14 days
+    STALE = "STALE"       # 14-30 days
+    EXPIRED = "EXPIRED"   # >30 days
 
 
 # SPEC_CONSTANTS
-ACTIVE_WINDOW_DAYS = 30       # Phase 1: normal recovery
-STALE_WINDOW_DAYS = 90        # Phase 2: harder recovery  
-RECOVERY_RATIO = 0.3          # n_recovery = ceil(n_initial * ratio)
-MIN_RECOVERY_N = 8            # Floor
-STALE_MULTIPLIER = 2.0        # 2x receipts needed in stale phase
-RECEIPT_DECAY_HALFLIFE = 14   # Days before receipt weight halves
-MAX_ALLEGED_STACK = 50        # Cap on stale ALLEGED receipts counted
+RECOVERY_DEADLINE_DEFAULT = 30 * 86400   # 30 days in seconds
+GRACE_PERIOD = 7 * 86400                  # 7 days
+STALE_HALFLIFE = 7 * 86400               # 7-day half-life for receipt decay
+MIN_RECOVERY_RATIO = 0.3                  # 30% of initial n
+MIN_RECOVERY_N = 8                        # Absolute minimum
+FRESHNESS_WINDOW = 7 * 86400             # 7 days = FRESH
+
+
+@dataclass
+class Receipt:
+    receipt_id: str
+    timestamp: float
+    evidence_grade: str  # A-F
+    counterparty_id: str
+    status: str  # CONFIRMED, ALLEGED, DISPUTED
 
 
 @dataclass
 class DegradedAgent:
     agent_id: str
-    degraded_at: float        # Timestamp of DEGRADED entry
-    n_initial: int            # Original attestation count
-    receipts_since: list = field(default_factory=list)  # (timestamp, grade, counterparty)
-    reason: str = ""
+    degraded_at: float
+    initial_n: int  # Receipts at time of degradation
+    recovery_deadline: float  # Genesis constant
+    receipts_since_degraded: list = field(default_factory=list)
+    genesis_recovery_deadline: float = RECOVERY_DEADLINE_DEFAULT
+
+
+def compute_n_recovery(initial_n: int) -> int:
+    """ATF V1.2: n_recovery = max(ceil(n_initial * 0.3), 8)."""
+    return max(math.ceil(initial_n * MIN_RECOVERY_RATIO), MIN_RECOVERY_N)
+
+
+def receipt_decay_weight(receipt_age_seconds: float) -> float:
+    """Exponential decay: weight = 0.5^(age/halflife)."""
+    return 0.5 ** (receipt_age_seconds / STALE_HALFLIFE)
+
+
+def classify_freshness(age_seconds: float) -> ReceiptFreshness:
+    """Classify receipt by age."""
+    if age_seconds <= 7 * 86400:
+        return ReceiptFreshness.FRESH
+    elif age_seconds <= 14 * 86400:
+        return ReceiptFreshness.AGING
+    elif age_seconds <= 30 * 86400:
+        return ReceiptFreshness.STALE
+    else:
+        return ReceiptFreshness.EXPIRED
+
+
+def assess_recovery(agent: DegradedAgent, now: float) -> dict:
+    """Assess recovery status with time cap."""
+    time_in_degraded = now - agent.degraded_at
+    deadline = agent.genesis_recovery_deadline
     
-    @property
-    def n_recovery(self) -> int:
-        return max(int(self.n_initial * RECOVERY_RATIO + 0.999), MIN_RECOVERY_N)
+    # Determine phase
+    if time_in_degraded <= deadline:
+        phase = RecoveryPhase.ACTIVE_RECOVERY
+    elif time_in_degraded <= deadline + GRACE_PERIOD:
+        phase = RecoveryPhase.GRACE
+    else:
+        phase = RecoveryPhase.EXPIRED
     
-    @property
-    def days_degraded(self) -> float:
-        return (time.time() - self.degraded_at) / 86400
+    # Count effective receipts (with decay weighting)
+    n_required = compute_n_recovery(agent.initial_n)
     
-    @property
-    def phase(self) -> RecoveryPhase:
-        d = self.days_degraded
-        if d <= ACTIVE_WINDOW_DAYS:
-            return RecoveryPhase.DEGRADED_ACTIVE
-        elif d <= STALE_WINDOW_DAYS:
-            return RecoveryPhase.DEGRADED_STALE
+    fresh_count = 0
+    weighted_count = 0.0
+    confirmed_count = 0
+    freshness_dist = {f.value: 0 for f in ReceiptFreshness}
+    
+    for r in agent.receipts_since_degraded:
+        age = now - r.timestamp
+        freshness = classify_freshness(age)
+        freshness_dist[freshness.value] += 1
+        weight = receipt_decay_weight(age)
+        weighted_count += weight
+        
+        if freshness == ReceiptFreshness.FRESH:
+            fresh_count += 1
+        if r.status == "CONFIRMED":
+            confirmed_count += 1
+    
+    # Recovery check: need n_required WEIGHTED receipts
+    recovery_met = weighted_count >= n_required
+    
+    # Phase-specific logic
+    if phase == RecoveryPhase.EXPIRED:
+        status = "SUSPENDED"
+        action = "Full re-attestation required. All stale receipts voided."
+    elif phase == RecoveryPhase.GRACE:
+        remaining = (deadline + GRACE_PERIOD) - time_in_degraded
+        if recovery_met:
+            status = "RECOVERED"
+            action = "Recovery met during grace period. Trust restored with penalty."
         else:
-            return RecoveryPhase.DEGRADED_EXPIRED
-
-
-def receipt_weight(receipt_age_days: float) -> float:
-    """Exponential decay on receipt freshness."""
-    return 2 ** (-receipt_age_days / RECEIPT_DECAY_HALFLIFE)
-
-
-def evaluate_recovery(agent: DegradedAgent) -> dict:
-    """Evaluate whether agent can recover from DEGRADED."""
-    phase = agent.phase
-    now = time.time()
-    
-    if phase == RecoveryPhase.DEGRADED_EXPIRED:
-        return {
-            "agent_id": agent.agent_id,
-            "phase": phase.value,
-            "days_degraded": round(agent.days_degraded, 1),
-            "recovery_possible": False,
-            "action": "BOOTSTRAP_REQUEST required. Full re-attestation.",
-            "n_recovery": agent.n_recovery,
-            "receipts_counted": 0,
-            "weighted_receipts": 0.0,
-            "reason": f"DEGRADED > {STALE_WINDOW_DAYS}d. Stale ALLEGED stack unreliable."
-        }
-    
-    # Count receipts with decay weighting
-    required = agent.n_recovery
-    if phase == RecoveryPhase.DEGRADED_STALE:
-        required = int(required * STALE_MULTIPLIER)
-    
-    weighted_sum = 0.0
-    valid_receipts = 0
-    alleged_count = 0
-    
-    for ts, grade, counterparty in agent.receipts_since:
-        age_days = (now - ts) / 86400
-        weight = receipt_weight(age_days)
-        
-        # Grade multiplier
-        grade_mult = {"A": 1.0, "B": 0.8, "C": 0.6, "D": 0.4, "F": 0.0}.get(grade, 0.0)
-        
-        # ALLEGED receipts count but are capped
-        if grade in ("D", "F"):
-            alleged_count += 1
-            if alleged_count > MAX_ALLEGED_STACK:
-                continue  # Cap stale ALLEGED
-        
-        contribution = weight * grade_mult
-        weighted_sum += contribution
-        if contribution > 0.1:  # Minimum threshold
-            valid_receipts += 1
-    
-    can_recover = weighted_sum >= required * 0.7  # 70% of weighted target
+            status = "GRACE_WARNING"
+            action = f"Grace period: {remaining/86400:.1f}d remaining. Need {n_required - weighted_count:.1f} more weighted receipts."
+    else:  # ACTIVE_RECOVERY
+        remaining = deadline - time_in_degraded
+        if recovery_met:
+            status = "RECOVERED"
+            action = "Recovery met within deadline. Trust restored."
+        else:
+            status = "RECOVERING"
+            action = f"Active recovery: {remaining/86400:.1f}d remaining. {weighted_count:.1f}/{n_required} weighted receipts."
     
     return {
         "agent_id": agent.agent_id,
         "phase": phase.value,
-        "days_degraded": round(agent.days_degraded, 1),
-        "n_recovery_base": agent.n_recovery,
-        "n_recovery_adjusted": required,
-        "receipts_total": len(agent.receipts_since),
-        "receipts_valid": valid_receipts,
-        "weighted_sum": round(weighted_sum, 2),
-        "weighted_target": round(required * 0.7, 2),
-        "alleged_capped": alleged_count > MAX_ALLEGED_STACK,
-        "recovery_possible": can_recover,
-        "action": "RECOVER" if can_recover else f"Need {round(required * 0.7 - weighted_sum, 1)} more weighted receipts",
-        "next_phase_in": _next_phase_days(agent)
+        "status": status,
+        "action": action,
+        "time_in_degraded_days": round(time_in_degraded / 86400, 1),
+        "deadline_days": round(deadline / 86400, 1),
+        "n_required": n_required,
+        "raw_receipt_count": len(agent.receipts_since_degraded),
+        "weighted_receipt_count": round(weighted_count, 2),
+        "fresh_count": fresh_count,
+        "confirmed_count": confirmed_count,
+        "freshness_distribution": freshness_dist,
+        "recovery_met": recovery_met,
+        "decay_applied": True
     }
-
-
-def _next_phase_days(agent: DegradedAgent) -> Optional[float]:
-    d = agent.days_degraded
-    if d < ACTIVE_WINDOW_DAYS:
-        return round(ACTIVE_WINDOW_DAYS - d, 1)
-    elif d < STALE_WINDOW_DAYS:
-        return round(STALE_WINDOW_DAYS - d, 1)
-    return None  # Already expired
 
 
 # === Scenarios ===
 
-def scenario_fresh_recovery():
-    """Agent recovers within 30-day active window."""
-    print("=== Scenario: Fresh Recovery (Active Phase) ===")
+def scenario_fast_recovery():
+    """Agent recovers within 48h — fast recovery rewarded."""
+    print("=== Scenario: Fast Recovery (48h) ===")
     now = time.time()
+    degraded_at = now - 2 * 86400  # 2 days ago
     
     agent = DegradedAgent(
-        agent_id="recovering_agent",
-        degraded_at=now - 86400 * 10,  # 10 days ago
-        n_initial=30,
-        reason="grader_revoked"
+        agent_id="fast_recoverer",
+        degraded_at=degraded_at,
+        initial_n=25,
+        recovery_deadline=degraded_at + RECOVERY_DEADLINE_DEFAULT,
+        receipts_since_degraded=[
+            Receipt(f"r{i}", now - i * 3600, "B", f"cp_{i}", "CONFIRMED")
+            for i in range(10)
+        ]
     )
     
-    # Add 12 good receipts over last 10 days
-    for i in range(12):
-        agent.receipts_since.append((now - 86400 * i, "B", f"counter_{i}"))
-    
-    result = evaluate_recovery(agent)
-    print(f"  Phase: {result['phase']}")
-    print(f"  Days degraded: {result['days_degraded']}")
-    print(f"  n_recovery: {result['n_recovery_base']} (adjusted: {result['n_recovery_adjusted']})")
-    print(f"  Weighted receipts: {result['weighted_sum']}/{result['weighted_target']}")
-    print(f"  Recovery: {result['action']}")
-    print(f"  Next phase in: {result['next_phase_in']}d")
+    result = assess_recovery(agent, now)
+    print(f"  Phase: {result['phase']}, Status: {result['status']}")
+    print(f"  Time degraded: {result['time_in_degraded_days']}d / {result['deadline_days']}d deadline")
+    print(f"  Receipts: {result['weighted_receipt_count']:.1f} weighted / {result['n_required']} needed")
+    print(f"  Fresh: {result['fresh_count']}, Confirmed: {result['confirmed_count']}")
+    print(f"  → {result['action']}")
     print()
 
 
-def scenario_stale_harder():
-    """Agent in stale phase — needs 2x receipts."""
-    print("=== Scenario: Stale Phase (2x Requirement) ===")
+def scenario_slow_recovery():
+    """Agent sits DEGRADED for 6 months — EXPIRED → SUSPENDED."""
+    print("=== Scenario: Slow Recovery (6 months) ===")
     now = time.time()
+    degraded_at = now - 180 * 86400  # 6 months ago
     
     agent = DegradedAgent(
-        agent_id="slow_recovery",
-        degraded_at=now - 86400 * 45,  # 45 days ago
-        n_initial=25,
-        reason="dispute_pattern"
+        agent_id="slow_recoverer",
+        degraded_at=degraded_at,
+        initial_n=30,
+        recovery_deadline=degraded_at + RECOVERY_DEADLINE_DEFAULT,
+        receipts_since_degraded=[
+            # Stale receipts from months ago
+            Receipt(f"r{i}", now - (150 - i) * 86400, "C", f"cp_{i}", "ALLEGED")
+            for i in range(15)
+        ]
     )
     
-    # 8 receipts, some old
-    for i in range(8):
-        agent.receipts_since.append((now - 86400 * (i * 5), "B", f"counter_{i}"))
-    
-    result = evaluate_recovery(agent)
-    print(f"  Phase: {result['phase']}")
-    print(f"  Days degraded: {result['days_degraded']}")
-    print(f"  n_recovery: {result['n_recovery_base']} → {result['n_recovery_adjusted']} (2x stale)")
-    print(f"  Weighted receipts: {result['weighted_sum']}/{result['weighted_target']}")
-    print(f"  Recovery: {result['action']}")
-    print(f"  Next phase in: {result['next_phase_in']}d")
+    result = assess_recovery(agent, now)
+    print(f"  Phase: {result['phase']}, Status: {result['status']}")
+    print(f"  Time degraded: {result['time_in_degraded_days']}d / {result['deadline_days']}d deadline")
+    print(f"  Receipts: {result['weighted_receipt_count']:.2f} weighted / {result['n_required']} needed")
+    print(f"  Freshness: {result['freshness_distribution']}")
+    print(f"  → {result['action']}")
     print()
 
 
-def scenario_expired_rebootstrap():
-    """Agent DEGRADED > 90 days — must re-bootstrap."""
-    print("=== Scenario: Expired — Full Re-Bootstrap Required ===")
+def scenario_grace_period():
+    """Agent in grace period — last chance."""
+    print("=== Scenario: Grace Period (day 33) ===")
     now = time.time()
+    degraded_at = now - 33 * 86400  # 33 days ago (3 days into grace)
     
     agent = DegradedAgent(
-        agent_id="abandoned_agent",
-        degraded_at=now - 86400 * 120,  # 120 days ago
-        n_initial=40,
-        reason="operator_revoked"
+        agent_id="grace_agent",
+        degraded_at=degraded_at,
+        initial_n=20,
+        recovery_deadline=degraded_at + RECOVERY_DEADLINE_DEFAULT,
+        receipts_since_degraded=[
+            Receipt(f"r{i}", now - i * 86400, "B", f"cp_{i}", "CONFIRMED")
+            for i in range(5)
+        ]
     )
     
-    # Even with receipts, expired = no recovery
-    for i in range(20):
-        agent.receipts_since.append((now - 86400 * i, "A", f"counter_{i}"))
-    
-    result = evaluate_recovery(agent)
-    print(f"  Phase: {result['phase']}")
-    print(f"  Days degraded: {result['days_degraded']}")
-    print(f"  Has {len(agent.receipts_since)} receipts but: {result['action']}")
-    print(f"  Recovery possible: {result['recovery_possible']}")
+    result = assess_recovery(agent, now)
+    print(f"  Phase: {result['phase']}, Status: {result['status']}")
+    print(f"  Time degraded: {result['time_in_degraded_days']}d (deadline: {result['deadline_days']}d)")
+    print(f"  Receipts: {result['weighted_receipt_count']:.1f} weighted / {result['n_required']} needed")
+    print(f"  → {result['action']}")
     print()
 
 
-def scenario_alleged_stack_misleading():
-    """Stale ALLEGED receipts accumulate — capped at MAX_ALLEGED_STACK."""
-    print("=== Scenario: Misleading ALLEGED Stack ===")
+def scenario_stale_receipts():
+    """Many receipts but all stale — decay reduces effective count."""
+    print("=== Scenario: Stale Receipt Accumulation ===")
     now = time.time()
+    degraded_at = now - 25 * 86400  # 25 days ago
     
     agent = DegradedAgent(
-        agent_id="alleged_heavy",
-        degraded_at=now - 86400 * 20,  # 20 days ago
-        n_initial=30,
-        reason="availability_failure"
+        agent_id="stale_accumulator",
+        degraded_at=degraded_at,
+        initial_n=30,
+        recovery_deadline=degraded_at + RECOVERY_DEADLINE_DEFAULT,
+        receipts_since_degraded=[
+            # 20 receipts but all from 20+ days ago
+            Receipt(f"r{i}", now - (20 + i) * 86400, "B", f"cp_{i}", "CONFIRMED")
+            for i in range(20)
+        ]
     )
     
-    # 60 D-grade ALLEGED receipts (quantity without quality)
-    for i in range(60):
-        agent.receipts_since.append((now - 86400 * (i * 0.3), "D", f"sybil_{i % 3}"))
+    result = assess_recovery(agent, now)
+    print(f"  Phase: {result['phase']}, Status: {result['status']}")
+    print(f"  Raw receipts: {result['raw_receipt_count']}")
+    print(f"  Weighted receipts: {result['weighted_receipt_count']:.2f} / {result['n_required']} needed")
+    print(f"  Freshness: {result['freshness_distribution']}")
+    print(f"  Key: 20 raw receipts → {result['weighted_receipt_count']:.1f} effective (decay applied)")
+    print(f"  → {result['action']}")
+    print()
+
+
+def scenario_stricter_genesis():
+    """Operator sets 14-day recovery deadline (stricter than 30d default)."""
+    print("=== Scenario: Stricter Genesis (14d deadline) ===")
+    now = time.time()
+    degraded_at = now - 20 * 86400  # 20 days ago
     
-    result = evaluate_recovery(agent)
-    print(f"  Phase: {result['phase']}")
-    print(f"  Total receipts: {result['receipts_total']}")
-    print(f"  Valid (weighted > 0.1): {result['receipts_valid']}")
-    print(f"  ALLEGED capped: {result['alleged_capped']}")
-    print(f"  Weighted sum: {result['weighted_sum']}/{result['weighted_target']}")
-    print(f"  Recovery: {result['action']}")
-    print(f"  KEY: quantity of low-grade receipts ≠ recovery signal")
+    agent = DegradedAgent(
+        agent_id="strict_agent",
+        degraded_at=degraded_at,
+        initial_n=20,
+        recovery_deadline=degraded_at + 14 * 86400,  # 14d not 30d
+        genesis_recovery_deadline=14 * 86400,
+        receipts_since_degraded=[
+            Receipt(f"r{i}", now - i * 86400, "B", f"cp_{i}", "CONFIRMED")
+            for i in range(4)
+        ]
+    )
+    
+    result = assess_recovery(agent, now)
+    print(f"  Phase: {result['phase']}, Status: {result['status']}")
+    print(f"  Genesis deadline: 14d (stricter than 30d default)")
+    print(f"  Time degraded: {result['time_in_degraded_days']}d")
+    print(f"  → {result['action']}")
     print()
 
 
 if __name__ == "__main__":
-    print("Recovery Time Cap — Time-Bounded DEGRADED Recovery for ATF")
-    print("Per santaclawd + RFC 5280 Section 3.3 (CRL nextUpdate)")
+    print("Recovery Time Cap — Time-Bounded DEGRADED Recovery for ATF V1.2")
+    print("Per santaclawd: stale DEGRADED ≠ fresh DEGRADED")
     print("=" * 70)
     print()
-    print(f"Phases: ACTIVE (0-{ACTIVE_WINDOW_DAYS}d) → STALE ({ACTIVE_WINDOW_DAYS}-{STALE_WINDOW_DAYS}d) → EXPIRED (>{STALE_WINDOW_DAYS}d)")
-    print(f"STALE = {STALE_MULTIPLIER}x receipts needed. EXPIRED = BOOTSTRAP_REQUEST.")
-    print(f"Receipt decay: {RECEIPT_DECAY_HALFLIFE}d half-life. ALLEGED cap: {MAX_ALLEGED_STACK}.")
+    print("SPEC_CONSTANTS:")
+    print(f"  RECOVERY_DEADLINE_DEFAULT = {RECOVERY_DEADLINE_DEFAULT // 86400}d")
+    print(f"  GRACE_PERIOD = {GRACE_PERIOD // 86400}d")
+    print(f"  STALE_HALFLIFE = {STALE_HALFLIFE // 86400}d")
+    print(f"  MIN_RECOVERY_RATIO = {MIN_RECOVERY_RATIO}")
+    print(f"  MIN_RECOVERY_N = {MIN_RECOVERY_N}")
     print()
     
-    scenario_fresh_recovery()
-    scenario_stale_harder()
-    scenario_expired_rebootstrap()
-    scenario_alleged_stack_misleading()
+    scenario_fast_recovery()
+    scenario_slow_recovery()
+    scenario_grace_period()
+    scenario_stale_receipts()
+    scenario_stricter_genesis()
     
     print("=" * 70)
-    print("KEY INSIGHT: DEGRADED without time bound = infinite limbo.")
-    print("RFC 5280 CRL nextUpdate = same principle: validity has a deadline.")
-    print("Stale ALLEGED receipts mislead — cap + decay + phase gates fix it.")
+    print("KEY INSIGHT: Recovery is time-bounded AND decay-weighted.")
+    print("Fast recovery (48h) = full credit. Stale accumulation = decayed signal.")
+    print("6-month DEGRADED → SUSPENDED (re-attestation). No infinite limbo.")
+    print("Genesis constant: operator stricter not looser than SPEC_DEFAULT.")
