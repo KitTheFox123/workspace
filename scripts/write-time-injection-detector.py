@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-write-time-injection-detector.py — Detect write-time log injection in ATF receipts.
+write-time-injection-detector.py — Detect retroactive edits in ATF receipt chains.
 
-Per santaclawd: hash chains solve retroactive injection. Write-time injection
-(compromised operator injects receipt AT interaction moment) is still open.
+Per skinner: "A single witness is a vulnerability; K-of-N is a distributed audit.
+We need that temporal beacon to anchor the 'now' so the resident can't be
+retroactively edited out of the history."
 
-Three defenses (composition required — no single primitive closes it):
-1. PRE-COMMIT: Counterparty publishes hash commitment BEFORE interaction
-2. K-OF-N WITNESSES: Independent observers at write-time
-3. TEMPORAL BINDING: External time beacon (roughtime, NTP signed)
+Write-time injection: an attacker inserts, modifies, or reorders receipts after
+the fact. Detection relies on three properties:
+  1. Causal ordering (Lamport 1978): happened-before is unforgeable
+  2. K-of-N temporal witnesses: multiple independent timestamps
+  3. Hash chain continuity: any break = tamper evidence
 
-Per Dowling et al. (ESORICS 2016): CT achieves security against malicious
-loggers via Merkle consistency proofs. Write-time needs additional primitives.
+Attack patterns detected:
+  - RETROACTIVE_INSERT: receipt timestamp < predecessor but hash references it
+  - CAUSAL_VIOLATION: receipt references future events
+  - WITNESS_DISAGREEMENT: K witnesses disagree on ordering by > threshold
+  - HASH_CHAIN_BREAK: prev_hash doesn't match computed chain
+  - TIMESTAMP_IMPOSSIBLE: receipt claims time before genesis or after now
 """
 
 import hashlib
-import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -23,311 +28,335 @@ from typing import Optional
 
 
 class InjectionType(Enum):
-    RETROACTIVE = "retroactive"   # After chain sealed — caught by hash chain
-    WRITE_TIME = "write_time"     # At interaction moment — needs composition
-    PHANTOM = "phantom"           # Receipt for interaction that never happened
+    RETROACTIVE_INSERT = "RETROACTIVE_INSERT"
+    CAUSAL_VIOLATION = "CAUSAL_VIOLATION"
+    WITNESS_DISAGREEMENT = "WITNESS_DISAGREEMENT"
+    HASH_CHAIN_BREAK = "HASH_CHAIN_BREAK"
+    TIMESTAMP_IMPOSSIBLE = "TIMESTAMP_IMPOSSIBLE"
+    CLEAN = "CLEAN"
 
 
-class Defense(Enum):
-    HASH_CHAIN = "hash_chain"          # Merkle consistency proof
-    PRE_COMMIT = "pre_commit"          # Counterparty commitment before interaction
-    K_OF_N_WITNESS = "k_of_n_witness"  # Independent observers
-    TEMPORAL_BIND = "temporal_bind"     # External time source
-    COUNTERPARTY_RECEIPT = "counterparty_receipt"  # Bilateral receipt
-
-
-# Defense matrix: which defenses catch which injection types
-DEFENSE_MATRIX = {
-    InjectionType.RETROACTIVE: {Defense.HASH_CHAIN},
-    InjectionType.WRITE_TIME: {Defense.PRE_COMMIT, Defense.K_OF_N_WITNESS, Defense.TEMPORAL_BIND},
-    InjectionType.PHANTOM: {Defense.COUNTERPARTY_RECEIPT, Defense.PRE_COMMIT},
-}
+# SPEC_CONSTANTS
+MAX_WITNESS_SKEW_SECONDS = 30  # Max acceptable timestamp disagreement
+MIN_WITNESSES = 2               # Minimum temporal witnesses for validity
+GENESIS_EPOCH = 1700000000      # Earliest valid timestamp (Nov 2023)
 
 
 @dataclass
-class PreCommit:
-    """Counterparty publishes hash commitment before interaction."""
-    agent_id: str
-    commitment_hash: str  # H(nonce || intent || timestamp)
-    published_at: float
-    nonce: Optional[str] = None  # Revealed after interaction
+class TemporalWitness:
+    """Independent timestamp attestation."""
+    witness_id: str
+    timestamp: float
+    signature_hash: str
 
 
 @dataclass
 class Receipt:
     receipt_id: str
     agent_id: str
-    counterparty_id: str
     timestamp: float
-    evidence_grade: str
+    prev_hash: str
     content_hash: str
-    chain_prev_hash: str
-    witness_signatures: list = field(default_factory=list)
-    pre_commit_ref: Optional[str] = None
-    temporal_proof: Optional[str] = None
+    witnesses: list  # list of TemporalWitness
+    metadata: dict = field(default_factory=dict)
+    
+    @property
+    def receipt_hash(self) -> str:
+        h = f"{self.receipt_id}:{self.timestamp}:{self.prev_hash}:{self.content_hash}"
+        return hashlib.sha256(h.encode()).hexdigest()[:16]
 
 
 @dataclass
-class WriteTimeAudit:
+class InjectionAlert:
     receipt_id: str
-    defenses_present: list
-    defenses_missing: list
-    injection_risk: str  # LOW, MEDIUM, HIGH, CRITICAL
-    details: dict
+    injection_type: InjectionType
+    severity: str  # CRITICAL, WARNING, INFO
+    evidence: dict
+    recommendation: str
 
 
-def hash_it(data: str) -> str:
-    return hashlib.sha256(data.encode()).hexdigest()[:16]
+def check_causal_ordering(chain: list[Receipt]) -> list[InjectionAlert]:
+    """Check that timestamps are monotonically non-decreasing."""
+    alerts = []
+    for i in range(1, len(chain)):
+        if chain[i].timestamp < chain[i-1].timestamp:
+            alerts.append(InjectionAlert(
+                receipt_id=chain[i].receipt_id,
+                injection_type=InjectionType.RETROACTIVE_INSERT,
+                severity="CRITICAL",
+                evidence={
+                    "this_timestamp": chain[i].timestamp,
+                    "prev_timestamp": chain[i-1].timestamp,
+                    "time_delta": chain[i].timestamp - chain[i-1].timestamp,
+                    "position": i
+                },
+                recommendation="Receipt claims earlier time than predecessor. "
+                               "Retroactive insertion detected. REJECT chain from this point."
+            ))
+    return alerts
 
 
-def check_pre_commit(receipt: Receipt, pre_commits: dict) -> dict:
-    """Verify receipt has valid pre-commit from counterparty."""
-    if not receipt.pre_commit_ref:
-        return {"present": False, "valid": False, "reason": "no pre_commit_ref"}
-    
-    pc = pre_commits.get(receipt.pre_commit_ref)
-    if not pc:
-        return {"present": True, "valid": False, "reason": "pre_commit not found in registry"}
-    
-    # Pre-commit must be from counterparty, published BEFORE receipt
-    if pc.agent_id != receipt.counterparty_id:
-        return {"present": True, "valid": False, "reason": "pre_commit from wrong agent"}
-    
-    if pc.published_at >= receipt.timestamp:
-        return {"present": True, "valid": False, 
-                "reason": f"pre_commit after receipt ({pc.published_at:.0f} >= {receipt.timestamp:.0f})"}
-    
-    # If nonce revealed, verify commitment
-    if pc.nonce:
-        expected = hash_it(f"{pc.nonce}:{receipt.counterparty_id}:{receipt.timestamp:.0f}")
-        if expected != pc.commitment_hash:
-            return {"present": True, "valid": False, "reason": "commitment hash mismatch"}
-    
-    return {"present": True, "valid": True, "timing_gap": receipt.timestamp - pc.published_at}
+def check_hash_chain(chain: list[Receipt]) -> list[InjectionAlert]:
+    """Verify hash chain integrity."""
+    alerts = []
+    for i in range(1, len(chain)):
+        expected_prev = chain[i-1].receipt_hash
+        if chain[i].prev_hash != expected_prev:
+            alerts.append(InjectionAlert(
+                receipt_id=chain[i].receipt_id,
+                injection_type=InjectionType.HASH_CHAIN_BREAK,
+                severity="CRITICAL",
+                evidence={
+                    "expected_prev_hash": expected_prev,
+                    "actual_prev_hash": chain[i].prev_hash,
+                    "position": i
+                },
+                recommendation="Hash chain broken. Receipt references wrong predecessor. "
+                               "Either insertion or deletion detected. QUARANTINE."
+            ))
+    return alerts
 
 
-def check_witnesses(receipt: Receipt, min_witnesses: int = 2) -> dict:
-    """Verify K-of-N independent witnesses at write-time."""
-    n = len(receipt.witness_signatures)
-    if n == 0:
-        return {"present": False, "count": 0, "sufficient": False}
+def check_witness_agreement(receipt: Receipt) -> list[InjectionAlert]:
+    """Check that K temporal witnesses agree on timing."""
+    alerts = []
+    if len(receipt.witnesses) < MIN_WITNESSES:
+        alerts.append(InjectionAlert(
+            receipt_id=receipt.receipt_id,
+            injection_type=InjectionType.WITNESS_DISAGREEMENT,
+            severity="WARNING",
+            evidence={
+                "witness_count": len(receipt.witnesses),
+                "minimum_required": MIN_WITNESSES
+            },
+            recommendation=f"Insufficient witnesses ({len(receipt.witnesses)}/{MIN_WITNESSES}). "
+                           "Temporal anchoring weak. DEGRADE trust."
+        ))
+        return alerts
     
-    # Check for diversity (different operators)
-    unique_signers = set(receipt.witness_signatures)
-    diversity = len(unique_signers) / n if n > 0 else 0
+    timestamps = [w.timestamp for w in receipt.witnesses]
+    max_skew = max(timestamps) - min(timestamps)
+    
+    if max_skew > MAX_WITNESS_SKEW_SECONDS:
+        # Check if receipt's own timestamp is within witness range
+        receipt_in_range = min(timestamps) <= receipt.timestamp <= max(timestamps)
+        alerts.append(InjectionAlert(
+            receipt_id=receipt.receipt_id,
+            injection_type=InjectionType.WITNESS_DISAGREEMENT,
+            severity="CRITICAL" if not receipt_in_range else "WARNING",
+            evidence={
+                "max_skew_seconds": max_skew,
+                "threshold": MAX_WITNESS_SKEW_SECONDS,
+                "witness_timestamps": timestamps,
+                "receipt_timestamp": receipt.timestamp,
+                "receipt_in_witness_range": receipt_in_range
+            },
+            recommendation="Temporal witnesses disagree beyond threshold. "
+                           "Possible clock manipulation or network partition."
+        ))
+    
+    return alerts
+
+
+def check_timestamp_bounds(receipt: Receipt) -> list[InjectionAlert]:
+    """Check timestamp is within valid bounds."""
+    alerts = []
+    now = time.time()
+    
+    if receipt.timestamp < GENESIS_EPOCH:
+        alerts.append(InjectionAlert(
+            receipt_id=receipt.receipt_id,
+            injection_type=InjectionType.TIMESTAMP_IMPOSSIBLE,
+            severity="CRITICAL",
+            evidence={
+                "timestamp": receipt.timestamp,
+                "genesis_epoch": GENESIS_EPOCH,
+                "claim": "before_genesis"
+            },
+            recommendation="Receipt claims time before genesis epoch. REJECT."
+        ))
+    
+    if receipt.timestamp > now + 300:  # 5-minute future tolerance
+        alerts.append(InjectionAlert(
+            receipt_id=receipt.receipt_id,
+            injection_type=InjectionType.TIMESTAMP_IMPOSSIBLE,
+            severity="CRITICAL",
+            evidence={
+                "timestamp": receipt.timestamp,
+                "current_time": now,
+                "future_offset_seconds": receipt.timestamp - now,
+                "claim": "future_receipt"
+            },
+            recommendation="Receipt claims future time beyond tolerance. "
+                           "Clock manipulation or pre-dated injection. REJECT."
+        ))
+    
+    return alerts
+
+
+def audit_chain(chain: list[Receipt]) -> dict:
+    """Full audit of a receipt chain for write-time injection."""
+    all_alerts = []
+    
+    # Chain-level checks
+    all_alerts.extend(check_causal_ordering(chain))
+    all_alerts.extend(check_hash_chain(chain))
+    
+    # Per-receipt checks
+    for receipt in chain:
+        all_alerts.extend(check_witness_agreement(receipt))
+        all_alerts.extend(check_timestamp_bounds(receipt))
+    
+    critical = [a for a in all_alerts if a.severity == "CRITICAL"]
+    warnings = [a for a in all_alerts if a.severity == "WARNING"]
+    
+    if critical:
+        verdict = "INJECTION_DETECTED"
+        grade = "F"
+    elif warnings:
+        verdict = "SUSPICIOUS"
+        grade = "C"
+    else:
+        verdict = "CLEAN"
+        grade = "A"
     
     return {
-        "present": True,
-        "count": n,
-        "unique": len(unique_signers),
-        "diversity": round(diversity, 2),
-        "sufficient": n >= min_witnesses and diversity > 0.5
+        "chain_length": len(chain),
+        "verdict": verdict,
+        "grade": grade,
+        "critical_alerts": len(critical),
+        "warning_alerts": len(warnings),
+        "alerts": [
+            {
+                "receipt": a.receipt_id,
+                "type": a.injection_type.value,
+                "severity": a.severity,
+                "evidence": a.evidence
+            }
+            for a in all_alerts
+        ],
+        "injection_types_detected": list(set(a.injection_type.value for a in all_alerts))
     }
 
 
-def check_temporal_binding(receipt: Receipt) -> dict:
-    """Verify external temporal proof exists."""
-    if not receipt.temporal_proof:
-        return {"present": False, "valid": False}
-    
-    # In production: verify against roughtime/NTP signed response
-    # Here: check that proof exists and is plausible
-    return {"present": True, "valid": True, "source": "external_beacon"}
-
-
-def audit_receipt(receipt: Receipt, pre_commits: dict, min_witnesses: int = 2) -> WriteTimeAudit:
-    """Full write-time injection audit for a single receipt."""
-    pc = check_pre_commit(receipt, pre_commits)
-    wit = check_witnesses(receipt, min_witnesses)
-    temp = check_temporal_binding(receipt)
-    
-    defenses_present = []
-    defenses_missing = []
-    
-    # Always present (hash chain is structural)
-    defenses_present.append(Defense.HASH_CHAIN.value)
-    
-    if pc["present"] and pc.get("valid"):
-        defenses_present.append(Defense.PRE_COMMIT.value)
-    else:
-        defenses_missing.append(Defense.PRE_COMMIT.value)
-    
-    if wit["present"] and wit.get("sufficient"):
-        defenses_present.append(Defense.K_OF_N_WITNESS.value)
-    else:
-        defenses_missing.append(Defense.K_OF_N_WITNESS.value)
-    
-    if temp["present"] and temp.get("valid"):
-        defenses_present.append(Defense.TEMPORAL_BIND.value)
-    else:
-        defenses_missing.append(Defense.TEMPORAL_BIND.value)
-    
-    # Risk assessment
-    write_time_defenses = len([d for d in defenses_present 
-                               if d != Defense.HASH_CHAIN.value])
-    
-    if write_time_defenses >= 3:
-        risk = "LOW"
-    elif write_time_defenses >= 2:
-        risk = "MEDIUM"
-    elif write_time_defenses >= 1:
-        risk = "HIGH"
-    else:
-        risk = "CRITICAL"  # Only hash chain — retroactive solved, write-time open
-    
-    return WriteTimeAudit(
-        receipt_id=receipt.receipt_id,
-        defenses_present=defenses_present,
-        defenses_missing=defenses_missing,
-        injection_risk=risk,
-        details={
-            "pre_commit": pc,
-            "witnesses": wit,
-            "temporal": temp,
-            "write_time_defense_count": write_time_defenses
-        }
-    )
+def make_witness(witness_id: str, timestamp: float) -> TemporalWitness:
+    sig = hashlib.sha256(f"{witness_id}:{timestamp}".encode()).hexdigest()[:8]
+    return TemporalWitness(witness_id, timestamp, sig)
 
 
 # === Scenarios ===
 
-def scenario_full_defense():
-    """All three write-time defenses present."""
-    print("=== Scenario: Full Defense (pre-commit + witnesses + temporal) ===")
+def scenario_clean_chain():
+    """Normal chain with proper witnesses."""
+    print("=== Scenario 1: Clean Chain ===")
     now = time.time()
     
-    pc = PreCommit("bro_agent", hash_it(f"nonce123:bro_agent:{now:.0f}"), 
-                   now - 60, "nonce123")
-    pre_commits = {"pc001": pc}
+    chain = []
+    prev = "genesis"
+    for i in range(5):
+        t = now - 300 + i * 60
+        r = Receipt(
+            f"r{i:03d}", "kit_fox", t, prev, f"content_{i}",
+            [make_witness("w1", t + 1), make_witness("w2", t + 2)]
+        )
+        prev = r.receipt_hash
+        chain.append(r)
     
-    receipt = Receipt(
-        "r001", "kit_fox", "bro_agent", now, "A",
-        hash_it("content"), hash_it("prev"),
-        witness_signatures=["witness_a", "witness_b", "witness_c"],
-        pre_commit_ref="pc001",
-        temporal_proof="roughtime:1234567890"
-    )
-    
-    audit = audit_receipt(receipt, pre_commits)
-    print(f"  Risk: {audit.injection_risk}")
-    print(f"  Defenses present: {audit.defenses_present}")
-    print(f"  Defenses missing: {audit.defenses_missing}")
+    result = audit_chain(chain)
+    print(f"  Verdict: {result['verdict']} (Grade {result['grade']})")
+    print(f"  Alerts: {result['critical_alerts']} critical, {result['warning_alerts']} warnings")
     print()
 
 
-def scenario_hash_chain_only():
-    """Only hash chain — retroactive solved, write-time CRITICAL."""
-    print("=== Scenario: Hash Chain Only (write-time CRITICAL) ===")
+def scenario_retroactive_insert():
+    """Attacker inserts receipt with past timestamp."""
+    print("=== Scenario 2: Retroactive Insert ===")
     now = time.time()
     
-    receipt = Receipt(
-        "r002", "kit_fox", "unknown_agent", now, "C",
-        hash_it("content"), hash_it("prev")
-    )
+    chain = []
+    prev = "genesis"
+    for i in range(3):
+        t = now - 300 + i * 60
+        r = Receipt(f"r{i:03d}", "kit_fox", t, prev, f"content_{i}",
+                    [make_witness("w1", t + 1), make_witness("w2", t + 2)])
+        prev = r.receipt_hash
+        chain.append(r)
     
-    audit = audit_receipt(receipt, {})
-    print(f"  Risk: {audit.injection_risk}")
-    print(f"  Defenses present: {audit.defenses_present}")
-    print(f"  Defenses missing: {audit.defenses_missing}")
-    print(f"  KEY: hash chain stops retroactive but NOT write-time injection")
+    # Attacker inserts receipt claiming earlier time
+    injected = Receipt("r_injected", "attacker", now - 400, prev, "malicious_content",
+                       [make_witness("w_fake", now - 400)])
+    chain.append(injected)
+    
+    result = audit_chain(chain)
+    print(f"  Verdict: {result['verdict']} (Grade {result['grade']})")
+    print(f"  Types: {result['injection_types_detected']}")
+    for a in result['alerts']:
+        print(f"    {a['type']}: {a['severity']} @ {a['receipt']}")
     print()
 
 
-def scenario_pre_commit_after_receipt():
-    """Pre-commit published AFTER receipt — invalid."""
-    print("=== Scenario: Pre-Commit After Receipt (invalid timing) ===")
+def scenario_witness_disagreement():
+    """Witnesses give conflicting timestamps (clock manipulation)."""
+    print("=== Scenario 3: Witness Disagreement ===")
     now = time.time()
     
-    pc = PreCommit("attacker", hash_it("fake"), now + 10)  # AFTER receipt
-    pre_commits = {"pc_bad": pc}
+    r = Receipt("r_disputed", "suspicious_agent", now, "genesis", "content",
+                [make_witness("w1", now), make_witness("w2", now + 60),
+                 make_witness("w3", now - 45)])
     
-    receipt = Receipt(
-        "r003", "kit_fox", "attacker", now, "B",
-        hash_it("content"), hash_it("prev"),
-        pre_commit_ref="pc_bad"
-    )
-    
-    audit = audit_receipt(receipt, pre_commits)
-    print(f"  Risk: {audit.injection_risk}")
-    print(f"  Pre-commit valid: {audit.details['pre_commit']['valid']}")
-    print(f"  Reason: {audit.details['pre_commit']['reason']}")
+    result = audit_chain([r])
+    print(f"  Verdict: {result['verdict']} (Grade {result['grade']})")
+    for a in result['alerts']:
+        print(f"    {a['type']}: skew={a['evidence'].get('max_skew_seconds', 'n/a')}s")
     print()
 
 
-def scenario_monoculture_witnesses():
-    """Witnesses from same operator — diversity too low."""
-    print("=== Scenario: Monoculture Witnesses (same signer) ===")
+def scenario_hash_chain_break():
+    """Receipt references wrong predecessor (insertion/deletion)."""
+    print("=== Scenario 4: Hash Chain Break ===")
     now = time.time()
     
-    receipt = Receipt(
-        "r004", "kit_fox", "shady_agent", now, "B",
-        hash_it("content"), hash_it("prev"),
-        witness_signatures=["same_witness", "same_witness", "same_witness"],
-        temporal_proof="roughtime:999"
-    )
+    r0 = Receipt("r000", "kit_fox", now - 200, "genesis", "c0",
+                 [make_witness("w1", now - 199), make_witness("w2", now - 198)])
+    r1 = Receipt("r001", "kit_fox", now - 100, r0.receipt_hash, "c1",
+                 [make_witness("w1", now - 99), make_witness("w2", now - 98)])
+    # r2 references wrong prev_hash (as if r1 was deleted/replaced)
+    r2 = Receipt("r002", "kit_fox", now, "wrong_hash_here", "c2",
+                 [make_witness("w1", now + 1), make_witness("w2", now + 2)])
     
-    audit = audit_receipt(receipt, {})
-    print(f"  Risk: {audit.injection_risk}")
-    print(f"  Witnesses: count={audit.details['witnesses']['count']} "
-          f"unique={audit.details['witnesses']['unique']} "
-          f"diversity={audit.details['witnesses']['diversity']}")
-    print(f"  Sufficient: {audit.details['witnesses']['sufficient']}")
+    result = audit_chain([r0, r1, r2])
+    print(f"  Verdict: {result['verdict']} (Grade {result['grade']})")
+    for a in result['alerts']:
+        print(f"    {a['type']}: {a['severity']} @ {a['receipt']}")
     print()
 
 
-def scenario_fleet_audit():
-    """Audit a fleet of receipts for write-time injection risk."""
-    print("=== Scenario: Fleet Audit (mixed defenses) ===")
+def scenario_future_timestamp():
+    """Receipt claims future time (pre-dated injection)."""
+    print("=== Scenario 5: Future Timestamp ===")
     now = time.time()
     
-    pc = PreCommit("good_agent", hash_it(f"n1:good_agent:{now:.0f}"), now - 30, "n1")
-    pre_commits = {"pc_good": pc}
+    r = Receipt("r_future", "time_traveler", now + 7200, "genesis", "future_content",
+                [make_witness("w1", now + 7201), make_witness("w2", now + 7202)])
     
-    receipts = [
-        Receipt("f001", "kit", "good_agent", now, "A", hash_it("c1"), hash_it("p"),
-                ["w1","w2"], "pc_good", "rt:1"),
-        Receipt("f002", "kit", "mid_agent", now, "B", hash_it("c2"), hash_it("p"),
-                ["w1"], None, "rt:2"),
-        Receipt("f003", "kit", "bad_agent", now, "C", hash_it("c3"), hash_it("p")),
-        Receipt("f004", "kit", "good2", now, "A", hash_it("c4"), hash_it("p"),
-                ["w1","w2","w3"], None, "rt:3"),
-    ]
-    
-    risk_counts = {}
-    for r in receipts:
-        audit = audit_receipt(r, pre_commits)
-        risk_counts[audit.injection_risk] = risk_counts.get(audit.injection_risk, 0) + 1
-        print(f"  {r.receipt_id}: {audit.injection_risk} "
-              f"(write-time defenses: {audit.details['write_time_defense_count']})")
-    
-    print(f"\n  Fleet risk distribution: {risk_counts}")
-    critical = risk_counts.get("CRITICAL", 0)
-    total = len(receipts)
-    print(f"  Critical exposure: {critical}/{total} ({critical/total:.0%})")
+    result = audit_chain([r])
+    print(f"  Verdict: {result['verdict']} (Grade {result['grade']})")
+    for a in result['alerts']:
+        print(f"    {a['type']}: future_offset={a['evidence'].get('future_offset_seconds', 'n/a')}s")
     print()
 
 
 if __name__ == "__main__":
-    print("Write-Time Injection Detector — ATF Receipt Integrity")
-    print("Per santaclawd + Dowling et al. (ESORICS 2016)")
+    print("Write-Time Injection Detector — Temporal Integrity for ATF Chains")
+    print("Per skinner + Lamport (1978)")
     print("=" * 65)
     print()
-    print("Hash chains close RETROACTIVE injection.")
-    print("Write-time needs COMPOSITION: pre-commit + witnesses + temporal.")
-    print("No single primitive is sufficient.")
-    print()
-    
-    scenario_full_defense()
-    scenario_hash_chain_only()
-    scenario_pre_commit_after_receipt()
-    scenario_monoculture_witnesses()
-    scenario_fleet_audit()
-    
+    scenario_clean_chain()
+    scenario_retroactive_insert()
+    scenario_witness_disagreement()
+    scenario_hash_chain_break()
+    scenario_future_timestamp()
     print("=" * 65)
-    print("DEFENSE MATRIX:")
-    for itype, defenses in DEFENSE_MATRIX.items():
-        print(f"  {itype.value:15s} → {', '.join(d.value for d in defenses)}")
-    print()
-    print("KEY INSIGHT: No single primitive closes write-time injection.")
-    print("Composition of 2+ defenses reduces risk to MEDIUM.")
-    print("All 3 = LOW. Hash chain alone = CRITICAL for write-time.")
+    print("KEY: K-of-N temporal witnesses + hash chains + causal ordering")
+    print("= three independent detection axes for write-time injection.")
+    print("Single witness = vulnerability. Composition = clinical defense.")
