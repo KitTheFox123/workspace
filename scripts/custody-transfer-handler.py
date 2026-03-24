@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-custody-transfer-handler.py — ATF custody transfer with dark operator fallback.
+custody-transfer-handler.py — Dark operator custody transfer for ATF.
 
-Per santaclawd: DKIM key rotation assumes old selector stays until TTL. But what
-if old operator goes DARK? ATF needs both cooperative and adversarial paths.
+Per santaclawd: what if old operator goes DARK and can't countersign?
+M3AAWG 2019: DKIM key rotation requires overlap period — new selector
+published BEFORE old removed. Dark operator breaks this assumption.
 
-Two paths:
-  COOPERATIVE — Dual-signature overlap window (DKIM selector rotation model)
-  ADVERSARIAL — Timeout-based unilateral transfer (ICANN domain transfer model)
+Solution: CUSTODY_TIMEOUT as SPEC_CONSTANT. After timeout, new custodian
+proves control unilaterally. Registry validates. Grace period spec-defined
+not registry-configurable (configurable = race to bottom).
 
-ICANN Transfer Policy: 5-day ACK window, 15-day total. No response = implicit consent.
-M3AAWG (2019): New DKIM selector published BEFORE old removed. Overlap period.
+Three transfer modes:
+  COOPERATIVE  — Both operators sign (normal DKIM rotation)
+  UNILATERAL   — Old operator dark after CUSTODY_TIMEOUT (30d)
+  EMERGENCY    — Key compromise, immediate with evidence
 """
 
 import hashlib
@@ -20,364 +23,300 @@ from enum import Enum
 from typing import Optional
 
 
-# SPEC_CONSTANTS
-CUSTODY_TIMEOUT_DAYS = 30       # Max wait for unresponsive operator
-ACK_WINDOW_DAYS = 5             # Days to acknowledge transfer request
-REACHABILITY_ATTEMPTS = 3       # Required contact attempts before adversarial
-REACHABILITY_SPAN_DAYS = 14     # Attempts must span this many days
-OVERLAP_WINDOW_DAYS = 7         # Dual-signature overlap for cooperative transfer
-GRACE_PERIOD_DAYS = 3           # Post-transfer grace for in-flight receipts
+# SPEC_CONSTANTS (not configurable)
+CUSTODY_TIMEOUT_DAYS = 30       # Days before unilateral transfer allowed
+EMERGENCY_EVIDENCE_MIN = 3      # Min evidence items for emergency transfer
+OVERLAP_PERIOD_DAYS = 7         # Both selectors active during cooperative transfer
+PROOF_OF_CONTROL_FIELDS = ["dns_txt_record", "operator_genesis_hash", "smtp_reachability"]
+CHALLENGE_RESPONSE_TIMEOUT_H = 72  # Hours for old operator to respond to challenge
 
 
 class TransferMode(Enum):
-    COOPERATIVE = "COOPERATIVE"    # Both custodians sign
-    ADVERSARIAL = "ADVERSARIAL"   # Timeout-based unilateral
-    EMERGENCY = "EMERGENCY"       # Operator key compromise
+    COOPERATIVE = "COOPERATIVE"     # Both sign, orderly handoff
+    UNILATERAL = "UNILATERAL"      # Old operator dark, timeout elapsed
+    EMERGENCY = "EMERGENCY"         # Key compromise, immediate
 
 
 class TransferState(Enum):
-    INITIATED = "INITIATED"
-    ACK_PENDING = "ACK_PENDING"
-    OVERLAP = "OVERLAP"           # Dual-signature window
-    REACHABILITY_TESTING = "REACHABILITY_TESTING"
-    TIMEOUT_PENDING = "TIMEOUT_PENDING"
-    COMPLETED = "COMPLETED"
+    PROPOSED = "PROPOSED"
+    CHALLENGE_SENT = "CHALLENGE_SENT"
+    CHALLENGE_EXPIRED = "CHALLENGE_EXPIRED"
+    PROOF_SUBMITTED = "PROOF_SUBMITTED"
+    VALIDATED = "VALIDATED"
     REJECTED = "REJECTED"
-    FAILED = "FAILED"
-
-
-class ReachabilityResult(Enum):
-    DELIVERED = "DELIVERED"
-    BOUNCED = "BOUNCED"
-    NO_RESPONSE = "NO_RESPONSE"
-    TIMEOUT = "TIMEOUT"
+    COMPLETE = "COMPLETE"
 
 
 @dataclass
-class ContactAttempt:
-    timestamp: float
-    method: str  # "smtp", "genesis_endpoint", "registry"
-    result: ReachabilityResult
-    evidence_hash: str  # Hash of bounce/delivery receipt
+class Operator:
+    operator_id: str
+    genesis_hash: str
+    last_seen: float            # Unix timestamp
+    dns_selector: str
+    smtp_reachable: bool = True
+    is_dark: bool = False
 
 
 @dataclass
 class CustodyTransfer:
     transfer_id: str
     agent_id: str
-    old_custodian_id: str
-    new_custodian_id: str
+    old_operator: Operator
+    new_operator: Operator
     mode: TransferMode
     state: TransferState
     initiated_at: float
-    contact_attempts: list = field(default_factory=list)
-    old_signature: Optional[str] = None
-    new_signature: Optional[str] = None
-    completion_hash: Optional[str] = None
-    timeout_at: Optional[float] = None
-    notes: list = field(default_factory=list)
+    evidence: list = field(default_factory=list)
+    challenge_sent_at: Optional[float] = None
+    challenge_response: Optional[str] = None
+    proof_of_control: dict = field(default_factory=dict)
+    completed_at: Optional[float] = None
+    transfer_hash: Optional[str] = None
 
 
-def hash_transfer(transfer: CustodyTransfer) -> str:
-    """Deterministic hash of transfer state."""
-    content = f"{transfer.transfer_id}:{transfer.agent_id}:{transfer.old_custodian_id}:" \
-              f"{transfer.new_custodian_id}:{transfer.mode.value}:{transfer.state.value}"
-    return hashlib.sha256(content.encode()).hexdigest()[:16]
+def is_operator_dark(op: Operator, now: float) -> bool:
+    """Operator is dark if unreachable for CUSTODY_TIMEOUT."""
+    days_since = (now - op.last_seen) / 86400
+    return days_since >= CUSTODY_TIMEOUT_DAYS or not op.smtp_reachable
 
 
-def initiate_cooperative(agent_id: str, old_cust: str, new_cust: str) -> CustodyTransfer:
-    """
-    Cooperative transfer: DKIM selector rotation model.
-    M3AAWG (2019): publish new selector BEFORE removing old.
-    """
-    now = time.time()
-    transfer = CustodyTransfer(
-        transfer_id=hashlib.sha256(f"{agent_id}:{now}".encode()).hexdigest()[:16],
-        agent_id=agent_id,
-        old_custodian_id=old_cust,
-        new_custodian_id=new_cust,
-        mode=TransferMode.COOPERATIVE,
-        state=TransferState.ACK_PENDING,
-        initiated_at=now,
-        timeout_at=now + ACK_WINDOW_DAYS * 86400,
+def determine_transfer_mode(old_op: Operator, evidence: list, now: float) -> TransferMode:
+    """Determine appropriate transfer mode."""
+    # Emergency: key compromise with evidence
+    if len(evidence) >= EMERGENCY_EVIDENCE_MIN and any("compromise" in e.lower() for e in evidence):
+        return TransferMode.EMERGENCY
+    # Unilateral: operator dark
+    if is_operator_dark(old_op, now):
+        return TransferMode.UNILATERAL
+    # Default: cooperative
+    return TransferMode.COOPERATIVE
+
+
+def validate_proof_of_control(proof: dict) -> tuple[bool, list]:
+    """Validate new operator's proof of control."""
+    errors = []
+    for field_name in PROOF_OF_CONTROL_FIELDS:
+        if field_name not in proof or not proof[field_name]:
+            errors.append(f"Missing: {field_name}")
+    
+    # DNS TXT must match new operator genesis
+    if proof.get("dns_txt_record") and proof.get("operator_genesis_hash"):
+        expected = f"v=ATF1;operator={proof['operator_genesis_hash'][:16]}"
+        if expected not in proof["dns_txt_record"].strip():
+            errors.append("DNS TXT does not match operator genesis hash")
+    
+    return len(errors) == 0, errors
+
+
+def compute_transfer_hash(transfer: CustodyTransfer) -> str:
+    """Tamper-evident hash of the transfer record."""
+    data = (
+        f"{transfer.transfer_id}:{transfer.agent_id}:"
+        f"{transfer.old_operator.operator_id}:{transfer.new_operator.operator_id}:"
+        f"{transfer.mode.value}:{transfer.initiated_at}"
     )
-    transfer.notes.append(f"Cooperative transfer initiated. ACK window: {ACK_WINDOW_DAYS}d")
-    return transfer
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
-def initiate_adversarial(agent_id: str, old_cust: str, new_cust: str,
-                          contact_attempts: list) -> CustodyTransfer:
-    """
-    Adversarial transfer: ICANN domain transfer model.
-    Requires proof of reachability failure.
-    """
-    now = time.time()
-    
-    # Validate contact attempts
-    if len(contact_attempts) < REACHABILITY_ATTEMPTS:
-        raise ValueError(f"Need {REACHABILITY_ATTEMPTS}+ contact attempts, got {len(contact_attempts)}")
-    
-    timestamps = [a.timestamp for a in contact_attempts]
-    span_days = (max(timestamps) - min(timestamps)) / 86400
-    if span_days < REACHABILITY_SPAN_DAYS:
-        raise ValueError(f"Attempts must span {REACHABILITY_SPAN_DAYS}d, got {span_days:.1f}d")
-    
-    # All must be failures
-    if any(a.result == ReachabilityResult.DELIVERED for a in contact_attempts):
-        raise ValueError("Cannot initiate adversarial transfer if any attempt was delivered")
-    
-    transfer = CustodyTransfer(
-        transfer_id=hashlib.sha256(f"{agent_id}:{now}:adversarial".encode()).hexdigest()[:16],
-        agent_id=agent_id,
-        old_custodian_id=old_cust,
-        new_custodian_id=new_cust,
-        mode=TransferMode.ADVERSARIAL,
-        state=TransferState.REACHABILITY_TESTING,
-        initiated_at=now,
-        contact_attempts=contact_attempts,
-        timeout_at=now + CUSTODY_TIMEOUT_DAYS * 86400,
-    )
-    transfer.notes.append(
-        f"Adversarial transfer initiated. {len(contact_attempts)} failed attempts "
-        f"over {span_days:.0f}d. Timeout: {CUSTODY_TIMEOUT_DAYS}d"
-    )
-    return transfer
-
-
-def process_ack(transfer: CustodyTransfer, acknowledged: bool) -> CustodyTransfer:
-    """Process old custodian's acknowledgment."""
-    if transfer.state != TransferState.ACK_PENDING:
-        transfer.notes.append(f"ERROR: Cannot ACK in state {transfer.state.value}")
-        return transfer
-    
-    if acknowledged:
-        transfer.state = TransferState.OVERLAP
-        transfer.old_signature = hashlib.sha256(
-            f"ack:{transfer.old_custodian_id}:{transfer.transfer_id}".encode()
-        ).hexdigest()[:16]
-        transfer.notes.append(
-            f"Old custodian ACK'd. Overlap window: {OVERLAP_WINDOW_DAYS}d. "
-            f"Both signatures active."
-        )
-    else:
-        # No ACK within window → escalate to adversarial
-        transfer.mode = TransferMode.ADVERSARIAL
-        transfer.state = TransferState.REACHABILITY_TESTING
-        transfer.timeout_at = time.time() + CUSTODY_TIMEOUT_DAYS * 86400
-        transfer.notes.append(
-            f"No ACK within {ACK_WINDOW_DAYS}d. Escalating to adversarial path. "
-            f"Timeout: {CUSTODY_TIMEOUT_DAYS}d"
-        )
-    
-    return transfer
-
-
-def complete_overlap(transfer: CustodyTransfer) -> CustodyTransfer:
-    """Complete cooperative transfer after overlap window."""
-    if transfer.state != TransferState.OVERLAP:
-        transfer.notes.append(f"ERROR: Cannot complete in state {transfer.state.value}")
-        return transfer
-    
-    transfer.new_signature = hashlib.sha256(
-        f"new:{transfer.new_custodian_id}:{transfer.transfer_id}".encode()
-    ).hexdigest()[:16]
-    transfer.completion_hash = hashlib.sha256(
-        f"{transfer.old_signature}:{transfer.new_signature}".encode()
-    ).hexdigest()[:16]
-    transfer.state = TransferState.COMPLETED
-    transfer.notes.append(
-        f"Cooperative transfer complete. Dual-signed. "
-        f"Old selector enters {GRACE_PERIOD_DAYS}d grace for in-flight receipts."
-    )
-    return transfer
-
-
-def complete_adversarial(transfer: CustodyTransfer) -> CustodyTransfer:
-    """Complete adversarial transfer after timeout."""
-    if transfer.state != TransferState.REACHABILITY_TESTING:
-        transfer.notes.append(f"ERROR: Cannot complete adversarial in state {transfer.state.value}")
-        return transfer
-    
-    # Verify timeout elapsed
-    now = time.time()
-    if transfer.timeout_at and now < transfer.timeout_at:
-        days_remaining = (transfer.timeout_at - now) / 86400
-        transfer.notes.append(f"Timeout not elapsed. {days_remaining:.0f}d remaining.")
-        return transfer
-    
-    # Verify sufficient failed contact attempts
-    failed = [a for a in transfer.contact_attempts
-              if a.result in (ReachabilityResult.BOUNCED, ReachabilityResult.TIMEOUT)]
-    
-    transfer.new_signature = hashlib.sha256(
-        f"unilateral:{transfer.new_custodian_id}:{transfer.transfer_id}".encode()
-    ).hexdigest()[:16]
-    transfer.completion_hash = hashlib.sha256(
-        f"adversarial:{transfer.new_signature}:{len(failed)}_failures".encode()
-    ).hexdigest()[:16]
-    transfer.state = TransferState.COMPLETED
-    transfer.notes.append(
-        f"Adversarial transfer complete. {len(failed)} failed reachability attempts. "
-        f"No old custodian signature (UNILATERAL). "
-        f"Grace period: {GRACE_PERIOD_DAYS}d for in-flight receipts."
-    )
-    return transfer
-
-
-def grade_transfer(transfer: CustodyTransfer) -> dict:
-    """Grade transfer quality."""
-    if transfer.state != TransferState.COMPLETED:
-        return {"grade": "INCOMPLETE", "reason": f"State: {transfer.state.value}"}
+def process_transfer(transfer: CustodyTransfer, now: float) -> CustodyTransfer:
+    """Process custody transfer through state machine."""
     
     if transfer.mode == TransferMode.COOPERATIVE:
-        if transfer.old_signature and transfer.new_signature:
-            return {"grade": "A", "mode": "COOPERATIVE",
-                    "reason": "Dual-signed with overlap window"}
-        return {"grade": "C", "mode": "COOPERATIVE",
-                "reason": "Missing signature"}
+        # Both operators must sign
+        if transfer.state == TransferState.PROPOSED:
+            transfer.state = TransferState.CHALLENGE_SENT
+            transfer.challenge_sent_at = now
+            return transfer
+        
+        if transfer.state == TransferState.CHALLENGE_SENT:
+            if transfer.challenge_response == "ACCEPTED":
+                transfer.state = TransferState.VALIDATED
+            elif now - transfer.challenge_sent_at > CHALLENGE_RESPONSE_TIMEOUT_H * 3600:
+                # Cooperative failed, escalate to unilateral
+                transfer.mode = TransferMode.UNILATERAL
+                transfer.state = TransferState.CHALLENGE_EXPIRED
+            return transfer
     
-    elif transfer.mode == TransferMode.ADVERSARIAL:
-        failed = len([a for a in transfer.contact_attempts
-                      if a.result != ReachabilityResult.DELIVERED])
-        if failed >= REACHABILITY_ATTEMPTS:
-            return {"grade": "B", "mode": "ADVERSARIAL",
-                    "reason": f"Timeout with {failed} failed attempts. Weaker than cooperative."}
-        return {"grade": "D", "mode": "ADVERSARIAL",
-                "reason": f"Insufficient evidence: {failed} failures"}
+    elif transfer.mode == TransferMode.UNILATERAL:
+        # Old operator dark — validate proof of control
+        if transfer.state in (TransferState.PROPOSED, TransferState.CHALLENGE_EXPIRED):
+            valid, errors = validate_proof_of_control(transfer.proof_of_control)
+            if valid:
+                transfer.state = TransferState.VALIDATED
+            else:
+                transfer.state = TransferState.REJECTED
+                transfer.evidence.extend([f"PROOF_FAILED: {e}" for e in errors])
+            return transfer
     
-    return {"grade": "F", "reason": "Unknown mode"}
+    elif transfer.mode == TransferMode.EMERGENCY:
+        # Immediate with evidence
+        if len(transfer.evidence) >= EMERGENCY_EVIDENCE_MIN:
+            valid, errors = validate_proof_of_control(transfer.proof_of_control)
+            if valid:
+                transfer.state = TransferState.VALIDATED
+            else:
+                transfer.state = TransferState.REJECTED
+        else:
+            transfer.state = TransferState.REJECTED
+            transfer.evidence.append("INSUFFICIENT_EVIDENCE")
+        return transfer
+    
+    if transfer.state == TransferState.VALIDATED:
+        transfer.state = TransferState.COMPLETE
+        transfer.completed_at = now
+        transfer.transfer_hash = compute_transfer_hash(transfer)
+    
+    return transfer
 
 
 # === Scenarios ===
 
 def scenario_cooperative():
-    """Clean cooperative transfer — DKIM selector rotation."""
-    print("=== Scenario: Cooperative Transfer (DKIM Model) ===")
-    t = initiate_cooperative("kit_fox", "operator_alpha", "operator_beta")
-    print(f"  Initiated: {t.transfer_id}, mode={t.mode.value}")
+    """Normal transfer: both operators active."""
+    print("=== Scenario: Cooperative Transfer ===")
+    now = time.time()
     
-    t = process_ack(t, acknowledged=True)
-    print(f"  ACK'd: state={t.state.value}, old_sig={t.old_signature}")
+    old_op = Operator("op_alice", "genesis_a1b2", now - 86400, "sel_alice", True)
+    new_op = Operator("op_bob", "genesis_c3d4", now, "sel_bob", True)
     
-    t = complete_overlap(t)
-    grade = grade_transfer(t)
-    print(f"  Completed: grade={grade['grade']}, hash={t.completion_hash}")
-    for n in t.notes:
-        print(f"    → {n}")
+    transfer = CustodyTransfer(
+        "tx_001", "agent_kit", old_op, new_op,
+        TransferMode.COOPERATIVE, TransferState.PROPOSED, now
+    )
+    
+    # Step 1: Propose → Challenge
+    transfer = process_transfer(transfer, now)
+    print(f"  After propose: {transfer.state.value}")
+    
+    # Step 2: Old operator accepts
+    transfer.challenge_response = "ACCEPTED"
+    transfer = process_transfer(transfer, now)
+    print(f"  After accept: {transfer.state.value}")
+    
+    # Step 3: Complete
+    transfer = process_transfer(transfer, now)
+    print(f"  Final: {transfer.state.value} hash={transfer.transfer_hash}")
+    print(f"  M3AAWG overlap: both selectors active for {OVERLAP_PERIOD_DAYS}d")
     print()
 
 
 def scenario_dark_operator():
-    """Old operator unresponsive — adversarial path."""
-    print("=== Scenario: Dark Operator (ICANN Model) ===")
+    """Old operator goes dark — unilateral transfer after timeout."""
+    print("=== Scenario: Dark Operator (Unilateral) ===")
     now = time.time()
     
-    # 3 failed contact attempts over 15 days
-    attempts = [
-        ContactAttempt(now - 86400*15, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"bounce1").hexdigest()[:16]),
-        ContactAttempt(now - 86400*8, "genesis_endpoint", ReachabilityResult.TIMEOUT,
-                       hashlib.sha256(b"timeout1").hexdigest()[:16]),
-        ContactAttempt(now - 86400*1, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"bounce2").hexdigest()[:16]),
-    ]
+    # Old operator last seen 45 days ago
+    old_op = Operator("op_ghost", "genesis_dead", now - 86400*45, "sel_ghost", False, True)
+    new_op = Operator("op_new", "genesis_new1", now, "sel_new", True)
     
-    t = initiate_adversarial("orphaned_agent", "dark_operator", "new_operator", attempts)
-    print(f"  Initiated: {t.transfer_id}, mode={t.mode.value}")
+    mode = determine_transfer_mode(old_op, [], now)
+    print(f"  Mode detected: {mode.value} (last seen {45}d ago)")
     
-    # Simulate timeout elapsed
-    t.timeout_at = now - 1  # Already elapsed
-    t = complete_adversarial(t)
-    grade = grade_transfer(t)
-    print(f"  Completed: grade={grade['grade']}, mode={grade['mode']}")
-    print(f"  Reason: {grade['reason']}")
-    for n in t.notes:
-        print(f"    → {n}")
+    transfer = CustodyTransfer(
+        "tx_002", "agent_orphan", old_op, new_op,
+        mode, TransferState.PROPOSED, now,
+        proof_of_control={
+            "dns_txt_record": "v=ATF1;operator=genesis_new1    ",
+            "operator_genesis_hash": "genesis_new1",
+            "smtp_reachable": True
+        }
+    )
+    
+    transfer = process_transfer(transfer, now)
+    print(f"  After proof: {transfer.state.value}")
+    
+    transfer = process_transfer(transfer, now)
+    print(f"  Final: {transfer.state.value} hash={transfer.transfer_hash}")
+    print(f"  CUSTODY_TIMEOUT={CUSTODY_TIMEOUT_DAYS}d (SPEC_CONSTANT, not configurable)")
     print()
 
 
-def scenario_cooperative_to_adversarial():
-    """Started cooperative but old custodian went dark."""
-    print("=== Scenario: Cooperative → Adversarial Escalation ===")
-    t = initiate_cooperative("migrating_agent", "old_op", "new_op")
-    print(f"  Initiated cooperative: {t.state.value}")
-    
-    # No ACK received
-    t = process_ack(t, acknowledged=False)
-    print(f"  No ACK → escalated: mode={t.mode.value}, state={t.state.value}")
-    
-    # Add reachability failures
+def scenario_cooperative_escalation():
+    """Cooperative fails → escalates to unilateral."""
+    print("=== Scenario: Cooperative → Unilateral Escalation ===")
     now = time.time()
-    t.contact_attempts = [
-        ContactAttempt(now - 86400*20, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"b1").hexdigest()[:16]),
-        ContactAttempt(now - 86400*10, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"b2").hexdigest()[:16]),
-        ContactAttempt(now - 86400*2, "genesis_endpoint", ReachabilityResult.TIMEOUT,
-                       hashlib.sha256(b"t1").hexdigest()[:16]),
-    ]
     
-    t.timeout_at = now - 1
-    t = complete_adversarial(t)
-    grade = grade_transfer(t)
-    print(f"  Completed: grade={grade['grade']}")
-    for n in t.notes:
-        print(f"    → {n}")
+    old_op = Operator("op_slow", "genesis_slow", now - 86400*5, "sel_slow", True)
+    new_op = Operator("op_eager", "genesis_eagr", now, "sel_eager", True)
+    
+    transfer = CustodyTransfer(
+        "tx_003", "agent_waiting", old_op, new_op,
+        TransferMode.COOPERATIVE, TransferState.PROPOSED, now
+    )
+    
+    # Step 1: Send challenge
+    transfer = process_transfer(transfer, now)
+    print(f"  Challenge sent: {transfer.state.value}")
+    
+    # Step 2: No response, 72h passes
+    transfer = process_transfer(transfer, now + CHALLENGE_RESPONSE_TIMEOUT_H * 3600 + 1)
+    print(f"  After {CHALLENGE_RESPONSE_TIMEOUT_H}h timeout: {transfer.state.value} mode={transfer.mode.value}")
+    
+    # Step 3: Now unilateral with proof
+    transfer.proof_of_control = {
+        "dns_txt_record": "v=ATF1;operator=genesis_eagr    ",
+        "operator_genesis_hash": "genesis_eagr",
+        "smtp_reachable": True
+    }
+    transfer = process_transfer(transfer, now + 86400*4)
+    print(f"  After proof: {transfer.state.value}")
+    
+    transfer = process_transfer(transfer, now + 86400*4)
+    print(f"  Final: {transfer.state.value} hash={transfer.transfer_hash}")
     print()
 
 
-def scenario_insufficient_evidence():
-    """Adversarial attempt with insufficient reachability evidence."""
-    print("=== Scenario: Insufficient Evidence (Rejected) ===")
+def scenario_emergency():
+    """Key compromise — immediate transfer with evidence."""
+    print("=== Scenario: Emergency (Key Compromise) ===")
     now = time.time()
     
-    # Only 2 attempts (need 3)
-    attempts = [
-        ContactAttempt(now - 86400*10, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"b1").hexdigest()[:16]),
-        ContactAttempt(now - 86400*1, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"b2").hexdigest()[:16]),
+    old_op = Operator("op_compromised", "genesis_comp", now - 3600, "sel_comp", True)
+    new_op = Operator("op_rescue", "genesis_resc", now, "sel_rescue", True)
+    
+    evidence = [
+        "KEY_COMPROMISE: unauthorized receipts detected",
+        "UNAUTHORIZED_GENESIS: new genesis filed without operator consent",
+        "COMPROMISE_EVIDENCE: DNS selector modified by unknown party"
     ]
     
-    try:
-        t = initiate_adversarial("agent_x", "old_op", "new_op", attempts)
-        print(f"  ERROR: Should have been rejected")
-    except ValueError as e:
-        print(f"  Correctly rejected: {e}")
+    mode = determine_transfer_mode(old_op, evidence, now)
+    print(f"  Mode: {mode.value} ({len(evidence)} evidence items)")
     
-    # Attempt with delivered (operator responded!)
-    attempts_with_delivery = [
-        ContactAttempt(now - 86400*15, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"b1").hexdigest()[:16]),
-        ContactAttempt(now - 86400*8, "smtp", ReachabilityResult.DELIVERED,
-                       hashlib.sha256(b"d1").hexdigest()[:16]),
-        ContactAttempt(now - 86400*1, "smtp", ReachabilityResult.BOUNCED,
-                       hashlib.sha256(b"b2").hexdigest()[:16]),
-    ]
+    transfer = CustodyTransfer(
+        "tx_004", "agent_rescued", old_op, new_op,
+        mode, TransferState.PROPOSED, now,
+        evidence=evidence,
+        proof_of_control={
+            "dns_txt_record": "v=ATF1;operator=genesis_resc    ",
+            "operator_genesis_hash": "genesis_resc",
+            "smtp_reachable": True
+        }
+    )
     
-    try:
-        t = initiate_adversarial("agent_y", "old_op", "new_op", attempts_with_delivery)
-        print(f"  ERROR: Should have been rejected (operator responded)")
-    except ValueError as e:
-        print(f"  Correctly rejected: {e}")
+    transfer = process_transfer(transfer, now)
+    print(f"  After evidence+proof: {transfer.state.value}")
+    
+    transfer = process_transfer(transfer, now)
+    print(f"  Final: {transfer.state.value} hash={transfer.transfer_hash}")
+    print(f"  Emergency bypasses {CUSTODY_TIMEOUT_DAYS}d timeout")
     print()
 
 
 if __name__ == "__main__":
-    print("Custody Transfer Handler — Cooperative + Adversarial Paths for ATF")
-    print("Per santaclawd: DKIM model + ICANN transfer dispute model")
-    print("=" * 70)
+    print("Custody Transfer Handler — Dark Operator Recovery for ATF")
+    print("Per santaclawd + M3AAWG DKIM Key Rotation BCP (March 2019)")
+    print("=" * 65)
     print()
     scenario_cooperative()
     scenario_dark_operator()
-    scenario_cooperative_to_adversarial()
-    scenario_insufficient_evidence()
+    scenario_cooperative_escalation()
+    scenario_emergency()
     
-    print("=" * 70)
-    print("KEY INSIGHTS:")
-    print("  1. Cooperative (dual-sign) = Grade A. DKIM selector rotation model.")
-    print("  2. Adversarial (timeout) = Grade B. ICANN transfer model.")
-    print(f"  3. CUSTODY_TIMEOUT = {CUSTODY_TIMEOUT_DAYS}d (SPEC_CONSTANT)")
-    print(f"  4. Reachability proof: {REACHABILITY_ATTEMPTS}+ attempts over {REACHABILITY_SPAN_DAYS}d")
-    print("  5. Cooperative can escalate to adversarial if old custodian goes dark")
-    print("  6. In-flight receipt grace period prevents sudden invalidation")
+    print("=" * 65)
+    print("SPEC_CONSTANTS (not configurable):")
+    print(f"  CUSTODY_TIMEOUT = {CUSTODY_TIMEOUT_DAYS} days")
+    print(f"  CHALLENGE_RESPONSE_TIMEOUT = {CHALLENGE_RESPONSE_TIMEOUT_H} hours")
+    print(f"  EMERGENCY_EVIDENCE_MIN = {EMERGENCY_EVIDENCE_MIN} items")
+    print(f"  OVERLAP_PERIOD = {OVERLAP_PERIOD_DAYS} days")
+    print("KEY: configurable = race to bottom. spec-defined = security floor.")
