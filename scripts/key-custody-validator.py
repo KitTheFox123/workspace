@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-key-custody-validator.py — Key custody models for ATF genesis.
+key-custody-validator.py — Key custody model validator for ATF genesis receipts.
 
 Per santaclawd: "who holds the signing key = who vouches for the agent."
-DKIM solved this with selector rotation (RFC 6376 §3.6.2.2).
+DKIM RFC 6376 solved this with selectors — same domain, multiple signing keys.
 
 Three custody models:
-  OPERATOR_HELD  — Provider/operator holds key, DNS proves control (DKIM default)
-  AGENT_HELD     — Agent holds own key, autonomous but vulnerable to key loss
-  HSM_BACKED     — Ceremony-generated, M-of-N recovery, highest assurance
+  OPERATOR_HELD  — Provider/operator holds key (Gmail model). Centralized but recoverable.
+  AGENT_HELD     — Agent holds own key. Autonomous but key loss = identity loss.
+  THRESHOLD_SPLIT — M-of-N split across operator + agent + witnesses.
 
-Genesis MUST declare: key_custodian, key_rotation_policy, recovery_mechanism.
+Recovery: reanchor (void old genesis, create new), NOT key escrow.
+Key escrow = trusted third party = axiom 1 violation.
+
+DKIM parallel: selector mechanism allows key rotation without domain change.
+ATF parallel: key_custodian in genesis, rotation via REANCHOR receipt.
 """
 
 import hashlib
@@ -22,156 +26,187 @@ from typing import Optional
 
 
 class CustodyModel(Enum):
-    OPERATOR_HELD = "OPERATOR_HELD"   # DKIM default: DNS proves control
-    AGENT_HELD = "AGENT_HELD"         # Autonomous: agent manages own key
-    HSM_BACKED = "HSM_BACKED"         # Ceremony: M-of-N, hardware security
+    OPERATOR_HELD = "OPERATOR_HELD"      # Provider manages key
+    AGENT_HELD = "AGENT_HELD"            # Agent manages own key
+    THRESHOLD_SPLIT = "THRESHOLD_SPLIT"  # M-of-N split
 
 
-class RotationPolicy(Enum):
-    FIXED = "FIXED"         # No rotation (highest risk)
-    SCHEDULED = "SCHEDULED" # Rotate every N days
-    EVENT = "EVENT"         # Rotate on compromise indicator
-    SELECTOR = "SELECTOR"   # DKIM selector rotation (old key stays valid during TTL)
+class KeyEvent(Enum):
+    GENESIS = "GENESIS"            # Key created at genesis
+    ROTATION = "ROTATION"          # Scheduled key rotation
+    COMPROMISE = "COMPROMISE"      # Key compromise detected
+    REANCHOR = "REANCHOR"          # New genesis, old voided
+    RECOVERY = "RECOVERY"          # Recovery from loss/compromise
 
 
-class RecoveryMechanism(Enum):
-    NONE = "NONE"               # Key loss = identity loss
-    OPERATOR_RECOVERY = "OPERATOR"  # Operator re-issues
-    M_OF_N = "M_OF_N"          # Shamir secret sharing
-    SOCIAL = "SOCIAL"          # Vouched by N trusted agents
-
-
-# SPEC_CONSTANTS for key management
-MAX_KEY_AGE_DAYS = 365          # DKIM selectors typically 90-365d
-MIN_ROTATION_DAYS = 30          # Too frequent = operational risk
-RECOVERY_QUORUM_MIN = 3         # Minimum for M-of-N
-KEY_TRANSITION_OVERLAP_HOURS = 72  # Old key valid during transition (DKIM TTL model)
+class CustodyRisk(Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
 
 
 @dataclass
 class KeyCustodyConfig:
-    """Key custody declaration in ATF genesis."""
+    """Genesis key custody configuration."""
+    model: CustodyModel
+    custodian_id: str           # Who holds the key
     agent_id: str
-    custody_model: CustodyModel
-    rotation_policy: RotationPolicy
-    rotation_interval_days: Optional[int]  # None for EVENT-based
-    recovery_mechanism: RecoveryMechanism
-    recovery_quorum: Optional[int]  # M in M-of-N
-    recovery_total: Optional[int]   # N in M-of-N
-    key_created_at: float
-    last_rotation: Optional[float]
-    operator_id: Optional[str]  # Required for OPERATOR_HELD
+    operator_id: str
+    # Threshold split params
+    threshold_m: int = 0        # M signatures required
+    threshold_n: int = 0        # N total key holders
+    key_holders: list = field(default_factory=list)
+    # Rotation policy
+    rotation_interval_days: int = 90   # DKIM: rotate every 90 days
+    max_key_age_days: int = 365
+    # Recovery
+    recovery_method: str = "REANCHOR"  # REANCHOR | ESCROW (escrow = axiom 1 violation)
+    # DKIM selector equivalent
+    selector: str = "default"
 
 
 @dataclass
-class ValidationResult:
-    grade: str  # A-F
-    issues: list = field(default_factory=list)
-    warnings: list = field(default_factory=list)
-    custody_risk: str = "UNKNOWN"  # LOW/MEDIUM/HIGH/CRITICAL
+class KeyEvent:
+    event_type: str
+    timestamp: float
+    old_key_hash: Optional[str] = None
+    new_key_hash: Optional[str] = None
+    authorized_by: list = field(default_factory=list)
+    reason: str = ""
 
 
-def validate_custody(config: KeyCustodyConfig) -> ValidationResult:
-    """Validate key custody configuration against ATF spec requirements."""
+def validate_custody_config(config: KeyCustodyConfig) -> dict:
+    """Validate key custody configuration against ATF requirements."""
     issues = []
     warnings = []
-    now = time.time()
-
-    # 1. Custody model checks
-    if config.custody_model == CustodyModel.OPERATOR_HELD:
-        if not config.operator_id:
-            issues.append("OPERATOR_HELD requires operator_id in genesis")
-        # DKIM model: DNS proves control, operator can rotate
-        if config.recovery_mechanism == RecoveryMechanism.NONE:
-            warnings.append("OPERATOR_HELD without recovery = operator is single point of failure")
-
-    elif config.custody_model == CustodyModel.AGENT_HELD:
-        if config.recovery_mechanism == RecoveryMechanism.NONE:
-            issues.append("AGENT_HELD without recovery = key loss destroys identity (CRITICAL)")
-        if config.recovery_mechanism == RecoveryMechanism.OPERATOR_RECOVERY:
-            warnings.append("AGENT_HELD with operator recovery contradicts autonomous model")
-
-    elif config.custody_model == CustodyModel.HSM_BACKED:
-        if config.recovery_mechanism != RecoveryMechanism.M_OF_N:
-            issues.append("HSM_BACKED should use M-of-N recovery (ceremony model)")
-        if config.recovery_quorum and config.recovery_total:
-            if config.recovery_quorum < RECOVERY_QUORUM_MIN:
-                issues.append(f"Recovery quorum {config.recovery_quorum} below minimum {RECOVERY_QUORUM_MIN}")
-            if config.recovery_quorum > config.recovery_total:
-                issues.append("Recovery quorum exceeds total shares")
-            if config.recovery_quorum == config.recovery_total:
-                warnings.append("M=N means all shares required — no fault tolerance")
-
-    # 2. Rotation policy checks
-    if config.rotation_policy == RotationPolicy.FIXED:
-        key_age_days = (now - config.key_created_at) / 86400
-        if key_age_days > MAX_KEY_AGE_DAYS:
-            issues.append(f"Key age {key_age_days:.0f}d exceeds MAX_KEY_AGE {MAX_KEY_AGE_DAYS}d with FIXED policy")
-        warnings.append("FIXED rotation = no key hygiene. DKIM selectors rotate every 90-365d")
-
-    elif config.rotation_policy == RotationPolicy.SCHEDULED:
-        if config.rotation_interval_days:
-            if config.rotation_interval_days < MIN_ROTATION_DAYS:
-                warnings.append(f"Rotation every {config.rotation_interval_days}d may cause operational issues")
-            if config.rotation_interval_days > MAX_KEY_AGE_DAYS:
-                issues.append(f"Rotation interval {config.rotation_interval_days}d exceeds MAX_KEY_AGE")
-            # Check if rotation is overdue
-            if config.last_rotation:
-                since_rotation = (now - config.last_rotation) / 86400
-                if since_rotation > config.rotation_interval_days * 1.5:
-                    issues.append(f"Rotation overdue: {since_rotation:.0f}d since last (interval={config.rotation_interval_days}d)")
-
-    elif config.rotation_policy == RotationPolicy.SELECTOR:
-        # DKIM model: old selector stays in DNS during TTL
-        warnings.append("SELECTOR rotation requires KEY_TRANSITION_OVERLAP_HOURS = "
-                        f"{KEY_TRANSITION_OVERLAP_HOURS}h")
-
-    # 3. M-of-N validation
-    if config.recovery_mechanism == RecoveryMechanism.M_OF_N:
-        if not config.recovery_quorum or not config.recovery_total:
-            issues.append("M-of-N recovery requires both quorum (M) and total (N)")
-        elif config.recovery_quorum < 2:
-            issues.append("M=1 means single share can recover — defeats purpose")
-
-    # 4. Grade assignment
-    critical = len([i for i in issues if "CRITICAL" in i])
-    if critical > 0:
-        grade = "F"
-        risk = "CRITICAL"
-    elif len(issues) >= 3:
-        grade = "D"
-        risk = "HIGH"
-    elif len(issues) >= 1:
-        grade = "C"
-        risk = "MEDIUM"
-    elif len(warnings) >= 3:
-        grade = "B"
-        risk = "LOW"
+    risk = CustodyRisk.LOW
+    
+    # Rule 1: custodian must be identified
+    if not config.custodian_id:
+        issues.append("MISSING: custodian_id required in genesis")
+        risk = CustodyRisk.CRITICAL
+    
+    # Rule 2: model-specific validation
+    if config.model == CustodyModel.OPERATOR_HELD:
+        if config.custodian_id == config.agent_id:
+            issues.append("OPERATOR_HELD but custodian = agent (self-custody)")
+            risk = CustodyRisk.HIGH
+        if config.operator_id and config.custodian_id != config.operator_id:
+            warnings.append("custodian ≠ operator in OPERATOR_HELD model")
+    
+    elif config.model == CustodyModel.AGENT_HELD:
+        if config.custodian_id != config.agent_id:
+            issues.append("AGENT_HELD but custodian ≠ agent")
+        warnings.append("AGENT_HELD: key loss = identity loss (no recovery without reanchor)")
+        risk = CustodyRisk.MEDIUM
+    
+    elif config.model == CustodyModel.THRESHOLD_SPLIT:
+        if config.threshold_m < 2:
+            issues.append(f"threshold_m={config.threshold_m} < 2 (no split)")
+            risk = CustodyRisk.HIGH
+        if config.threshold_n < config.threshold_m:
+            issues.append(f"threshold_n={config.threshold_n} < threshold_m={config.threshold_m}")
+            risk = CustodyRisk.CRITICAL
+        if config.threshold_n < 3:
+            warnings.append("threshold_n < 3: limited fault tolerance")
+        if len(config.key_holders) != config.threshold_n:
+            issues.append(f"key_holders count ({len(config.key_holders)}) ≠ threshold_n ({config.threshold_n})")
+        # Check for operator monoculture in key holders
+        unique_holders = set(config.key_holders)
+        if len(unique_holders) < config.threshold_m:
+            issues.append("MONOCULTURE: fewer unique holders than threshold")
+            risk = CustodyRisk.CRITICAL
+        # BFT check: can tolerate f < n/3 compromised holders
+        max_compromised = (config.threshold_n - 1) // 3
+        if max_compromised < 1:
+            warnings.append(f"BFT tolerance: 0 compromised holders (n={config.threshold_n})")
+    
+    # Rule 3: recovery method
+    if config.recovery_method == "ESCROW":
+        issues.append("ESCROW = trusted third party = axiom 1 violation. Use REANCHOR.")
+        risk = CustodyRisk.CRITICAL
+    
+    # Rule 4: rotation policy
+    if config.rotation_interval_days > 365:
+        warnings.append(f"rotation interval {config.rotation_interval_days}d > 365d (DKIM best practice: 90d)")
+    if config.rotation_interval_days < 7:
+        warnings.append(f"rotation interval {config.rotation_interval_days}d < 7d (too frequent)")
+    
+    # Rule 5: max key age
+    if config.max_key_age_days > 730:
+        issues.append(f"max key age {config.max_key_age_days}d > 730d (2 year maximum)")
+    
+    # Grade
+    if issues:
+        grade = "F" if risk == CustodyRisk.CRITICAL else "D"
+    elif warnings:
+        grade = "B" if len(warnings) <= 2 else "C"
     else:
         grade = "A"
-        risk = "LOW"
-
-    return ValidationResult(grade=grade, issues=issues, warnings=warnings, custody_risk=risk)
-
-
-def dkim_selector_model(agent_id: str) -> dict:
-    """
-    DKIM selector rotation model applied to ATF.
     
-    RFC 6376 §3.6.2.2: Signer can publish new key under new selector,
-    keeping old selector active until TTL expires. Transition is seamless.
-    
-    ATF equivalent: agent publishes new signing key in genesis update,
-    old key valid for KEY_TRANSITION_OVERLAP_HOURS.
-    """
-    now = time.time()
     return {
-        "agent_id": agent_id,
-        "current_selector": f"atf-{int(now) % 10000}",
-        "previous_selector": f"atf-{int(now - 86400*90) % 10000}",
-        "transition_overlap_hours": KEY_TRANSITION_OVERLAP_HOURS,
-        "model": "DKIM selector rotation (RFC 6376 §3.6.2.2)",
-        "note": "Old key stays valid during overlap. Receipts signed with either key are valid."
+        "model": config.model.value,
+        "custodian": config.custodian_id,
+        "grade": grade,
+        "risk": risk.value,
+        "issues": issues,
+        "warnings": warnings,
+        "dkim_parallel": _dkim_parallel(config),
+    }
+
+
+def _dkim_parallel(config: KeyCustodyConfig) -> str:
+    """Map ATF custody model to DKIM equivalent."""
+    parallels = {
+        CustodyModel.OPERATOR_HELD: "Gmail/provider DKIM: domain operator holds signing key, manages rotation",
+        CustodyModel.AGENT_HELD: "Self-hosted DKIM: domain owner manages own keys via DNS TXT",
+        CustodyModel.THRESHOLD_SPLIT: "No DKIM equivalent — DKIM is single-signer. Closest: DNSSEC multi-signer (RFC 8901)",
+    }
+    return parallels.get(config.model, "unknown")
+
+
+def validate_key_rotation(events: list, config: KeyCustodyConfig) -> dict:
+    """Validate key rotation history against policy."""
+    if not events:
+        return {"status": "NO_HISTORY", "grade": "C"}
+    
+    rotations = [e for e in events if e.event_type == "ROTATION"]
+    compromises = [e for e in events if e.event_type == "COMPROMISE"]
+    reanchors = [e for e in events if e.event_type == "REANCHOR"]
+    
+    issues = []
+    
+    # Check rotation frequency
+    if len(rotations) >= 2:
+        intervals = []
+        for i in range(1, len(rotations)):
+            gap_days = (rotations[i].timestamp - rotations[i-1].timestamp) / 86400
+            intervals.append(gap_days)
+            if gap_days > config.max_key_age_days:
+                issues.append(f"key age exceeded: {gap_days:.0f}d > {config.max_key_age_days}d")
+    
+    # Check compromise response time
+    for c in compromises:
+        next_rotation = None
+        for r in rotations + reanchors:
+            if r.timestamp > c.timestamp:
+                next_rotation = r
+                break
+        if next_rotation:
+            response_hours = (next_rotation.timestamp - c.timestamp) / 3600
+            if response_hours > 24:
+                issues.append(f"compromise response: {response_hours:.0f}h > 24h")
+        else:
+            issues.append("COMPROMISE without subsequent rotation/reanchor")
+    
+    return {
+        "total_events": len(events),
+        "rotations": len(rotations),
+        "compromises": len(compromises),
+        "reanchors": len(reanchors),
+        "issues": issues,
+        "grade": "A" if not issues else ("C" if len(issues) <= 1 else "F"),
     }
 
 
@@ -179,72 +214,117 @@ def dkim_selector_model(agent_id: str) -> dict:
 
 def run_scenarios():
     now = time.time()
-
-    scenarios = [
-        ("Kit_Fox (operator-held, scheduled rotation, operator recovery)", KeyCustodyConfig(
-            agent_id="kit_fox", custody_model=CustodyModel.OPERATOR_HELD,
-            rotation_policy=RotationPolicy.SELECTOR,
-            rotation_interval_days=90, recovery_mechanism=RecoveryMechanism.OPERATOR_RECOVERY,
-            recovery_quorum=None, recovery_total=None,
-            key_created_at=now - 86400*60, last_rotation=now - 86400*30, operator_id="ilya"
-        )),
-        ("autonomous_agent (agent-held, NO recovery — CRITICAL)", KeyCustodyConfig(
-            agent_id="autonomous_agent", custody_model=CustodyModel.AGENT_HELD,
-            rotation_policy=RotationPolicy.FIXED,
-            rotation_interval_days=None, recovery_mechanism=RecoveryMechanism.NONE,
-            recovery_quorum=None, recovery_total=None,
-            key_created_at=now - 86400*400, last_rotation=None, operator_id=None
-        )),
-        ("ceremony_agent (HSM-backed, 3-of-5 recovery)", KeyCustodyConfig(
-            agent_id="ceremony_agent", custody_model=CustodyModel.HSM_BACKED,
-            rotation_policy=RotationPolicy.SCHEDULED,
-            rotation_interval_days=180, recovery_mechanism=RecoveryMechanism.M_OF_N,
-            recovery_quorum=3, recovery_total=5,
-            key_created_at=now - 86400*90, last_rotation=now - 86400*45, operator_id="consortium"
-        )),
-        ("sybil_agent (agent-held with operator recovery — contradiction)", KeyCustodyConfig(
-            agent_id="sybil_agent", custody_model=CustodyModel.AGENT_HELD,
-            rotation_policy=RotationPolicy.SCHEDULED,
-            rotation_interval_days=15, recovery_mechanism=RecoveryMechanism.OPERATOR_RECOVERY,
-            recovery_quorum=None, recovery_total=None,
-            key_created_at=now - 86400*30, last_rotation=now - 86400*10, operator_id="shady_op"
-        )),
-        ("hsm_bad_quorum (HSM with M=1 — defeats purpose)", KeyCustodyConfig(
-            agent_id="hsm_bad", custody_model=CustodyModel.HSM_BACKED,
-            rotation_policy=RotationPolicy.SCHEDULED,
-            rotation_interval_days=90, recovery_mechanism=RecoveryMechanism.M_OF_N,
-            recovery_quorum=1, recovery_total=3,
-            key_created_at=now - 86400*45, last_rotation=now - 86400*20, operator_id="bad_org"
-        )),
+    
+    # Scenario 1: Operator-held (Gmail model)
+    print("=== Scenario 1: Operator-Held (Gmail DKIM model) ===")
+    config = KeyCustodyConfig(
+        model=CustodyModel.OPERATOR_HELD,
+        custodian_id="operator_acme",
+        agent_id="kit_fox",
+        operator_id="operator_acme",
+        rotation_interval_days=90,
+        max_key_age_days=365,
+    )
+    result = validate_custody_config(config)
+    print(f"  Grade: {result['grade']} | Risk: {result['risk']}")
+    print(f"  DKIM parallel: {result['dkim_parallel']}")
+    print(f"  Issues: {result['issues'] or 'none'}")
+    print(f"  Warnings: {result['warnings'] or 'none'}")
+    print()
+    
+    # Scenario 2: Agent-held (autonomous)
+    print("=== Scenario 2: Agent-Held (Self-hosted DKIM) ===")
+    config = KeyCustodyConfig(
+        model=CustodyModel.AGENT_HELD,
+        custodian_id="kit_fox",
+        agent_id="kit_fox",
+        operator_id="operator_acme",
+        rotation_interval_days=90,
+    )
+    result = validate_custody_config(config)
+    print(f"  Grade: {result['grade']} | Risk: {result['risk']}")
+    print(f"  DKIM parallel: {result['dkim_parallel']}")
+    print(f"  Warnings: {result['warnings']}")
+    print()
+    
+    # Scenario 3: Threshold split (2-of-3)
+    print("=== Scenario 3: Threshold Split 2-of-3 ===")
+    config = KeyCustodyConfig(
+        model=CustodyModel.THRESHOLD_SPLIT,
+        custodian_id="threshold_group",
+        agent_id="kit_fox",
+        operator_id="operator_acme",
+        threshold_m=2,
+        threshold_n=3,
+        key_holders=["operator_acme", "kit_fox", "witness_1"],
+    )
+    result = validate_custody_config(config)
+    print(f"  Grade: {result['grade']} | Risk: {result['risk']}")
+    print(f"  DKIM parallel: {result['dkim_parallel']}")
+    print(f"  Warnings: {result['warnings']}")
+    print()
+    
+    # Scenario 4: Escrow (axiom 1 violation)
+    print("=== Scenario 4: Key Escrow (AXIOM 1 VIOLATION) ===")
+    config = KeyCustodyConfig(
+        model=CustodyModel.OPERATOR_HELD,
+        custodian_id="escrow_service",
+        agent_id="kit_fox",
+        operator_id="operator_acme",
+        recovery_method="ESCROW",
+    )
+    result = validate_custody_config(config)
+    print(f"  Grade: {result['grade']} | Risk: {result['risk']}")
+    print(f"  Issues: {result['issues']}")
+    print()
+    
+    # Scenario 5: Monoculture threshold (fake split)
+    print("=== Scenario 5: Monoculture Threshold (Fake Split) ===")
+    config = KeyCustodyConfig(
+        model=CustodyModel.THRESHOLD_SPLIT,
+        custodian_id="threshold_group",
+        agent_id="sybil_agent",
+        operator_id="operator_shady",
+        threshold_m=2,
+        threshold_n=3,
+        key_holders=["operator_shady", "operator_shady", "sybil_agent"],
+    )
+    result = validate_custody_config(config)
+    print(f"  Grade: {result['grade']} | Risk: {result['risk']}")
+    print(f"  Issues: {result['issues']}")
+    print()
+    
+    # Scenario 6: Key rotation history
+    print("=== Scenario 6: Key Rotation History ===")
+    config = KeyCustodyConfig(
+        model=CustodyModel.OPERATOR_HELD,
+        custodian_id="operator_acme",
+        agent_id="kit_fox",
+        operator_id="operator_acme",
+        max_key_age_days=365,
+    )
+    events = [
+        KeyEvent("GENESIS", now - 86400*400),
+        KeyEvent("ROTATION", now - 86400*300, "old1", "new1", ["operator_acme"]),
+        KeyEvent("COMPROMISE", now - 86400*100, reason="key_leak"),
+        KeyEvent("REANCHOR", now - 86400*99.5, "new1", "new2", ["operator_acme", "witness_1"]),
+        KeyEvent("ROTATION", now - 86400*10, "new2", "new3", ["operator_acme"]),
     ]
-
-    for name, config in scenarios:
-        result = validate_custody(config)
-        print(f"=== {name} ===")
-        print(f"  Grade: {result.grade} | Risk: {result.custody_risk}")
-        for i in result.issues:
-            print(f"  ❌ {i}")
-        for w in result.warnings:
-            print(f"  ⚠️  {w}")
-        print()
-
-    # DKIM selector model
-    print("=== DKIM Selector Rotation Model ===")
-    model = dkim_selector_model("kit_fox")
-    for k, v in model.items():
-        print(f"  {k}: {v}")
+    result = validate_key_rotation(events, config)
+    print(f"  Grade: {result['grade']}")
+    print(f"  Rotations: {result['rotations']}, Compromises: {result['compromises']}, Reanchors: {result['reanchors']}")
+    print(f"  Issues: {result['issues'] or 'none'}")
+    print()
 
 
 if __name__ == "__main__":
-    print("Key Custody Validator — ATF Genesis Key Management")
-    print("Per santaclawd: who holds the key = who vouches for the agent")
-    print("DKIM model: RFC 6376 §3.6.2.2 selector rotation")
-    print("=" * 65)
+    print("Key Custody Validator — DKIM Key Management Model for ATF")
+    print("Per santaclawd: 'who holds the signing key = who vouches for the agent'")
+    print("=" * 70)
     print()
     run_scenarios()
-    print()
-    print("=" * 65)
-    print("KEY INSIGHT: key_custodian + key_rotation_policy + recovery_mechanism")
-    print("are MUST fields in ATF V1.1 genesis. DKIM solved key rotation with")
-    print("selector overlap — old key stays valid during transition TTL.")
-    print(f"KEY_TRANSITION_OVERLAP_HOURS = {KEY_TRANSITION_OVERLAP_HOURS}")
+    print("=" * 70)
+    print("KEY INSIGHT: key_custodian in genesis = DKIM selector mechanism.")
+    print("Three models: OPERATOR_HELD (Gmail), AGENT_HELD (self-hosted), THRESHOLD_SPLIT.")
+    print("Recovery = REANCHOR (void + new genesis), NOT escrow (axiom 1 violation).")
+    print("Rotation policy: 90d recommended (DKIM best practice), 365d max.")
