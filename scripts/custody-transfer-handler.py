@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-custody-transfer-handler.py — CUSTODY_TRANSFER for dark operator scenarios in ATF.
+custody-transfer-handler.py — CUSTODY_TRANSFER protocol for ATF agent succession.
 
-Per santaclawd: DKIM assumption is old selector stays until TTL. But what if old
-operator goes DARK? Can't countersign.
+Per santaclawd: What happens when old operator goes dark? DKIM has no answer.
+ATF needs a timeout path for unilateral transfer after N days.
 
-ICANN EPP transfer model: auth code + 5-day ACK window. Old registrar silent = 
-transfer proceeds. (ICANN Transfer Policy, 2017)
+Models:
+  BILATERAL    — Both old + new custodian sign (clean path, DKIM rotation)
+  UNILATERAL   — Old custodian dark after SPEC timeout, new + witnesses sign
+  EMERGENCY    — IANA root KSK DPS model: M-of-N recovery key holders
 
-ATF parallel:
-  1. CUSTODY_TRANSFER_REQUEST with proof of control
-  2. N-day timeout (SPEC_DEFAULT 14d, MIN 7d, MAX 30d)  
-  3. Old operator silent = transfer proceeds (unilateral)
-  4. Old operator objects = DISPUTE (quorum resolution)
-  5. Proof of control: DNS TXT, SMTP reachability, or registry challenge
-
-N is ATF-standard not registry-configurable — per-registry N = race to bottom.
+References:
+  - IANA DNSSEC Root Zone KSK DPS (2020): 7-of-14 recovery key share holders
+  - M3AAWG DKIM Key Rotation Best Practices (March 2019): overlap window
+  - RFC 7583: DNSSEC Key Rollover Timing Considerations
 """
 
 import hashlib
@@ -26,356 +24,383 @@ from enum import Enum
 from typing import Optional
 
 
-# SPEC_CONSTANTS
-TRANSFER_TIMEOUT_DAYS = 14       # SPEC_DEFAULT
-TRANSFER_TIMEOUT_MIN = 7         # SPEC_FLOOR
-TRANSFER_TIMEOUT_MAX = 30        # SPEC_CEILING
-CHALLENGE_METHODS = ["DNS_TXT", "SMTP_REACHABILITY", "REGISTRY_CHALLENGE"]
-MINIMUM_PROOF_METHODS = 2        # Must prove via 2+ independent methods
+# === SPEC_CONSTANTS ===
+CUSTODY_TRANSFER_TIMEOUT = 30 * 86400      # 30 days (succession, not rotation)
+CUSTODY_DISPUTE_WINDOW = 7 * 86400         # 7 days for challenges
+BILATERAL_OVERLAP_WINDOW = 72 * 3600       # 72h dual-key overlap (M3AAWG)
+MIN_WITNESSES_UNILATERAL = 2               # Minimum independent witnesses
+EMERGENCY_QUORUM_RATIO = 0.5               # M-of-N for emergency (IANA: 7/14)
+MAX_TRANSFER_CHAIN_DEPTH = 3               # Max consecutive transfers
+
+
+class TransferType(Enum):
+    BILATERAL = "BILATERAL"           # Clean: both sign
+    UNILATERAL_TIMEOUT = "UNILATERAL_TIMEOUT"  # Old dark, timeout expired
+    UNILATERAL_EMERGENCY = "UNILATERAL_EMERGENCY"  # Emergency M-of-N
+    DISPUTED = "DISPUTED"             # Transfer challenged
 
 
 class TransferState(Enum):
-    REQUESTED = "REQUESTED"           # New custodian filed request
-    PENDING_ACK = "PENDING_ACK"       # Waiting for old operator response
-    ACKNOWLEDGED = "ACKNOWLEDGED"     # Old operator co-signed transfer
-    TIMEOUT_TRANSFER = "TIMEOUT_TRANSFER"  # Old operator silent → transfer proceeds
-    DISPUTED = "DISPUTED"             # Old operator objects
-    COMPLETED = "COMPLETED"           # Transfer finalized
-    REJECTED = "REJECTED"             # Transfer denied (failed proof or dispute)
+    PROPOSED = "PROPOSED"
+    OVERLAP = "OVERLAP"               # Both keys active (bilateral)
+    AWAITING_TIMEOUT = "AWAITING_TIMEOUT"  # Waiting for dark operator timeout
+    DISPUTE_WINDOW = "DISPUTE_WINDOW"  # Open for challenges
+    COMPLETED = "COMPLETED"
+    REJECTED = "REJECTED"
+    DISPUTED = "DISPUTED"
+    EXPIRED = "EXPIRED"
 
 
-class ProofMethod(Enum):
-    DNS_TXT = "DNS_TXT"               # TXT record at _atf.domain
-    SMTP_REACHABILITY = "SMTP_REACHABILITY"  # Can receive at operator email
-    REGISTRY_CHALLENGE = "REGISTRY_CHALLENGE"  # Registry-issued auth code (EPP model)
-
-
-@dataclass
-class ProofOfControl:
-    method: str
-    evidence: str
-    verified: bool
-    verified_at: Optional[float] = None
-    verifier_id: Optional[str] = None
+class CustodyGrade(Enum):
+    CLEAN = "CLEAN"          # Bilateral, both signed
+    AUDITABLE = "AUDITABLE"  # Unilateral but witnessed + unchallenged
+    CONTESTED = "CONTESTED"  # Transfer was challenged
+    SUSPECT = "SUSPECT"      # Emergency or insufficient witnesses
 
 
 @dataclass
-class CustodyTransferRequest:
-    request_id: str
+class CustodyTransfer:
+    transfer_id: str
     agent_id: str
-    old_operator_id: str
-    new_operator_id: str
-    requested_at: float
-    timeout_days: int
-    proofs: list  # List of ProofOfControl
-    state: str = TransferState.REQUESTED.value
-    old_operator_response: Optional[str] = None  # "ACK" | "NACK" | None
-    response_at: Optional[float] = None
+    old_custodian_id: str
+    new_custodian_id: str
+    transfer_type: str
+    state: str
+    initiated_at: float
     completed_at: Optional[float] = None
+    old_custodian_signature: Optional[str] = None
+    new_custodian_signature: Optional[str] = None
+    witness_ids: list = field(default_factory=list)
+    witness_signatures: list = field(default_factory=list)
+    proof_of_control: Optional[str] = None
+    challenges: list = field(default_factory=list)
+    predecessor_transfer_id: Optional[str] = None
     transfer_hash: Optional[str] = None
-    genesis_predecessor: Optional[str] = None  # Hash of old genesis (void, don't modify)
+    grade: Optional[str] = None
 
 
-def compute_transfer_hash(request: CustodyTransferRequest) -> str:
-    """Deterministic hash of transfer request for audit trail."""
-    data = f"{request.request_id}:{request.agent_id}:{request.old_operator_id}:" \
-           f"{request.new_operator_id}:{request.requested_at}"
-    return hashlib.sha256(data.encode()).hexdigest()[:16]
+def compute_transfer_hash(transfer: CustodyTransfer) -> str:
+    """Deterministic hash of transfer for audit trail."""
+    fields = {
+        "transfer_id": transfer.transfer_id,
+        "agent_id": transfer.agent_id,
+        "old_custodian": transfer.old_custodian_id,
+        "new_custodian": transfer.new_custodian_id,
+        "type": transfer.transfer_type,
+        "initiated_at": transfer.initiated_at,
+        "witnesses": sorted(transfer.witness_ids),
+    }
+    canonical = json.dumps(fields, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
-def validate_proofs(proofs: list[ProofOfControl]) -> dict:
-    """
-    Validate proof of control meets ATF requirements.
-    
-    Requires 2+ independent verified methods (MINIMUM_PROOF_METHODS).
-    DNS_TXT alone insufficient (operator might still control DNS).
-    SMTP + DNS = stronger than either alone.
-    """
-    verified = [p for p in proofs if p.verified]
-    methods_used = set(p.method for p in verified)
-    
-    issues = []
-    if len(verified) < MINIMUM_PROOF_METHODS:
-        issues.append(f"Insufficient proofs: {len(verified)}/{MINIMUM_PROOF_METHODS}")
-    
-    if len(methods_used) < MINIMUM_PROOF_METHODS:
-        issues.append(f"Insufficient independent methods: {len(methods_used)}")
-    
-    # DNS alone is insufficient (operator might retain DNS after going dark)
-    if methods_used == {"DNS_TXT"}:
-        issues.append("DNS_TXT alone insufficient — old operator may retain DNS control")
-    
-    # Check for stale proofs (>48h old)
+def initiate_bilateral(agent_id: str, old_id: str, new_id: str) -> CustodyTransfer:
+    """Clean bilateral transfer — both custodians present."""
     now = time.time()
-    for p in verified:
-        if p.verified_at and (now - p.verified_at) > 172800:
-            issues.append(f"Stale proof: {p.method} verified {(now - p.verified_at)/3600:.0f}h ago")
+    t = CustodyTransfer(
+        transfer_id=hashlib.sha256(f"{agent_id}:{now}".encode()).hexdigest()[:12],
+        agent_id=agent_id,
+        old_custodian_id=old_id,
+        new_custodian_id=new_id,
+        transfer_type=TransferType.BILATERAL.value,
+        state=TransferState.PROPOSED.value,
+        initiated_at=now,
+        old_custodian_signature=f"sig_old_{old_id[:8]}",
+        new_custodian_signature=f"sig_new_{new_id[:8]}",
+    )
+    t.transfer_hash = compute_transfer_hash(t)
+    return t
+
+
+def process_bilateral(transfer: CustodyTransfer) -> CustodyTransfer:
+    """Process bilateral transfer through overlap window."""
+    if not transfer.old_custodian_signature or not transfer.new_custodian_signature:
+        transfer.state = TransferState.REJECTED.value
+        transfer.grade = CustodyGrade.SUSPECT.value
+        return transfer
+    
+    # Enter overlap window (both keys active)
+    transfer.state = TransferState.OVERLAP.value
+    # After overlap: complete
+    transfer.completed_at = transfer.initiated_at + BILATERAL_OVERLAP_WINDOW
+    transfer.state = TransferState.COMPLETED.value
+    transfer.grade = CustodyGrade.CLEAN.value
+    return transfer
+
+
+def initiate_unilateral_timeout(agent_id: str, old_id: str, new_id: str,
+                                  witness_ids: list, proof: str,
+                                  last_old_activity: float) -> CustodyTransfer:
+    """Unilateral transfer after old custodian goes dark."""
+    now = time.time()
+    silence_duration = now - last_old_activity
+    
+    t = CustodyTransfer(
+        transfer_id=hashlib.sha256(f"{agent_id}:{now}:unilateral".encode()).hexdigest()[:12],
+        agent_id=agent_id,
+        old_custodian_id=old_id,
+        new_custodian_id=new_id,
+        transfer_type=TransferType.UNILATERAL_TIMEOUT.value,
+        state=TransferState.PROPOSED.value,
+        initiated_at=now,
+        new_custodian_signature=f"sig_new_{new_id[:8]}",
+        witness_ids=witness_ids,
+        witness_signatures=[f"sig_w_{w[:8]}" for w in witness_ids],
+        proof_of_control=proof,
+    )
+    t.transfer_hash = compute_transfer_hash(t)
+    
+    # Check timeout
+    if silence_duration < CUSTODY_TRANSFER_TIMEOUT:
+        remaining_days = (CUSTODY_TRANSFER_TIMEOUT - silence_duration) / 86400
+        print(f"  ⏳ Timeout not reached. {remaining_days:.1f} days remaining.")
+        t.state = TransferState.AWAITING_TIMEOUT.value
+        return t
+    
+    # Check witnesses
+    if len(witness_ids) < MIN_WITNESSES_UNILATERAL:
+        print(f"  ❌ Insufficient witnesses: {len(witness_ids)} < {MIN_WITNESSES_UNILATERAL}")
+        t.state = TransferState.REJECTED.value
+        t.grade = CustodyGrade.SUSPECT.value
+        return t
+    
+    # Enter dispute window
+    t.state = TransferState.DISPUTE_WINDOW.value
+    return t
+
+
+def resolve_dispute_window(transfer: CustodyTransfer) -> CustodyTransfer:
+    """Resolve after dispute window closes."""
+    if transfer.challenges:
+        transfer.state = TransferState.DISPUTED.value if len(transfer.challenges) > 0 else TransferState.COMPLETED.value
+        transfer.grade = CustodyGrade.CONTESTED.value
+        # Contested transfers need external resolution
+        print(f"  ⚠️ {len(transfer.challenges)} challenge(s) filed. CONTESTED.")
+        return transfer
+    
+    # No challenges: complete
+    transfer.completed_at = transfer.initiated_at + CUSTODY_DISPUTE_WINDOW
+    transfer.state = TransferState.COMPLETED.value
+    transfer.grade = CustodyGrade.AUDITABLE.value
+    return transfer
+
+
+def initiate_emergency(agent_id: str, old_id: str, new_id: str,
+                        recovery_holders: list, threshold: int) -> CustodyTransfer:
+    """Emergency transfer via M-of-N recovery key holders (IANA model)."""
+    now = time.time()
+    
+    t = CustodyTransfer(
+        transfer_id=hashlib.sha256(f"{agent_id}:{now}:emergency".encode()).hexdigest()[:12],
+        agent_id=agent_id,
+        old_custodian_id=old_id,
+        new_custodian_id=new_id,
+        transfer_type=TransferType.UNILATERAL_EMERGENCY.value,
+        state=TransferState.PROPOSED.value,
+        initiated_at=now,
+        new_custodian_signature=f"sig_new_{new_id[:8]}",
+        witness_ids=recovery_holders,
+        witness_signatures=[f"sig_rh_{h[:8]}" for h in recovery_holders],
+    )
+    t.transfer_hash = compute_transfer_hash(t)
+    
+    # Check quorum
+    total_holders = 14  # IANA model
+    if len(recovery_holders) < threshold:
+        print(f"  ❌ Quorum not met: {len(recovery_holders)}/{threshold} ({total_holders} total)")
+        t.state = TransferState.REJECTED.value
+        t.grade = CustodyGrade.SUSPECT.value
+        return t
+    
+    print(f"  ✅ Emergency quorum: {len(recovery_holders)}/{threshold}")
+    t.completed_at = now
+    t.state = TransferState.COMPLETED.value
+    t.grade = CustodyGrade.AUDITABLE.value
+    return t
+
+
+def validate_transfer_chain(transfers: list[CustodyTransfer]) -> dict:
+    """Validate chain of custody transfers."""
+    issues = []
+    
+    if len(transfers) > MAX_TRANSFER_CHAIN_DEPTH:
+        issues.append(f"Chain depth {len(transfers)} > max {MAX_TRANSFER_CHAIN_DEPTH}")
+    
+    # Check continuity
+    for i in range(1, len(transfers)):
+        prev = transfers[i-1]
+        curr = transfers[i]
+        if curr.old_custodian_id != prev.new_custodian_id:
+            issues.append(f"Discontinuity at step {i}: {prev.new_custodian_id} → {curr.old_custodian_id}")
+    
+    # Check for circular transfers
+    custodians = set()
+    for t in transfers:
+        if t.new_custodian_id in custodians:
+            issues.append(f"Circular transfer: {t.new_custodian_id} appears twice")
+        custodians.add(t.new_custodian_id)
+    
+    # Grade = worst in chain
+    grades = [t.grade for t in transfers if t.grade]
+    grade_order = ["CLEAN", "AUDITABLE", "CONTESTED", "SUSPECT"]
+    worst = max(grades, key=lambda g: grade_order.index(g)) if grades else "UNKNOWN"
     
     return {
-        "valid": len(issues) == 0,
-        "verified_count": len(verified),
-        "methods": list(methods_used),
+        "chain_length": len(transfers),
         "issues": issues,
-        "strength": "STRONG" if len(methods_used) >= 3 else
-                    "ADEQUATE" if len(methods_used) >= 2 and len(verified) >= 2 else
-                    "WEAK"
+        "chain_grade": worst,
+        "valid": len(issues) == 0,
     }
-
-
-def process_transfer(request: CustodyTransferRequest) -> dict:
-    """
-    Process a custody transfer request through its lifecycle.
-    
-    Returns transfer result with state transition log.
-    """
-    now = time.time()
-    transitions = []
-    
-    # Validate transfer hash
-    request.transfer_hash = compute_transfer_hash(request)
-    transitions.append(f"INIT: transfer_hash={request.transfer_hash}")
-    
-    # Validate timeout bounds
-    if request.timeout_days < TRANSFER_TIMEOUT_MIN:
-        return {"state": "REJECTED", "reason": f"Timeout {request.timeout_days}d below SPEC_FLOOR {TRANSFER_TIMEOUT_MIN}d"}
-    if request.timeout_days > TRANSFER_TIMEOUT_MAX:
-        return {"state": "REJECTED", "reason": f"Timeout {request.timeout_days}d above SPEC_CEILING {TRANSFER_TIMEOUT_MAX}d"}
-    
-    # Validate proofs
-    proof_result = validate_proofs(request.proofs)
-    transitions.append(f"PROOF_CHECK: {proof_result['strength']} ({proof_result['verified_count']} verified)")
-    
-    if not proof_result["valid"]:
-        request.state = TransferState.REJECTED.value
-        return {
-            "state": "REJECTED",
-            "reason": "Insufficient proof of control",
-            "proof_issues": proof_result["issues"],
-            "transitions": transitions
-        }
-    
-    # Check old operator response
-    timeout_seconds = request.timeout_days * 86400
-    elapsed = now - request.requested_at
-    
-    if request.old_operator_response == "ACK":
-        # Cooperative transfer — both parties agree
-        request.state = TransferState.COMPLETED.value
-        request.completed_at = now
-        transitions.append(f"ACK: old operator co-signed at {request.response_at}")
-        transitions.append("COMPLETED: cooperative transfer")
-        return {
-            "state": "COMPLETED",
-            "type": "COOPERATIVE",
-            "transfer_hash": request.transfer_hash,
-            "genesis_predecessor": request.genesis_predecessor,
-            "transitions": transitions,
-            "note": "New genesis references old genesis_hash as predecessor (void, don't modify)"
-        }
-    
-    elif request.old_operator_response == "NACK":
-        # Old operator disputes — enter dispute resolution
-        request.state = TransferState.DISPUTED.value
-        transitions.append(f"NACK: old operator disputed at {request.response_at}")
-        transitions.append("DISPUTED: requires quorum resolution")
-        return {
-            "state": "DISPUTED",
-            "type": "CONTESTED",
-            "transfer_hash": request.transfer_hash,
-            "transitions": transitions,
-            "next_steps": [
-                "Submit to quorum (BFT f<n/3)",
-                "Both parties present evidence",
-                "Quorum decides within 72h",
-                "Losing party can appeal once"
-            ]
-        }
-    
-    elif elapsed >= timeout_seconds:
-        # Timeout — old operator dark → unilateral transfer
-        request.state = TransferState.TIMEOUT_TRANSFER.value
-        request.completed_at = now
-        transitions.append(f"TIMEOUT: {elapsed/86400:.1f}d elapsed > {request.timeout_days}d limit")
-        transitions.append("TIMEOUT_TRANSFER: old operator dark, unilateral transfer proceeds")
-        transitions.append("NOTE: ICANN EPP parallel — registrar silent = transfer proceeds")
-        return {
-            "state": "COMPLETED",
-            "type": "TIMEOUT_UNILATERAL",
-            "transfer_hash": request.transfer_hash,
-            "genesis_predecessor": request.genesis_predecessor,
-            "elapsed_days": elapsed / 86400,
-            "transitions": transitions,
-            "note": "Old genesis voided. New genesis created with predecessor_hash. "
-                    "Old operator regains no rights after timeout completion."
-        }
-    
-    else:
-        # Still waiting
-        remaining = timeout_seconds - elapsed
-        request.state = TransferState.PENDING_ACK.value
-        transitions.append(f"PENDING: {elapsed/86400:.1f}d elapsed, {remaining/86400:.1f}d remaining")
-        return {
-            "state": "PENDING_ACK",
-            "elapsed_days": elapsed / 86400,
-            "remaining_days": remaining / 86400,
-            "transitions": transitions
-        }
 
 
 # === Scenarios ===
 
-def scenario_cooperative_transfer():
-    """Both operators agree — smooth handoff."""
-    print("=== Scenario: Cooperative Transfer ===")
-    now = time.time()
-    
-    request = CustodyTransferRequest(
-        request_id="ct_001",
-        agent_id="kit_fox",
-        old_operator_id="operator_alpha",
-        new_operator_id="operator_beta",
-        requested_at=now - 86400 * 3,  # 3 days ago
-        timeout_days=14,
-        proofs=[
-            ProofOfControl("DNS_TXT", "_atf.example.com TXT v=ATF1;transfer=ct_001", True, now - 3600, "registry"),
-            ProofOfControl("SMTP_REACHABILITY", "operator_beta@example.com verified", True, now - 3600, "registry"),
-        ],
-        old_operator_response="ACK",
-        response_at=now - 86400,
-        genesis_predecessor="abc123def456"
-    )
-    
-    result = process_transfer(request)
-    print(f"  State: {result['state']}")
-    print(f"  Type: {result.get('type', 'N/A')}")
-    for t in result["transitions"]:
-        print(f"    {t}")
+def scenario_clean_bilateral():
+    """Happy path: both custodians cooperate."""
+    print("=== Scenario 1: Clean Bilateral Transfer ===")
+    t = initiate_bilateral("agent_kit", "operator_alpha", "operator_beta")
+    t = process_bilateral(t)
+    print(f"  Type: {t.transfer_type}")
+    print(f"  State: {t.state}")
+    print(f"  Grade: {t.grade}")
+    print(f"  Overlap window: {BILATERAL_OVERLAP_WINDOW/3600:.0f}h (M3AAWG convention)")
+    print(f"  Transfer hash: {t.transfer_hash}")
     print()
 
 
-def scenario_dark_operator_timeout():
-    """Old operator vanishes — timeout transfer."""
-    print("=== Scenario: Dark Operator (Timeout) ===")
+def scenario_dark_operator():
+    """Old operator goes dark — timeout path."""
+    print("=== Scenario 2: Dark Operator (Unilateral Timeout) ===")
     now = time.time()
     
-    request = CustodyTransferRequest(
-        request_id="ct_002",
-        agent_id="orphan_agent",
-        old_operator_id="dark_operator",
-        new_operator_id="rescue_operator",
-        requested_at=now - 86400 * 15,  # 15 days ago
-        timeout_days=14,
-        proofs=[
-            ProofOfControl("DNS_TXT", "_atf.orphan.example TXT v=ATF1;transfer=ct_002", True, now - 7200, "registry"),
-            ProofOfControl("REGISTRY_CHALLENGE", "auth_code=XK9F2M verified", True, now - 7200, "registry"),
-        ],
-        genesis_predecessor="deadbeef12345678"
+    # Old operator last seen 45 days ago
+    last_activity = now - (45 * 86400)
+    t = initiate_unilateral_timeout(
+        "agent_kit", "operator_dark", "operator_rescue",
+        witness_ids=["witness_1", "witness_2", "witness_3"],
+        proof="proof_of_dns_control_hash_abc123",
+        last_old_activity=last_activity
     )
+    print(f"  Silence: 45 days > {CUSTODY_TRANSFER_TIMEOUT/86400:.0f}d timeout")
+    print(f"  Witnesses: {len(t.witness_ids)} (min {MIN_WITNESSES_UNILATERAL})")
+    print(f"  State: {t.state}")
     
-    result = process_transfer(request)
-    print(f"  State: {result['state']}")
-    print(f"  Type: {result.get('type', 'N/A')}")
-    print(f"  Elapsed: {result.get('elapsed_days', 'N/A'):.1f}d")
-    for t in result["transitions"]:
-        print(f"    {t}")
+    # Resolve dispute window (no challenges)
+    t = resolve_dispute_window(t)
+    print(f"  After dispute window: {t.state}")
+    print(f"  Grade: {t.grade} (weaker than CLEAN but auditable)")
     print()
 
 
-def scenario_disputed_transfer():
-    """Old operator objects — enters dispute."""
-    print("=== Scenario: Disputed Transfer ===")
+def scenario_timeout_not_reached():
+    """Attempt transfer before timeout — rejected."""
+    print("=== Scenario 3: Timeout Not Reached ===")
     now = time.time()
     
-    request = CustodyTransferRequest(
-        request_id="ct_003",
-        agent_id="contested_agent",
-        old_operator_id="operator_a",
-        new_operator_id="operator_b",
-        requested_at=now - 86400 * 5,
-        timeout_days=14,
-        proofs=[
-            ProofOfControl("DNS_TXT", "TXT record verified", True, now - 3600, "registry"),
-            ProofOfControl("SMTP_REACHABILITY", "Email verified", True, now - 3600, "registry"),
-        ],
-        old_operator_response="NACK",
-        response_at=now - 86400 * 2,
-        genesis_predecessor="facecafe12345678"
+    # Old operator last seen 10 days ago
+    last_activity = now - (10 * 86400)
+    t = initiate_unilateral_timeout(
+        "agent_kit", "operator_recent", "operator_impatient",
+        witness_ids=["witness_1", "witness_2"],
+        proof="proof_hash",
+        last_old_activity=last_activity
     )
-    
-    result = process_transfer(request)
-    print(f"  State: {result['state']}")
-    print(f"  Type: {result.get('type', 'N/A')}")
-    for t in result["transitions"]:
-        print(f"    {t}")
-    if "next_steps" in result:
-        print(f"  Next steps: {result['next_steps']}")
+    print(f"  State: {t.state}")
+    print(f"  Must wait for timeout before unilateral transfer.")
     print()
 
 
-def scenario_insufficient_proof():
-    """DNS only — rejected (insufficient methods)."""
-    print("=== Scenario: Insufficient Proof (DNS Only) ===")
+def scenario_challenged_transfer():
+    """Transfer challenged during dispute window."""
+    print("=== Scenario 4: Challenged Transfer ===")
     now = time.time()
     
-    request = CustodyTransferRequest(
-        request_id="ct_004",
-        agent_id="weak_claim",
-        old_operator_id="operator_x",
-        new_operator_id="operator_y",
-        requested_at=now - 86400,
-        timeout_days=14,
-        proofs=[
-            ProofOfControl("DNS_TXT", "TXT record", True, now - 3600, "registry"),
-        ],
+    last_activity = now - (60 * 86400)
+    t = initiate_unilateral_timeout(
+        "agent_kit", "operator_contested", "operator_claimant",
+        witness_ids=["witness_1", "witness_2"],
+        proof="proof_hash",
+        last_old_activity=last_activity
     )
     
-    result = process_transfer(request)
-    print(f"  State: {result['state']}")
-    print(f"  Reason: {result.get('reason', 'N/A')}")
-    if "proof_issues" in result:
-        for issue in result["proof_issues"]:
-            print(f"    Issue: {issue}")
+    # Challenge filed during dispute window
+    t.challenges.append({
+        "challenger_id": "operator_contested",
+        "reason": "I was not dark, DNS was misconfigured",
+        "evidence": "proof_of_activity_hash_xyz",
+        "filed_at": now + 86400  # Day 1 of dispute window
+    })
+    
+    t = resolve_dispute_window(t)
+    print(f"  Grade: {t.grade}")
+    print(f"  Old operator came back during dispute window.")
+    print(f"  Resolution: external judgment required.")
     print()
 
 
-def scenario_timeout_too_short():
-    """Below SPEC_FLOOR — rejected."""
-    print("=== Scenario: Timeout Below SPEC_FLOOR ===")
-    now = time.time()
-    
-    request = CustodyTransferRequest(
-        request_id="ct_005",
-        agent_id="rush_agent",
-        old_operator_id="slow_operator",
-        new_operator_id="eager_operator",
-        requested_at=now,
-        timeout_days=3,  # Below MIN of 7
-        proofs=[
-            ProofOfControl("DNS_TXT", "TXT", True, now, "registry"),
-            ProofOfControl("SMTP_REACHABILITY", "SMTP", True, now, "registry"),
-        ],
+def scenario_emergency_recovery():
+    """Emergency M-of-N recovery (IANA root KSK model)."""
+    print("=== Scenario 5: Emergency Recovery (IANA Model) ===")
+    holders = [f"recovery_holder_{i}" for i in range(8)]  # 8 of 14
+    t = initiate_emergency(
+        "agent_critical", "operator_compromised", "operator_emergency",
+        recovery_holders=holders,
+        threshold=7  # 7-of-14 (IANA standard)
     )
+    print(f"  Type: {t.transfer_type}")
+    print(f"  State: {t.state}")
+    print(f"  Grade: {t.grade}")
+    print(f"  IANA model: 7-of-14 recovery key share holders")
+    print()
+
+
+def scenario_transfer_chain():
+    """Multiple consecutive transfers — chain validation."""
+    print("=== Scenario 6: Transfer Chain Validation ===")
+    t1 = initiate_bilateral("agent_kit", "op_a", "op_b")
+    t1 = process_bilateral(t1)
     
-    result = process_transfer(request)
-    print(f"  State: {result['state']}")
-    print(f"  Reason: {result.get('reason', 'N/A')}")
+    now = time.time()
+    t2 = initiate_unilateral_timeout(
+        "agent_kit", "op_b", "op_c",
+        witness_ids=["w1", "w2"],
+        proof="proof",
+        last_old_activity=now - (40 * 86400)
+    )
+    t2 = resolve_dispute_window(t2)
+    
+    t3 = initiate_bilateral("agent_kit", "op_c", "op_d")
+    t3 = process_bilateral(t3)
+    
+    result = validate_transfer_chain([t1, t2, t3])
+    print(f"  Chain: op_a → op_b → op_c → op_d")
+    print(f"  Length: {result['chain_length']}")
+    print(f"  Valid: {result['valid']}")
+    print(f"  Chain grade: {result['chain_grade']} (worst in chain)")
+    print(f"  Issues: {result['issues'] or 'none'}")
     print()
 
 
 if __name__ == "__main__":
-    print("Custody Transfer Handler — Dark Operator Paths for ATF")
-    print("Per santaclawd + ICANN EPP Transfer Policy")
-    print("=" * 60)
+    print("Custody Transfer Handler — ATF Agent Succession Protocol")
+    print("Per santaclawd: dark operator path + IANA root KSK DPS model")
+    print("=" * 65)
     print()
-    scenario_cooperative_transfer()
-    scenario_dark_operator_timeout()
-    scenario_disputed_transfer()
-    scenario_insufficient_proof()
-    scenario_timeout_too_short()
+    scenario_clean_bilateral()
+    scenario_dark_operator()
+    scenario_timeout_not_reached()
+    scenario_challenged_transfer()
+    scenario_emergency_recovery()
+    scenario_transfer_chain()
     
-    print("=" * 60)
-    print("KEY: ICANN EPP model — old registrar silent = transfer proceeds.")
-    print("ATF parallel: CUSTODY_TRANSFER_REQUEST + 14d SPEC_DEFAULT timeout.")
-    print("Proof requires 2+ independent methods (DNS alone insufficient).")
-    print("Old genesis VOIDED (not modified). New genesis has predecessor_hash.")
-    print("N is ATF-standard, not registry-configurable (race to bottom).")
+    print("=" * 65)
+    print("SPEC_CONSTANTS:")
+    print(f"  CUSTODY_TRANSFER_TIMEOUT = {CUSTODY_TRANSFER_TIMEOUT/86400:.0f}d")
+    print(f"  CUSTODY_DISPUTE_WINDOW = {CUSTODY_DISPUTE_WINDOW/86400:.0f}d")
+    print(f"  BILATERAL_OVERLAP = {BILATERAL_OVERLAP_WINDOW/3600:.0f}h (M3AAWG)")
+    print(f"  MIN_WITNESSES_UNILATERAL = {MIN_WITNESSES_UNILATERAL}")
+    print(f"  EMERGENCY_QUORUM = {EMERGENCY_QUORUM_RATIO} (IANA: 7/14)")
+    print()
+    print("KEY INSIGHT: Succession != rotation.")
+    print("DKIM rotation = 72h overlap. Custody transfer = 30d timeout + 7d dispute.")
+    print("Dark operator has no DKIM answer. ATF does: timeout + witnesses + dispute window.")
