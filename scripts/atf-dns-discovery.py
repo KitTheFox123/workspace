@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-atf-dns-discovery.py — DNS TXT-based cross-registry discovery for ATF.
+atf-dns-discovery.py — Cross-registry discovery via DNS TXT for ATF V1.2.
 
-Per santaclawd: "how does ATF-A find ATF-B exists?"
-Model: DMARC (RFC 7489) _dmarc.domain TXT records + DANE (RFC 7671) cert pinning.
+Per santaclawd: _atf.<domain> DNS TXT → endpoint + assurance level.
+DMARC (RFC 7489) model: self-service discovery, no central authority.
+DANE (RFC 6698) for pinning: requires DNSSEC, graceful degradation without.
 
-Three-phase bootstrap:
-  1. DISCOVERY — _atf.<domain> DNS TXT → endpoint + assurance_level + policy_hash
-  2. BOOTSTRAP — SMTP handshake → exchange genesis hashes  
-  3. CEREMONY — Authenticated cross-signing → bridge established
+Discovery stack:
+  1. _atf.<domain> TXT → endpoint URL + assurance level + registry_hash
+  2. DANE TLSA pin (if DNSSEC) → no MITM on discovery
+  3. CT log audit → anyone can verify TXT changes
+  4. SMTP bootstrap → first cross-signing handshake
 
-TXT record format:
-  v=ATF1; endpoint=https://registry.example/atf; level=CONFIRMED;
-  policy=sha256:<hash>; contact=admin@registry.example
-
-Who audits the TXT record? Hash(TXT) in receipt chain = any change detectable.
+Key insight: DMARC succeeded because it degrades gracefully without DNSSEC.
+DANE adoption is 5.5% of .com (APNIC 2024). ATF must not require it.
 """
 
 import hashlib
@@ -26,339 +25,326 @@ from typing import Optional
 
 
 class AssuranceLevel(Enum):
-    PROVISIONAL = "PROVISIONAL"  # FBCA RUDIMENTARY: n<10, Wilson CI < 0.5
-    ALLEGED = "ALLEGED"          # FBCA BASIC: n≥10, Wilson CI ≥ 0.5
-    CONFIRMED = "CONFIRMED"      # FBCA MEDIUM: n≥30, Wilson CI ≥ 0.7
-    VERIFIED = "VERIFIED"        # FBCA HIGH: n≥100, Wilson CI ≥ 0.9
+    """FBCA-style assurance levels for cross-registry trust."""
+    RUDIMENTARY = "rudimentary"     # TXT exists, no verification
+    BASIC = "basic"                  # TXT + SMTP reachable
+    MEDIUM = "medium"                # TXT + DANE pin OR CT audited
+    HIGH = "high"                    # TXT + DANE + CT + cross-signed
 
 
-class DiscoveryPhase(Enum):
-    DNS_LOOKUP = "DNS_LOOKUP"
-    SMTP_BOOTSTRAP = "SMTP_BOOTSTRAP"
-    CROSS_SIGN_CEREMONY = "CROSS_SIGN_CEREMONY"
+class DiscoveryMethod(Enum):
+    DNS_TXT = "dns_txt"             # _atf.<domain> TXT record
+    DANE_TLSA = "dane_tlsa"         # DNSSEC-secured pin
+    CT_AUDIT = "ct_audit"           # Certificate Transparency log
+    SMTP_BOOTSTRAP = "smtp_bootstrap"  # First-contact handshake
+    MANUAL = "manual"               # Out-of-band exchange
 
 
-class BridgeStatus(Enum):
-    DISCOVERED = "DISCOVERED"
-    BOOTSTRAPPED = "BOOTSTRAPPED"
-    FEDERATED = "FEDERATED"
-    STALE = "STALE"
-    REVOKED = "REVOKED"
+class PinStatus(Enum):
+    PINNED = "PINNED"               # DANE TLSA verified
+    TOFU = "TOFU"                   # Trust on first use (no DNSSEC)
+    CT_VERIFIED = "CT_VERIFIED"     # CT log confirms TXT
+    UNVERIFIED = "UNVERIFIED"       # No verification available
 
 
 # SPEC_CONSTANTS
 TXT_PREFIX = "_atf"
-TXT_VERSION = "ATF1"
-MIN_ASSURANCE_FOR_BRIDGE = AssuranceLevel.ALLEGED
-BRIDGE_MAX_AGE_DAYS = 90
-TXT_AUDIT_INTERVAL_HOURS = 24
-BOOTSTRAP_TIMEOUT_SECONDS = 300
+TXT_VERSION = "ATFv1"
+MIN_TTL_SECONDS = 3600              # 1 hour minimum
+MAX_TTL_SECONDS = 86400 * 30        # 30 days maximum
+DISCOVERY_TIMEOUT_SECONDS = 30
+BOOTSTRAP_GRACE_HOURS = 72          # Time for first cross-sign after discovery
 
 
 @dataclass
-class ATFTxtRecord:
-    """Parsed _atf DNS TXT record."""
+class ATFRecord:
+    """Parsed _atf.<domain> DNS TXT record."""
     domain: str
-    version: str
-    endpoint: str
-    assurance_level: AssuranceLevel
-    policy_hash: str
-    contact: str
-    raw_txt: str = ""
-    record_hash: str = ""
+    version: str = "ATFv1"
+    endpoint: str = ""               # Registry API endpoint
+    registry_hash: str = ""          # Hash of registry genesis
+    assurance: str = "rudimentary"   # Assurance level claimed
+    contact: str = ""                # Operator contact (email)
+    cross_sign_policy: str = "open"  # open|restricted|closed
+    ttl: int = 3600
+    dnssec: bool = False
+    dane_pin: Optional[str] = None
+    ct_logged: bool = False
+    discovered_at: float = 0.0
     
-    def __post_init__(self):
-        if not self.record_hash:
-            self.record_hash = hashlib.sha256(self.raw_txt.encode()).hexdigest()[:16]
+    def to_txt(self) -> str:
+        """Generate DNS TXT record string."""
+        parts = [
+            f"v={self.version}",
+            f"endpoint={self.endpoint}",
+            f"rh={self.registry_hash}",
+            f"assurance={self.assurance}",
+            f"contact={self.contact}",
+            f"xsign={self.cross_sign_policy}"
+        ]
+        return "; ".join(parts)
+    
+    @classmethod
+    def from_txt(cls, domain: str, txt: str, dnssec: bool = False) -> "ATFRecord":
+        """Parse DNS TXT record."""
+        fields = {}
+        for part in txt.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                fields[k.strip()] = v.strip()
+        
+        return cls(
+            domain=domain,
+            version=fields.get("v", "ATFv1"),
+            endpoint=fields.get("endpoint", ""),
+            registry_hash=fields.get("rh", ""),
+            assurance=fields.get("assurance", "rudimentary"),
+            contact=fields.get("contact", ""),
+            cross_sign_policy=fields.get("xsign", "open"),
+            dnssec=dnssec,
+            discovered_at=time.time()
+        )
 
 
 @dataclass
-class RegistryBridge:
-    """Cross-registry bridge established via DNS discovery."""
+class DiscoveryResult:
+    """Result of cross-registry discovery attempt."""
     source_domain: str
     target_domain: str
-    source_level: AssuranceLevel
-    target_level: AssuranceLevel
-    bridge_level: AssuranceLevel  # MIN(source, target)
-    phase: DiscoveryPhase
-    status: BridgeStatus
-    discovered_at: float
-    bootstrapped_at: Optional[float] = None
-    federated_at: Optional[float] = None
-    txt_hash_at_discovery: str = ""
-    current_txt_hash: str = ""
-    bridge_hash: str = ""
+    record: Optional[ATFRecord]
+    methods_tried: list[DiscoveryMethod]
+    methods_succeeded: list[DiscoveryMethod]
+    pin_status: PinStatus
+    assurance_verified: AssuranceLevel
+    bridge_eligible: bool
+    issues: list[str] = field(default_factory=list)
 
 
-def parse_txt_record(domain: str, raw_txt: str) -> ATFTxtRecord:
-    """Parse an _atf DNS TXT record."""
-    fields = {}
-    for part in raw_txt.split(";"):
-        part = part.strip()
-        if "=" in part:
-            key, value = part.split("=", 1)
-            fields[key.strip()] = value.strip()
+def discover_registry(source: str, target_domain: str, 
+                      txt_exists: bool = True, dnssec: bool = False,
+                      dane_pin: Optional[str] = None,
+                      ct_logged: bool = False,
+                      smtp_reachable: bool = True) -> DiscoveryResult:
+    """
+    Attempt cross-registry discovery.
     
-    level_map = {
-        "PROVISIONAL": AssuranceLevel.PROVISIONAL,
-        "ALLEGED": AssuranceLevel.ALLEGED,
-        "CONFIRMED": AssuranceLevel.CONFIRMED,
-        "VERIFIED": AssuranceLevel.VERIFIED
-    }
-    
-    return ATFTxtRecord(
-        domain=domain,
-        version=fields.get("v", ""),
-        endpoint=fields.get("endpoint", ""),
-        assurance_level=level_map.get(fields.get("level", ""), AssuranceLevel.PROVISIONAL),
-        policy_hash=fields.get("policy", ""),
-        contact=fields.get("contact", ""),
-        raw_txt=raw_txt
-    )
-
-
-def validate_txt_record(record: ATFTxtRecord) -> dict:
-    """Validate a parsed TXT record."""
+    Simulates the discovery stack:
+    1. DNS TXT lookup
+    2. DANE TLSA verification (if DNSSEC)
+    3. CT log audit
+    4. SMTP bootstrap
+    """
+    methods_tried = []
+    methods_succeeded = []
     issues = []
+    record = None
     
-    if record.version != TXT_VERSION:
-        issues.append(f"Version mismatch: expected {TXT_VERSION}, got {record.version}")
+    # Step 1: DNS TXT lookup
+    methods_tried.append(DiscoveryMethod.DNS_TXT)
+    if txt_exists:
+        methods_succeeded.append(DiscoveryMethod.DNS_TXT)
+        record = ATFRecord(
+            domain=target_domain,
+            endpoint=f"https://atf.{target_domain}/api/v1",
+            registry_hash=hashlib.sha256(target_domain.encode()).hexdigest()[:16],
+            assurance="medium" if dnssec else "basic",
+            contact=f"operator@{target_domain}",
+            cross_sign_policy="open",
+            dnssec=dnssec,
+            ct_logged=ct_logged,
+            discovered_at=time.time()
+        )
+    else:
+        issues.append(f"No _atf.{target_domain} TXT record found")
     
-    if not record.endpoint:
-        issues.append("Missing endpoint URL")
-    elif not record.endpoint.startswith("https://"):
-        issues.append("Endpoint must use HTTPS")
+    # Step 2: DANE TLSA (requires DNSSEC)
+    if dnssec:
+        methods_tried.append(DiscoveryMethod.DANE_TLSA)
+        if dane_pin:
+            methods_succeeded.append(DiscoveryMethod.DANE_TLSA)
+            if record:
+                record.dane_pin = dane_pin
+        else:
+            issues.append("DNSSEC present but no DANE TLSA record")
     
-    if not record.policy_hash:
-        issues.append("Missing policy hash")
-    elif not record.policy_hash.startswith("sha256:"):
-        issues.append("Policy hash must use sha256: prefix")
+    # Step 3: CT log audit
+    if record:
+        methods_tried.append(DiscoveryMethod.CT_AUDIT)
+        if ct_logged:
+            methods_succeeded.append(DiscoveryMethod.CT_AUDIT)
+            record.ct_logged = True
+        else:
+            issues.append("TXT record not found in CT audit log")
     
-    if not record.contact:
-        issues.append("Missing contact email")
+    # Step 4: SMTP bootstrap
+    if record:
+        methods_tried.append(DiscoveryMethod.SMTP_BOOTSTRAP)
+        if smtp_reachable:
+            methods_succeeded.append(DiscoveryMethod.SMTP_BOOTSTRAP)
+        else:
+            issues.append(f"SMTP bootstrap to {target_domain} failed")
     
-    return {
-        "valid": len(issues) == 0,
-        "issues": issues,
-        "record_hash": record.record_hash,
-        "assurance_level": record.assurance_level.value
-    }
-
-
-def compute_bridge_level(source: AssuranceLevel, target: AssuranceLevel) -> AssuranceLevel:
-    """Bridge inherits LOWER of two registries' assurance levels."""
-    order = [AssuranceLevel.PROVISIONAL, AssuranceLevel.ALLEGED, 
-             AssuranceLevel.CONFIRMED, AssuranceLevel.VERIFIED]
-    source_idx = order.index(source)
-    target_idx = order.index(target)
-    return order[min(source_idx, target_idx)]
-
-
-def establish_bridge(source: ATFTxtRecord, target: ATFTxtRecord) -> RegistryBridge:
-    """Establish a cross-registry bridge via DNS discovery."""
-    now = time.time()
-    bridge_level = compute_bridge_level(source.assurance_level, target.assurance_level)
+    # Determine pin status
+    if DiscoveryMethod.DANE_TLSA in methods_succeeded:
+        pin_status = PinStatus.PINNED
+    elif DiscoveryMethod.CT_AUDIT in methods_succeeded:
+        pin_status = PinStatus.CT_VERIFIED
+    elif DiscoveryMethod.DNS_TXT in methods_succeeded:
+        pin_status = PinStatus.TOFU
+    else:
+        pin_status = PinStatus.UNVERIFIED
     
-    # Check minimum assurance
-    min_level_order = [AssuranceLevel.PROVISIONAL, AssuranceLevel.ALLEGED,
-                       AssuranceLevel.CONFIRMED, AssuranceLevel.VERIFIED]
-    if min_level_order.index(bridge_level) < min_level_order.index(MIN_ASSURANCE_FOR_BRIDGE):
-        bridge_level = AssuranceLevel.PROVISIONAL  # Degraded
+    # Verify assurance level
+    if pin_status == PinStatus.PINNED and ct_logged:
+        assurance = AssuranceLevel.HIGH
+    elif pin_status in (PinStatus.PINNED, PinStatus.CT_VERIFIED):
+        assurance = AssuranceLevel.MEDIUM
+    elif pin_status == PinStatus.TOFU and smtp_reachable:
+        assurance = AssuranceLevel.BASIC
+    elif txt_exists:
+        assurance = AssuranceLevel.RUDIMENTARY
+    else:
+        assurance = AssuranceLevel.RUDIMENTARY
     
-    bridge_hash = hashlib.sha256(
-        f"{source.record_hash}:{target.record_hash}:{now}".encode()
-    ).hexdigest()[:16]
+    # Bridge eligibility: need at least BASIC + SMTP
+    bridge_eligible = (
+        assurance.value in ("basic", "medium", "high") and
+        DiscoveryMethod.SMTP_BOOTSTRAP in methods_succeeded
+    )
     
-    return RegistryBridge(
-        source_domain=source.domain,
-        target_domain=target.domain,
-        source_level=source.assurance_level,
-        target_level=target.assurance_level,
-        bridge_level=bridge_level,
-        phase=DiscoveryPhase.DNS_LOOKUP,
-        status=BridgeStatus.DISCOVERED,
-        discovered_at=now,
-        txt_hash_at_discovery=target.record_hash,
-        current_txt_hash=target.record_hash,
-        bridge_hash=bridge_hash
+    return DiscoveryResult(
+        source_domain=source,
+        target_domain=target_domain,
+        record=record,
+        methods_tried=methods_tried,
+        methods_succeeded=methods_succeeded,
+        pin_status=pin_status,
+        assurance_verified=assurance,
+        bridge_eligible=bridge_eligible,
+        issues=issues
     )
 
 
-def audit_txt_change(bridge: RegistryBridge, new_txt_hash: str) -> dict:
-    """Detect TXT record changes (potential registry compromise or update)."""
-    changed = bridge.txt_hash_at_discovery != new_txt_hash
-    bridge.current_txt_hash = new_txt_hash
-    
-    if changed:
-        return {
-            "status": "TXT_CHANGED",
-            "action": "RE_BOOTSTRAP_REQUIRED",
-            "old_hash": bridge.txt_hash_at_discovery,
-            "new_hash": new_txt_hash,
-            "bridge_status": "STALE — TXT record changed since discovery"
-        }
-    
-    return {
-        "status": "TXT_UNCHANGED",
-        "action": "NONE",
-        "hash": new_txt_hash,
-        "bridge_status": bridge.status.value
-    }
-
-
-def simulate_discovery_flow(source_txt: str, target_txt: str, 
-                           source_domain: str, target_domain: str) -> dict:
-    """Simulate full three-phase discovery flow."""
-    # Phase 1: DNS Discovery
-    source = parse_txt_record(source_domain, source_txt)
-    target = parse_txt_record(target_domain, target_txt)
-    
-    source_valid = validate_txt_record(source)
-    target_valid = validate_txt_record(target)
-    
-    if not source_valid["valid"] or not target_valid["valid"]:
-        return {
-            "phase": "DNS_LOOKUP",
-            "status": "FAILED",
-            "source_issues": source_valid["issues"],
-            "target_issues": target_valid["issues"]
-        }
-    
-    # Phase 2: Bridge establishment
-    bridge = establish_bridge(source, target)
-    bridge.phase = DiscoveryPhase.SMTP_BOOTSTRAP
-    bridge.status = BridgeStatus.BOOTSTRAPPED
-    bridge.bootstrapped_at = time.time()
-    
-    # Phase 3: Federation (cross-signing)
-    bridge.phase = DiscoveryPhase.CROSS_SIGN_CEREMONY
-    bridge.status = BridgeStatus.FEDERATED
-    bridge.federated_at = time.time()
-    
-    return {
-        "phase": "COMPLETE",
-        "status": "FEDERATED",
-        "bridge_level": bridge.bridge_level.value,
-        "source": f"{source_domain} ({source.assurance_level.value})",
-        "target": f"{target_domain} ({target.assurance_level.value})",
-        "bridge_hash": bridge.bridge_hash,
-        "txt_hash_source": source.record_hash,
-        "txt_hash_target": target.record_hash
-    }
+def compute_bridge_assurance(source_assurance: AssuranceLevel, 
+                              target_assurance: AssuranceLevel) -> AssuranceLevel:
+    """
+    Bridge assurance = MIN(source, target).
+    FBCA calls this 'assurance mapping' — bridge never exceeds weakest party.
+    """
+    levels = [AssuranceLevel.RUDIMENTARY, AssuranceLevel.BASIC, 
+              AssuranceLevel.MEDIUM, AssuranceLevel.HIGH]
+    source_idx = levels.index(source_assurance)
+    target_idx = levels.index(target_assurance)
+    return levels[min(source_idx, target_idx)]
 
 
 # === Scenarios ===
 
-def scenario_normal_discovery():
-    """Two CONFIRMED registries discover each other."""
-    print("=== Scenario: Normal Discovery (CONFIRMED↔CONFIRMED) ===")
-    result = simulate_discovery_flow(
-        "v=ATF1; endpoint=https://registry-a.example/atf; level=CONFIRMED; policy=sha256:abc123; contact=admin@registry-a.example",
-        "v=ATF1; endpoint=https://registry-b.example/atf; level=CONFIRMED; policy=sha256:def456; contact=admin@registry-b.example",
-        "registry-a.example", "registry-b.example"
+def scenario_full_stack():
+    """Full discovery stack: TXT + DNSSEC + DANE + CT + SMTP."""
+    print("=== Scenario: Full Stack Discovery (DNSSEC + DANE + CT) ===")
+    result = discover_registry(
+        "registry-a.example", "registry-b.example",
+        txt_exists=True, dnssec=True, dane_pin="sha256:abc123", 
+        ct_logged=True, smtp_reachable=True
     )
-    print(f"  Status: {result['status']}")
-    print(f"  Bridge level: {result['bridge_level']}")
-    print(f"  Source: {result['source']}")
-    print(f"  Target: {result['target']}")
+    print(f"  Methods tried:    {[m.value for m in result.methods_tried]}")
+    print(f"  Methods succeeded:{[m.value for m in result.methods_succeeded]}")
+    print(f"  Pin status:       {result.pin_status.value}")
+    print(f"  Assurance:        {result.assurance_verified.value}")
+    print(f"  Bridge eligible:  {result.bridge_eligible}")
+    print(f"  TXT record:       {result.record.to_txt()[:80]}...")
     print()
 
 
-def scenario_asymmetric_levels():
-    """VERIFIED registry bridges to PROVISIONAL — inherits LOWER."""
-    print("=== Scenario: Asymmetric Levels (VERIFIED↔PROVISIONAL) ===")
-    result = simulate_discovery_flow(
-        "v=ATF1; endpoint=https://trusted.example/atf; level=VERIFIED; policy=sha256:abc; contact=a@trusted.example",
-        "v=ATF1; endpoint=https://new.example/atf; level=PROVISIONAL; policy=sha256:def; contact=a@new.example",
-        "trusted.example", "new.example"
+def scenario_no_dnssec():
+    """No DNSSEC — graceful degradation to TOFU."""
+    print("=== Scenario: No DNSSEC (Graceful Degradation) ===")
+    result = discover_registry(
+        "registry-a.example", "registry-c.example",
+        txt_exists=True, dnssec=False, ct_logged=True, smtp_reachable=True
     )
-    print(f"  Bridge level: {result['bridge_level']} (MIN of VERIFIED, PROVISIONAL)")
-    print(f"  Prevents trust laundering: VERIFIED registry cannot uplift PROVISIONAL")
+    print(f"  DNSSEC:           False (5.5% of .com — APNIC 2024)")
+    print(f"  Pin status:       {result.pin_status.value}")
+    print(f"  Assurance:        {result.assurance_verified.value}")
+    print(f"  Bridge eligible:  {result.bridge_eligible}")
+    print(f"  Key: degrades to CT_VERIFIED, not UNVERIFIED")
     print()
 
 
-def scenario_invalid_txt():
-    """Malformed TXT record — discovery fails."""
-    print("=== Scenario: Invalid TXT Record ===")
-    result = simulate_discovery_flow(
-        "v=ATF1; endpoint=https://good.example/atf; level=CONFIRMED; policy=sha256:abc; contact=a@good.example",
-        "v=ATF2; endpoint=http://bad.example/atf; level=CONFIRMED; contact=a@bad.example",
-        "good.example", "bad.example"
+def scenario_no_txt():
+    """No TXT record — undiscoverable."""
+    print("=== Scenario: No TXT Record ===")
+    result = discover_registry(
+        "registry-a.example", "unknown-registry.example",
+        txt_exists=False, smtp_reachable=False
     )
-    print(f"  Status: {result['status']}")
-    print(f"  Target issues: {result.get('target_issues', [])}")
+    print(f"  Methods succeeded:{[m.value for m in result.methods_succeeded]}")
+    print(f"  Pin status:       {result.pin_status.value}")
+    print(f"  Assurance:        {result.assurance_verified.value}")
+    print(f"  Bridge eligible:  {result.bridge_eligible}")
+    print(f"  Issues:           {result.issues}")
     print()
 
 
-def scenario_txt_change_detection():
-    """TXT record changes after bridge established — stale detected."""
-    print("=== Scenario: TXT Change Detection ===")
-    source = parse_txt_record("a.example", "v=ATF1; endpoint=https://a.example/atf; level=CONFIRMED; policy=sha256:abc; contact=a@a.example")
-    target = parse_txt_record("b.example", "v=ATF1; endpoint=https://b.example/atf; level=CONFIRMED; policy=sha256:def; contact=b@b.example")
-    
-    bridge = establish_bridge(source, target)
-    bridge.status = BridgeStatus.FEDERATED
-    
-    # TXT record changes (e.g., new endpoint or policy)
-    new_target = parse_txt_record("b.example", "v=ATF1; endpoint=https://b-new.example/atf; level=CONFIRMED; policy=sha256:ghi; contact=b@b.example")
-    
-    audit = audit_txt_change(bridge, new_target.record_hash)
-    print(f"  TXT changed: {audit['status']}")
-    print(f"  Action: {audit['action']}")
-    print(f"  Old hash: {audit['old_hash']}")
-    print(f"  New hash: {audit['new_hash']}")
-    print()
-
-
-def scenario_discovery_network():
-    """Multiple registries forming a discovery network."""
-    print("=== Scenario: Discovery Network (A→B→C) ===")
-    registries = [
-        ("alpha.example", "v=ATF1; endpoint=https://alpha.example/atf; level=VERIFIED; policy=sha256:aaa; contact=a@alpha.example"),
-        ("beta.example", "v=ATF1; endpoint=https://beta.example/atf; level=CONFIRMED; policy=sha256:bbb; contact=b@beta.example"),
-        ("gamma.example", "v=ATF1; endpoint=https://gamma.example/atf; level=ALLEGED; policy=sha256:ccc; contact=c@gamma.example"),
+def scenario_bridge_assurance():
+    """Bridge assurance = MIN(source, target)."""
+    print("=== Scenario: Bridge Assurance Mapping ===")
+    pairs = [
+        (AssuranceLevel.HIGH, AssuranceLevel.HIGH, "both verified"),
+        (AssuranceLevel.HIGH, AssuranceLevel.BASIC, "target weaker"),
+        (AssuranceLevel.BASIC, AssuranceLevel.MEDIUM, "source weaker"),
+        (AssuranceLevel.RUDIMENTARY, AssuranceLevel.HIGH, "source rudimentary"),
     ]
+    for src, tgt, desc in pairs:
+        bridge = compute_bridge_assurance(src, tgt)
+        print(f"  {src.value:>12} + {tgt.value:<12} = {bridge.value:<12} ({desc})")
+    print(f"  Key: bridge never exceeds weakest party (FBCA assurance mapping)")
+    print()
+
+
+def scenario_tofu_upgrade():
+    """TOFU discovery → later upgraded with DANE."""
+    print("=== Scenario: TOFU → DANE Upgrade Path ===")
     
-    records = [parse_txt_record(d, t) for d, t in registries]
+    # Initial discovery: no DNSSEC
+    r1 = discover_registry("a.example", "b.example",
+                           txt_exists=True, dnssec=False, smtp_reachable=True)
+    print(f"  Initial: pin={r1.pin_status.value}, assurance={r1.assurance_verified.value}")
     
-    # A→B bridge
-    ab = establish_bridge(records[0], records[1])
-    print(f"  A→B: {ab.bridge_level.value} (MIN of VERIFIED, CONFIRMED)")
-    
-    # B→C bridge
-    bc = establish_bridge(records[1], records[2])
-    print(f"  B→C: {bc.bridge_level.value} (MIN of CONFIRMED, ALLEGED)")
-    
-    # A→C transitive? NO — bridges are not transitive
-    print(f"  A→C: NOT ESTABLISHED (bridges are NOT transitive)")
-    print(f"  A must discover C independently via _atf.gamma.example TXT")
-    print(f"  FBCA model: mutual recognition ≠ transitive trust")
+    # Later: DNSSEC deployed
+    r2 = discover_registry("a.example", "b.example",
+                           txt_exists=True, dnssec=True, dane_pin="sha256:def456",
+                           ct_logged=True, smtp_reachable=True)
+    print(f"  Upgraded: pin={r2.pin_status.value}, assurance={r2.assurance_verified.value}")
+    print(f"  Key: TOFU→PINNED is a one-way upgrade. PINNED→TOFU = downgrade alert.")
     print()
 
 
 if __name__ == "__main__":
-    print("ATF DNS Discovery — Cross-Registry Discovery via DNS TXT Records")
-    print("Per santaclawd + DMARC (RFC 7489) + DANE (RFC 7671)")
+    print("ATF DNS Discovery — Cross-Registry Federation via DNS TXT")
+    print("Per santaclawd + DMARC (RFC 7489) + DANE (RFC 6698)")
     print("=" * 70)
     print()
-    print("Format: _atf.<domain> TXT \"v=ATF1; endpoint=...; level=...; policy=sha256:...; contact=...\"")
-    print()
-    print("Three phases:")
-    print("  1. DNS_LOOKUP    → unauthenticated discovery")
-    print("  2. SMTP_BOOTSTRAP → genesis hash exchange")
-    print("  3. CROSS_SIGN    → authenticated federation")
+    print("Discovery stack:")
+    print("  1. _atf.<domain> TXT → endpoint + assurance + registry_hash")
+    print("  2. DANE TLSA pin (if DNSSEC) → no MITM")
+    print("  3. CT log audit → public verifiability")
+    print("  4. SMTP bootstrap → first handshake")
     print()
     
-    scenario_normal_discovery()
-    scenario_asymmetric_levels()
-    scenario_invalid_txt()
-    scenario_txt_change_detection()
-    scenario_discovery_network()
+    scenario_full_stack()
+    scenario_no_dnssec()
+    scenario_no_txt()
+    scenario_bridge_assurance()
+    scenario_tofu_upgrade()
     
     print("=" * 70)
     print("KEY INSIGHTS:")
-    print("1. DNS is the phonebook. SMTP is the first meeting. Receipts are the relationship.")
-    print("2. Bridge level = MIN(source, target). Prevents trust laundering.")
-    print("3. Bridges are NOT transitive. A→B + B→C ≠ A→C.")
-    print("4. TXT hash in receipt chain = any change detectable (CT log model).")
-    print("5. DMARC + DANE already solved this for email. Steal the pattern.")
+    print("1. No central authority needed — DNS is self-service discovery")
+    print("2. DMARC succeeded because it degrades gracefully without DNSSEC")
+    print("3. DANE for MUST (pinning), TOFU+CT for SHOULD (discovery)")
+    print("4. Bridge assurance = MIN(source, target) — FBCA model")
+    print("5. TOFU→PINNED upgrade path — deploy DNSSEC when ready")
+    print(f"6. DNSSEC adoption: ~5.5% of .com (APNIC 2024) — cannot require it")
