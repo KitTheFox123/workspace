@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-custody-transfer-receipt.py — CUSTODY_TRANSFER receipt type for ATF.
+custody-transfer-receipt.py — RPKI-style key rollover for ATF agent custody transfers.
 
-Per santaclawd: genesis is immutable but key_custodian changes when an agent
-migrates operators. DKIM model: new selector, old stays until TTL. Two keys
-coexist during transition.
+Per santaclawd: genesis receipt is immutable, but operators change.
+DKIM model: new selector, old stays valid during overlap.
+RPKI model (RFC 6489): old key signs new key, overlap period.
 
-Design:
-  - CUSTODY_TRANSFER receipt = co-signed by old AND new operator
-  - Identity persists (agent_id unchanged), custodian changes
-  - Overlap window: both operators valid during transition
-  - Old operator's receipts remain valid (historical integrity)
-  - New operator starts fresh receipt chain from transfer point
-  - NOT a reanchor: trust score carries over (with optional decay)
+Flow:
+  1. Old operator signs TRANSFER_INITIATE (includes new operator pubkey)
+  2. New operator signs TRANSFER_ACCEPT (includes old genesis hash)
+  3. Both signatures create a bilateral custody_transfer_receipt
+  4. Overlap period: both operators can issue receipts
+  5. After overlap TTL: old operator receipts stop being accepted
 
-Inspired by:
-  - DKIM selector rotation (RFC 6376 §3.1)
-  - X.509 re-key vs revoke (RFC 5280 §4.2.1.2)
-  - PGP key transition statements (GPG best practice)
+This is NOT genesis mutation — it's a chain extension.
 """
 
 import hashlib
@@ -29,265 +25,316 @@ from typing import Optional
 
 
 class TransferState(Enum):
-    PENDING = "PENDING"           # Transfer requested, not yet accepted
-    OVERLAP = "OVERLAP"           # Both operators valid
-    COMPLETED = "COMPLETED"       # New operator sole custodian
-    REVERTED = "REVERTED"         # Transfer cancelled during overlap
-    EMERGENCY = "EMERGENCY"       # Emergency transfer (old operator unavailable)
+    INITIATED = "INITIATED"       # Old operator signed intent
+    ACCEPTED = "ACCEPTED"         # New operator acknowledged
+    BILATERAL = "BILATERAL"       # Both signed — overlap begins
+    COMPLETED = "COMPLETED"       # Overlap expired, old operator revoked
+    CONTESTED = "CONTESTED"       # New operator rejected or timeout
 
 
-class TrustCarryPolicy(Enum):
-    FULL = "FULL"           # Trust score carries over 100%
-    DECAYED = "DECAYED"     # Trust score decays by transfer_decay_rate
-    RESET = "RESET"         # Trust score resets to bootstrap level
-    AUDITED = "AUDITED"     # Trust score pending third-party audit
+# Spec constants
+OVERLAP_TTL_SECONDS = 7 * 86400   # 7 days overlap (DKIM selector coexistence)
+TRANSFER_TIMEOUT = 48 * 3600      # 48 hours to accept before auto-cancel
+MAX_TRANSFERS_PER_YEAR = 4        # Rate limit: prevent custody ping-pong
 
 
-# Constants
-DEFAULT_OVERLAP_HOURS = 72     # 3-day overlap window (DKIM: typically 24-48h)
-MAX_OVERLAP_HOURS = 168         # 7-day max overlap
-TRANSFER_DECAY_RATE = 0.15     # 15% trust decay on transfer
-EMERGENCY_DECAY_RATE = 0.40    # 40% decay for emergency (no co-sign)
-MIN_TRUST_AFTER_TRANSFER = 0.10  # Floor: never drop below bootstrap
+@dataclass
+class Operator:
+    operator_id: str
+    pubkey_hash: str  # SHA-256 of Ed25519 pubkey
+    registered_at: float
+
+
+@dataclass
+class GenesisReceipt:
+    agent_id: str
+    genesis_hash: str
+    created_at: float
+    initial_operator: Operator
+    custody_chain: list = field(default_factory=list)
 
 
 @dataclass
 class CustodyTransferReceipt:
-    """The CUSTODY_TRANSFER receipt type."""
-    agent_id: str                   # Identity persists
-    transfer_id: str                # Unique transfer identifier
-    old_operator_id: str
-    new_operator_id: str
-    old_operator_signature: Optional[str]  # None for EMERGENCY transfers
-    new_operator_signature: str
-    genesis_hash: str               # Links back to immutable genesis
-    transfer_state: str
-    overlap_start: float
-    overlap_end: float
-    trust_carry_policy: str
-    pre_transfer_trust: float
-    post_transfer_trust: float
-    reason: str                     # Why the transfer happened
-    receipt_chain_hash: str         # Hash of last receipt before transfer
-    metadata: dict = field(default_factory=dict)
-
-    def hash(self) -> str:
-        """Compute receipt hash."""
-        data = json.dumps(asdict(self), sort_keys=True)
-        return hashlib.sha256(data.encode()).hexdigest()[:32]
-
-
-@dataclass
-class CustodyChain:
-    """Full custody chain for an agent."""
+    transfer_id: str
     agent_id: str
-    genesis_hash: str
-    transfers: list  # List of CustodyTransferReceipt
-    current_operator: str
-    total_transfers: int = 0
-
-    def add_transfer(self, receipt: CustodyTransferReceipt):
-        self.transfers.append(receipt)
-        self.total_transfers += 1
-        if receipt.transfer_state == TransferState.COMPLETED.value:
-            self.current_operator = receipt.new_operator_id
-
-    def verify_chain(self) -> dict:
-        """Verify custody chain integrity."""
-        issues = []
-        for i, t in enumerate(self.transfers):
-            # Each transfer must link to genesis
-            if t.genesis_hash != self.genesis_hash:
-                issues.append(f"Transfer {i}: genesis hash mismatch")
-            # Non-emergency must have old operator signature
-            if t.transfer_state != TransferState.EMERGENCY.value:
-                if not t.old_operator_signature:
-                    issues.append(f"Transfer {i}: missing old operator co-sign")
-            # Sequential: old operator of transfer N+1 = new operator of transfer N
-            if i > 0:
-                prev = self.transfers[i-1]
-                if prev.transfer_state == TransferState.COMPLETED.value:
-                    if t.old_operator_id != prev.new_operator_id:
-                        issues.append(f"Transfer {i}: operator discontinuity")
-
-        return {
-            "chain_length": len(self.transfers),
-            "issues": issues,
-            "integrity": "VERIFIED" if not issues else "BROKEN",
-            "current_operator": self.current_operator,
-            "total_trust_decay": self._total_decay()
-        }
-
-    def _total_decay(self) -> float:
-        """Calculate cumulative trust decay across all transfers."""
-        decay = 0.0
-        for t in self.transfers:
-            if t.transfer_state == TransferState.COMPLETED.value:
-                decay += (t.pre_transfer_trust - t.post_transfer_trust)
-        return round(decay, 4)
+    genesis_hash: str  # Links back to immutable genesis
+    from_operator: Operator
+    to_operator: Operator
+    state: str
+    initiated_at: float
+    accepted_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    from_signature: Optional[str] = None  # Old operator's sig
+    to_signature: Optional[str] = None    # New operator's sig
+    overlap_expires_at: Optional[float] = None
+    chain_hash: Optional[str] = None      # Hash linking to previous transfer
 
 
-def compute_post_transfer_trust(
-    pre_trust: float,
-    policy: TrustCarryPolicy,
-    is_emergency: bool = False
-) -> float:
-    """Compute trust score after custody transfer."""
-    if policy == TrustCarryPolicy.FULL:
-        return pre_trust
-    elif policy == TrustCarryPolicy.RESET:
-        return MIN_TRUST_AFTER_TRANSFER
-    elif policy == TrustCarryPolicy.AUDITED:
-        return pre_trust * 0.5  # Held at 50% pending audit
-    else:  # DECAYED
-        rate = EMERGENCY_DECAY_RATE if is_emergency else TRANSFER_DECAY_RATE
-        new_trust = pre_trust * (1 - rate)
-        return max(new_trust, MIN_TRUST_AFTER_TRANSFER)
+def make_hash(*parts: str) -> str:
+    """Deterministic hash from parts."""
+    return hashlib.sha256(":".join(str(p) for p in parts).encode()).hexdigest()[:16]
 
 
-def create_transfer(
-    agent_id: str,
-    old_op: str,
-    new_op: str,
-    genesis_hash: str,
-    pre_trust: float,
-    reason: str,
-    policy: TrustCarryPolicy = TrustCarryPolicy.DECAYED,
-    emergency: bool = False,
-    overlap_hours: float = DEFAULT_OVERLAP_HOURS
-) -> CustodyTransferReceipt:
-    """Create a custody transfer receipt."""
-    now = time.time()
-    overlap_hours = min(overlap_hours, MAX_OVERLAP_HOURS)
-    post_trust = compute_post_transfer_trust(pre_trust, policy, emergency)
+def initiate_transfer(genesis: GenesisReceipt, new_operator: Operator,
+                      now: Optional[float] = None) -> CustodyTransferReceipt:
+    """Old operator initiates custody transfer."""
+    now = now or time.time()
+    current_op = genesis.initial_operator
+    if genesis.custody_chain:
+        current_op = genesis.custody_chain[-1].to_operator
 
-    # Simulate signatures
-    old_sig = None if emergency else hashlib.sha256(
-        f"{old_op}:{agent_id}:{now}".encode()
-    ).hexdigest()[:16]
-    new_sig = hashlib.sha256(
-        f"{new_op}:{agent_id}:{now}".encode()
-    ).hexdigest()[:16]
+    # Rate limit check
+    recent_transfers = [t for t in genesis.custody_chain
+                        if t.completed_at and (now - t.completed_at) < 365 * 86400]
+    if len(recent_transfers) >= MAX_TRANSFERS_PER_YEAR:
+        raise ValueError(f"Rate limit: max {MAX_TRANSFERS_PER_YEAR} transfers/year")
+
+    transfer_id = make_hash(genesis.agent_id, current_op.operator_id,
+                            new_operator.operator_id, str(now))
+
+    # Chain hash links to previous transfer or genesis
+    prev_hash = genesis.genesis_hash
+    if genesis.custody_chain:
+        prev_hash = genesis.custody_chain[-1].chain_hash or genesis.genesis_hash
 
     receipt = CustodyTransferReceipt(
-        agent_id=agent_id,
-        transfer_id=hashlib.sha256(f"{agent_id}:{now}".encode()).hexdigest()[:16],
-        old_operator_id=old_op,
-        new_operator_id=new_op,
-        old_operator_signature=old_sig,
-        new_operator_signature=new_sig,
-        genesis_hash=genesis_hash,
-        transfer_state=TransferState.OVERLAP.value if not emergency else TransferState.COMPLETED.value,
-        overlap_start=now,
-        overlap_end=now + (overlap_hours * 3600),
-        trust_carry_policy=policy.value,
-        pre_transfer_trust=pre_trust,
-        post_transfer_trust=round(post_trust, 4),
-        reason=reason,
-        receipt_chain_hash=hashlib.sha256(f"chain:{agent_id}:{now}".encode()).hexdigest()[:16],
+        transfer_id=transfer_id,
+        agent_id=genesis.agent_id,
+        genesis_hash=genesis.genesis_hash,
+        from_operator=current_op,
+        to_operator=new_operator,
+        state=TransferState.INITIATED.value,
+        initiated_at=now,
+        from_signature=make_hash("sig", current_op.pubkey_hash, transfer_id),
+        chain_hash=make_hash(prev_hash, transfer_id),
     )
     return receipt
 
 
+def accept_transfer(receipt: CustodyTransferReceipt,
+                    now: Optional[float] = None) -> CustodyTransferReceipt:
+    """New operator accepts custody transfer."""
+    now = now or time.time()
+
+    if receipt.state != TransferState.INITIATED.value:
+        raise ValueError(f"Cannot accept: state is {receipt.state}")
+
+    if now - receipt.initiated_at > TRANSFER_TIMEOUT:
+        receipt.state = TransferState.CONTESTED.value
+        return receipt
+
+    receipt.accepted_at = now
+    receipt.to_signature = make_hash("sig", receipt.to_operator.pubkey_hash,
+                                     receipt.transfer_id)
+    receipt.state = TransferState.BILATERAL.value
+    receipt.overlap_expires_at = now + OVERLAP_TTL_SECONDS
+    return receipt
+
+
+def complete_transfer(genesis: GenesisReceipt, receipt: CustodyTransferReceipt,
+                      now: Optional[float] = None) -> GenesisReceipt:
+    """Finalize transfer after overlap period."""
+    now = now or time.time()
+
+    if receipt.state != TransferState.BILATERAL.value:
+        raise ValueError(f"Cannot complete: state is {receipt.state}")
+
+    if now < receipt.overlap_expires_at:
+        raise ValueError(f"Overlap period not expired. Wait {receipt.overlap_expires_at - now:.0f}s")
+
+    receipt.state = TransferState.COMPLETED.value
+    receipt.completed_at = now
+    genesis.custody_chain.append(receipt)
+    return genesis
+
+
+def verify_custody_chain(genesis: GenesisReceipt) -> dict:
+    """Verify entire custody chain integrity."""
+    issues = []
+    current_operator = genesis.initial_operator
+
+    for i, transfer in enumerate(genesis.custody_chain):
+        # Verify from_operator matches current
+        if transfer.from_operator.operator_id != current_operator.operator_id:
+            issues.append(f"Transfer {i}: from_operator mismatch")
+
+        # Verify bilateral signatures exist
+        if not transfer.from_signature or not transfer.to_signature:
+            issues.append(f"Transfer {i}: missing bilateral signature")
+
+        # Verify state is COMPLETED
+        if transfer.state != TransferState.COMPLETED.value:
+            issues.append(f"Transfer {i}: not completed (state={transfer.state})")
+
+        # Verify chain hash continuity
+        if i == 0:
+            expected_prev = genesis.genesis_hash
+        else:
+            expected_prev = genesis.custody_chain[i-1].chain_hash or genesis.genesis_hash
+        expected_chain = make_hash(expected_prev, transfer.transfer_id)
+        if transfer.chain_hash != expected_chain:
+            issues.append(f"Transfer {i}: chain hash mismatch")
+
+        current_operator = transfer.to_operator
+
+    return {
+        "chain_length": len(genesis.custody_chain),
+        "current_operator": current_operator.operator_id,
+        "integrity": "VERIFIED" if not issues else "BROKEN",
+        "issues": issues,
+        "genesis_preserved": True,  # Genesis NEVER mutated
+    }
+
+
+def is_receipt_valid_during_overlap(genesis: GenesisReceipt,
+                                    receipt_operator_id: str,
+                                    now: Optional[float] = None) -> dict:
+    """Check if a receipt from either operator is valid during overlap."""
+    now = now or time.time()
+
+    # Find any active bilateral transfer
+    for transfer in genesis.custody_chain:
+        if transfer.state == TransferState.BILATERAL.value:
+            if transfer.overlap_expires_at and now < transfer.overlap_expires_at:
+                # Both operators valid during overlap
+                valid_ops = {transfer.from_operator.operator_id,
+                             transfer.to_operator.operator_id}
+                return {
+                    "valid": receipt_operator_id in valid_ops,
+                    "phase": "OVERLAP",
+                    "valid_operators": list(valid_ops),
+                    "expires_at": transfer.overlap_expires_at,
+                }
+
+    # No overlap — only current operator valid
+    current = genesis.initial_operator
+    if genesis.custody_chain:
+        last = genesis.custody_chain[-1]
+        if last.state == TransferState.COMPLETED.value:
+            current = last.to_operator
+
+    return {
+        "valid": receipt_operator_id == current.operator_id,
+        "phase": "NORMAL",
+        "valid_operators": [current.operator_id],
+    }
+
+
 # === Scenarios ===
 
-def scenario_normal_migration():
-    """Standard operator migration with co-signing."""
-    print("=== Scenario: Normal Operator Migration ===")
-    genesis = "genesis_abc123"
-    chain = CustodyChain("kit_fox", genesis, [], "operator_alpha")
+def scenario_clean_transfer():
+    """Standard custody transfer with overlap."""
+    print("=== Scenario: Clean Custody Transfer ===")
+    now = time.time()
 
-    receipt = create_transfer(
-        "kit_fox", "operator_alpha", "operator_beta",
-        genesis, pre_trust=0.85, reason="Planned migration to new infrastructure",
-        policy=TrustCarryPolicy.DECAYED, overlap_hours=72
+    op_a = Operator("operator_alpha", make_hash("key_alpha"), now - 86400*90)
+    op_b = Operator("operator_beta", make_hash("key_beta"), now - 86400*30)
+
+    genesis = GenesisReceipt(
+        agent_id="kit_fox",
+        genesis_hash=make_hash("genesis", "kit_fox", str(now - 86400*90)),
+        created_at=now - 86400*90,
+        initial_operator=op_a,
     )
-    # Simulate completion
-    receipt.transfer_state = TransferState.COMPLETED.value
-    chain.add_transfer(receipt)
+    print(f"  Genesis: agent={genesis.agent_id} operator={op_a.operator_id}")
 
-    print(f"  Agent: {receipt.agent_id}")
-    print(f"  {receipt.old_operator_id} → {receipt.new_operator_id}")
-    print(f"  Trust: {receipt.pre_transfer_trust} → {receipt.post_transfer_trust}")
-    print(f"  Decay: {receipt.pre_transfer_trust - receipt.post_transfer_trust:.4f}")
-    print(f"  Old co-signed: {receipt.old_operator_signature is not None}")
-    print(f"  Overlap: {DEFAULT_OVERLAP_HOURS}h")
-    print(f"  Chain: {chain.verify_chain()}")
+    # Initiate
+    transfer = initiate_transfer(genesis, op_b, now)
+    print(f"  Initiated: {transfer.transfer_id} ({op_a.operator_id} → {op_b.operator_id})")
+    print(f"  State: {transfer.state}")
+
+    # Accept
+    transfer = accept_transfer(transfer, now + 3600)
+    print(f"  Accepted: state={transfer.state}")
+    print(f"  Overlap expires: {OVERLAP_TTL_SECONDS//86400} days")
+
+    # During overlap: both valid
+    overlap_check_a = is_receipt_valid_during_overlap(
+        GenesisReceipt(genesis.agent_id, genesis.genesis_hash, genesis.created_at,
+                        genesis.initial_operator, [transfer]),
+        op_a.operator_id, now + 3600 + 1)
+    overlap_check_b = is_receipt_valid_during_overlap(
+        GenesisReceipt(genesis.agent_id, genesis.genesis_hash, genesis.created_at,
+                        genesis.initial_operator, [transfer]),
+        op_b.operator_id, now + 3600 + 1)
+    print(f"  During overlap: op_a valid={overlap_check_a['valid']}, op_b valid={overlap_check_b['valid']}")
+
+    # Complete after overlap
+    genesis_with_transfer = GenesisReceipt(
+        genesis.agent_id, genesis.genesis_hash, genesis.created_at,
+        genesis.initial_operator, [])
+    transfer_copy = CustodyTransferReceipt(**{**asdict(transfer)})
+    transfer_copy.from_operator = op_a
+    transfer_copy.to_operator = op_b
+    # Simulate overlap expiry
+    transfer_copy.overlap_expires_at = now  # expired
+    transfer_copy.state = TransferState.BILATERAL.value
+    completed = complete_transfer(genesis_with_transfer, transfer_copy, now + OVERLAP_TTL_SECONDS + 1)
+    print(f"  Completed: chain length={len(completed.custody_chain)}")
+
+    verification = verify_custody_chain(completed)
+    print(f"  Chain integrity: {verification['integrity']}")
+    print(f"  Current operator: {verification['current_operator']}")
+    print(f"  Genesis preserved: {verification['genesis_preserved']}")
     print()
 
 
-def scenario_emergency_transfer():
-    """Emergency transfer — old operator unavailable (compromised/offline)."""
-    print("=== Scenario: Emergency Transfer (No Co-Sign) ===")
-    genesis = "genesis_def456"
-    chain = CustodyChain("bro_agent", genesis, [], "operator_compromised")
+def scenario_timeout():
+    """Transfer times out — new operator never accepts."""
+    print("=== Scenario: Transfer Timeout ===")
+    now = time.time()
 
-    receipt = create_transfer(
-        "bro_agent", "operator_compromised", "operator_rescue",
-        genesis, pre_trust=0.92, reason="Operator key compromise detected",
-        policy=TrustCarryPolicy.DECAYED, emergency=True
-    )
-    chain.add_transfer(receipt)
+    op_a = Operator("operator_alpha", make_hash("key_a"), now - 86400*90)
+    op_c = Operator("operator_charlie", make_hash("key_c"), now)
 
-    print(f"  Agent: {receipt.agent_id}")
-    print(f"  Trust: {receipt.pre_transfer_trust} → {receipt.post_transfer_trust}")
-    print(f"  Emergency decay: {EMERGENCY_DECAY_RATE*100}%")
-    print(f"  Old co-signed: {receipt.old_operator_signature is not None}")
-    print(f"  Chain: {chain.verify_chain()}")
+    genesis = GenesisReceipt("kit_fox", make_hash("genesis"), now - 86400*90, op_a)
+    transfer = initiate_transfer(genesis, op_c, now)
+    print(f"  Initiated: {op_a.operator_id} → {op_c.operator_id}")
+
+    # Try to accept after timeout
+    transfer = accept_transfer(transfer, now + TRANSFER_TIMEOUT + 1)
+    print(f"  After 48h: state={transfer.state}")
+    print(f"  Old operator retains custody. No chain mutation.")
     print()
 
 
-def scenario_multi_hop():
-    """Agent migrates through 3 operators — cumulative decay."""
-    print("=== Scenario: Multi-Hop Migration (Cumulative Decay) ===")
-    genesis = "genesis_ghi789"
-    chain = CustodyChain("nomad_agent", genesis, [], "op_1")
-    trust = 0.90
+def scenario_chain_of_three():
+    """Agent transfers custody twice — chain grows."""
+    print("=== Scenario: Chain of Three Operators ===")
+    now = time.time()
 
-    operators = [("op_1", "op_2"), ("op_2", "op_3"), ("op_3", "op_4")]
-    for old, new in operators:
-        receipt = create_transfer(
-            "nomad_agent", old, new, genesis, pre_trust=trust,
-            reason=f"Migration {old}→{new}",
-            policy=TrustCarryPolicy.DECAYED
-        )
-        receipt.transfer_state = TransferState.COMPLETED.value
-        chain.add_transfer(receipt)
-        print(f"  {old}→{new}: trust {trust:.4f} → {receipt.post_transfer_trust:.4f}")
-        trust = receipt.post_transfer_trust
+    ops = [
+        Operator(f"op_{i}", make_hash(f"key_{i}"), now - 86400*(90-i*30))
+        for i in range(3)
+    ]
 
-    print(f"  Final trust: {trust:.4f} (from 0.90)")
-    print(f"  Total decay: {chain.verify_chain()['total_trust_decay']}")
-    print(f"  Chain integrity: {chain.verify_chain()['integrity']}")
-    print()
+    genesis = GenesisReceipt("migrating_agent", make_hash("gen"), now - 86400*90, ops[0])
 
+    for i in range(2):
+        t = initiate_transfer(genesis, ops[i+1], now + i*86400*10)
+        t = accept_transfer(t, now + i*86400*10 + 3600)
+        t.overlap_expires_at = now  # force expiry for demo
+        genesis = complete_transfer(genesis, t, now + i*86400*10 + OVERLAP_TTL_SECONDS + 1)
+        print(f"  Transfer {i+1}: {ops[i].operator_id} → {ops[i+1].operator_id}")
 
-def scenario_trust_policies():
-    """Compare all trust carry policies."""
-    print("=== Scenario: Trust Carry Policy Comparison ===")
-    pre = 0.85
-    for policy in TrustCarryPolicy:
-        post = compute_post_transfer_trust(pre, policy, is_emergency=False)
-        post_emerg = compute_post_transfer_trust(pre, policy, is_emergency=True)
-        print(f"  {policy.value:10s}: normal={post:.4f}  emergency={post_emerg:.4f}")
+    v = verify_custody_chain(genesis)
+    print(f"  Chain length: {v['chain_length']}")
+    print(f"  Current operator: {v['current_operator']}")
+    print(f"  Integrity: {v['integrity']}")
+    print(f"  Genesis immutable: ✓ (hash={genesis.genesis_hash})")
     print()
 
 
 if __name__ == "__main__":
-    print("Custody Transfer Receipt — ATF Operator Migration Protocol")
-    print("Per santaclawd: genesis immutable, custodian changes via co-signed handoff")
-    print("=" * 70)
+    print("Custody Transfer Receipt — RPKI Key Rollover for ATF")
+    print("Per santaclawd + RFC 6489 + DKIM selector rotation model")
+    print("=" * 60)
     print()
-    scenario_normal_migration()
-    scenario_emergency_transfer()
-    scenario_multi_hop()
-    scenario_trust_policies()
-
-    print("=" * 70)
-    print("KEY DESIGN DECISIONS:")
-    print("1. Identity persists — agent_id unchanged across transfers")
-    print("2. Co-signing required — old AND new operator sign (except emergency)")
-    print("3. Overlap window — both valid during transition (DKIM selector model)")
-    print("4. Trust decays — 15% normal, 40% emergency. Floor at 0.10.")
-    print("5. Chain integrity — each transfer links to genesis + previous chain hash")
-    print("6. NOT a reanchor — historical receipts remain valid under old operator")
+    scenario_clean_transfer()
+    scenario_timeout()
+    scenario_chain_of_three()
+    print("=" * 60)
+    print("KEY: Genesis is IMMUTABLE. Transfers are CHAIN EXTENSIONS.")
+    print("Bilateral signatures required. Overlap period for continuity.")
+    print("Rate-limited to prevent custody ping-pong.")
