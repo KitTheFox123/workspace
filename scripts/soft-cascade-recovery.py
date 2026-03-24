@@ -1,311 +1,336 @@
 #!/usr/bin/env python3
 """
-soft-cascade-recovery.py — SOFT_CASCADE recovery paths for ATF V1.1.
+soft-cascade-recovery.py — SOFT_CASCADE recovery for ATF DEGRADED→HEALTHY path.
 
-Per santaclawd: four primitives confirmed (PROBE_TIMEOUT, ALLEGED, CO_GRADER, DELEGATION).
-Next gap: what happens when a grader in the chain is revoked?
+Per santaclawd: "next gap = SOFT_CASCADE recovery."
+Four primitives confirmed (PROBE_TIMEOUT, ALLEGED, CO_GRADER, DELEGATION).
+This handles the gap between DEGRADED and REJECT.
 
-Two recovery paths:
-  RE_ATTEST    — Agent seeks new grader, fresh attestation chain (inherits decay curve)
-  DEGRADE      — Existing grade decays to floor, no re-attestation
+Three recovery modes:
+  RE_ATTEST   — Grader alive but stale. Cheapest path. Request fresh attestation.
+  REPLACE     — Grader revoked/unavailable. Find new grader. Migration receipt.
+  ORPHAN      — No eligible grader. BOOTSTRAP_REQUEST redux.
 
-RFC 5280 parallel: revoked intermediate CA → certificates below can be
-re-issued under different intermediate (cross-certification, RFC 5217).
+Key insight from ElSalamouny et al. (TCS 2009): exponential decay principle —
+decay tracks evidence staleness, not observer state. CO_GRADER inherits decay curve.
 
-Key constraint: decay curve is evidence staleness, not grader state.
-New grader inherits T_elapsed (Jacobson-Karels: new sample updates estimate,
-variance history persists).
+Decay model: weight = 0.5 * exp(-lambda * T_elapsed)
+  lambda = SPEC_CONSTANT (0.1), FLOOR = 0.05
+  grader-defined lambda = gaming surface (lambda=0.001 → ALLEGED never decays)
 """
 
+import hashlib
 import math
 import time
-import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class RecoveryPath(Enum):
-    RE_ATTEST = "RE_ATTEST"        # Seek new grader
-    DEGRADE_IN_PLACE = "DEGRADE"   # Decay to floor
-    QUARANTINE = "QUARANTINE"      # Freeze pending review
-
-
-class CascadeType(Enum):
-    HARD = "HARD"    # Root/genesis revoked → all downstream REJECT
-    SOFT = "SOFT"    # Intermediate revoked → downstream DEGRADED + recovery window
-
-
-class AgentState(Enum):
+class TrustState(Enum):
     HEALTHY = "HEALTHY"
     DEGRADED = "DEGRADED"
-    RECOVERING = "RECOVERING"
-    QUARANTINED = "QUARANTINED"
+    SUSPENDED = "SUSPENDED"
     REJECTED = "REJECTED"
 
 
+class RecoveryMode(Enum):
+    RE_ATTEST = "RE_ATTEST"      # Grader alive, just stale
+    REPLACE = "REPLACE"          # Grader revoked, find new
+    ORPHAN = "ORPHAN"            # No eligible grader
+
+
+class RecoveryStatus(Enum):
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    RECOVERED = "RECOVERED"
+    FAILED = "FAILED"
+    ESCALATED = "ESCALATED"
+
+
 # SPEC_CONSTANTS
-LAMBDA_DECAY = 0.1           # Exponential decay rate (SPEC_CONSTANT, not grader-defined)
-RECOVERY_WINDOW_HOURS = 72   # Time to find new grader before REJECT
-GRADE_FLOOR = 0.2            # Minimum grade during degradation
-RE_ATTEST_GRACE_HOURS = 24   # Grace period for re-attestation
-MAX_DELEGATION_DEPTH = 3
+LAMBDA_DECAY = 0.1           # Exponential decay rate
+LAMBDA_FLOOR = 0.05          # Minimum lambda (stricter OK, looser REJECTED)
+ALLEGED_INITIAL_WEIGHT = 0.5 # Starting weight for ALLEGED receipts
+GRACE_PERIOD_HOURS = 72      # Before DEGRADED → SUSPENDED
+RE_ATTEST_TIMEOUT_HOURS = 24 # Time for grader to respond to RE_ATTEST
+REPLACE_TIMEOUT_HOURS = 168  # 7 days to find replacement grader
+ORPHAN_TIMEOUT_HOURS = 720   # 30 days before ORPHAN → REJECTED
+MIN_GRADER_DIVERSITY = 2     # Minimum independent graders for recovery
 
 
 @dataclass
-class Grader:
+class GraderInfo:
     grader_id: str
     operator: str
-    is_revoked: bool = False
-    revoked_at: Optional[float] = None
+    is_alive: bool
+    is_revoked: bool
+    last_attestation_age_hours: float
+    co_sign_rate: float
 
 
 @dataclass
-class AttestationChain:
+class Agent:
     agent_id: str
-    graders: list[Grader]
-    current_grade: float
-    grade_issued_at: float
-    evidence_age_hours: float  # T_elapsed for ALLEGED decay
+    current_state: TrustState
+    current_grade: str  # A-F
+    grader: GraderInfo
+    alleged_receipts: list = field(default_factory=list)
     delegation_depth: int = 0
+    degraded_since_hours: float = 0.0
 
 
 @dataclass
 class RecoveryPlan:
     agent_id: str
-    cascade_type: CascadeType
-    recovery_path: RecoveryPath
-    current_state: AgentState
-    grade_before: float
-    grade_after: float
-    decay_curve_inherited: bool  # Does new grader inherit T_elapsed?
-    recovery_deadline: Optional[float] = None
-    new_grader: Optional[str] = None
-    explanation: str = ""
+    mode: RecoveryMode
+    status: RecoveryStatus
+    steps: list = field(default_factory=list)
+    timeout_hours: float = 0.0
+    fallback_mode: Optional[RecoveryMode] = None
+    decay_inherited: bool = True  # ElSalamouny: inherit, don't reset
 
 
-def alleged_weight(t_elapsed_hours: float) -> float:
-    """ALLEGED receipt weight with exponential decay. SPEC_CONSTANT lambda."""
-    return 0.5 * math.exp(-LAMBDA_DECAY * t_elapsed_hours)
-
-
-def compute_degraded_grade(original_grade: float, hours_since_revocation: float) -> float:
-    """Grade decay after grader revocation."""
-    decay_factor = math.exp(-0.05 * hours_since_revocation)
-    degraded = original_grade * decay_factor
-    return max(degraded, GRADE_FLOOR)
-
-
-def classify_cascade(chain: AttestationChain, revoked_grader_idx: int) -> CascadeType:
-    """Determine HARD vs SOFT cascade based on which grader was revoked."""
-    if revoked_grader_idx == 0:
-        # Root grader revoked = HARD cascade
-        return CascadeType.HARD
-    else:
-        # Intermediate grader = SOFT cascade
-        return CascadeType.SOFT
-
-
-def plan_recovery(chain: AttestationChain, revoked_grader_idx: int,
-                  hours_since_revocation: float = 0) -> RecoveryPlan:
-    """Generate recovery plan for a revoked grader in the chain."""
-    cascade = classify_cascade(chain, revoked_grader_idx)
+def compute_alleged_weight(t_elapsed_hours: float, lambda_val: float = LAMBDA_DECAY) -> float:
+    """
+    Compute ALLEGED receipt weight with exponential decay.
+    weight = 0.5 * exp(-lambda * T)
     
-    if cascade == CascadeType.HARD:
-        # HARD cascade: root revoked → REJECT, no recovery within this chain
-        return RecoveryPlan(
-            agent_id=chain.agent_id,
-            cascade_type=CascadeType.HARD,
-            recovery_path=RecoveryPath.QUARANTINE,
-            current_state=AgentState.REJECTED,
-            grade_before=chain.current_grade,
-            grade_after=0.0,
-            decay_curve_inherited=False,
-            explanation="Root grader revoked. HARD_CASCADE → REJECT. "
-                       "Agent must bootstrap new chain from different root. "
-                       "RFC 5280: root CA compromise invalidates entire PKI."
+    Per ElSalamouny et al. (TCS 2009): decay tracks evidence staleness.
+    """
+    if lambda_val < LAMBDA_FLOOR:
+        lambda_val = LAMBDA_FLOOR  # Enforce floor
+    return ALLEGED_INITIAL_WEIGHT * math.exp(-lambda_val * t_elapsed_hours)
+
+
+def classify_recovery_mode(agent: Agent) -> RecoveryMode:
+    """Determine cheapest recovery path."""
+    grader = agent.grader
+    
+    if grader.is_revoked:
+        # Check if any other grader available
+        return RecoveryMode.REPLACE
+    
+    if not grader.is_alive:
+        if grader.last_attestation_age_hours > REPLACE_TIMEOUT_HOURS:
+            return RecoveryMode.ORPHAN  # Long-dead grader, likely no replacement
+        return RecoveryMode.REPLACE
+    
+    # Grader alive but stale
+    if grader.last_attestation_age_hours > GRACE_PERIOD_HOURS:
+        return RecoveryMode.RE_ATTEST
+    
+    # Not actually degraded?
+    return RecoveryMode.RE_ATTEST
+
+
+def build_recovery_plan(agent: Agent) -> RecoveryPlan:
+    """Build recovery plan with fallback chain."""
+    mode = classify_recovery_mode(agent)
+    
+    if mode == RecoveryMode.RE_ATTEST:
+        steps = [
+            f"1. Send RE_ATTESTATION_REQUEST to grader {agent.grader.grader_id}",
+            f"2. Wait {RE_ATTEST_TIMEOUT_HOURS}h for response",
+            "3. If response: verify fresh attestation, compute new grade",
+            "4. If no response: escalate to REPLACE mode",
+            "5. ALLEGED receipts during gap: weight decayed (inherited curve)"
+        ]
+        timeout = RE_ATTEST_TIMEOUT_HOURS
+        fallback = RecoveryMode.REPLACE
+        
+    elif mode == RecoveryMode.REPLACE:
+        steps = [
+            f"1. Mark grader {agent.grader.grader_id} as UNAVAILABLE",
+            "2. Broadcast GRADER_MIGRATION_REQUEST to registry",
+            "3. Candidate graders submit bids (co-sign rate + operator diversity)",
+            f"4. Wait {REPLACE_TIMEOUT_HOURS}h for candidates",
+            "5. Select grader: highest co-sign rate from different operator",
+            "6. Issue GRADER_MIGRATION_RECEIPT (old_grader → new_grader)",
+            "7. New grader INHERITS decay curve (ElSalamouny: staleness is evidence, not observer)",
+            "8. If no candidates: escalate to ORPHAN mode"
+        ]
+        timeout = REPLACE_TIMEOUT_HOURS
+        fallback = RecoveryMode.ORPHAN
+        
+    else:  # ORPHAN
+        steps = [
+            "1. No eligible grader found. Agent enters ORPHAN state.",
+            "2. Issue BOOTSTRAP_REQUEST (cold-start redux)",
+            "3. Wilson CI ceiling applies: n=1→0.21, n=5→0.57",
+            f"4. {ORPHAN_TIMEOUT_HOURS}h to find bootstrap grader",
+            "5. If timeout: DEGRADED → SUSPENDED → REJECTED",
+            "6. Existing ALLEGED receipts: weight continues decaying",
+            "7. Recovery requires operator intervention (genesis-level)"
+        ]
+        timeout = ORPHAN_TIMEOUT_HOURS
+        fallback = None
+    
+    return RecoveryPlan(
+        agent_id=agent.agent_id,
+        mode=mode,
+        status=RecoveryStatus.PENDING,
+        steps=steps,
+        timeout_hours=timeout,
+        fallback_mode=fallback,
+        decay_inherited=True
+    )
+
+
+def simulate_decay_during_recovery(t_hours: list[float]) -> list[dict]:
+    """Show ALLEGED weight decay during recovery window."""
+    results = []
+    for t in t_hours:
+        weight = compute_alleged_weight(t)
+        grade_equivalent = (
+            "A" if weight > 0.4 else
+            "B" if weight > 0.3 else
+            "C" if weight > 0.2 else
+            "D" if weight > 0.1 else
+            "F"
         )
-    
-    # SOFT cascade: intermediate revoked
-    degraded_grade = compute_degraded_grade(chain.current_grade, hours_since_revocation)
-    
-    if hours_since_revocation > RECOVERY_WINDOW_HOURS:
-        # Recovery window expired
-        return RecoveryPlan(
-            agent_id=chain.agent_id,
-            cascade_type=CascadeType.SOFT,
-            recovery_path=RecoveryPath.DEGRADE_IN_PLACE,
-            current_state=AgentState.REJECTED,
-            grade_before=chain.current_grade,
-            grade_after=0.0,
-            decay_curve_inherited=False,
-            recovery_deadline=hours_since_revocation,
-            explanation=f"Recovery window expired ({hours_since_revocation:.0f}h > "
-                       f"{RECOVERY_WINDOW_HOURS}h). SOFT_CASCADE → REJECT. "
-                       "Must bootstrap new chain."
-        )
-    
-    if degraded_grade > GRADE_FLOOR:
-        # Still within recovery window, grade above floor
-        return RecoveryPlan(
-            agent_id=chain.agent_id,
-            cascade_type=CascadeType.SOFT,
-            recovery_path=RecoveryPath.RE_ATTEST,
-            current_state=AgentState.RECOVERING,
-            grade_before=chain.current_grade,
-            grade_after=degraded_grade,
-            decay_curve_inherited=True,  # KEY: new grader inherits T_elapsed
-            recovery_deadline=RECOVERY_WINDOW_HOURS - hours_since_revocation,
-            explanation=f"Intermediate grader revoked. SOFT_CASCADE → RECOVERING. "
-                       f"Grade decayed {chain.current_grade:.2f} → {degraded_grade:.2f}. "
-                       f"{RECOVERY_WINDOW_HOURS - hours_since_revocation:.0f}h to find new grader. "
-                       "New grader inherits evidence decay curve (T_elapsed preserved). "
-                       "Jacobson-Karels: new sample updates estimate, variance persists."
-        )
-    else:
-        # Grade at floor
-        return RecoveryPlan(
-            agent_id=chain.agent_id,
-            cascade_type=CascadeType.SOFT,
-            recovery_path=RecoveryPath.DEGRADE_IN_PLACE,
-            current_state=AgentState.DEGRADED,
-            grade_before=chain.current_grade,
-            grade_after=GRADE_FLOOR,
-            decay_curve_inherited=True,
-            recovery_deadline=RECOVERY_WINDOW_HOURS - hours_since_revocation,
-            explanation=f"Grade at floor ({GRADE_FLOOR}). Agent operational but degraded. "
-                       f"{RECOVERY_WINDOW_HOURS - hours_since_revocation:.0f}h to recover."
-        )
+        results.append({
+            "t_hours": t,
+            "weight": round(weight, 4),
+            "grade_equivalent": grade_equivalent,
+            "usable": weight > 0.05
+        })
+    return results
 
 
-def fleet_recovery_audit(chains: list[tuple[AttestationChain, int, float]]) -> dict:
-    """Audit fleet of agents for cascade recovery status."""
-    plans = []
-    state_counts = {}
-    for chain, revoked_idx, hours in chains:
-        plan = plan_recovery(chain, revoked_idx, hours)
-        plans.append(plan)
-        state_counts[plan.current_state.value] = state_counts.get(plan.current_state.value, 0) + 1
-    
-    at_risk = sum(1 for p in plans if p.current_state in 
-                  {AgentState.RECOVERING, AgentState.DEGRADED})
-    
-    return {
-        "total_agents": len(plans),
-        "state_distribution": state_counts,
-        "at_risk": at_risk,
-        "plans": plans
-    }
+def compute_double_decay(t_hours: float, delegation_depth: int) -> float:
+    """
+    ALLEGED + DELEGATION double-decay.
+    Per santaclawd: compounding uncertainty = compounding staleness.
+    """
+    alleged_weight = compute_alleged_weight(t_hours)
+    delegation_factor = max(0, 1.0 - (delegation_depth * 0.25))  # 1/hop decay
+    return round(alleged_weight * delegation_factor, 4)
 
 
 # === Scenarios ===
 
-def scenario_intermediate_revoked():
-    """Intermediate grader revoked — SOFT cascade with recovery."""
-    print("=== Scenario: Intermediate Grader Revoked (SOFT CASCADE) ===")
-    
-    chain = AttestationChain(
+def scenario_re_attest():
+    """Grader alive but stale — cheapest recovery."""
+    print("=== Scenario: RE_ATTEST — Stale Grader ===")
+    agent = Agent(
         agent_id="kit_fox",
-        graders=[
-            Grader("root_grader", "op_trusted"),
-            Grader("mid_grader", "op_mid", is_revoked=True),
-            Grader("leaf_grader", "op_leaf")
-        ],
-        current_grade=0.85,
-        grade_issued_at=time.time() - 86400,
-        evidence_age_hours=12.0,
-        delegation_depth=1
+        current_state=TrustState.DEGRADED,
+        current_grade="B",
+        grader=GraderInfo("grader_alpha", "op_1", is_alive=True, is_revoked=False,
+                          last_attestation_age_hours=96, co_sign_rate=0.85),
+        degraded_since_hours=24
     )
     
-    for hours in [0, 12, 48, 80]:
-        plan = plan_recovery(chain, revoked_grader_idx=1, hours_since_revocation=hours)
-        print(f"  T+{hours}h: state={plan.current_state.value} "
-              f"grade={plan.grade_after:.3f} path={plan.recovery_path.value}")
-        if plan.recovery_deadline is not None:
-            print(f"    deadline: {plan.recovery_deadline:.0f}h remaining")
+    plan = build_recovery_plan(agent)
+    print(f"  Mode: {plan.mode.value}")
+    print(f"  Timeout: {plan.timeout_hours}h")
+    print(f"  Fallback: {plan.fallback_mode.value if plan.fallback_mode else 'NONE'}")
+    print(f"  Decay inherited: {plan.decay_inherited}")
+    for step in plan.steps:
+        print(f"    {step}")
+    
+    # Show decay during recovery
+    decay = simulate_decay_during_recovery([0, 6, 12, 24, 48, 72])
+    print(f"\n  ALLEGED weight decay during recovery:")
+    for d in decay:
+        print(f"    T+{d['t_hours']:3.0f}h: weight={d['weight']:.4f} grade≈{d['grade_equivalent']} usable={d['usable']}")
     print()
 
 
-def scenario_root_revoked():
-    """Root grader revoked — HARD cascade."""
-    print("=== Scenario: Root Grader Revoked (HARD CASCADE) ===")
-    
-    chain = AttestationChain(
-        agent_id="compromised_agent",
-        graders=[Grader("root", "op_root", is_revoked=True)],
-        current_grade=0.92,
-        grade_issued_at=time.time(),
-        evidence_age_hours=2.0
+def scenario_grader_revoked():
+    """Grader revoked — need replacement."""
+    print("=== Scenario: REPLACE — Grader Revoked ===")
+    agent = Agent(
+        agent_id="new_agent",
+        current_state=TrustState.DEGRADED,
+        current_grade="C",
+        grader=GraderInfo("grader_bad", "op_compromised", is_alive=True, is_revoked=True,
+                          last_attestation_age_hours=48, co_sign_rate=0.30),
+        degraded_since_hours=48
     )
     
-    plan = plan_recovery(chain, revoked_grader_idx=0)
-    print(f"  State: {plan.current_state.value}")
-    print(f"  Grade: {plan.grade_before:.2f} → {plan.grade_after:.2f}")
-    print(f"  Path: {plan.recovery_path.value}")
-    print(f"  {plan.explanation}")
+    plan = build_recovery_plan(agent)
+    print(f"  Mode: {plan.mode.value}")
+    print(f"  Timeout: {plan.timeout_hours}h")
+    print(f"  Fallback: {plan.fallback_mode.value if plan.fallback_mode else 'NONE'}")
+    for step in plan.steps:
+        print(f"    {step}")
     print()
 
 
-def scenario_alleged_decay_inheritance():
-    """New grader inherits ALLEGED decay curve."""
-    print("=== Scenario: ALLEGED Decay Curve Inheritance ===")
+def scenario_orphan():
+    """No grader available — bootstrap redux."""
+    print("=== Scenario: ORPHAN — No Eligible Grader ===")
+    agent = Agent(
+        agent_id="isolated_agent",
+        current_state=TrustState.DEGRADED,
+        current_grade="D",
+        grader=GraderInfo("grader_dead", "op_gone", is_alive=False, is_revoked=False,
+                          last_attestation_age_hours=500, co_sign_rate=0.0),
+        degraded_since_hours=168
+    )
     
-    print("  ALLEGED weight at different T_elapsed:")
-    for t in [0, 1, 5, 12, 24, 48, 72]:
-        w = alleged_weight(t)
-        print(f"    T+{t:2d}h: weight={w:.4f}")
-    
-    print()
-    print("  Key insight: new grader sees SAME T_elapsed.")
-    print("  CO_GRADER supersession resets GRADER trust, not EVIDENCE age.")
-    print("  Lambda=0.1 is SPEC_CONSTANT — grader cannot speed up/slow decay.")
+    plan = build_recovery_plan(agent)
+    print(f"  Mode: {plan.mode.value}")
+    print(f"  Timeout: {plan.timeout_hours}h")
+    print(f"  Fallback: {plan.fallback_mode}")
+    for step in plan.steps:
+        print(f"    {step}")
     print()
 
 
-def scenario_fleet_audit():
-    """Fleet-level cascade recovery audit."""
-    print("=== Scenario: Fleet Recovery Audit ===")
-    now = time.time()
-    
-    chains = [
-        (AttestationChain("agent_a", [Grader("g1", "op1"), Grader("g2", "op2", True)],
-                          0.90, now, 6.0), 1, 6),
-        (AttestationChain("agent_b", [Grader("g1", "op1"), Grader("g2", "op2", True)],
-                          0.75, now, 24.0), 1, 48),
-        (AttestationChain("agent_c", [Grader("g1", "op1", True)],
-                          0.88, now, 2.0), 0, 1),
-        (AttestationChain("agent_d", [Grader("g1", "op1"), Grader("g3", "op3")],
-                          0.92, now, 1.0), 1, 0),
-        (AttestationChain("agent_e", [Grader("g1", "op1"), Grader("g2", "op2", True)],
-                          0.60, now, 80.0), 1, 80),
-    ]
-    
-    audit = fleet_recovery_audit(chains)
-    print(f"  Fleet: {audit['total_agents']} agents")
-    print(f"  States: {audit['state_distribution']}")
-    print(f"  At risk: {audit['at_risk']}")
-    for plan in audit['plans']:
-        print(f"    {plan.agent_id}: {plan.current_state.value} "
-              f"({plan.grade_before:.2f}→{plan.grade_after:.2f}) "
-              f"via {plan.recovery_path.value}")
+def scenario_double_decay():
+    """ALLEGED + DELEGATION compounding decay."""
+    print("=== Scenario: Double Decay (ALLEGED + DELEGATION) ===")
+    print("  Per santaclawd: compounding uncertainty = compounding staleness")
     print()
+    
+    for depth in [0, 1, 2, 3]:
+        for t in [1, 12, 24, 72]:
+            weight = compute_double_decay(t, depth)
+            alleged_only = compute_alleged_weight(t)
+            print(f"  depth={depth} t={t:3d}h: alleged={alleged_only:.4f} "
+                  f"double_decay={weight:.4f} "
+                  f"{'USABLE' if weight > 0.05 else 'EXPIRED'}")
+        print()
+
+
+def scenario_lambda_gaming():
+    """Demonstrate why lambda must be SPEC_CONSTANT."""
+    print("=== Scenario: Lambda Gaming Prevention ===")
+    print("  Why grader-defined lambda = gaming surface")
+    print()
+    
+    for label, lam in [("SPEC_DEFAULT (0.1)", 0.1), 
+                        ("Gaming attempt (0.001)", 0.001),
+                        ("Enforced floor (0.05)", 0.05)]:
+        w24 = compute_alleged_weight(24, lam)
+        w168 = compute_alleged_weight(168, lam)
+        print(f"  {label}:")
+        print(f"    T+24h:  weight={w24:.4f}")
+        print(f"    T+168h: weight={w168:.4f}")
+        if lam < LAMBDA_FLOOR:
+            print(f"    ⚠ REJECTED: lambda {lam} < FLOOR {LAMBDA_FLOOR}")
+        print()
 
 
 if __name__ == "__main__":
-    print("Soft-Cascade Recovery — ATF V1.1 Grader Revocation Recovery")
-    print("Per santaclawd: four primitives confirmed, SOFT_CASCADE = next gap")
+    print("Soft-Cascade Recovery — DEGRADED→HEALTHY Path for ATF V1.1")
+    print("Per santaclawd + ElSalamouny et al. (TCS 2009)")
     print("=" * 70)
     print()
     
-    scenario_intermediate_revoked()
-    scenario_root_revoked()
-    scenario_alleged_decay_inheritance()
-    scenario_fleet_audit()
+    scenario_re_attest()
+    scenario_grader_revoked()
+    scenario_orphan()
+    scenario_double_decay()
+    scenario_lambda_gaming()
     
     print("=" * 70)
     print("KEY INSIGHTS:")
-    print("1. HARD cascade (root) = REJECT, no recovery in same chain")
-    print("2. SOFT cascade (intermediate) = DEGRADED + 72h recovery window")
-    print("3. New grader INHERITS decay curve (evidence age, not grader state)")
-    print("4. Lambda=0.1 is SPEC_CONSTANT, not grader-defined (Axiom 1)")
-    print("5. Grade floor=0.2 prevents total collapse during recovery")
+    print("1. Three recovery modes: RE_ATTEST (cheapest) → REPLACE → ORPHAN")
+    print("2. CO_GRADER inherits decay curve (ElSalamouny: staleness is evidence)")
+    print("3. Lambda = SPEC_CONSTANT, not grader-defined (gaming surface)")
+    print("4. ALLEGED+DELEGATION = double decay (compounding uncertainty)")
+    print("5. ORPHAN = BOOTSTRAP_REQUEST redux (Wilson CI cold-start)")
