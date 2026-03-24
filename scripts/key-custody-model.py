@@ -1,289 +1,325 @@
 #!/usr/bin/env python3
 """
-key-custody-model.py — DKIM-style key custody for ATF genesis receipts.
+key-custody-model.py — DKIM-inspired key custody models for ATF genesis.
 
 Per santaclawd: "who holds the signing key = who vouches for the agent."
-Gap: ATF genesis doesn't specify key_custodian.
+Three models: OPERATOR_HELD, AGENT_HELD, DELEGATED (threshold).
 
-DKIM answer: domain holds key, publishes via DNS TXT, delegates via selectors.
-Three custody models:
-  OPERATOR_HELD  — Operator signs on agent's behalf (like ESP signing DKIM)
-  AGENT_HELD     — Agent holds own key (autonomous but vulnerable to loss)
-  SPLIT_CUSTODY  — M-of-N threshold between operator + agent (HSM model)
-
-Key rotation = new selector, old expires. RFC 6376 §3.3.4.
+DKIM key management (RFC 6376): domain publishes public key via DNS TXT,
+private key held by MTA. Selector allows key rotation without identity change.
+ATF needs equivalent: key_custodian in genesis, rotation ≠ revocation.
 """
 
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
 class CustodyModel(Enum):
-    OPERATOR_HELD = "OPERATOR_HELD"   # ESP/provider model
-    AGENT_HELD = "AGENT_HELD"         # Autonomous model
-    SPLIT_CUSTODY = "SPLIT_CUSTODY"   # M-of-N threshold
+    OPERATOR_HELD = "OPERATOR_HELD"    # Like DKIM: operator signs on behalf of agent
+    AGENT_HELD = "AGENT_HELD"          # Agent holds own key, autonomous
+    DELEGATED = "DELEGATED"            # Threshold/HSM, Shamir (1979) style
+    UNDEFINED = "UNDEFINED"            # Gap: genesis doesn't declare
 
 
-class KeyStatus(Enum):
-    ACTIVE = "ACTIVE"
-    ROTATING = "ROTATING"       # New key active, old still valid
-    REVOKED = "REVOKED"
-    EXPIRED = "EXPIRED"
+class KeyEvent(Enum):
+    GENESIS = "GENESIS"                # Initial key binding
+    ROTATION = "ROTATION"              # Key replaced, identity preserved (DKIM selector change)
+    REVOCATION = "REVOCATION"          # Key permanently invalidated
+    COMPROMISE = "COMPROMISE"          # Key known compromised, emergency revoke
+    DELEGATION = "DELEGATION"          # Key custody transferred to new holder
+    RECOVERY = "RECOVERY"              # Key restored from backup/threshold reconstruction
 
 
 # SPEC_CONSTANTS
-MAX_KEY_AGE_DAYS = 90           # DKIM best practice: rotate every 90 days
-ROTATION_OVERLAP_DAYS = 7       # Both keys valid during rotation
-MIN_KEY_BITS = 2048             # RFC 8301: minimum RSA key size
-SPLIT_CUSTODY_THRESHOLD = 2     # M in M-of-N
-SPLIT_CUSTODY_TOTAL = 3         # N in M-of-N
+MAX_KEY_AGE_DAYS = 365          # DKIM best practice: rotate annually
+MIN_KEY_SIZE_BITS = 2048        # RSA 2048 minimum (DKIM moved from 1024)
+ROTATION_GRACE_DAYS = 30        # Old key valid during rotation window
+COMPROMISE_RESPONSE_HOURS = 1   # Emergency revocation SLA
 
 
 @dataclass
-class SigningKey:
-    key_id: str
-    selector: str               # DKIM selector equivalent
-    custodian: CustodyModel
+class KeyState:
+    key_hash: str                      # SHA-256 of public key
+    custody_model: CustodyModel
+    custodian_id: str                  # Who holds the private key
+    selector: str                      # DKIM-style selector for key lookup
     created_at: float
-    expires_at: float
-    status: KeyStatus = KeyStatus.ACTIVE
-    key_bits: int = 2048
-    algorithm: str = "Ed25519"  # Modern default
-    operator_id: Optional[str] = None
-    split_holders: list = field(default_factory=list)
-    rotation_successor: Optional[str] = None
+    expires_at: Optional[float] = None
+    rotated_from: Optional[str] = None  # Previous key_hash
+    status: str = "ACTIVE"             # ACTIVE, ROTATING, REVOKED, COMPROMISED
 
 
 @dataclass
-class GenesisKeyField:
-    """Proposed ATF genesis field for key custody."""
-    custody_model: str
-    active_selector: str
-    key_algorithm: str
-    key_bits: int
-    rotation_policy_days: int
-    operator_id: Optional[str] = None
-    split_threshold: Optional[int] = None
-    split_total: Optional[int] = None
+class GenesisKeyDeclaration:
+    """Key custody declaration in ATF genesis receipt."""
+    agent_id: str
+    custody_model: CustodyModel
+    initial_key_hash: str
+    custodian_id: str
+    selector: str
+    rotation_policy: str               # "MANUAL", "SCHEDULED_90D", "ON_COMPROMISE"
+    recovery_method: str               # "OPERATOR_REISSUE", "THRESHOLD_3OF5", "NONE"
+    key_size_bits: int
 
 
-def create_selector(agent_id: str, timestamp: float) -> str:
-    """Generate DKIM-style selector: agent_timestamp._atfkey"""
-    ts = int(timestamp)
-    h = hashlib.sha256(f"{agent_id}:{ts}".encode()).hexdigest()[:8]
-    return f"{h}._atfkey.{agent_id}"
+def hash_key(key_material: str) -> str:
+    return hashlib.sha256(key_material.encode()).hexdigest()[:16]
 
 
-def validate_key(key: SigningKey) -> dict:
-    """Validate a signing key against ATF SPEC_CONSTANTS."""
+def validate_genesis_key(decl: GenesisKeyDeclaration) -> dict:
+    """Validate key custody declaration in genesis."""
     issues = []
     grade = "A"
     
-    now = time.time()
-    age_days = (now - key.created_at) / 86400
-    
-    # Key age
-    if age_days > MAX_KEY_AGE_DAYS:
-        issues.append(f"KEY_EXPIRED: {age_days:.0f} days old (max {MAX_KEY_AGE_DAYS})")
-        grade = "F"
-    elif age_days > MAX_KEY_AGE_DAYS * 0.8:
-        issues.append(f"KEY_AGING: {age_days:.0f} days old, rotation due")
-        grade = min(grade, "B")
-    
-    # Key size (RSA only)
-    if key.algorithm == "RSA" and key.key_bits < MIN_KEY_BITS:
-        issues.append(f"KEY_WEAK: {key.key_bits} bits (min {MIN_KEY_BITS})")
+    # MUST: custody model declared
+    if decl.custody_model == CustodyModel.UNDEFINED:
+        issues.append("CRITICAL: custody_model not declared — who vouches?")
         grade = "F"
     
-    # Custody model validation
-    if key.custodian == CustodyModel.OPERATOR_HELD and not key.operator_id:
-        issues.append("CUSTODY_GAP: operator_held but no operator_id")
+    # MUST: key size adequate
+    if decl.key_size_bits < MIN_KEY_SIZE_BITS:
+        issues.append(f"CRITICAL: key_size {decl.key_size_bits} < {MIN_KEY_SIZE_BITS} minimum")
         grade = "F"
     
-    if key.custodian == CustodyModel.SPLIT_CUSTODY:
-        if len(key.split_holders) < SPLIT_CUSTODY_TOTAL:
-            issues.append(f"SPLIT_INCOMPLETE: {len(key.split_holders)}/{SPLIT_CUSTODY_TOTAL} holders")
-            grade = "D"
-        # Check for self-split (operator is also holder)
-        if key.operator_id and key.operator_id in key.split_holders:
-            issues.append("SELF_SPLIT: operator is also split holder (axiom 1 risk)")
-            grade = min(grade, "C")
+    # MUST: recovery method for AGENT_HELD
+    if decl.custody_model == CustodyModel.AGENT_HELD and decl.recovery_method == "NONE":
+        issues.append("WARNING: AGENT_HELD with no recovery = identity death on key loss")
+        if grade > "C": grade = "C"
     
-    if key.custodian == CustodyModel.AGENT_HELD:
-        # No operator oversight = higher risk
-        if not key.rotation_successor:
-            issues.append("NO_ROTATION_PLAN: agent-held key without successor selector")
-            grade = min(grade, "C")
+    # SHOULD: rotation policy not MANUAL
+    if decl.rotation_policy == "MANUAL":
+        issues.append("WARNING: MANUAL rotation often means never-rotated")
+        if grade > "B": grade = "B"
+    
+    # Check: self-custodied operator (circular)
+    if decl.custody_model == CustodyModel.OPERATOR_HELD and decl.custodian_id == decl.agent_id:
+        issues.append("CRITICAL: agent is own operator — circular custody (axiom 1)")
+        grade = "F"
+    
+    # Check: DELEGATED needs threshold details
+    if decl.custody_model == CustodyModel.DELEGATED and "THRESHOLD" not in decl.recovery_method:
+        issues.append("WARNING: DELEGATED custody without threshold spec")
+        if grade > "B": grade = "B"
     
     return {
-        "key_id": key.key_id,
-        "selector": key.selector,
-        "custodian": key.custodian.value,
-        "age_days": round(age_days, 1),
+        "agent_id": decl.agent_id,
+        "custody_model": decl.custody_model.value,
+        "custodian_id": decl.custodian_id,
         "grade": grade,
-        "issues": issues
+        "issues": issues,
+        "dkim_parallel": _dkim_parallel(decl.custody_model)
     }
 
 
-def rotate_key(old_key: SigningKey, agent_id: str) -> tuple[SigningKey, SigningKey]:
-    """
-    Rotate a signing key. Returns (new_key, updated_old_key).
-    
-    DKIM model: both keys valid during overlap period.
-    Old key status → ROTATING, then EXPIRED after overlap.
-    """
+def _dkim_parallel(model: CustodyModel) -> str:
+    """Map ATF custody model to DKIM equivalent."""
+    return {
+        CustodyModel.OPERATOR_HELD: "Domain signs via MTA (standard DKIM). Gmail holds key for gmail.com users.",
+        CustodyModel.AGENT_HELD: "End-user holds key (PGP model). DKIM doesn't support this — it's always domain-level.",
+        CustodyModel.DELEGATED: "HSM-backed signing (enterprise DKIM). Key never leaves hardware. Threshold for recovery.",
+        CustodyModel.UNDEFINED: "No DKIM equivalent — mail without DKIM signature. Treated as suspicious by default.",
+    }[model]
+
+
+def simulate_key_rotation(initial_key: str, custody: CustodyModel, custodian: str) -> list[KeyState]:
+    """Simulate key lifecycle: genesis → rotation → compromise → recovery."""
     now = time.time()
-    new_selector = create_selector(agent_id, now)
+    events = []
     
-    new_key = SigningKey(
-        key_id=hashlib.sha256(new_selector.encode()).hexdigest()[:16],
-        selector=new_selector,
-        custodian=old_key.custodian,
-        created_at=now,
-        expires_at=now + MAX_KEY_AGE_DAYS * 86400,
-        key_bits=old_key.key_bits,
-        algorithm=old_key.algorithm,
-        operator_id=old_key.operator_id,
-        split_holders=old_key.split_holders.copy(),
+    # Genesis
+    k0 = KeyState(
+        key_hash=hash_key(initial_key),
+        custody_model=custody,
+        custodian_id=custodian,
+        selector="s202603",  # DKIM-style: s + YYYYMM
+        created_at=now - 86400 * 180,
     )
+    events.append(("GENESIS", k0))
     
-    # Old key enters rotation period
-    old_key.status = KeyStatus.ROTATING
-    old_key.expires_at = now + ROTATION_OVERLAP_DAYS * 86400
-    old_key.rotation_successor = new_key.key_id
-    
-    return new_key, old_key
-
-
-def genesis_key_field(key: SigningKey) -> GenesisKeyField:
-    """Generate the genesis key custody field for ATF."""
-    return GenesisKeyField(
-        custody_model=key.custodian.value,
-        active_selector=key.selector,
-        key_algorithm=key.algorithm,
-        key_bits=key.key_bits,
-        rotation_policy_days=MAX_KEY_AGE_DAYS,
-        operator_id=key.operator_id,
-        split_threshold=SPLIT_CUSTODY_THRESHOLD if key.custodian == CustodyModel.SPLIT_CUSTODY else None,
-        split_total=SPLIT_CUSTODY_TOTAL if key.custodian == CustodyModel.SPLIT_CUSTODY else None,
+    # Scheduled rotation at 90 days
+    k1 = KeyState(
+        key_hash=hash_key(initial_key + "_rotated"),
+        custody_model=custody,
+        custodian_id=custodian,
+        selector="s202609",
+        created_at=now - 86400 * 90,
+        rotated_from=k0.key_hash,
     )
+    k0.status = "ROTATING"  # Grace period
+    events.append(("ROTATION", k1))
+    
+    # Old key expires after grace
+    k0.status = "EXPIRED"
+    k0.expires_at = now - 86400 * 60
+    events.append(("GRACE_EXPIRED", k0))
+    
+    # Compromise detected
+    k1.status = "COMPROMISED"
+    events.append(("COMPROMISE", k1))
+    
+    # Recovery depends on custody model
+    if custody == CustodyModel.OPERATOR_HELD:
+        k2 = KeyState(
+            key_hash=hash_key(initial_key + "_reissued"),
+            custody_model=custody,
+            custodian_id=custodian,
+            selector="s202612_emergency",
+            created_at=now,
+            rotated_from=k1.key_hash,
+        )
+        events.append(("OPERATOR_REISSUE", k2))
+    elif custody == CustodyModel.DELEGATED:
+        k2 = KeyState(
+            key_hash=hash_key(initial_key + "_threshold_recovered"),
+            custody_model=custody,
+            custodian_id=custodian,
+            selector="s202612_threshold",
+            created_at=now,
+            rotated_from=k1.key_hash,
+        )
+        events.append(("THRESHOLD_RECOVERY", k2))
+    else:  # AGENT_HELD
+        events.append(("IDENTITY_DEATH", None))
+    
+    return events
 
 
 # === Scenarios ===
 
 def scenario_operator_held():
-    """Standard operator-held key (like Gmail signing DKIM)."""
-    print("=== Scenario: Operator-Held Key (ESP Model) ===")
-    now = time.time()
-    
-    key = SigningKey(
-        key_id="op_key_001",
-        selector=create_selector("kit_fox", now),
-        custodian=CustodyModel.OPERATOR_HELD,
-        created_at=now - 30 * 86400,  # 30 days old
-        expires_at=now + 60 * 86400,
-        operator_id="ilya_openclaw",
+    """Standard DKIM model — operator signs for agent."""
+    print("=== Scenario: OPERATOR_HELD (DKIM Standard) ===")
+    decl = GenesisKeyDeclaration(
+        agent_id="kit_fox",
+        custody_model=CustodyModel.OPERATOR_HELD,
+        initial_key_hash=hash_key("kit_operator_key"),
+        custodian_id="ilya_operator",
+        selector="s202603",
+        rotation_policy="SCHEDULED_90D",
+        recovery_method="OPERATOR_REISSUE",
+        key_size_bits=2048
     )
+    result = validate_genesis_key(decl)
+    print(f"  Grade: {result['grade']}")
+    print(f"  DKIM parallel: {result['dkim_parallel']}")
+    for issue in result['issues']:
+        print(f"  {issue}")
     
-    result = validate_key(key)
-    genesis = genesis_key_field(key)
-    print(f"  Key: {result['key_id']}, age={result['age_days']}d, grade={result['grade']}")
-    print(f"  Custody: {result['custodian']}")
-    print(f"  Genesis field: custody={genesis.custody_model}, rotation={genesis.rotation_policy_days}d")
-    print(f"  Issues: {result['issues'] or 'none'}")
+    events = simulate_key_rotation("kit_key", CustodyModel.OPERATOR_HELD, "ilya_operator")
+    print(f"  Lifecycle: {' → '.join(e[0] for e in events)}")
     print()
 
 
-def scenario_agent_held_no_rotation():
-    """Agent-held key with no rotation plan — catches the gap."""
-    print("=== Scenario: Agent-Held Key (No Rotation Plan) ===")
-    now = time.time()
-    
-    key = SigningKey(
-        key_id="agent_key_001",
-        selector=create_selector("autonomous_bot", now),
-        custodian=CustodyModel.AGENT_HELD,
-        created_at=now - 100 * 86400,  # 100 days = expired!
-        expires_at=now - 10 * 86400,
+def scenario_agent_held_no_recovery():
+    """Autonomous agent, no backup — identity death on compromise."""
+    print("=== Scenario: AGENT_HELD No Recovery ===")
+    decl = GenesisKeyDeclaration(
+        agent_id="autonomous_bot",
+        custody_model=CustodyModel.AGENT_HELD,
+        initial_key_hash=hash_key("autonomous_key"),
+        custodian_id="autonomous_bot",
+        selector="s202603",
+        rotation_policy="MANUAL",
+        recovery_method="NONE",
+        key_size_bits=2048
     )
+    result = validate_genesis_key(decl)
+    print(f"  Grade: {result['grade']}")
+    for issue in result['issues']:
+        print(f"  {issue}")
     
-    result = validate_key(key)
-    print(f"  Key: {result['key_id']}, age={result['age_days']}d, grade={result['grade']}")
-    print(f"  Issues: {result['issues']}")
+    events = simulate_key_rotation("auto_key", CustodyModel.AGENT_HELD, "autonomous_bot")
+    print(f"  Lifecycle: {' → '.join(e[0] for e in events)}")
+    print(f"  Key loss = permanent identity death. No DKIM equivalent — PGP model.")
     print()
 
 
-def scenario_split_custody():
-    """M-of-N split custody (HSM model)."""
-    print("=== Scenario: Split Custody (2-of-3 Threshold) ===")
-    now = time.time()
-    
-    key = SigningKey(
-        key_id="split_key_001",
-        selector=create_selector("high_value_agent", now),
-        custodian=CustodyModel.SPLIT_CUSTODY,
-        created_at=now - 45 * 86400,
-        expires_at=now + 45 * 86400,
-        operator_id="org_operator",
-        split_holders=["org_operator", "agent_self", "independent_witness"],
+def scenario_delegated_threshold():
+    """HSM/threshold — enterprise DKIM model."""
+    print("=== Scenario: DELEGATED (Threshold/HSM) ===")
+    decl = GenesisKeyDeclaration(
+        agent_id="enterprise_agent",
+        custody_model=CustodyModel.DELEGATED,
+        initial_key_hash=hash_key("threshold_key"),
+        custodian_id="hsm_cluster_3of5",
+        selector="s202603",
+        rotation_policy="SCHEDULED_90D",
+        recovery_method="THRESHOLD_3OF5",
+        key_size_bits=4096
     )
+    result = validate_genesis_key(decl)
+    print(f"  Grade: {result['grade']}")
+    print(f"  DKIM parallel: {result['dkim_parallel']}")
+    for issue in result['issues']:
+        print(f"  {issue}")
     
-    result = validate_key(key)
-    genesis = genesis_key_field(key)
-    print(f"  Key: {result['key_id']}, age={result['age_days']}d, grade={result['grade']}")
-    print(f"  Custody: {result['custodian']}, threshold={genesis.split_threshold}/{genesis.split_total}")
-    print(f"  Issues: {result['issues'] or 'none'}")
-    # Note: operator is also split holder = axiom 1 risk
+    events = simulate_key_rotation("threshold_key", CustodyModel.DELEGATED, "hsm_cluster")
+    print(f"  Lifecycle: {' → '.join(e[0] for e in events)}")
     print()
 
 
-def scenario_key_rotation():
-    """Demonstrate DKIM-style key rotation with overlap."""
-    print("=== Scenario: Key Rotation (DKIM Overlap Model) ===")
-    now = time.time()
-    
-    old_key = SigningKey(
-        key_id="old_key_001",
-        selector=create_selector("rotating_agent", now - 85 * 86400),
-        custodian=CustodyModel.OPERATOR_HELD,
-        created_at=now - 85 * 86400,  # Almost expired
-        expires_at=now + 5 * 86400,
-        operator_id="org_operator",
+def scenario_circular_custody():
+    """Agent is own operator — axiom 1 violation."""
+    print("=== Scenario: Circular Custody (Axiom 1 Violation) ===")
+    decl = GenesisKeyDeclaration(
+        agent_id="self_signer",
+        custody_model=CustodyModel.OPERATOR_HELD,
+        initial_key_hash=hash_key("self_key"),
+        custodian_id="self_signer",  # Circular!
+        selector="s202603",
+        rotation_policy="MANUAL",
+        recovery_method="NONE",
+        key_size_bits=2048
     )
-    
-    print(f"  Before rotation:")
-    print(f"    Old key: {old_key.key_id}, status={old_key.status.value}, age={85}d")
-    
-    new_key, updated_old = rotate_key(old_key, "rotating_agent")
-    
-    print(f"  After rotation:")
-    print(f"    Old key: {updated_old.key_id}, status={updated_old.status.value}, "
-          f"expires in {ROTATION_OVERLAP_DAYS}d")
-    print(f"    New key: {new_key.key_id}, status={new_key.status.value}, "
-          f"expires in {MAX_KEY_AGE_DAYS}d")
-    print(f"    Successor chain: {updated_old.key_id} → {new_key.key_id}")
-    print(f"    Both valid during {ROTATION_OVERLAP_DAYS}d overlap")
+    result = validate_genesis_key(decl)
+    print(f"  Grade: {result['grade']}")
+    for issue in result['issues']:
+        print(f"  {issue}")
+    print(f"  Self-signed root without external vouching = X.509 self-signed cert.")
+    print()
+
+
+def scenario_undefined_custody():
+    """Genesis without key custody declaration."""
+    print("=== Scenario: UNDEFINED Custody (Gap) ===")
+    decl = GenesisKeyDeclaration(
+        agent_id="mystery_agent",
+        custody_model=CustodyModel.UNDEFINED,
+        initial_key_hash=hash_key("unknown_key"),
+        custodian_id="unknown",
+        selector="s202603",
+        rotation_policy="MANUAL",
+        recovery_method="NONE",
+        key_size_bits=2048
+    )
+    result = validate_genesis_key(decl)
+    print(f"  Grade: {result['grade']}")
+    for issue in result['issues']:
+        print(f"  {issue}")
+    print(f"  Mail without DKIM = treated as suspicious. Agent without custody = same.")
     print()
 
 
 if __name__ == "__main__":
-    print("Key Custody Model — DKIM-Style Key Management for ATF")
-    print("Per santaclawd: 'who holds the signing key = who vouches for the agent'")
+    print("Key Custody Model — DKIM-Inspired Key Management for ATF")
+    print("Per santaclawd: key_custodian is a gap in the spec")
     print("=" * 65)
     print()
     scenario_operator_held()
-    scenario_agent_held_no_rotation()
-    scenario_split_custody()
-    scenario_key_rotation()
+    scenario_agent_held_no_recovery()
+    scenario_delegated_threshold()
+    scenario_circular_custody()
+    scenario_undefined_custody()
     
     print("=" * 65)
-    print("KEY INSIGHT: key_custodian is a missing ATF genesis field.")
-    print("Three models: OPERATOR_HELD (centralized trust),")
-    print("  AGENT_HELD (autonomous but fragile),")
-    print("  SPLIT_CUSTODY (M-of-N threshold, HSM model).")
-    print("DKIM solved this 20 years ago: selector delegation + DNS TXT.")
-    print("ATF needs: custody_model + active_selector + rotation_policy in genesis.")
+    print("KEY INSIGHT: DKIM solved key custody at the domain level.")
+    print("ATF must declare at genesis level. Three models:")
+    print("  OPERATOR_HELD = DKIM standard (domain signs for mailbox)")
+    print("  AGENT_HELD = PGP model (autonomous, fragile)")
+    print("  DELEGATED = Enterprise HSM (threshold recovery)")
+    print("Rotation via selector change ≠ revocation.")
+    print("key_custodian MUST be in genesis. Undefined = Grade F.")
