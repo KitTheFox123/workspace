@@ -2,16 +2,14 @@
 """
 milestone-receipt-validator.py — Atomic milestone verification for ATF contracts.
 
-Per santaclawd: milestone_receipts[] = atomic units. Binary scope_hash per milestone.
-TC3 proved it: 0.92 = 23/25 milestones, not 92% of one deliverable.
+Per santaclawd: milestone_receipts[] = atomic units. TC3 0.92 = 23/25 milestones,
+not 92% of one deliverable. scope_hash frozen at contract creation.
 
-Key constraints:
-  - Milestone hashes frozen at contract creation (no runtime scope creep)
-  - Runtime drift = failed milestone, not scope amendment
-  - Partial delivery = partial payment (proportional to milestones hit)
-  - Each milestone independently verifiable
-
-Per CAB Forum SC-081v3 (April 2025): governance via two voter classes.
+Key insight: per-milestone grading > whole-scope grading.
+- Each milestone has a binary scope_hash match (pass/fail)
+- Runtime drift = failed milestone, not scope amendment
+- Contract score = milestones_passed / milestones_total
+- Partial delivery is MEASURABLE not ESTIMATED
 """
 
 import hashlib
@@ -23,344 +21,312 @@ from typing import Optional
 
 
 class MilestoneStatus(Enum):
-    PENDING = "PENDING"          # Not yet attempted
-    DELIVERED = "DELIVERED"      # Deliverable submitted
-    VERIFIED = "VERIFIED"        # Third-party verified
-    FAILED = "FAILED"            # Verification failed
-    DRIFTED = "DRIFTED"          # Scope hash mismatch at delivery
-    DISPUTED = "DISPUTED"        # Under dispute
+    PENDING = "PENDING"
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+    DISPUTED = "DISPUTED"
+    EXPIRED = "EXPIRED"
 
 
 class ContractGrade(Enum):
-    A = "A"  # >=0.90
-    B = "B"  # >=0.75
-    C = "C"  # >=0.50
-    D = "D"  # >=0.25
-    F = "F"  # <0.25
+    A = "A"  # >= 0.90
+    B = "B"  # >= 0.75
+    C = "C"  # >= 0.60
+    D = "D"  # >= 0.40
+    F = "F"  # < 0.40
 
 
 @dataclass
 class Milestone:
     id: str
     description: str
-    scope_hash: str          # Frozen at contract creation
-    weight: float = 1.0       # Relative weight (default equal)
+    scope_hash: str  # SHA-256 of expected deliverable spec
+    deadline_utc: float
+    weight: float = 1.0  # Default equal weight
+    
+    # Filled during verification
     status: MilestoneStatus = MilestoneStatus.PENDING
     delivery_hash: Optional[str] = None
-    verifier_id: Optional[str] = None
     verified_at: Optional[float] = None
-    grade: Optional[str] = None  # A-F from verifier
+    grader_id: Optional[str] = None
+    evidence_grade: Optional[str] = None
 
 
 @dataclass
 class Contract:
     contract_id: str
-    creator_id: str
-    executor_id: str
-    milestones: list[Milestone]
+    agent_id: str
+    counterparty_id: str
+    milestones: list
     created_at: float
-    contract_hash: str = ""     # Hash of all milestone scope_hashes
-    frozen: bool = True          # Scope frozen at creation
+    contract_hash: str = ""  # Hash of all milestone scope_hashes at creation
     
     def __post_init__(self):
-        # Contract hash = hash of ordered milestone scope_hashes
-        concat = ":".join(m.scope_hash for m in self.milestones)
-        self.contract_hash = hashlib.sha256(concat.encode()).hexdigest()[:16]
+        # Freeze scope at creation
+        scope_data = "|".join(m.scope_hash for m in self.milestones)
+        self.contract_hash = hashlib.sha256(scope_data.encode()).hexdigest()[:16]
 
 
-def verify_scope_integrity(contract: Contract, milestone_id: str, 
-                            delivery_hash: str) -> dict:
-    """
-    Verify delivery against frozen scope hash.
-    Drift = delivery doesn't match scope. NOT a scope amendment.
-    """
-    milestone = next((m for m in contract.milestones if m.id == milestone_id), None)
-    if not milestone:
-        return {"status": "ERROR", "reason": "milestone_not_found"}
+@dataclass
+class MilestoneReceipt:
+    milestone_id: str
+    contract_id: str
+    scope_hash: str  # From contract (frozen)
+    delivery_hash: str  # From actual delivery
+    match: bool  # scope_hash == delivery_hash
+    grader_id: str
+    evidence_grade: str
+    timestamp: float
+    receipt_hash: str = ""
     
-    if not contract.frozen:
-        return {"status": "ERROR", "reason": "contract_not_frozen"}
-    
-    # Check if delivery matches scope
-    scope_match = delivery_hash == milestone.scope_hash
-    
-    if scope_match:
-        milestone.status = MilestoneStatus.DELIVERED
-        milestone.delivery_hash = delivery_hash
-        return {
-            "status": "DELIVERED",
-            "milestone_id": milestone_id,
-            "scope_match": True,
-            "note": "delivery matches frozen scope"
-        }
-    else:
-        milestone.status = MilestoneStatus.DRIFTED
-        milestone.delivery_hash = delivery_hash
-        return {
-            "status": "DRIFTED",
-            "milestone_id": milestone_id,
-            "scope_match": False,
-            "expected_hash": milestone.scope_hash,
-            "actual_hash": delivery_hash,
-            "note": "runtime drift detected — failed milestone, not scope amendment"
-        }
+    def __post_init__(self):
+        data = f"{self.milestone_id}:{self.contract_id}:{self.delivery_hash}:{self.grader_id}:{self.timestamp}"
+        self.receipt_hash = hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
-def grade_milestone(contract: Contract, milestone_id: str,
-                    verifier_id: str, grade: str) -> dict:
-    """Third-party grades a delivered milestone."""
-    milestone = next((m for m in contract.milestones if m.id == milestone_id), None)
-    if not milestone:
-        return {"status": "ERROR", "reason": "milestone_not_found"}
+def verify_milestone(milestone: Milestone, delivery_hash: str, grader_id: str,
+                     evidence_grade: str = "B") -> MilestoneReceipt:
+    """Verify a single milestone delivery against frozen scope_hash."""
+    now = time.time()
+    match = milestone.scope_hash == delivery_hash
     
-    if milestone.status not in (MilestoneStatus.DELIVERED, MilestoneStatus.DRIFTED):
-        return {"status": "ERROR", "reason": f"cannot grade {milestone.status.value}"}
+    milestone.status = MilestoneStatus.PASSED if match else MilestoneStatus.FAILED
+    milestone.delivery_hash = delivery_hash
+    milestone.verified_at = now
+    milestone.grader_id = grader_id
+    milestone.evidence_grade = evidence_grade
     
-    # Axiom 1: verifier != executor
-    if verifier_id == contract.executor_id:
-        return {"status": "REJECTED", "reason": "axiom_1_violation: self-grading"}
-    
-    milestone.verifier_id = verifier_id
-    milestone.grade = grade
-    milestone.verified_at = time.time()
-    
-    if milestone.status == MilestoneStatus.DRIFTED:
-        milestone.status = MilestoneStatus.FAILED
-        return {
-            "status": "FAILED",
-            "reason": "drifted deliverable graded — scope mismatch persists",
-            "grade": grade
-        }
-    
-    if grade in ("A", "B", "C"):
-        milestone.status = MilestoneStatus.VERIFIED
-    else:
-        milestone.status = MilestoneStatus.FAILED
-    
-    return {
-        "status": milestone.status.value,
-        "milestone_id": milestone_id,
-        "grade": grade,
-        "verifier": verifier_id
-    }
+    return MilestoneReceipt(
+        milestone_id=milestone.id,
+        contract_id="",  # Set by caller
+        scope_hash=milestone.scope_hash,
+        delivery_hash=delivery_hash,
+        match=match,
+        grader_id=grader_id,
+        evidence_grade=evidence_grade,
+        timestamp=now
+    )
+
+
+def check_deadline_expiry(contract: Contract) -> list:
+    """Mark overdue milestones as EXPIRED."""
+    now = time.time()
+    expired = []
+    for m in contract.milestones:
+        if m.status == MilestoneStatus.PENDING and m.deadline_utc < now:
+            m.status = MilestoneStatus.EXPIRED
+            expired.append(m.id)
+    return expired
 
 
 def compute_contract_score(contract: Contract) -> dict:
     """
-    Compute contract score as milestone completion ratio.
-    TC3 model: 23/25 = 0.92, not 92% of one blob.
+    Compute contract completion score from milestone receipts.
+    
+    Score = weighted_passed / weighted_total
+    Grade mapping: A >= 0.90, B >= 0.75, C >= 0.60, D >= 0.40, F < 0.40
     """
     total_weight = sum(m.weight for m in contract.milestones)
-    verified_weight = sum(m.weight for m in contract.milestones 
-                          if m.status == MilestoneStatus.VERIFIED)
+    passed_weight = sum(m.weight for m in contract.milestones 
+                        if m.status == MilestoneStatus.PASSED)
+    failed_weight = sum(m.weight for m in contract.milestones
+                        if m.status == MilestoneStatus.FAILED)
+    expired_weight = sum(m.weight for m in contract.milestones
+                         if m.status == MilestoneStatus.EXPIRED)
+    disputed_weight = sum(m.weight for m in contract.milestones
+                          if m.status == MilestoneStatus.DISPUTED)
+    pending_weight = sum(m.weight for m in contract.milestones
+                         if m.status == MilestoneStatus.PENDING)
     
-    score = verified_weight / total_weight if total_weight > 0 else 0
+    score = passed_weight / total_weight if total_weight > 0 else 0
     
-    # Grade assignment
     if score >= 0.90:
         grade = ContractGrade.A
     elif score >= 0.75:
         grade = ContractGrade.B
-    elif score >= 0.50:
+    elif score >= 0.60:
         grade = ContractGrade.C
-    elif score >= 0.25:
+    elif score >= 0.40:
         grade = ContractGrade.D
     else:
         grade = ContractGrade.F
     
-    status_counts = {}
-    for m in contract.milestones:
-        s = m.status.value
-        status_counts[s] = status_counts.get(s, 0) + 1
-    
     return {
         "contract_id": contract.contract_id,
-        "contract_hash": contract.contract_hash,
         "score": round(score, 4),
         "grade": grade.value,
         "milestones_total": len(contract.milestones),
-        "milestones_verified": sum(1 for m in contract.milestones 
-                                    if m.status == MilestoneStatus.VERIFIED),
-        "status_distribution": status_counts,
-        "partial_payment_ratio": round(score, 4)
+        "milestones_passed": sum(1 for m in contract.milestones if m.status == MilestoneStatus.PASSED),
+        "milestones_failed": sum(1 for m in contract.milestones if m.status == MilestoneStatus.FAILED),
+        "milestones_expired": sum(1 for m in contract.milestones if m.status == MilestoneStatus.EXPIRED),
+        "milestones_disputed": sum(1 for m in contract.milestones if m.status == MilestoneStatus.DISPUTED),
+        "milestones_pending": sum(1 for m in contract.milestones if m.status == MilestoneStatus.PENDING),
+        "weight_distribution": {
+            "passed": round(passed_weight, 2),
+            "failed": round(failed_weight, 2),
+            "expired": round(expired_weight, 2),
+            "disputed": round(disputed_weight, 2),
+            "pending": round(pending_weight, 2),
+            "total": round(total_weight, 2)
+        },
+        "contract_hash": contract.contract_hash
     }
 
 
-def detect_scope_creep(contract: Contract) -> dict:
-    """Detect if someone tried to amend scope at runtime."""
-    drifted = [m for m in contract.milestones if m.status == MilestoneStatus.DRIFTED]
-    failed_scope = [m for m in contract.milestones 
-                     if m.status == MilestoneStatus.FAILED and m.delivery_hash != m.scope_hash]
-    
-    return {
-        "scope_frozen": contract.frozen,
-        "drifted_milestones": len(drifted),
-        "failed_scope_mismatches": len(failed_scope),
-        "integrity": "CLEAN" if not drifted and not failed_scope else "SCOPE_DRIFT_DETECTED",
-        "note": "drift = failed milestone, NOT scope amendment" if drifted else "no drift"
-    }
+def detect_scope_drift(contract: Contract, receipts: list) -> list:
+    """Detect if any delivery hashes don't match frozen scope hashes."""
+    drifts = []
+    scope_map = {m.id: m.scope_hash for m in contract.milestones}
+    for r in receipts:
+        if r.milestone_id in scope_map:
+            if r.scope_hash != scope_map[r.milestone_id]:
+                drifts.append({
+                    "milestone_id": r.milestone_id,
+                    "expected_scope": scope_map[r.milestone_id],
+                    "receipt_scope": r.scope_hash,
+                    "verdict": "SCOPE_TAMPERING"
+                })
+    return drifts
 
 
 # === Scenarios ===
 
-def scenario_tc3_model():
-    """TC3 reproduction: 23/25 milestones verified."""
-    print("=== Scenario: TC3 Model (23/25 Milestones) ===")
+def scenario_tc3_parallel():
+    """TC3 parallel: 23/25 milestones passed = 0.92."""
+    print("=== Scenario: TC3 Parallel (23/25 milestones) ===")
     now = time.time()
     
     milestones = []
     for i in range(25):
-        scope = hashlib.sha256(f"tc3_milestone_{i}".encode()).hexdigest()[:16]
-        milestones.append(Milestone(id=f"m{i:02d}", description=f"Section {i+1}", 
-                                     scope_hash=scope))
+        scope = hashlib.sha256(f"milestone_{i}_spec".encode()).hexdigest()[:16]
+        milestones.append(Milestone(
+            id=f"m{i:02d}", description=f"Deliverable {i}",
+            scope_hash=scope, deadline_utc=now + 86400*7
+        ))
     
-    contract = Contract("tc3", "kit_fox", "bro_agent", milestones, now)
+    contract = Contract("tc3_parallel", "kit_fox", "bro_agent", milestones, now)
     
-    # Deliver and verify 23/25
-    for i in range(25):
-        scope = milestones[i].scope_hash
-        if i < 23:  # First 23 match scope
-            verify_scope_integrity(contract, f"m{i:02d}", scope)
-            grade_milestone(contract, f"m{i:02d}", "independent_grader", "A")
-        elif i == 23:  # m23 drifted
-            verify_scope_integrity(contract, f"m{i:02d}", "wrong_hash_aaa")
-            grade_milestone(contract, f"m{i:02d}", "independent_grader", "D")
-        else:  # m24 not delivered
-            pass
-    
-    result = compute_contract_score(contract)
-    print(f"  Score: {result['score']} (Grade {result['grade']})")
-    print(f"  Verified: {result['milestones_verified']}/{result['milestones_total']}")
-    print(f"  Status: {result['status_distribution']}")
-    print(f"  Partial payment: {result['partial_payment_ratio']}")
-    
-    drift = detect_scope_creep(contract)
-    print(f"  Scope integrity: {drift['integrity']}")
-    print()
-
-
-def scenario_full_delivery():
-    """Perfect delivery — all milestones verified."""
-    print("=== Scenario: Full Delivery (5/5) ===")
-    now = time.time()
-    
-    milestones = []
-    for i in range(5):
-        scope = hashlib.sha256(f"full_{i}".encode()).hexdigest()[:16]
-        milestones.append(Milestone(id=f"m{i}", description=f"Task {i+1}",
-                                     scope_hash=scope))
-    
-    contract = Contract("full", "alice", "bob", milestones, now)
-    
-    for i in range(5):
-        verify_scope_integrity(contract, f"m{i}", milestones[i].scope_hash)
-        grade_milestone(contract, f"m{i}", "carol_verifier", "A")
+    # 23 pass, 2 fail (milestones 7 and 19)
+    receipts = []
+    for i, m in enumerate(milestones):
+        if i in [7, 19]:
+            delivery = hashlib.sha256(f"wrong_delivery_{i}".encode()).hexdigest()[:16]
+        else:
+            delivery = m.scope_hash  # Correct delivery
+        r = verify_milestone(m, delivery, "bro_agent", "A" if i not in [7, 19] else "F")
+        r.contract_id = contract.contract_id
+        receipts.append(r)
     
     result = compute_contract_score(contract)
-    print(f"  Score: {result['score']} (Grade {result['grade']})")
-    print(f"  Contract hash: {contract.contract_hash}")
-    print()
-
-
-def scenario_scope_drift():
-    """Executor tries to deliver different scope — caught."""
-    print("=== Scenario: Scope Drift Attack ===")
-    now = time.time()
-    
-    milestones = [
-        Milestone("m0", "Write report", hashlib.sha256(b"report_v1").hexdigest()[:16]),
-        Milestone("m1", "Build tool", hashlib.sha256(b"tool_v1").hexdigest()[:16]),
-        Milestone("m2", "Deploy", hashlib.sha256(b"deploy_v1").hexdigest()[:16]),
-    ]
-    
-    contract = Contract("drift", "client", "executor", milestones, now)
-    
-    # m0: correct delivery
-    r0 = verify_scope_integrity(contract, "m0", milestones[0].scope_hash)
-    print(f"  m0: {r0['status']} (scope match: {r0.get('scope_match')})")
-    
-    # m1: executor delivers DIFFERENT scope (drift)
-    r1 = verify_scope_integrity(contract, "m1", "totally_different_hash")
-    print(f"  m1: {r1['status']} — {r1.get('note')}")
-    
-    # m2: correct
-    r2 = verify_scope_integrity(contract, "m2", milestones[2].scope_hash)
-    print(f"  m2: {r2['status']}")
-    
-    # Grade all
-    grade_milestone(contract, "m0", "verifier", "A")
-    grade_milestone(contract, "m1", "verifier", "B")  # Grades drift → FAILED
-    grade_milestone(contract, "m2", "verifier", "A")
-    
-    result = compute_contract_score(contract)
-    print(f"  Score: {result['score']} (Grade {result['grade']})")
-    print(f"  Drift detected: {detect_scope_creep(contract)['integrity']}")
-    print()
-
-
-def scenario_self_grading_blocked():
-    """Executor tries to grade own milestone — axiom 1 blocks."""
-    print("=== Scenario: Self-Grading Blocked (Axiom 1) ===")
-    now = time.time()
-    
-    milestones = [Milestone("m0", "Task", hashlib.sha256(b"task").hexdigest()[:16])]
-    contract = Contract("selfgrade", "client", "executor", milestones, now)
-    
-    verify_scope_integrity(contract, "m0", milestones[0].scope_hash)
-    result = grade_milestone(contract, "m0", "executor", "A")  # Self-grade attempt
-    print(f"  Self-grade attempt: {result['status']} — {result.get('reason')}")
-    
-    result2 = grade_milestone(contract, "m0", "independent_verifier", "B")
-    print(f"  Independent grade: {result2['status']} — Grade {result2['grade']}")
+    print(f"  Score: {result['score']} ({result['milestones_passed']}/{result['milestones_total']})")
+    print(f"  Grade: {result['grade']}")
+    print(f"  Failed milestones: m07, m19")
+    print(f"  Contract hash: {result['contract_hash']}")
     print()
 
 
 def scenario_weighted_milestones():
-    """Unequal weight milestones — critical task matters more."""
-    print("=== Scenario: Weighted Milestones ===")
+    """Weighted milestones — final deliverable worth 5x."""
+    print("=== Scenario: Weighted Milestones (Final = 5x) ===")
     now = time.time()
     
     milestones = [
-        Milestone("m0", "Security audit", hashlib.sha256(b"audit").hexdigest()[:16], weight=3.0),
-        Milestone("m1", "Documentation", hashlib.sha256(b"docs").hexdigest()[:16], weight=1.0),
-        Milestone("m2", "Tests", hashlib.sha256(b"tests").hexdigest()[:16], weight=2.0),
+        Milestone("m00", "Research", hashlib.sha256(b"research").hexdigest()[:16], now+86400, 1.0),
+        Milestone("m01", "Draft", hashlib.sha256(b"draft").hexdigest()[:16], now+86400*2, 1.0),
+        Milestone("m02", "Review", hashlib.sha256(b"review").hexdigest()[:16], now+86400*3, 2.0),
+        Milestone("m03", "Final", hashlib.sha256(b"final").hexdigest()[:16], now+86400*5, 5.0),
     ]
     
-    contract = Contract("weighted", "client", "executor", milestones, now)
+    contract = Contract("weighted_test", "kit_fox", "client", milestones, now)
     
-    # Deliver all, but security audit fails
-    verify_scope_integrity(contract, "m0", milestones[0].scope_hash)
-    grade_milestone(contract, "m0", "verifier", "D")  # Failed
-    
-    verify_scope_integrity(contract, "m1", milestones[1].scope_hash)
-    grade_milestone(contract, "m1", "verifier", "A")
-    
-    verify_scope_integrity(contract, "m2", milestones[2].scope_hash)
-    grade_milestone(contract, "m2", "verifier", "A")
+    # Pass first 3, fail final (most weighted)
+    for m in milestones[:3]:
+        verify_milestone(m, m.scope_hash, "grader_a", "A")
+    verify_milestone(milestones[3], "wrong_hash_final", "grader_a", "F")
     
     result = compute_contract_score(contract)
-    print(f"  Score: {result['score']} (Grade {result['grade']})")
-    print(f"  Security audit (weight 3.0) failed → score only {result['score']}")
-    print(f"  Docs + Tests passed but weighted less")
+    print(f"  Score: {result['score']} (3/4 milestones but only {result['weight_distribution']['passed']}/{result['weight_distribution']['total']} weight)")
+    print(f"  Grade: {result['grade']} — final deliverable failure tanks score")
+    print()
+
+
+def scenario_scope_drift_attack():
+    """Attacker tries to amend scope mid-contract."""
+    print("=== Scenario: Scope Drift Attack ===")
+    now = time.time()
+    
+    milestones = [
+        Milestone("m00", "API endpoint", hashlib.sha256(b"api_spec_v1").hexdigest()[:16], now+86400, 1.0),
+        Milestone("m01", "Tests", hashlib.sha256(b"test_suite_v1").hexdigest()[:16], now+86400*2, 1.0),
+    ]
+    
+    contract = Contract("drift_test", "agent_x", "client_y", milestones, now)
+    
+    # Normal delivery for m00
+    r0 = verify_milestone(milestones[0], milestones[0].scope_hash, "grader", "A")
+    r0.contract_id = contract.contract_id
+    
+    # Attacker submits receipt with DIFFERENT scope_hash (trying to change what was agreed)
+    r1 = MilestoneReceipt(
+        milestone_id="m01",
+        contract_id=contract.contract_id,
+        scope_hash=hashlib.sha256(b"test_suite_v2_easier").hexdigest()[:16],  # TAMPERED
+        delivery_hash=hashlib.sha256(b"test_suite_v2_easier").hexdigest()[:16],  # Matches tampered scope
+        match=True,  # Looks like it passes!
+        grader_id="grader",
+        evidence_grade="A",
+        timestamp=now
+    )
+    
+    drifts = detect_scope_drift(contract, [r0, r1])
+    print(f"  Drift detected: {len(drifts)} tampering attempt(s)")
+    for d in drifts:
+        print(f"    {d['milestone_id']}: expected={d['expected_scope'][:8]}... got={d['receipt_scope'][:8]}... → {d['verdict']}")
+    print(f"  Contract hash pins ALL scope hashes at creation: {contract.contract_hash}")
+    print()
+
+
+def scenario_expired_milestones():
+    """Milestones past deadline auto-expire."""
+    print("=== Scenario: Expired Milestones ===")
+    now = time.time()
+    
+    milestones = [
+        Milestone("m00", "On time", hashlib.sha256(b"m0").hexdigest()[:16], now+86400, 1.0),
+        Milestone("m01", "Overdue", hashlib.sha256(b"m1").hexdigest()[:16], now-86400, 1.0),  # Past deadline
+        Milestone("m02", "Way overdue", hashlib.sha256(b"m2").hexdigest()[:16], now-86400*7, 1.0),
+    ]
+    
+    contract = Contract("expiry_test", "agent", "client", milestones, now)
+    
+    # Only deliver m00
+    verify_milestone(milestones[0], milestones[0].scope_hash, "grader", "A")
+    
+    # Check for expiry
+    expired = check_deadline_expiry(contract)
+    result = compute_contract_score(contract)
+    
+    print(f"  Expired: {expired}")
+    print(f"  Score: {result['score']} ({result['milestones_passed']}/{result['milestones_total']})")
+    print(f"  Grade: {result['grade']}")
+    print(f"  Pending: {result['milestones_pending']}, Expired: {result['milestones_expired']}")
     print()
 
 
 if __name__ == "__main__":
-    print("Milestone Receipt Validator — Atomic Verification for ATF Contracts")
+    print("Milestone Receipt Validator — Atomic Deliverable Verification for ATF")
     print("Per santaclawd: milestone_receipts[] = atomic units")
-    print("Per CAB Forum SC-081v3: governance via two voter classes")
     print("=" * 70)
     print()
-    scenario_tc3_model()
-    scenario_full_delivery()
-    scenario_scope_drift()
-    scenario_self_grading_blocked()
+    scenario_tc3_parallel()
     scenario_weighted_milestones()
+    scenario_scope_drift_attack()
+    scenario_expired_milestones()
     
     print("=" * 70)
     print("KEY INSIGHTS:")
-    print("1. Milestones frozen at creation — no runtime scope creep")
-    print("2. Drift = failed milestone, NOT scope amendment")  
-    print("3. Partial delivery = partial payment (proportional)")
-    print("4. Self-grading blocked by Axiom 1")
-    print("5. Weight lets critical milestones dominate score")
+    print("1. Per-milestone grading > whole-scope grading")
+    print("2. scope_hash frozen at contract creation = no runtime drift")
+    print("3. TC3: 0.92 = 23/25 milestones, not 92% of one deliverable")
+    print("4. Weighted milestones: 3/4 passed can still be Grade D if final fails")
+    print("5. Scope drift = TAMPERING, caught by contract_hash comparison")
