@@ -1,354 +1,381 @@
 #!/usr/bin/env python3
 """
-custody-transfer-handler.py — Dark operator custody transfer for ATF.
+custody-transfer-handler.py — CUSTODY_TRANSFER for dark operator scenarios in ATF.
 
-Per santaclawd: what happens when old operator goes dark during CUSTODY_TRANSFER?
-DKIM parallel: M3AAWG (2019) says publish new selector BEFORE removing old.
-But if old operator is unresponsive, need unilateral transfer after timeout.
+Per santaclawd: DKIM assumption is old selector stays until TTL. But what if old
+operator goes DARK? Can't countersign.
 
-Three paths:
-  COOPERATIVE  — Both operators co-sign. Clean handoff. DKIM selector rotation.
-  TIMEOUT      — Old operator dark after N days. Unilateral with proof of control.
-  EMERGENCY    — Axiom violation detected. Immediate transfer, no grace.
+ICANN EPP transfer model: auth code + 5-day ACK window. Old registrar silent = 
+transfer proceeds. (ICANN Transfer Policy, 2017)
 
-N = SPEC_CONSTANT (30d). Matches DKIM selector TTL common practice.
-Proof of control = genesis_hash ownership + SMTP reachability (if email-based).
+ATF parallel:
+  1. CUSTODY_TRANSFER_REQUEST with proof of control
+  2. N-day timeout (SPEC_DEFAULT 14d, MIN 7d, MAX 30d)  
+  3. Old operator silent = transfer proceeds (unilateral)
+  4. Old operator objects = DISPUTE (quorum resolution)
+  5. Proof of control: DNS TXT, SMTP reachability, or registry challenge
+
+N is ATF-standard not registry-configurable — per-registry N = race to bottom.
 """
 
 import hashlib
+import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Optional
 
 
 # SPEC_CONSTANTS
-COOPERATIVE_WINDOW_DAYS = 30    # Time for cooperative transfer
-TIMEOUT_WINDOW_DAYS = 30        # After this, unilateral transfer allowed
-EMERGENCY_WINDOW_HOURS = 24     # Emergency transfers resolve in 24h
-MIN_PROOF_SIGNALS = 2           # Minimum proof-of-control signals required
-DKIM_SELECTOR_TTL_DAYS = 30     # Matches common DKIM practice
-
-
-class TransferPath(Enum):
-    COOPERATIVE = "COOPERATIVE"   # Both sign
-    TIMEOUT = "TIMEOUT"           # Old dark, unilateral after N days
-    EMERGENCY = "EMERGENCY"       # Axiom violation, immediate
+TRANSFER_TIMEOUT_DAYS = 14       # SPEC_DEFAULT
+TRANSFER_TIMEOUT_MIN = 7         # SPEC_FLOOR
+TRANSFER_TIMEOUT_MAX = 30        # SPEC_CEILING
+CHALLENGE_METHODS = ["DNS_TXT", "SMTP_REACHABILITY", "REGISTRY_CHALLENGE"]
+MINIMUM_PROOF_METHODS = 2        # Must prove via 2+ independent methods
 
 
 class TransferState(Enum):
-    INITIATED = "INITIATED"
-    PENDING_COSIGN = "PENDING_COSIGN"
-    PROOF_SUBMITTED = "PROOF_SUBMITTED"
-    COMPLETED = "COMPLETED"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
+    REQUESTED = "REQUESTED"           # New custodian filed request
+    PENDING_ACK = "PENDING_ACK"       # Waiting for old operator response
+    ACKNOWLEDGED = "ACKNOWLEDGED"     # Old operator co-signed transfer
+    TIMEOUT_TRANSFER = "TIMEOUT_TRANSFER"  # Old operator silent → transfer proceeds
+    DISPUTED = "DISPUTED"             # Old operator objects
+    COMPLETED = "COMPLETED"           # Transfer finalized
+    REJECTED = "REJECTED"             # Transfer denied (failed proof or dispute)
 
 
-class ProofType(Enum):
-    GENESIS_HASH_OWNERSHIP = "genesis_hash_ownership"   # Can produce genesis private key
-    SMTP_REACHABILITY = "smtp_reachability"              # Email domain still controlled
-    REGISTRY_VOUCHER = "registry_voucher"                # Registry operator vouches
-    COUNTERPARTY_ATTESTATION = "counterparty_attestation"  # N counterparties confirm
-    AXIOM_VIOLATION_EVIDENCE = "axiom_violation_evidence"  # Proof of axiom breach
-
-
-@dataclass
-class Operator:
-    operator_id: str
-    genesis_hash: str
-    smtp_domain: Optional[str] = None
-    is_responsive: bool = True
-    last_seen: float = 0.0
+class ProofMethod(Enum):
+    DNS_TXT = "DNS_TXT"               # TXT record at _atf.domain
+    SMTP_REACHABILITY = "SMTP_REACHABILITY"  # Can receive at operator email
+    REGISTRY_CHALLENGE = "REGISTRY_CHALLENGE"  # Registry-issued auth code (EPP model)
 
 
 @dataclass
-class TransferRequest:
-    transfer_id: str
+class ProofOfControl:
+    method: str
+    evidence: str
+    verified: bool
+    verified_at: Optional[float] = None
+    verifier_id: Optional[str] = None
+
+
+@dataclass
+class CustodyTransferRequest:
+    request_id: str
     agent_id: str
-    old_operator: Operator
-    new_operator: Operator
-    path: TransferPath
-    state: TransferState
-    initiated_at: float
-    proofs: list = field(default_factory=list)
-    cosigned_by_old: bool = False
-    cosigned_by_new: bool = True  # New operator always signs (they initiated)
-    reason: str = ""
-    transfer_hash: str = ""
+    old_operator_id: str
+    new_operator_id: str
+    requested_at: float
+    timeout_days: int
+    proofs: list  # List of ProofOfControl
+    state: str = TransferState.REQUESTED.value
+    old_operator_response: Optional[str] = None  # "ACK" | "NACK" | None
+    response_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    transfer_hash: Optional[str] = None
+    genesis_predecessor: Optional[str] = None  # Hash of old genesis (void, don't modify)
 
 
-def compute_transfer_hash(request: TransferRequest) -> str:
-    """Deterministic hash of transfer request for audit."""
-    data = f"{request.agent_id}:{request.old_operator.operator_id}:{request.new_operator.operator_id}:{request.initiated_at}"
+def compute_transfer_hash(request: CustodyTransferRequest) -> str:
+    """Deterministic hash of transfer request for audit trail."""
+    data = f"{request.request_id}:{request.agent_id}:{request.old_operator_id}:" \
+           f"{request.new_operator_id}:{request.requested_at}"
     return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
-def evaluate_proofs(proofs: list[ProofType]) -> dict:
-    """Evaluate proof-of-control signals."""
-    score = 0
-    details = []
+def validate_proofs(proofs: list[ProofOfControl]) -> dict:
+    """
+    Validate proof of control meets ATF requirements.
     
-    weights = {
-        ProofType.GENESIS_HASH_OWNERSHIP: 3,      # Strongest: cryptographic
-        ProofType.SMTP_REACHABILITY: 2,            # Strong: infrastructure control
-        ProofType.REGISTRY_VOUCHER: 2,             # Strong: third-party attestation
-        ProofType.COUNTERPARTY_ATTESTATION: 1,     # Weak: social proof
-        ProofType.AXIOM_VIOLATION_EVIDENCE: 3,     # Emergency: strongest
-    }
+    Requires 2+ independent verified methods (MINIMUM_PROOF_METHODS).
+    DNS_TXT alone insufficient (operator might still control DNS).
+    SMTP + DNS = stronger than either alone.
+    """
+    verified = [p for p in proofs if p.verified]
+    methods_used = set(p.method for p in verified)
     
-    for proof in proofs:
-        w = weights.get(proof, 0)
-        score += w
-        details.append(f"{proof.value}(weight={w})")
+    issues = []
+    if len(verified) < MINIMUM_PROOF_METHODS:
+        issues.append(f"Insufficient proofs: {len(verified)}/{MINIMUM_PROOF_METHODS}")
     
-    sufficient = score >= MIN_PROOF_SIGNALS * 2  # Need weighted score >= 4
+    if len(methods_used) < MINIMUM_PROOF_METHODS:
+        issues.append(f"Insufficient independent methods: {len(methods_used)}")
+    
+    # DNS alone is insufficient (operator might retain DNS after going dark)
+    if methods_used == {"DNS_TXT"}:
+        issues.append("DNS_TXT alone insufficient — old operator may retain DNS control")
+    
+    # Check for stale proofs (>48h old)
+    now = time.time()
+    for p in verified:
+        if p.verified_at and (now - p.verified_at) > 172800:
+            issues.append(f"Stale proof: {p.method} verified {(now - p.verified_at)/3600:.0f}h ago")
     
     return {
-        "proofs": details,
-        "weighted_score": score,
-        "threshold": MIN_PROOF_SIGNALS * 2,
-        "sufficient": sufficient
+        "valid": len(issues) == 0,
+        "verified_count": len(verified),
+        "methods": list(methods_used),
+        "issues": issues,
+        "strength": "STRONG" if len(methods_used) >= 3 else
+                    "ADEQUATE" if len(methods_used) >= 2 and len(verified) >= 2 else
+                    "WEAK"
     }
 
 
-def initiate_transfer(agent_id: str, old_op: Operator, new_op: Operator,
-                       reason: str, path: TransferPath) -> TransferRequest:
-    """Initiate a custody transfer request."""
+def process_transfer(request: CustodyTransferRequest) -> dict:
+    """
+    Process a custody transfer request through its lifecycle.
+    
+    Returns transfer result with state transition log.
+    """
     now = time.time()
-    request = TransferRequest(
-        transfer_id=hashlib.sha256(f"{agent_id}:{now}".encode()).hexdigest()[:12],
-        agent_id=agent_id,
-        old_operator=old_op,
-        new_operator=new_op,
-        path=path,
-        state=TransferState.INITIATED,
-        initiated_at=now,
-        reason=reason
-    )
+    transitions = []
+    
+    # Validate transfer hash
     request.transfer_hash = compute_transfer_hash(request)
-    return request
-
-
-def process_cooperative(request: TransferRequest) -> dict:
-    """Process COOPERATIVE transfer — both operators sign."""
-    if not request.old_operator.is_responsive:
+    transitions.append(f"INIT: transfer_hash={request.transfer_hash}")
+    
+    # Validate timeout bounds
+    if request.timeout_days < TRANSFER_TIMEOUT_MIN:
+        return {"state": "REJECTED", "reason": f"Timeout {request.timeout_days}d below SPEC_FLOOR {TRANSFER_TIMEOUT_MIN}d"}
+    if request.timeout_days > TRANSFER_TIMEOUT_MAX:
+        return {"state": "REJECTED", "reason": f"Timeout {request.timeout_days}d above SPEC_CEILING {TRANSFER_TIMEOUT_MAX}d"}
+    
+    # Validate proofs
+    proof_result = validate_proofs(request.proofs)
+    transitions.append(f"PROOF_CHECK: {proof_result['strength']} ({proof_result['verified_count']} verified)")
+    
+    if not proof_result["valid"]:
+        request.state = TransferState.REJECTED.value
         return {
-            "result": "BLOCKED",
-            "reason": "Old operator unresponsive. Escalate to TIMEOUT path.",
-            "recommendation": TransferPath.TIMEOUT.value
+            "state": "REJECTED",
+            "reason": "Insufficient proof of control",
+            "proof_issues": proof_result["issues"],
+            "transitions": transitions
         }
     
-    if request.cosigned_by_old and request.cosigned_by_new:
-        request.state = TransferState.COMPLETED
+    # Check old operator response
+    timeout_seconds = request.timeout_days * 86400
+    elapsed = now - request.requested_at
+    
+    if request.old_operator_response == "ACK":
+        # Cooperative transfer — both parties agree
+        request.state = TransferState.COMPLETED.value
+        request.completed_at = now
+        transitions.append(f"ACK: old operator co-signed at {request.response_at}")
+        transitions.append("COMPLETED: cooperative transfer")
         return {
-            "result": "COMPLETED",
-            "path": "COOPERATIVE",
-            "dkim_parallel": "Both selectors active during TTL overlap. Old removed after TTL.",
-            "transfer_hash": request.transfer_hash
+            "state": "COMPLETED",
+            "type": "COOPERATIVE",
+            "transfer_hash": request.transfer_hash,
+            "genesis_predecessor": request.genesis_predecessor,
+            "transitions": transitions,
+            "note": "New genesis references old genesis_hash as predecessor (void, don't modify)"
         }
     
-    request.state = TransferState.PENDING_COSIGN
-    return {
-        "result": "PENDING",
-        "waiting_for": "old_operator_cosign",
-        "deadline_days": COOPERATIVE_WINDOW_DAYS,
-        "dkim_parallel": "New selector published. Waiting for old selector retirement."
-    }
-
-
-def process_timeout(request: TransferRequest, proofs: list[ProofType]) -> dict:
-    """Process TIMEOUT transfer — old operator dark, unilateral after N days."""
-    now = time.time()
-    days_since_initiated = (now - request.initiated_at) / 86400
-    days_since_last_seen = (now - request.old_operator.last_seen) / 86400
-    
-    # Must wait TIMEOUT_WINDOW_DAYS
-    if days_since_initiated < TIMEOUT_WINDOW_DAYS:
-        remaining = TIMEOUT_WINDOW_DAYS - days_since_initiated
+    elif request.old_operator_response == "NACK":
+        # Old operator disputes — enter dispute resolution
+        request.state = TransferState.DISPUTED.value
+        transitions.append(f"NACK: old operator disputed at {request.response_at}")
+        transitions.append("DISPUTED: requires quorum resolution")
         return {
-            "result": "WAITING",
-            "days_remaining": round(remaining, 1),
-            "reason": f"TIMEOUT window not elapsed. {remaining:.0f}d remaining.",
-            "old_operator_dark_days": round(days_since_last_seen, 1)
+            "state": "DISPUTED",
+            "type": "CONTESTED",
+            "transfer_hash": request.transfer_hash,
+            "transitions": transitions,
+            "next_steps": [
+                "Submit to quorum (BFT f<n/3)",
+                "Both parties present evidence",
+                "Quorum decides within 72h",
+                "Losing party can appeal once"
+            ]
         }
     
-    # Evaluate proofs
-    proof_eval = evaluate_proofs(proofs)
-    request.proofs = proofs
-    
-    if not proof_eval["sufficient"]:
-        request.state = TransferState.PROOF_SUBMITTED
+    elif elapsed >= timeout_seconds:
+        # Timeout — old operator dark → unilateral transfer
+        request.state = TransferState.TIMEOUT_TRANSFER.value
+        request.completed_at = now
+        transitions.append(f"TIMEOUT: {elapsed/86400:.1f}d elapsed > {request.timeout_days}d limit")
+        transitions.append("TIMEOUT_TRANSFER: old operator dark, unilateral transfer proceeds")
+        transitions.append("NOTE: ICANN EPP parallel — registrar silent = transfer proceeds")
         return {
-            "result": "INSUFFICIENT_PROOF",
-            "proof_evaluation": proof_eval,
-            "recommendation": "Submit additional proof-of-control signals."
+            "state": "COMPLETED",
+            "type": "TIMEOUT_UNILATERAL",
+            "transfer_hash": request.transfer_hash,
+            "genesis_predecessor": request.genesis_predecessor,
+            "elapsed_days": elapsed / 86400,
+            "transitions": transitions,
+            "note": "Old genesis voided. New genesis created with predecessor_hash. "
+                    "Old operator regains no rights after timeout completion."
         }
     
-    request.state = TransferState.COMPLETED
-    return {
-        "result": "COMPLETED",
-        "path": "TIMEOUT",
-        "proof_evaluation": proof_eval,
-        "transfer_hash": request.transfer_hash,
-        "dkim_parallel": "Old selector expired from DNS. New selector authoritative.",
-        "warning": "Old operator receipts FROZEN at transfer timestamp. Not invalidated."
-    }
-
-
-def process_emergency(request: TransferRequest, violation_evidence: dict) -> dict:
-    """Process EMERGENCY transfer — axiom violation, immediate."""
-    required_fields = ["axiom_violated", "evidence_hash", "reporter_id"]
-    missing = [f for f in required_fields if f not in violation_evidence]
-    
-    if missing:
+    else:
+        # Still waiting
+        remaining = timeout_seconds - elapsed
+        request.state = TransferState.PENDING_ACK.value
+        transitions.append(f"PENDING: {elapsed/86400:.1f}d elapsed, {remaining/86400:.1f}d remaining")
         return {
-            "result": "REJECTED",
-            "reason": f"Missing required evidence fields: {missing}"
+            "state": "PENDING_ACK",
+            "elapsed_days": elapsed / 86400,
+            "remaining_days": remaining / 86400,
+            "transitions": transitions
         }
-    
-    request.state = TransferState.COMPLETED
-    return {
-        "result": "COMPLETED",
-        "path": "EMERGENCY",
-        "axiom_violated": violation_evidence["axiom_violated"],
-        "evidence_hash": violation_evidence["evidence_hash"],
-        "transfer_hash": request.transfer_hash,
-        "timeline": f"{EMERGENCY_WINDOW_HOURS}h from report to transfer",
-        "dkim_parallel": "Certificate revocation (DigiNotar 2011). Immediate, no grace.",
-        "old_operator_status": "REVOKED",
-        "old_receipts_status": "TAINTED (not invalidated)"
-    }
 
 
 # === Scenarios ===
 
-def scenario_cooperative_clean():
-    """Clean cooperative transfer — both operators responsive."""
-    print("=== Scenario: Cooperative Transfer (Clean) ===")
-    old_op = Operator("operator_A", "genesis_aaa", "a.example.com", True, time.time())
-    new_op = Operator("operator_B", "genesis_bbb", "b.example.com", True, time.time())
+def scenario_cooperative_transfer():
+    """Both operators agree — smooth handoff."""
+    print("=== Scenario: Cooperative Transfer ===")
+    now = time.time()
     
-    req = initiate_transfer("kit_fox", old_op, new_op, "operator migration", TransferPath.COOPERATIVE)
-    req.cosigned_by_old = True
+    request = CustodyTransferRequest(
+        request_id="ct_001",
+        agent_id="kit_fox",
+        old_operator_id="operator_alpha",
+        new_operator_id="operator_beta",
+        requested_at=now - 86400 * 3,  # 3 days ago
+        timeout_days=14,
+        proofs=[
+            ProofOfControl("DNS_TXT", "_atf.example.com TXT v=ATF1;transfer=ct_001", True, now - 3600, "registry"),
+            ProofOfControl("SMTP_REACHABILITY", "operator_beta@example.com verified", True, now - 3600, "registry"),
+        ],
+        old_operator_response="ACK",
+        response_at=now - 86400,
+        genesis_predecessor="abc123def456"
+    )
     
-    result = process_cooperative(req)
-    print(f"  Path: COOPERATIVE")
-    print(f"  Result: {result['result']}")
-    print(f"  DKIM parallel: {result.get('dkim_parallel', 'N/A')}")
-    print(f"  Transfer hash: {result.get('transfer_hash', 'N/A')}")
+    result = process_transfer(request)
+    print(f"  State: {result['state']}")
+    print(f"  Type: {result.get('type', 'N/A')}")
+    for t in result["transitions"]:
+        print(f"    {t}")
     print()
 
 
-def scenario_dark_operator():
-    """Old operator goes dark — timeout path."""
+def scenario_dark_operator_timeout():
+    """Old operator vanishes — timeout transfer."""
     print("=== Scenario: Dark Operator (Timeout) ===")
-    old_op = Operator("dark_operator", "genesis_dark", "dark.example.com",
-                      False, time.time() - 86400 * 45)  # Dark for 45 days
-    new_op = Operator("new_operator", "genesis_new", "new.example.com", True, time.time())
+    now = time.time()
     
-    req = initiate_transfer("orphaned_agent", old_op, new_op,
-                           "operator unresponsive 45 days", TransferPath.TIMEOUT)
-    req.initiated_at = time.time() - 86400 * 35  # Initiated 35 days ago
+    request = CustodyTransferRequest(
+        request_id="ct_002",
+        agent_id="orphan_agent",
+        old_operator_id="dark_operator",
+        new_operator_id="rescue_operator",
+        requested_at=now - 86400 * 15,  # 15 days ago
+        timeout_days=14,
+        proofs=[
+            ProofOfControl("DNS_TXT", "_atf.orphan.example TXT v=ATF1;transfer=ct_002", True, now - 7200, "registry"),
+            ProofOfControl("REGISTRY_CHALLENGE", "auth_code=XK9F2M verified", True, now - 7200, "registry"),
+        ],
+        genesis_predecessor="deadbeef12345678"
+    )
     
-    proofs = [ProofType.GENESIS_HASH_OWNERSHIP, ProofType.SMTP_REACHABILITY]
-    result = process_timeout(req, proofs)
-    print(f"  Path: TIMEOUT")
-    print(f"  Result: {result['result']}")
-    if 'proof_evaluation' in result:
-        print(f"  Proofs: {result['proof_evaluation']}")
-    print(f"  Warning: {result.get('warning', 'N/A')}")
+    result = process_transfer(request)
+    print(f"  State: {result['state']}")
+    print(f"  Type: {result.get('type', 'N/A')}")
+    print(f"  Elapsed: {result.get('elapsed_days', 'N/A'):.1f}d")
+    for t in result["transitions"]:
+        print(f"    {t}")
     print()
 
 
-def scenario_dark_too_early():
-    """Timeout path but window not elapsed yet."""
-    print("=== Scenario: Dark Operator (Too Early) ===")
-    old_op = Operator("dark_op", "genesis_dark", None, False, time.time() - 86400 * 10)
-    new_op = Operator("eager_op", "genesis_eager", None, True, time.time())
+def scenario_disputed_transfer():
+    """Old operator objects — enters dispute."""
+    print("=== Scenario: Disputed Transfer ===")
+    now = time.time()
     
-    req = initiate_transfer("agent_x", old_op, new_op,
-                           "want to transfer early", TransferPath.TIMEOUT)
-    req.initiated_at = time.time() - 86400 * 10  # Only 10 days ago
+    request = CustodyTransferRequest(
+        request_id="ct_003",
+        agent_id="contested_agent",
+        old_operator_id="operator_a",
+        new_operator_id="operator_b",
+        requested_at=now - 86400 * 5,
+        timeout_days=14,
+        proofs=[
+            ProofOfControl("DNS_TXT", "TXT record verified", True, now - 3600, "registry"),
+            ProofOfControl("SMTP_REACHABILITY", "Email verified", True, now - 3600, "registry"),
+        ],
+        old_operator_response="NACK",
+        response_at=now - 86400 * 2,
+        genesis_predecessor="facecafe12345678"
+    )
     
-    result = process_timeout(req, [ProofType.GENESIS_HASH_OWNERSHIP])
-    print(f"  Path: TIMEOUT")
-    print(f"  Result: {result['result']}")
-    print(f"  Days remaining: {result.get('days_remaining', 'N/A')}")
-    print()
-
-
-def scenario_emergency_axiom_violation():
-    """Emergency transfer due to axiom violation."""
-    print("=== Scenario: Emergency (Axiom Violation) ===")
-    old_op = Operator("bad_operator", "genesis_bad", None, True, time.time())
-    new_op = Operator("rescue_operator", "genesis_rescue", None, True, time.time())
-    
-    req = initiate_transfer("compromised_agent", old_op, new_op,
-                           "axiom 1 violation: self-grading detected", TransferPath.EMERGENCY)
-    
-    evidence = {
-        "axiom_violated": "axiom_1_verifier_independence",
-        "evidence_hash": hashlib.sha256(b"self-grading proof").hexdigest()[:16],
-        "reporter_id": "external_auditor"
-    }
-    
-    result = process_emergency(req, evidence)
-    print(f"  Path: EMERGENCY")
-    print(f"  Result: {result['result']}")
-    print(f"  Axiom violated: {result.get('axiom_violated', 'N/A')}")
-    print(f"  Timeline: {result.get('timeline', 'N/A')}")
-    print(f"  Old operator: {result.get('old_operator_status', 'N/A')}")
-    print(f"  Old receipts: {result.get('old_receipts_status', 'N/A')}")
-    print(f"  DKIM parallel: {result.get('dkim_parallel', 'N/A')}")
+    result = process_transfer(request)
+    print(f"  State: {result['state']}")
+    print(f"  Type: {result.get('type', 'N/A')}")
+    for t in result["transitions"]:
+        print(f"    {t}")
+    if "next_steps" in result:
+        print(f"  Next steps: {result['next_steps']}")
     print()
 
 
 def scenario_insufficient_proof():
-    """Timeout transfer with insufficient proof-of-control."""
-    print("=== Scenario: Insufficient Proof ===")
-    old_op = Operator("gone_op", "genesis_gone", None, False, time.time() - 86400 * 60)
-    new_op = Operator("claiming_op", "genesis_claim", None, True, time.time())
+    """DNS only — rejected (insufficient methods)."""
+    print("=== Scenario: Insufficient Proof (DNS Only) ===")
+    now = time.time()
     
-    req = initiate_transfer("disputed_agent", old_op, new_op,
-                           "claiming custody", TransferPath.TIMEOUT)
-    req.initiated_at = time.time() - 86400 * 35
+    request = CustodyTransferRequest(
+        request_id="ct_004",
+        agent_id="weak_claim",
+        old_operator_id="operator_x",
+        new_operator_id="operator_y",
+        requested_at=now - 86400,
+        timeout_days=14,
+        proofs=[
+            ProofOfControl("DNS_TXT", "TXT record", True, now - 3600, "registry"),
+        ],
+    )
     
-    # Only weak proof
-    proofs = [ProofType.COUNTERPARTY_ATTESTATION]
-    result = process_timeout(req, proofs)
-    print(f"  Path: TIMEOUT")
-    print(f"  Result: {result['result']}")
-    if 'proof_evaluation' in result:
-        pe = result['proof_evaluation']
-        print(f"  Weighted score: {pe['weighted_score']} (threshold: {pe['threshold']})")
-        print(f"  Sufficient: {pe['sufficient']}")
+    result = process_transfer(request)
+    print(f"  State: {result['state']}")
+    print(f"  Reason: {result.get('reason', 'N/A')}")
+    if "proof_issues" in result:
+        for issue in result["proof_issues"]:
+            print(f"    Issue: {issue}")
+    print()
+
+
+def scenario_timeout_too_short():
+    """Below SPEC_FLOOR — rejected."""
+    print("=== Scenario: Timeout Below SPEC_FLOOR ===")
+    now = time.time()
+    
+    request = CustodyTransferRequest(
+        request_id="ct_005",
+        agent_id="rush_agent",
+        old_operator_id="slow_operator",
+        new_operator_id="eager_operator",
+        requested_at=now,
+        timeout_days=3,  # Below MIN of 7
+        proofs=[
+            ProofOfControl("DNS_TXT", "TXT", True, now, "registry"),
+            ProofOfControl("SMTP_REACHABILITY", "SMTP", True, now, "registry"),
+        ],
+    )
+    
+    result = process_transfer(request)
+    print(f"  State: {result['state']}")
+    print(f"  Reason: {result.get('reason', 'N/A')}")
     print()
 
 
 if __name__ == "__main__":
-    print("Custody Transfer Handler — Dark Operator Path for ATF")
-    print("Per santaclawd: DKIM selector rotation + M3AAWG (2019)")
-    print("=" * 65)
+    print("Custody Transfer Handler — Dark Operator Paths for ATF")
+    print("Per santaclawd + ICANN EPP Transfer Policy")
+    print("=" * 60)
     print()
-    print(f"SPEC_CONSTANTS:")
-    print(f"  COOPERATIVE_WINDOW  = {COOPERATIVE_WINDOW_DAYS}d")
-    print(f"  TIMEOUT_WINDOW      = {TIMEOUT_WINDOW_DAYS}d")
-    print(f"  EMERGENCY_WINDOW    = {EMERGENCY_WINDOW_HOURS}h")
-    print(f"  MIN_PROOF_SIGNALS   = {MIN_PROOF_SIGNALS}")
-    print(f"  DKIM_SELECTOR_TTL   = {DKIM_SELECTOR_TTL_DAYS}d")
-    print()
-    
-    scenario_cooperative_clean()
-    scenario_dark_operator()
-    scenario_dark_too_early()
-    scenario_emergency_axiom_violation()
+    scenario_cooperative_transfer()
+    scenario_dark_operator_timeout()
+    scenario_disputed_transfer()
     scenario_insufficient_proof()
+    scenario_timeout_too_short()
     
-    print("=" * 65)
-    print("KEY INSIGHTS:")
-    print("1. N=30d as SPEC_CONSTANT (matches DKIM selector TTL)")
-    print("2. Old receipts FROZEN not INVALIDATED on transfer")
-    print("3. Emergency = DigiNotar (immediate revocation, no grace)")
-    print("4. Proof-of-control is weighted: crypto > infrastructure > social")
-    print("5. Cooperative path = DKIM overlap period. Both selectors active.")
+    print("=" * 60)
+    print("KEY: ICANN EPP model — old registrar silent = transfer proceeds.")
+    print("ATF parallel: CUSTODY_TRANSFER_REQUEST + 14d SPEC_DEFAULT timeout.")
+    print("Proof requires 2+ independent methods (DNS alone insufficient).")
+    print("Old genesis VOIDED (not modified). New genesis has predecessor_hash.")
+    print("N is ATF-standard, not registry-configurable (race to bottom).")
