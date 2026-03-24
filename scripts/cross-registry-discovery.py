@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-cross-registry-discovery.py — Federation discovery for ATF cross-registry trust.
+cross-registry-discovery.py — How ATF registries find each other.
 
 Per santaclawd: ATF V1.1 complete. Next frontier = cross-registry federation.
-Per FBCA (Federal Bridge CA): mutual recognition ≠ transitive trust.
+Per FPKI: Federal Bridge CA uses cross-certification with published trust lists.
 
-Three discovery methods:
-  1. DNS SRV   — _atf-federation._tcp.registry.example (RFC 2782)
-  2. Well-Known — /.well-known/atf-federation.json (RFC 8615)
-  3. Mutual Introduction — existing bridge vouches for new registry
+Three discovery mechanisms:
+  DNS TXT     — v=ATF1;registry=https://...;hash=abc123 (like DKIM/DMARC)
+  WELL_KNOWN  — /.well-known/atf-registry.json (like security.txt)
+  GOSSIP      — Receipt-embedded registry hints (like CT gossip, but working)
 
-Key FBCA lessons:
-  - Cross-certification maps policies, not identities
-  - Bridge CA is conduit of trust, not root
-  - A↔Bridge↔B ≠ A trusts B directly
-  - Each registry maintains own PKI
+Key insight: CT's gossip mechanism was specified but never deployed (draft-ietf-trans-gossip
+abandoned). ATF must not repeat this. Receipts ARE the gossip channel.
 """
 
 import hashlib
@@ -26,370 +23,377 @@ from typing import Optional
 
 
 class DiscoveryMethod(Enum):
-    DNS_SRV = "DNS_SRV"                    # SRV record lookup
-    WELL_KNOWN = "WELL_KNOWN"              # /.well-known/ endpoint
-    MUTUAL_INTRODUCTION = "MUTUAL_INTRO"   # Existing bridge vouches
+    DNS_TXT = "DNS_TXT"           # Domain-anchored
+    WELL_KNOWN = "WELL_KNOWN"     # HTTP-based
+    GOSSIP = "GOSSIP"             # Receipt-embedded
+    MANUAL = "MANUAL"             # Operator-configured
 
 
 class FederationStatus(Enum):
-    DISCOVERED = "DISCOVERED"       # Found, not yet verified
-    VERIFIED = "VERIFIED"           # Policy compatibility confirmed
-    FEDERATED = "FEDERATED"         # Active bridge established
-    SUSPENDED = "SUSPENDED"         # Bridge suspended (audit failure)
-    REVOKED = "REVOKED"            # Bridge permanently revoked
-
-
-class TrustDirection(Enum):
-    UNIDIRECTIONAL = "UNIDIRECTIONAL"  # A→B only
-    BIDIRECTIONAL = "BIDIRECTIONAL"     # A↔B (two unidirectional bridges)
+    DISCOVERED = "DISCOVERED"       # Found, not yet validated
+    VALIDATED = "VALIDATED"         # Schema + hash verified
+    BRIDGED = "BRIDGED"            # Cross-certification active
+    STALE = "STALE"                # Discovery TTL expired
+    REVOKED = "REVOKED"            # Explicitly revoked
 
 
 # SPEC_CONSTANTS
-DISCOVERY_TTL_HOURS = 24           # Re-discover every 24h
-BRIDGE_MAX_AGE_DAYS = 90           # Bridge expires without renewal
-POLICY_FIELDS_REQUIRED = [         # Minimum fields for compatibility check
-    "schema_version", "evidence_grade_scale", "error_type_enum",
-    "axiom_count", "attestation_entropy_method"
-]
-MIN_POLICY_OVERLAP = 0.7           # 70% field compatibility required
-INTRODUCTION_REQUIRES_RECEIPTS = 5  # Introducer must have 5+ receipts with target
+DNS_TXT_PREFIX = "v=ATF1"
+WELL_KNOWN_PATH = "/.well-known/atf-registry.json"
+DISCOVERY_TTL_DAYS = 30          # Re-discover every 30 days
+GOSSIP_MIN_SOURCES = 3           # Require 3 independent receipts before trusting gossip
+BRIDGE_MAX_DEPTH = 2             # A→B→C allowed, A→B→C→D not
+REGISTRY_HASH_ALGO = "sha256"
 
 
 @dataclass
-class RegistryInfo:
+class RegistryRecord:
     registry_id: str
-    registry_hash: str
-    endpoint: str               # Base URL
-    policy_version: str
-    policy_fields: dict         # Field name → spec version
-    axiom_count: int
-    grade_scale: str            # "A-F" or "0-100" etc
-    operator_id: str
-    last_audit: float           # Timestamp
-    discovered_via: Optional[DiscoveryMethod] = None
-    discovered_at: float = 0.0
+    registry_url: str
+    registry_hash: str           # Hash of registry's genesis document
+    operator: str
+    schema_version: str
+    agent_count: int
+    discovered_via: DiscoveryMethod
+    discovered_at: float
+    status: FederationStatus = FederationStatus.DISCOVERED
+    bridge_direction: str = "NONE"  # NONE, OUTBOUND, INBOUND, MUTUAL
+    ttl_days: int = DISCOVERY_TTL_DAYS
+    gossip_sources: list = field(default_factory=list)
 
 
 @dataclass
-class FederationBridge:
-    bridge_id: str
-    source_registry: str        # Registry offering trust
-    target_registry: str        # Registry receiving trust
-    direction: TrustDirection
-    status: FederationStatus
-    policy_overlap: float       # 0.0-1.0
-    field_mapping: dict         # source_field → target_field
-    grade_translation: dict     # source_grade → target_grade
-    scope: list                 # Which grade levels transfer
-    created_at: float
+class BridgeCertificate:
+    """Cross-certification between two registries."""
+    source_registry: str
+    target_registry: str
+    scope: list                  # Which grade levels are trusted
+    direction: str               # UNIDIRECTIONAL or MUTUAL
+    issued_at: float
     expires_at: float
-    introduced_by: Optional[str] = None  # For MUTUAL_INTRO
     bridge_hash: str = ""
+    depth: int = 0               # How many hops from source
     
     def __post_init__(self):
         if not self.bridge_hash:
             h = hashlib.sha256(
-                f"{self.source_registry}:{self.target_registry}:{self.created_at}".encode()
+                f"{self.source_registry}:{self.target_registry}:{self.issued_at}".encode()
             ).hexdigest()[:16]
             self.bridge_hash = h
 
 
-def check_policy_compatibility(source: RegistryInfo, target: RegistryInfo) -> dict:
-    """
-    Check if two registries have compatible policies for federation.
-    FBCA model: cross-certification maps policies, not identities.
-    """
-    source_fields = set(source.policy_fields.keys())
-    target_fields = set(target.policy_fields.keys())
+def parse_dns_txt(txt_record: str) -> Optional[dict]:
+    """Parse ATF DNS TXT record (DKIM-style key=value pairs)."""
+    if not txt_record.startswith(DNS_TXT_PREFIX):
+        return None
     
-    # Required field overlap
-    required_overlap = set(POLICY_FIELDS_REQUIRED)
-    source_has = source_fields & required_overlap
-    target_has = target_fields & required_overlap
-    both_have = source_has & target_has
+    parts = {}
+    for pair in txt_record.split(";"):
+        pair = pair.strip()
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            parts[k.strip()] = v.strip()
     
-    # Total field overlap
-    all_fields = source_fields | target_fields
-    shared_fields = source_fields & target_fields
-    overlap = len(shared_fields) / len(all_fields) if all_fields else 0
+    required = {"v", "registry", "hash"}
+    if not required.issubset(parts.keys()):
+        return None
     
-    # Grade scale compatibility
-    grade_compatible = source.grade_scale == target.grade_scale
-    
-    # Axiom compatibility (target must have >= source axioms)
-    axiom_compatible = target.axiom_count >= source.axiom_count
-    
-    # Version compatibility
-    version_compatible = source.policy_version.split('.')[0] == target.policy_version.split('.')[0]
-    
-    compatible = (
-        overlap >= MIN_POLICY_OVERLAP and
-        len(both_have) == len(required_overlap) and
-        grade_compatible and
-        axiom_compatible and
-        version_compatible
-    )
-    
-    return {
-        "compatible": compatible,
-        "policy_overlap": round(overlap, 3),
-        "required_fields_met": len(both_have) == len(required_overlap),
-        "required_present": list(both_have),
-        "required_missing": list(required_overlap - both_have),
-        "grade_compatible": grade_compatible,
-        "axiom_compatible": axiom_compatible,
-        "version_compatible": version_compatible,
-        "shared_fields": len(shared_fields),
-        "total_fields": len(all_fields),
-        "field_mapping": {f: f for f in shared_fields}  # Identity mapping for compatible fields
-    }
+    return parts
 
 
-def discover_dns_srv(registry_domain: str) -> Optional[RegistryInfo]:
-    """Simulate DNS SRV discovery (_atf-federation._tcp.domain)."""
-    # In production: dns.resolver.resolve(f"_atf-federation._tcp.{domain}", "SRV")
-    known = {
-        "registry-alpha.example": RegistryInfo(
-            registry_id="reg_alpha", registry_hash="a1b2c3",
-            endpoint="https://registry-alpha.example/atf",
-            policy_version="1.1", axiom_count=3, grade_scale="A-F",
-            operator_id="op_alpha", last_audit=time.time() - 86400*10,
-            policy_fields={f: "1.1" for f in POLICY_FIELDS_REQUIRED + ["extra_field_1", "shared_1", "shared_2"]},
-            discovered_via=DiscoveryMethod.DNS_SRV, discovered_at=time.time()
-        ),
-        "registry-beta.example": RegistryInfo(
-            registry_id="reg_beta", registry_hash="d4e5f6",
-            endpoint="https://registry-beta.example/atf",
-            policy_version="1.1", axiom_count=3, grade_scale="A-F",
-            operator_id="op_beta", last_audit=time.time() - 86400*5,
-            policy_fields={f: "1.1" for f in POLICY_FIELDS_REQUIRED + ["extra_field_2", "shared_1", "shared_2"]},
-            discovered_via=DiscoveryMethod.DNS_SRV, discovered_at=time.time()
-        ),
-    }
-    return known.get(registry_domain)
-
-
-def discover_well_known(endpoint: str) -> Optional[RegistryInfo]:
-    """Simulate /.well-known/atf-federation.json discovery."""
-    # In production: requests.get(f"{endpoint}/.well-known/atf-federation.json")
-    if "incompatible" in endpoint:
-        return RegistryInfo(
-            registry_id="reg_incompat", registry_hash="x1y2z3",
-            endpoint=endpoint, policy_version="2.0",  # Major version mismatch!
-            axiom_count=5, grade_scale="0-100",  # Different grade scale!
-            operator_id="op_incompat", last_audit=time.time() - 86400*200,
-            policy_fields={"schema_version": "2.0", "custom_field": "2.0"},
-            discovered_via=DiscoveryMethod.WELL_KNOWN, discovered_at=time.time()
-        )
+def discover_via_dns(domain: str, txt_records: list[str]) -> Optional[RegistryRecord]:
+    """Discover ATF registry via DNS TXT records."""
+    for txt in txt_records:
+        parsed = parse_dns_txt(txt)
+        if parsed:
+            return RegistryRecord(
+                registry_id=f"dns:{domain}",
+                registry_url=parsed["registry"],
+                registry_hash=parsed["hash"],
+                operator=parsed.get("op", domain),
+                schema_version=parsed.get("v", "ATF1"),
+                agent_count=int(parsed.get("agents", "0")),
+                discovered_via=DiscoveryMethod.DNS_TXT,
+                discovered_at=time.time()
+            )
     return None
 
 
-def create_bridge(source: RegistryInfo, target: RegistryInfo,
-                  direction: TrustDirection = TrustDirection.UNIDIRECTIONAL,
-                  introducer: Optional[str] = None) -> tuple[Optional[FederationBridge], dict]:
-    """
-    Create a federation bridge between two registries.
-    Returns (bridge, compatibility_report).
-    """
-    compat = check_policy_compatibility(source, target)
+def discover_via_wellknown(url: str, content: dict) -> Optional[RegistryRecord]:
+    """Discover ATF registry via .well-known endpoint."""
+    if "registry_id" not in content or "registry_hash" not in content:
+        return None
     
-    if not compat["compatible"]:
-        return None, compat
-    
-    # Grade translation (identity for same scale)
-    grade_trans = {}
-    if source.grade_scale == target.grade_scale:
-        for g in ["A", "B", "C", "D", "F"]:
-            grade_trans[g] = g
-    
-    # Scope: only transfer grades A and B by default (conservative)
-    scope = ["A", "B"]
-    
-    now = time.time()
-    bridge = FederationBridge(
-        bridge_id=f"bridge_{source.registry_id}_{target.registry_id}",
-        source_registry=source.registry_id,
-        target_registry=target.registry_id,
-        direction=direction,
-        status=FederationStatus.FEDERATED,
-        policy_overlap=compat["policy_overlap"],
-        field_mapping=compat["field_mapping"],
-        grade_translation=grade_trans,
-        scope=scope,
-        created_at=now,
-        expires_at=now + BRIDGE_MAX_AGE_DAYS * 86400,
-        introduced_by=introducer
+    return RegistryRecord(
+        registry_id=content["registry_id"],
+        registry_url=url.replace(WELL_KNOWN_PATH, ""),
+        registry_hash=content["registry_hash"],
+        operator=content.get("operator", "unknown"),
+        schema_version=content.get("schema_version", "ATF1"),
+        agent_count=content.get("agent_count", 0),
+        discovered_via=DiscoveryMethod.WELL_KNOWN,
+        discovered_at=time.time()
     )
-    
-    return bridge, compat
 
 
-def audit_bridge(bridge: FederationBridge, source: RegistryInfo, target: RegistryInfo) -> dict:
-    """Audit an existing bridge for continued validity."""
-    now = time.time()
+def discover_via_gossip(registry_hints: list[dict]) -> Optional[RegistryRecord]:
+    """
+    Discover ATF registry via receipt-embedded hints.
     
+    Requires GOSSIP_MIN_SOURCES independent sources to prevent spoofing.
+    CT's gossip failed because it was optional. ATF makes it structural.
+    """
+    if len(registry_hints) < GOSSIP_MIN_SOURCES:
+        return None
+    
+    # Check operator diversity (prevent sybil gossip)
+    operators = set(h.get("source_operator", "") for h in registry_hints)
+    if len(operators) < 2:
+        return None  # Same operator = 1 effective source
+    
+    # Consensus on registry_hash (majority)
+    hashes = [h.get("registry_hash", "") for h in registry_hints]
+    hash_counts = {}
+    for h in hashes:
+        hash_counts[h] = hash_counts.get(h, 0) + 1
+    
+    consensus_hash = max(hash_counts, key=hash_counts.get)
+    consensus_ratio = hash_counts[consensus_hash] / len(hashes)
+    
+    if consensus_ratio < 0.67:
+        return None  # No strong consensus
+    
+    # Use first hint's URL (they should all agree)
+    first = registry_hints[0]
+    record = RegistryRecord(
+        registry_id=f"gossip:{consensus_hash[:8]}",
+        registry_url=first.get("registry_url", ""),
+        registry_hash=consensus_hash,
+        operator=first.get("operator", "unknown"),
+        schema_version=first.get("schema_version", "ATF1"),
+        agent_count=0,  # Unknown via gossip
+        discovered_via=DiscoveryMethod.GOSSIP,
+        discovered_at=time.time(),
+        gossip_sources=[h.get("source_agent", "") for h in registry_hints]
+    )
+    return record
+
+
+def validate_bridge(bridge: BridgeCertificate, known_registries: dict) -> dict:
+    """Validate a cross-registry bridge certificate."""
     issues = []
     
-    # Check expiry
-    if now > bridge.expires_at:
-        issues.append("EXPIRED")
-    elif now > bridge.expires_at - 7 * 86400:
-        issues.append("EXPIRING_SOON")
+    # Source must be known
+    if bridge.source_registry not in known_registries:
+        issues.append(f"Unknown source registry: {bridge.source_registry}")
     
-    # Re-check compatibility
-    compat = check_policy_compatibility(source, target)
-    if not compat["compatible"]:
-        issues.append("POLICY_DRIFT")
+    # Target must be discovered
+    if bridge.target_registry not in known_registries:
+        issues.append(f"Unknown target registry: {bridge.target_registry}")
     
-    # Check audit freshness
-    if now - source.last_audit > 180 * 86400:
-        issues.append("SOURCE_AUDIT_STALE")
-    if now - target.last_audit > 180 * 86400:
-        issues.append("TARGET_AUDIT_STALE")
+    # Depth check
+    if bridge.depth > BRIDGE_MAX_DEPTH:
+        issues.append(f"Bridge depth {bridge.depth} exceeds max {BRIDGE_MAX_DEPTH}")
     
-    # Determine status
-    if "EXPIRED" in issues or "POLICY_DRIFT" in issues:
-        recommended_status = FederationStatus.SUSPENDED
-    elif issues:
-        recommended_status = FederationStatus.FEDERATED  # Warnings only
-    else:
-        recommended_status = FederationStatus.FEDERATED
+    # Expiry check
+    if bridge.expires_at < time.time():
+        issues.append("Bridge certificate expired")
+    
+    # Self-bridge check
+    if bridge.source_registry == bridge.target_registry:
+        issues.append("Self-bridge detected (axiom 1 violation)")
+    
+    # Scope check
+    if not bridge.scope:
+        issues.append("Empty scope — bridge trusts nothing")
     
     return {
-        "bridge_id": bridge.bridge_id,
-        "current_status": bridge.status.value,
-        "recommended_status": recommended_status.value,
+        "valid": len(issues) == 0,
         "issues": issues,
-        "policy_overlap": compat["policy_overlap"],
-        "days_until_expiry": round((bridge.expires_at - now) / 86400, 1),
-        "source_audit_age_days": round((now - source.last_audit) / 86400, 1),
-        "target_audit_age_days": round((now - target.last_audit) / 86400, 1)
+        "direction": bridge.direction,
+        "depth": bridge.depth,
+        "scope": bridge.scope
+    }
+
+
+def compute_federation_graph(registries: list[RegistryRecord], 
+                              bridges: list[BridgeCertificate]) -> dict:
+    """Build federation topology graph."""
+    nodes = {r.registry_id: {
+        "url": r.registry_url,
+        "status": r.status.value,
+        "discovered_via": r.discovered_via.value,
+        "agents": r.agent_count
+    } for r in registries}
+    
+    edges = []
+    for b in bridges:
+        validation = validate_bridge(b, {r.registry_id: r for r in registries})
+        edges.append({
+            "source": b.source_registry,
+            "target": b.target_registry,
+            "direction": b.direction,
+            "scope": b.scope,
+            "valid": validation["valid"],
+            "depth": b.depth
+        })
+    
+    # Find connected components
+    adj = {}
+    for e in edges:
+        if e["valid"]:
+            adj.setdefault(e["source"], []).append(e["target"])
+            if e["direction"] == "MUTUAL":
+                adj.setdefault(e["target"], []).append(e["source"])
+    
+    visited = set()
+    components = []
+    for node in nodes:
+        if node not in visited:
+            component = set()
+            stack = [node]
+            while stack:
+                n = stack.pop()
+                if n not in visited:
+                    visited.add(n)
+                    component.add(n)
+                    for neighbor in adj.get(n, []):
+                        if neighbor not in visited:
+                            stack.append(neighbor)
+            components.append(component)
+    
+    return {
+        "nodes": len(nodes),
+        "edges": len(edges),
+        "valid_edges": sum(1 for e in edges if e["valid"]),
+        "components": len(components),
+        "largest_component": max(len(c) for c in components) if components else 0,
+        "isolated": sum(1 for c in components if len(c) == 1)
     }
 
 
 # === Scenarios ===
 
 def scenario_dns_discovery():
-    """Discover registries via DNS SRV records."""
-    print("=== Scenario: DNS SRV Discovery ===")
+    """Registry discovered via DNS TXT record."""
+    print("=== Scenario: DNS TXT Discovery ===")
     
-    alpha = discover_dns_srv("registry-alpha.example")
-    beta = discover_dns_srv("registry-beta.example")
+    txt_records = [
+        "v=ATF1;registry=https://atf.example.com;hash=abc123def456;op=example_operator;agents=150",
+        "v=spf1 include:_spf.google.com ~all"  # Non-ATF record
+    ]
     
-    print(f"  Discovered: {alpha.registry_id} via {alpha.discovered_via.value}")
-    print(f"  Discovered: {beta.registry_id} via {beta.discovered_via.value}")
-    
-    bridge, compat = create_bridge(alpha, beta)
-    print(f"  Compatibility: {compat['policy_overlap']:.1%} overlap")
-    print(f"  Grade compatible: {compat['grade_compatible']}")
-    print(f"  Bridge created: {bridge is not None}")
-    if bridge:
-        print(f"  Bridge: {bridge.source_registry}→{bridge.target_registry}")
-        print(f"  Scope: grades {bridge.scope}")
-        print(f"  Expires: {BRIDGE_MAX_AGE_DAYS} days")
+    record = discover_via_dns("example.com", txt_records)
+    if record:
+        print(f"  Found: {record.registry_id}")
+        print(f"  URL: {record.registry_url}")
+        print(f"  Hash: {record.registry_hash}")
+        print(f"  Operator: {record.operator}")
+        print(f"  Agents: {record.agent_count}")
+        print(f"  Method: {record.discovered_via.value}")
     print()
 
 
-def scenario_incompatible_registry():
-    """Attempt to federate with incompatible registry."""
-    print("=== Scenario: Incompatible Registry ===")
+def scenario_gossip_discovery():
+    """Registry discovered via receipt-embedded hints from 3+ independent sources."""
+    print("=== Scenario: Gossip Discovery (Receipt-Embedded) ===")
     
-    alpha = discover_dns_srv("registry-alpha.example")
-    incompat = discover_well_known("https://incompatible.example/atf")
+    hints = [
+        {"registry_url": "https://atf-b.io", "registry_hash": "hash_b_123",
+         "source_agent": "agent_1", "source_operator": "op_alpha", "schema_version": "ATF1"},
+        {"registry_url": "https://atf-b.io", "registry_hash": "hash_b_123",
+         "source_agent": "agent_2", "source_operator": "op_beta", "schema_version": "ATF1"},
+        {"registry_url": "https://atf-b.io", "registry_hash": "hash_b_123",
+         "source_agent": "agent_3", "source_operator": "op_gamma", "schema_version": "ATF1"},
+    ]
     
-    print(f"  Source: v{alpha.policy_version}, {alpha.axiom_count} axioms, scale={alpha.grade_scale}")
-    print(f"  Target: v{incompat.policy_version}, {incompat.axiom_count} axioms, scale={incompat.grade_scale}")
-    
-    bridge, compat = create_bridge(alpha, incompat)
-    print(f"  Compatible: {compat['compatible']}")
-    print(f"  Policy overlap: {compat['policy_overlap']:.1%}")
-    print(f"  Grade compatible: {compat['grade_compatible']}")
-    print(f"  Version compatible: {compat['version_compatible']}")
-    print(f"  Required fields missing: {compat['required_missing']}")
-    print(f"  Bridge created: {bridge is not None}")
+    record = discover_via_gossip(hints)
+    if record:
+        print(f"  Found: {record.registry_id}")
+        print(f"  URL: {record.registry_url}")
+        print(f"  Sources: {len(record.gossip_sources)} independent agents")
+        print(f"  Consensus: hash_b_123 (100%)")
+        print(f"  Method: {record.discovered_via.value}")
     print()
 
 
-def scenario_mutual_introduction():
-    """Registry introduced by existing federated partner."""
-    print("=== Scenario: Mutual Introduction ===")
+def scenario_sybil_gossip():
+    """Gossip from same operator — rejected."""
+    print("=== Scenario: Sybil Gossip (Same Operator) ===")
     
-    alpha = discover_dns_srv("registry-alpha.example")
-    beta = discover_dns_srv("registry-beta.example")
+    hints = [
+        {"registry_url": "https://fake.io", "registry_hash": "fake_hash",
+         "source_agent": f"sybil_{i}", "source_operator": "op_sybil", "schema_version": "ATF1"}
+        for i in range(5)
+    ]
     
-    # Alpha introduces Beta to a new registry (gamma)
-    gamma = RegistryInfo(
-        registry_id="reg_gamma", registry_hash="g7h8i9",
-        endpoint="https://registry-gamma.example/atf",
-        policy_version="1.1", axiom_count=3, grade_scale="A-F",
-        operator_id="op_gamma", last_audit=time.time() - 86400*15,
-        policy_fields={f: "1.1" for f in POLICY_FIELDS_REQUIRED},
-        discovered_via=DiscoveryMethod.MUTUAL_INTRODUCTION,
-        discovered_at=time.time()
-    )
-    
-    bridge, compat = create_bridge(beta, gamma, introducer=alpha.registry_id)
-    print(f"  Introducer: {alpha.registry_id}")
-    print(f"  Bridge: {beta.registry_id}→{gamma.registry_id}")
-    print(f"  Compatible: {compat['compatible']}")
-    if bridge:
-        print(f"  Introduced by: {bridge.introduced_by}")
-        print(f"  Key: A↔Bridge↔B ≠ A trusts B directly (FBCA model)")
+    record = discover_via_gossip(hints)
+    print(f"  5 hints from same operator")
+    print(f"  Discovery result: {'FOUND' if record else 'REJECTED'}")
+    print(f"  Reason: same operator = 1 effective source < minimum {GOSSIP_MIN_SOURCES}")
     print()
 
 
-def scenario_bridge_audit():
-    """Audit existing bridge for continued validity."""
-    print("=== Scenario: Bridge Audit ===")
+def scenario_federation_graph():
+    """Multi-registry federation topology."""
+    print("=== Scenario: Federation Graph ===")
+    now = time.time()
     
-    alpha = discover_dns_srv("registry-alpha.example")
-    beta = discover_dns_srv("registry-beta.example")
+    registries = [
+        RegistryRecord("reg_alpha", "https://alpha.atf", "hash_a", "op_a", "ATF1", 100,
+                       DiscoveryMethod.DNS_TXT, now, FederationStatus.BRIDGED),
+        RegistryRecord("reg_beta", "https://beta.atf", "hash_b", "op_b", "ATF1", 50,
+                       DiscoveryMethod.WELL_KNOWN, now, FederationStatus.BRIDGED),
+        RegistryRecord("reg_gamma", "https://gamma.atf", "hash_g", "op_g", "ATF1", 75,
+                       DiscoveryMethod.GOSSIP, now, FederationStatus.VALIDATED),
+        RegistryRecord("reg_delta", "https://delta.atf", "hash_d", "op_d", "ATF1", 30,
+                       DiscoveryMethod.MANUAL, now, FederationStatus.DISCOVERED),
+    ]
     
-    bridge, compat = create_bridge(alpha, beta)
-    if not bridge:
-        print(f"  Bridge creation failed: overlap={compat['policy_overlap']:.1%}")
-        return
+    bridges = [
+        BridgeCertificate("reg_alpha", "reg_beta", ["A", "B"], "MUTUAL",
+                         now, now + 86400*90, depth=1),
+        BridgeCertificate("reg_beta", "reg_gamma", ["A", "B", "C"], "UNIDIRECTIONAL",
+                         now, now + 86400*90, depth=1),
+        BridgeCertificate("reg_alpha", "reg_alpha", ["A"], "MUTUAL",
+                         now, now + 86400*90, depth=0),  # Self-bridge!
+    ]
     
-    # Simulate fresh bridge
-    audit1 = audit_bridge(bridge, alpha, beta)
-    print(f"  Fresh bridge: status={audit1['recommended_status']}, issues={audit1['issues']}")
-    print(f"  Days until expiry: {audit1['days_until_expiry']}")
+    graph = compute_federation_graph(registries, bridges)
+    print(f"  Registries: {graph['nodes']}")
+    print(f"  Bridges: {graph['edges']} ({graph['valid_edges']} valid)")
+    print(f"  Connected components: {graph['components']}")
+    print(f"  Largest component: {graph['largest_component']} registries")
+    print(f"  Isolated: {graph['isolated']} registries")
     
-    # Simulate stale audit
-    alpha_stale = RegistryInfo(
-        registry_id="reg_alpha", registry_hash="a1b2c3",
-        endpoint="https://registry-alpha.example/atf",
-        policy_version="1.1", axiom_count=3, grade_scale="A-F",
-        operator_id="op_alpha", last_audit=time.time() - 86400*200,  # 200 days!
-        policy_fields={f: "1.1" for f in POLICY_FIELDS_REQUIRED}
-    )
-    
-    audit2 = audit_bridge(bridge, alpha_stale, beta)
-    print(f"  Stale audit: status={audit2['recommended_status']}, issues={audit2['issues']}")
-    print(f"  Source audit age: {audit2['source_audit_age_days']} days")
+    # Validate each bridge
+    known = {r.registry_id: r for r in registries}
+    for b in bridges:
+        v = validate_bridge(b, known)
+        status = "VALID" if v["valid"] else f"INVALID: {v['issues']}"
+        print(f"  Bridge {b.source_registry}→{b.target_registry}: {status}")
     print()
 
 
 if __name__ == "__main__":
-    print("Cross-Registry Discovery — ATF Federation via FBCA Model")
-    print("Per santaclawd: ATF V1.1 complete. Next = cross-registry federation.")
+    print("Cross-Registry Discovery — How ATF Registries Find Each Other")
+    print("Per santaclawd: next frontier after V1.1 = cross-registry federation")
     print("=" * 70)
     print()
-    print("Three discovery methods:")
-    print("  1. DNS SRV: _atf-federation._tcp.registry.example")
-    print("  2. Well-Known: /.well-known/atf-federation.json")
-    print("  3. Mutual Introduction: existing bridge vouches")
+    print(f"Discovery methods: DNS_TXT, WELL_KNOWN, GOSSIP, MANUAL")
+    print(f"Gossip requires {GOSSIP_MIN_SOURCES}+ independent sources (CT gossip failed by being optional)")
+    print(f"Bridge max depth: {BRIDGE_MAX_DEPTH} (FPKI model)")
     print()
     
     scenario_dns_discovery()
-    scenario_incompatible_registry()
-    scenario_mutual_introduction()
-    scenario_bridge_audit()
+    scenario_gossip_discovery()
+    scenario_sybil_gossip()
+    scenario_federation_graph()
     
     print("=" * 70)
-    print("KEY FBCA LESSONS:")
-    print("  1. Cross-certification maps POLICIES, not identities")
-    print("  2. Bridge is conduit of trust, not root")
-    print("  3. A↔Bridge↔B ≠ A trusts B directly")
-    print("  4. Each registry maintains own PKI")
-    print("  5. Unidirectional bridges by default (conservative)")
+    print("KEY INSIGHTS:")
+    print("1. CT gossip was specified but never deployed. Receipts ARE gossip.")
+    print("2. DNS TXT = domain-anchored (like DKIM). Strongest signal.")  
+    print("3. Gossip requires operator diversity (sybil prevention).")
+    print("4. Bridge depth limited to 2 (FPKI model). A→B→C ok, deeper = no.")
+    print("5. Self-bridge = axiom 1 violation. Always rejected.")
