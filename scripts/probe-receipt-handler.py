@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-probe-receipt-handler.py — Liveness probes for ATF sparse receipt model.
+probe-receipt-handler.py — PROBE liveness receipts for ATF sparse model.
 
 Per santaclawd + funwolf: silence-as-CONFIRMED fails on network partition.
-Cannot distinguish "delivered + confirmed" from "delivery failed."
+Per Chandra & Toueg (1996): eventually strong failure detector needs active probing.
+Per Fischer-Lynch-Paterson (1985): no deterministic consensus with async + crash fault.
 
-PROBE receipt: sent at T-hour mark if no FAILED/DISPUTED received.
-Custodian ACKs or silence → UNCONFIRMED (not CONFIRMED).
+PROBE = active liveness check at T-hour intervals.
+  - Sent by verifier at T-hour if no FAILED/DISPUTED received
+  - Custodian ACKs within grace period → CONFIRMED
+  - Silence past grace → escalate to DISPUTED
+  - PROBE interval = genesis constant (too short = DDoS, too long = stale)
 
-Per Aguilera et al. (1997): timeout-free failure detectors use heartbeat
-MESSAGES not heartbeat TIMEOUTS. PROBE = heartbeat message for trust state.
-
-Five receipt states:
-  CONFIRMED  — bilateral agreement (co-signed)
-  FAILED     — explicit failure reported
-  DISPUTED   — explicit disagreement
-  PROBE      — liveness check sent, awaiting ACK
-  UNCONFIRMED — PROBE sent, no ACK received within window
-
-SMTP parallel: VRFY command (RFC 5321) — rarely used but proves channel works.
+Five receipt types:
+  CONFIRMED — bilateral agreement (co-signed)
+  FAILED    — verifier detected failure
+  DISPUTED  — explicit disagreement or PROBE timeout
+  PROBE     — liveness check (active heartbeat)
+  AMENDMENT — scope change (AIA G701 model)
 """
 
 import hashlib
@@ -28,280 +27,330 @@ from enum import Enum
 from typing import Optional
 
 
-class ReceiptState(Enum):
+class ReceiptType(Enum):
     CONFIRMED = "CONFIRMED"
     FAILED = "FAILED"
     DISPUTED = "DISPUTED"
-    PROBE = "PROBE"           # Liveness check in flight
-    UNCONFIRMED = "UNCONFIRMED"  # PROBE timeout — partition or failure
+    PROBE = "PROBE"
+    AMENDMENT = "AMENDMENT"
 
 
-class ProbeResult(Enum):
-    ACK = "ACK"               # Custodian responded — state persists
-    NACK = "NACK"             # Custodian explicitly rejected
-    TIMEOUT = "TIMEOUT"       # No response within window
-    CHANNEL_FAIL = "CHANNEL_FAIL"  # Delivery of PROBE itself failed
+class ProbeStatus(Enum):
+    PENDING = "PENDING"       # Sent, awaiting ACK
+    ACKED = "ACKED"           # Custodian responded
+    TIMEOUT = "TIMEOUT"       # Grace period expired
+    ESCALATED = "ESCALATED"   # Timeout → DISPUTED
+
+
+class FailureMode(Enum):
+    CRASH = "CRASH"           # Node down (Chandra-Toueg)
+    PARTITION = "PARTITION"    # Network split (FLP)
+    BYZANTINE = "BYZANTINE"   # Malicious behavior
+    SLOW = "SLOW"             # Responsive but degraded
 
 
 # SPEC_CONSTANTS
-PROBE_INTERVAL_HOURS = 24     # Send PROBE every T hours if silent
-PROBE_ACK_WINDOW_HOURS = 4    # ACK required within this window
-MAX_CONSECUTIVE_TIMEOUTS = 3  # Before escalation to UNCONFIRMED
-PROBE_ESCALATION_CHAIN = [
-    "PROBE",           # First: standard probe
-    "PROBE_ELEVATED",  # Second: elevated priority
-    "PROBE_FINAL",     # Third: last chance before UNCONFIRMED
-]
+PROBE_INTERVAL_HOURS = 24       # T-hour: probe every 24h
+PROBE_GRACE_HOURS = 4           # Grace period for ACK
+MIN_PROBE_INTERVAL_HOURS = 6    # Floor (DDoS prevention)
+MAX_PROBE_INTERVAL_HOURS = 168  # Ceiling (1 week, staleness)
+CONSECUTIVE_TIMEOUTS_THRESHOLD = 3  # → SUSPENDED
+PROBE_COST_WEIGHT = 0.01       # Cost per probe (prevents DDoS)
 
 
 @dataclass
-class ProbeEvent:
+class Probe:
     probe_id: str
-    target_agent: str
-    milestone_hash: Optional[str]
+    agent_id: str
+    counterparty_id: str
     sent_at: float
-    probe_type: str = "PROBE"  # PROBE / PROBE_ELEVATED / PROBE_FINAL
-    result: Optional[ProbeResult] = None
+    interval_hours: float
+    grace_hours: float
+    status: ProbeStatus = ProbeStatus.PENDING
     ack_at: Optional[float] = None
-    hash: str = ""
-    
+    ack_latency_ms: Optional[float] = None
+    failure_mode: Optional[FailureMode] = None
+    escalated_to: Optional[str] = None  # receipt_id of DISPUTED receipt
+    probe_hash: str = ""
+
     def __post_init__(self):
-        if not self.hash:
-            self.hash = hashlib.sha256(
-                f"{self.probe_id}:{self.target_agent}:{self.sent_at}".encode()
+        if not self.probe_hash:
+            self.probe_hash = hashlib.sha256(
+                f"{self.probe_id}:{self.agent_id}:{self.sent_at}".encode()
             ).hexdigest()[:16]
 
 
 @dataclass
-class AgentLivenessState:
+class ProbeHistory:
     agent_id: str
-    last_receipt_at: float
-    last_probe_at: Optional[float] = None
+    counterparty_id: str
+    probes: list[Probe] = field(default_factory=list)
     consecutive_timeouts: int = 0
-    state: ReceiptState = ReceiptState.CONFIRMED
-    probe_history: list = field(default_factory=list)
+    total_probes: int = 0
+    total_acks: int = 0
+    avg_latency_ms: float = 0.0
 
 
-def should_probe(agent: AgentLivenessState, now: float) -> bool:
-    """Determine if a PROBE should be sent."""
-    hours_since_receipt = (now - agent.last_receipt_at) / 3600
+def send_probe(agent_id: str, counterparty_id: str, now: float,
+               interval: float = PROBE_INTERVAL_HOURS,
+               grace: float = PROBE_GRACE_HOURS) -> Probe:
+    """Create and send a PROBE receipt."""
+    probe_id = hashlib.sha256(
+        f"probe:{agent_id}:{counterparty_id}:{now}".encode()
+    ).hexdigest()[:12]
     
-    # Don't probe if we have a recent receipt
-    if hours_since_receipt < PROBE_INTERVAL_HOURS:
-        return False
-    
-    # Don't probe if we already have one in flight
-    if agent.state == ReceiptState.PROBE:
-        if agent.last_probe_at:
-            hours_since_probe = (now - agent.last_probe_at) / 3600
-            if hours_since_probe < PROBE_ACK_WINDOW_HOURS:
-                return False  # Still waiting for ACK
-    
-    return True
-
-
-def send_probe(agent: AgentLivenessState, now: float) -> ProbeEvent:
-    """Send a PROBE to the agent."""
-    probe_type = PROBE_ESCALATION_CHAIN[
-        min(agent.consecutive_timeouts, len(PROBE_ESCALATION_CHAIN) - 1)
-    ]
-    
-    probe = ProbeEvent(
-        probe_id=f"probe_{agent.agent_id}_{int(now)}",
-        target_agent=agent.agent_id,
-        milestone_hash=None,
+    return Probe(
+        probe_id=probe_id,
+        agent_id=agent_id,
+        counterparty_id=counterparty_id,
         sent_at=now,
-        probe_type=probe_type
+        interval_hours=interval,
+        grace_hours=grace
     )
+
+
+def process_ack(probe: Probe, ack_time: float) -> Probe:
+    """Process ACK response to a PROBE."""
+    grace_deadline = probe.sent_at + (probe.grace_hours * 3600)
     
-    agent.state = ReceiptState.PROBE
-    agent.last_probe_at = now
-    agent.probe_history.append(probe)
+    if ack_time <= grace_deadline:
+        probe.status = ProbeStatus.ACKED
+        probe.ack_at = ack_time
+        probe.ack_latency_ms = (ack_time - probe.sent_at) * 1000
+    else:
+        # Late ACK — still record but mark as timeout
+        probe.status = ProbeStatus.TIMEOUT
+        probe.ack_at = ack_time
+        probe.ack_latency_ms = (ack_time - probe.sent_at) * 1000
+        probe.failure_mode = FailureMode.SLOW
     
     return probe
 
 
-def process_ack(agent: AgentLivenessState, probe: ProbeEvent, 
-                result: ProbeResult, now: float) -> dict:
-    """Process a PROBE response."""
-    probe.result = result
-    probe.ack_at = now if result == ProbeResult.ACK else None
+def check_timeout(probe: Probe, now: float) -> Probe:
+    """Check if PROBE has timed out."""
+    grace_deadline = probe.sent_at + (probe.grace_hours * 3600)
     
-    if result == ProbeResult.ACK:
-        agent.state = ReceiptState.CONFIRMED
-        agent.consecutive_timeouts = 0
-        agent.last_receipt_at = now
-        return {"action": "CONFIRMED", "message": "Liveness verified"}
+    if probe.status == ProbeStatus.PENDING and now > grace_deadline:
+        probe.status = ProbeStatus.TIMEOUT
+        probe.failure_mode = FailureMode.PARTITION  # Default assumption
     
-    elif result == ProbeResult.NACK:
-        agent.state = ReceiptState.DISPUTED
-        agent.consecutive_timeouts = 0
-        return {"action": "DISPUTED", "message": "Custodian explicitly rejected"}
-    
-    elif result == ProbeResult.TIMEOUT:
-        agent.consecutive_timeouts += 1
-        if agent.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
-            agent.state = ReceiptState.UNCONFIRMED
-            return {
-                "action": "UNCONFIRMED",
-                "message": f"{MAX_CONSECUTIVE_TIMEOUTS} consecutive timeouts — partition or failure",
-                "consecutive_timeouts": agent.consecutive_timeouts
-            }
-        else:
-            return {
-                "action": "PROBE_RETRY",
-                "message": f"Timeout {agent.consecutive_timeouts}/{MAX_CONSECUTIVE_TIMEOUTS}",
-                "next_probe": PROBE_ESCALATION_CHAIN[
-                    min(agent.consecutive_timeouts, len(PROBE_ESCALATION_CHAIN) - 1)
-                ]
-            }
-    
-    elif result == ProbeResult.CHANNEL_FAIL:
-        agent.state = ReceiptState.UNCONFIRMED
-        return {"action": "CHANNEL_FAILURE", "message": "Delivery channel broken"}
+    return probe
 
 
-def audit_fleet(agents: list[AgentLivenessState]) -> dict:
-    """Fleet-level liveness audit."""
-    states = {}
-    for a in agents:
-        states[a.state.value] = states.get(a.state.value, 0) + 1
+def escalate_timeout(probe: Probe) -> Probe:
+    """Escalate timeout to DISPUTED receipt."""
+    if probe.status == ProbeStatus.TIMEOUT:
+        probe.status = ProbeStatus.ESCALATED
+        probe.escalated_to = f"disputed_{probe.probe_id}"
+    return probe
+
+
+def classify_failure(history: ProbeHistory) -> dict:
+    """Classify failure mode from probe history."""
+    if not history.probes:
+        return {"mode": "UNKNOWN", "confidence": 0.0}
     
-    total = len(agents)
-    unconfirmed = states.get("UNCONFIRMED", 0)
-    probing = states.get("PROBE", 0)
+    recent = history.probes[-5:]  # Last 5 probes
+    timeouts = [p for p in recent if p.status in (ProbeStatus.TIMEOUT, ProbeStatus.ESCALATED)]
+    acked = [p for p in recent if p.status == ProbeStatus.ACKED]
     
-    health = "HEALTHY" if unconfirmed == 0 else (
-        "DEGRADED" if unconfirmed / total < 0.1 else "CRITICAL"
-    )
+    timeout_ratio = len(timeouts) / len(recent)
+    
+    if timeout_ratio == 1.0:
+        # All timeouts — crash or sustained partition
+        return {"mode": FailureMode.CRASH.value, "confidence": 0.9,
+                "evidence": "5/5 consecutive timeouts"}
+    elif timeout_ratio > 0.5:
+        # Intermittent — likely partition (flapping)
+        return {"mode": FailureMode.PARTITION.value, "confidence": 0.7,
+                "evidence": f"{len(timeouts)}/5 timeouts (intermittent)"}
+    elif acked and max(p.ack_latency_ms for p in acked if p.ack_latency_ms) > (PROBE_GRACE_HOURS * 3600 * 1000 * 0.8):
+        # Responding but very slow
+        return {"mode": FailureMode.SLOW.value, "confidence": 0.6,
+                "evidence": "ACKs near grace deadline"}
+    else:
+        return {"mode": "HEALTHY", "confidence": 0.95,
+                "evidence": f"{len(acked)}/5 timely ACKs"}
+
+
+def compute_liveness_score(history: ProbeHistory) -> dict:
+    """Compute liveness score from probe history."""
+    if history.total_probes == 0:
+        return {"score": 0.0, "grade": "UNKNOWN", "probes": 0}
+    
+    ack_rate = history.total_acks / history.total_probes
+    
+    # Wilson CI lower bound
+    n = history.total_probes
+    p = ack_rate
+    z = 1.96
+    denominator = 1 + z**2 / n
+    centre = p + z**2 / (2 * n)
+    spread = z * ((p * (1 - p) / n + z**2 / (4 * n**2)) ** 0.5)
+    ci_lower = (centre - spread) / denominator
+    
+    # Grade based on CI lower bound
+    if ci_lower >= 0.9:
+        grade = "A"
+    elif ci_lower >= 0.7:
+        grade = "B"
+    elif ci_lower >= 0.5:
+        grade = "C"
+    elif ci_lower >= 0.3:
+        grade = "D"
+    else:
+        grade = "F"
+    
+    suspended = history.consecutive_timeouts >= CONSECUTIVE_TIMEOUTS_THRESHOLD
     
     return {
-        "total_agents": total,
-        "state_distribution": states,
-        "health": health,
-        "probe_pending": probing,
-        "unconfirmed_rate": round(unconfirmed / total, 3) if total > 0 else 0
+        "score": round(ack_rate, 4),
+        "ci_lower": round(ci_lower, 4),
+        "grade": grade,
+        "probes": history.total_probes,
+        "acks": history.total_acks,
+        "consecutive_timeouts": history.consecutive_timeouts,
+        "suspended": suspended,
+        "avg_latency_ms": round(history.avg_latency_ms, 1)
     }
 
 
 # === Scenarios ===
 
-def scenario_healthy_ack():
-    """Normal operation: PROBE sent, ACK received."""
-    print("=== Scenario: Healthy ACK ===")
+def scenario_healthy_agent():
+    """Agent responds to all probes on time."""
+    print("=== Scenario: Healthy Agent ===")
     now = time.time()
+    history = ProbeHistory("kit_fox", "bro_agent")
     
-    agent = AgentLivenessState("bro_agent", last_receipt_at=now - 86400 * 2)
+    for i in range(20):
+        probe = send_probe("kit_fox", "bro_agent", now + i * 86400)
+        ack_time = probe.sent_at + 1800  # 30 min response
+        probe = process_ack(probe, ack_time)
+        history.probes.append(probe)
+        history.total_probes += 1
+        if probe.status == ProbeStatus.ACKED:
+            history.total_acks += 1
+            history.avg_latency_ms = (
+                (history.avg_latency_ms * (history.total_acks - 1) + probe.ack_latency_ms)
+                / history.total_acks
+            )
     
-    print(f"  Last receipt: 48h ago")
-    print(f"  Should probe: {should_probe(agent, now)}")
-    
-    probe = send_probe(agent, now)
-    print(f"  Sent: {probe.probe_type}")
-    
-    result = process_ack(agent, probe, ProbeResult.ACK, now + 3600)
-    print(f"  Result: {result['action']} — {result['message']}")
-    print(f"  State: {agent.state.value}")
+    failure = classify_failure(history)
+    liveness = compute_liveness_score(history)
+    print(f"  Probes: {liveness['probes']}, ACKs: {liveness['acks']}")
+    print(f"  Score: {liveness['score']}, CI lower: {liveness['ci_lower']}, Grade: {liveness['grade']}")
+    print(f"  Failure mode: {failure['mode']} (confidence: {failure['confidence']})")
+    print(f"  Avg latency: {liveness['avg_latency_ms']}ms")
     print()
 
 
-def scenario_partition_timeout():
-    """Network partition: 3 consecutive timeouts → UNCONFIRMED."""
-    print("=== Scenario: Partition — 3 Timeouts → UNCONFIRMED ===")
+def scenario_network_partition():
+    """Agent unreachable — all probes timeout."""
+    print("=== Scenario: Network Partition ===")
     now = time.time()
+    history = ProbeHistory("kit_fox", "partitioned_agent")
     
-    agent = AgentLivenessState("partitioned_agent", last_receipt_at=now - 86400 * 3)
+    for i in range(5):
+        probe = send_probe("kit_fox", "partitioned_agent", now + i * 86400)
+        probe = check_timeout(probe, probe.sent_at + 5 * 3600)  # Check after 5h
+        probe = escalate_timeout(probe)
+        history.probes.append(probe)
+        history.total_probes += 1
+        history.consecutive_timeouts += 1
     
-    for i in range(3):
-        probe = send_probe(agent, now + i * PROBE_INTERVAL_HOURS * 3600)
-        result = process_ack(agent, probe, ProbeResult.TIMEOUT, 
-                           now + (i + 1) * PROBE_INTERVAL_HOURS * 3600)
-        print(f"  Probe {i+1} ({probe.probe_type}): {result['action']} — {result['message']}")
-    
-    print(f"  Final state: {agent.state.value}")
-    print(f"  Consecutive timeouts: {agent.consecutive_timeouts}")
+    failure = classify_failure(history)
+    liveness = compute_liveness_score(history)
+    print(f"  Probes: {liveness['probes']}, ACKs: {liveness['acks']}")
+    print(f"  Score: {liveness['score']}, Grade: {liveness['grade']}")
+    print(f"  Consecutive timeouts: {liveness['consecutive_timeouts']}")
+    print(f"  SUSPENDED: {liveness['suspended']}")
+    print(f"  Failure mode: {failure['mode']} (confidence: {failure['confidence']})")
     print()
 
 
-def scenario_nack_dispute():
-    """Custodian explicitly rejects → DISPUTED."""
-    print("=== Scenario: Explicit NACK → DISPUTED ===")
+def scenario_intermittent_failure():
+    """Agent flapping — some ACKs, some timeouts."""
+    print("=== Scenario: Intermittent Failure (Flapping) ===")
     now = time.time()
+    history = ProbeHistory("kit_fox", "flaky_agent")
     
-    agent = AgentLivenessState("hostile_agent", last_receipt_at=now - 86400)
+    for i in range(10):
+        probe = send_probe("kit_fox", "flaky_agent", now + i * 86400)
+        if i % 3 == 0:  # Every 3rd probe times out
+            probe = check_timeout(probe, probe.sent_at + 5 * 3600)
+            history.consecutive_timeouts += 1
+        else:
+            ack_time = probe.sent_at + 7200  # 2h response
+            probe = process_ack(probe, ack_time)
+            history.consecutive_timeouts = 0
+            history.total_acks += 1
+            history.avg_latency_ms = (
+                (history.avg_latency_ms * (history.total_acks - 1) + probe.ack_latency_ms)
+                / history.total_acks
+            ) if history.total_acks > 0 else probe.ack_latency_ms
+        history.probes.append(probe)
+        history.total_probes += 1
     
-    probe = send_probe(agent, now)
-    result = process_ack(agent, probe, ProbeResult.NACK, now + 7200)
-    print(f"  Probe: {probe.probe_type}")
-    print(f"  Result: {result['action']} — {result['message']}")
-    print(f"  State: {agent.state.value}")
+    failure = classify_failure(history)
+    liveness = compute_liveness_score(history)
+    print(f"  Probes: {liveness['probes']}, ACKs: {liveness['acks']}")
+    print(f"  Score: {liveness['score']}, CI lower: {liveness['ci_lower']}, Grade: {liveness['grade']}")
+    print(f"  Failure mode: {failure['mode']} ({failure['evidence']})")
     print()
 
 
-def scenario_recovery_after_partition():
-    """Agent recovers after 2 timeouts — resets counter."""
-    print("=== Scenario: Recovery After 2 Timeouts ===")
+def scenario_slow_degradation():
+    """Agent responding but slower and slower."""
+    print("=== Scenario: Slow Degradation ===")
     now = time.time()
+    history = ProbeHistory("kit_fox", "degrading_agent")
     
-    agent = AgentLivenessState("recovering_agent", last_receipt_at=now - 86400 * 4)
+    for i in range(10):
+        probe = send_probe("kit_fox", "degrading_agent", now + i * 86400)
+        # Latency increases: 30min → 3.5h (near grace deadline)
+        latency_s = 1800 + (i * 1200)  # 30min + 20min per probe
+        ack_time = probe.sent_at + latency_s
+        probe = process_ack(probe, ack_time)
+        history.probes.append(probe)
+        history.total_probes += 1
+        if probe.status == ProbeStatus.ACKED:
+            history.total_acks += 1
+            history.avg_latency_ms = (
+                (history.avg_latency_ms * (history.total_acks - 1) + probe.ack_latency_ms)
+                / history.total_acks
+            )
+        else:
+            history.consecutive_timeouts += 1
     
-    # Two timeouts
-    for i in range(2):
-        probe = send_probe(agent, now + i * PROBE_INTERVAL_HOURS * 3600)
-        result = process_ack(agent, probe, ProbeResult.TIMEOUT,
-                           now + (i + 1) * PROBE_INTERVAL_HOURS * 3600)
-        print(f"  Probe {i+1}: {result['action']}")
-    
-    # Recovery
-    probe = send_probe(agent, now + 3 * PROBE_INTERVAL_HOURS * 3600)
-    result = process_ack(agent, probe, ProbeResult.ACK,
-                        now + 3 * PROBE_INTERVAL_HOURS * 3600 + 1800)
-    print(f"  Probe 3: {result['action']} — counter reset!")
-    print(f"  Consecutive timeouts: {agent.consecutive_timeouts}")
-    print(f"  State: {agent.state.value}")
-    print()
-
-
-def scenario_fleet_audit():
-    """Fleet-level health check."""
-    print("=== Scenario: Fleet Audit ===")
-    now = time.time()
-    
-    agents = [
-        AgentLivenessState("healthy_1", now - 3600, state=ReceiptState.CONFIRMED),
-        AgentLivenessState("healthy_2", now - 7200, state=ReceiptState.CONFIRMED),
-        AgentLivenessState("probing_1", now - 86400*2, state=ReceiptState.PROBE),
-        AgentLivenessState("unconfirmed_1", now - 86400*5, state=ReceiptState.UNCONFIRMED, consecutive_timeouts=3),
-        AgentLivenessState("disputed_1", now - 86400, state=ReceiptState.DISPUTED),
-    ]
-    
-    audit = audit_fleet(agents)
-    print(f"  Fleet: {audit['total_agents']} agents")
-    print(f"  States: {audit['state_distribution']}")
-    print(f"  Health: {audit['health']}")
-    print(f"  Unconfirmed rate: {audit['unconfirmed_rate']}")
+    failure = classify_failure(history)
+    liveness = compute_liveness_score(history)
+    print(f"  Probes: {liveness['probes']}, ACKs: {liveness['acks']}")
+    print(f"  Score: {liveness['score']}, CI lower: {liveness['ci_lower']}, Grade: {liveness['grade']}")
+    print(f"  Avg latency: {liveness['avg_latency_ms']/1000:.0f}s ({liveness['avg_latency_ms']/3600000:.1f}h)")
+    print(f"  Failure mode: {failure['mode']}")
     print()
 
 
 if __name__ == "__main__":
-    print("Probe Receipt Handler — Liveness Probes for ATF Sparse Model")
-    print("Per santaclawd + funwolf + Aguilera et al. (1997)")
+    print("PROBE Receipt Handler — Liveness Proofs for ATF Sparse Model")
+    print("Per santaclawd + funwolf + Chandra & Toueg (1996)")
     print("=" * 70)
     print()
-    print("Five receipt states: CONFIRMED | FAILED | DISPUTED | PROBE | UNCONFIRMED")
-    print(f"Probe interval: {PROBE_INTERVAL_HOURS}h | ACK window: {PROBE_ACK_WINDOW_HOURS}h")
-    print(f"Max timeouts before UNCONFIRMED: {MAX_CONSECUTIVE_TIMEOUTS}")
-    print(f"Escalation: {' → '.join(PROBE_ESCALATION_CHAIN)}")
+    print(f"PROBE_INTERVAL: {PROBE_INTERVAL_HOURS}h (genesis constant)")
+    print(f"PROBE_GRACE: {PROBE_GRACE_HOURS}h")
+    print(f"TIMEOUT_THRESHOLD: {CONSECUTIVE_TIMEOUTS_THRESHOLD} consecutive → SUSPENDED")
+    print(f"Receipt types: CONFIRMED, FAILED, DISPUTED, PROBE, AMENDMENT")
     print()
     
-    scenario_healthy_ack()
-    scenario_partition_timeout()
-    scenario_nack_dispute()
-    scenario_recovery_after_partition()
-    scenario_fleet_audit()
+    scenario_healthy_agent()
+    scenario_network_partition()
+    scenario_intermittent_failure()
+    scenario_slow_degradation()
     
     print("=" * 70)
-    print("KEY INSIGHT: Silence is ambiguous. PROBE makes it unambiguous.")
-    print("No ACK after PROBE = UNCONFIRMED (partition or failure).")
-    print("No ACK without PROBE = still could be CONFIRMED (sparse model).")
-    print("SMTP VRFY parallel: proves channel works, not just content.")
+    print("KEY INSIGHT: Silence is never safe in distributed systems (FLP 1985).")
+    print("PROBE = synchrony assumption made explicit.")
+    print("Sparse receipts + PROBE = partition-safe without DDoS overhead.")
+    print("Failure classification: CRASH / PARTITION / BYZANTINE / SLOW.")
