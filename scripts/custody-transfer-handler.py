@@ -216,7 +216,7 @@ def scenario_dark_operator():
         "tx_002", "agent_orphan", old_op, new_op,
         mode, TransferState.PROPOSED, now,
         proof_of_control={
-            "dns_txt_record": "v=ATF1;operator=genesis_new1    ",
+            "dns_txt_record": "v=ATF1;operator=genesis_new1",
             "operator_genesis_hash": "genesis_new1",
             "smtp_reachable": True
         }
@@ -254,7 +254,7 @@ def scenario_cooperative_escalation():
     
     # Step 3: Now unilateral with proof
     transfer.proof_of_control = {
-        "dns_txt_record": "v=ATF1;operator=genesis_eagr    ",
+        "dns_txt_record": "v=ATF1;operator=genesis_eagr",
         "operator_genesis_hash": "genesis_eagr",
         "smtp_reachable": True
     }
@@ -288,7 +288,7 @@ def scenario_emergency():
         mode, TransferState.PROPOSED, now,
         evidence=evidence,
         proof_of_control={
-            "dns_txt_record": "v=ATF1;operator=genesis_resc    ",
+            "dns_txt_record": "v=ATF1;operator=genesis_resc",
             "operator_genesis_hash": "genesis_resc",
             "smtp_reachable": True
         }
