@@ -2,27 +2,25 @@
 """
 assurance-level-mapper.py — FBCA-to-ATF assurance level mapping for cross-registry federation.
 
-Per santaclawd: FBCA has RUDIMENTARY/BASIC/MEDIUM/HIGH. ATF needs equivalent.
-Per RFC 6763: DNS-SD for discovery. _atf._tcp.<domain> TXT for registry endpoints.
+Per santaclawd: FBCA has RUDIMENTARY/BASIC/MEDIUM/HIGH.
+ATF needs equivalent: PROVISIONAL/ALLEGED/CONFIRMED/VERIFIED.
 
-Mapping:
-  RUDIMENTARY → PROVISIONAL  (n<5, depth≤1, Wilson CI floor 0.00)
-  BASIC       → ALLEGED      (n<30, depth≤2, Wilson CI floor 0.30)
-  MEDIUM      → CONFIRMED    (n≥30, depth≤3, Wilson CI floor 0.70)
-  HIGH        → VERIFIED     (n≥100, depth≤4, Wilson CI floor 0.90)
+Cross-registry bridge inherits the LOWER of two registries' assurance floors.
+Prevents trust laundering upward.
 
-Cross-registry bridge: grade = MIN(source_assurance, target_assurance).
-Trust laundering upward = structurally impossible.
+DNS-SD (RFC 6763) + SRP (RFC 9665, Dec 2024) for discovery.
+_atf._tcp.<domain> SRV for endpoint, TXT for policy level.
 """
 
 import hashlib
-import math
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
 class FBCALevel(Enum):
+    """Federal Bridge CA assurance levels."""
     RUDIMENTARY = 1
     BASIC = 2
     MEDIUM = 3
@@ -30,46 +28,51 @@ class FBCALevel(Enum):
 
 
 class ATFLevel(Enum):
-    PROVISIONAL = 1
-    ALLEGED = 2
-    CONFIRMED = 3
-    VERIFIED = 4
+    """ATF trust assurance levels."""
+    PROVISIONAL = 1   # Cold start, n < 5
+    ALLEGED = 2       # Building, n < 30 or Wilson CI < 0.7
+    CONFIRMED = 3     # Established, n >= 30, Wilson CI >= 0.7
+    VERIFIED = 4      # Mature, n >= 100, Wilson CI >= 0.9
 
 
-# SPEC_CONSTANTS: assurance level requirements
+# SPEC_CONSTANTS: level requirements
 LEVEL_REQUIREMENTS = {
     ATFLevel.PROVISIONAL: {
-        "min_receipts": 1,
-        "wilson_ci_floor": 0.00,
+        "min_receipts": 0,
+        "max_receipts": 4,
+        "wilson_ci_floor": 0.0,
         "max_delegation_depth": 1,
-        "min_counterparties": 1,
-        "min_days_active": 0,
-        "fbca_equivalent": FBCALevel.RUDIMENTARY,
+        "description": "Cold start. TOFU territory."
     },
     ATFLevel.ALLEGED: {
         "min_receipts": 5,
-        "wilson_ci_floor": 0.30,
+        "max_receipts": 29,
+        "wilson_ci_floor": 0.0,
         "max_delegation_depth": 2,
-        "min_counterparties": 2,
-        "min_days_active": 7,
-        "fbca_equivalent": FBCALevel.BASIC,
+        "description": "Building trust. Wilson CI still wide."
     },
     ATFLevel.CONFIRMED: {
         "min_receipts": 30,
+        "max_receipts": 99,
         "wilson_ci_floor": 0.70,
         "max_delegation_depth": 3,
-        "min_counterparties": 5,
-        "min_days_active": 30,
-        "fbca_equivalent": FBCALevel.MEDIUM,
+        "description": "Established. CLT kicks in. CI meaningful."
     },
     ATFLevel.VERIFIED: {
         "min_receipts": 100,
+        "max_receipts": float('inf'),
         "wilson_ci_floor": 0.90,
         "max_delegation_depth": 4,
-        "min_counterparties": 10,
-        "min_days_active": 90,
-        "fbca_equivalent": FBCALevel.HIGH,
-    },
+        "description": "Mature. Narrow CI. High confidence."
+    }
+}
+
+# FBCA → ATF mapping
+FBCA_TO_ATF = {
+    FBCALevel.RUDIMENTARY: ATFLevel.PROVISIONAL,
+    FBCALevel.BASIC: ATFLevel.ALLEGED,
+    FBCALevel.MEDIUM: ATFLevel.CONFIRMED,
+    FBCALevel.HIGH: ATFLevel.VERIFIED,
 }
 
 
@@ -78,239 +81,201 @@ class RegistryProfile:
     registry_id: str
     domain: str
     assurance_level: ATFLevel
-    policy_hash: str
-    endpoint: str
-    cross_sign_contact: str  # email for cross-signing ceremony
-    dns_txt: str = ""  # _atf._tcp.<domain> TXT record value
-
+    total_agents: int
+    avg_receipts_per_agent: float
+    avg_wilson_ci: float
+    dns_txt_record: str = ""  # _atf._tcp.<domain> TXT
+    
     def __post_init__(self):
-        if not self.dns_txt:
-            self.dns_txt = (f"v=ATF1; level={self.assurance_level.name}; "
-                          f"endpoint={self.endpoint}; policy={self.policy_hash[:16]}; "
-                          f"contact={self.cross_sign_contact}")
+        if not self.dns_txt_record:
+            self.dns_txt_record = (
+                f"v=ATF1; level={self.assurance_level.name}; "
+                f"agents={self.total_agents}; "
+                f"endpoint=https://{self.domain}/api/atf"
+            )
 
 
 @dataclass
-class AgentTrustProfile:
-    agent_id: str
-    registry: str
-    total_receipts: int
-    confirmed_receipts: int
-    unique_counterparties: int
-    days_active: int
-    max_delegation_depth: int
+class CrossRegistryBridge:
+    source: RegistryProfile
+    target: RegistryProfile
+    bridge_level: ATFLevel = None
+    bridge_hash: str = ""
+    created_at: float = 0.0
+    expires_at: float = 0.0  # TTL
+    
+    def __post_init__(self):
+        if self.bridge_level is None:
+            # Bridge inherits LOWER of two floors
+            self.bridge_level = ATFLevel(min(
+                self.source.assurance_level.value,
+                self.target.assurance_level.value
+            ))
+        if not self.bridge_hash:
+            self.bridge_hash = hashlib.sha256(
+                f"{self.source.registry_id}:{self.target.registry_id}:{self.bridge_level.name}".encode()
+            ).hexdigest()[:16]
+        if not self.created_at:
+            self.created_at = time.time()
+        if not self.expires_at:
+            self.expires_at = self.created_at + 86400 * 90  # 90-day TTL
 
 
 def wilson_ci_lower(successes: int, total: int, z: float = 1.96) -> float:
-    """Wilson score interval lower bound."""
+    """Wilson score confidence interval lower bound."""
     if total == 0:
         return 0.0
     p = successes / total
     denominator = 1 + z**2 / total
-    centre = p + z**2 / (2 * total)
-    spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total)
-    return max(0, (centre - spread) / denominator)
+    center = p + z**2 / (2 * total)
+    spread = z * ((p * (1 - p) / total + z**2 / (4 * total**2)) ** 0.5)
+    return round((center - spread) / denominator, 4)
 
 
-def assess_level(profile: AgentTrustProfile) -> dict:
-    """Assess which ATF assurance level an agent qualifies for."""
-    ci = wilson_ci_lower(profile.confirmed_receipts, profile.total_receipts)
+def classify_agent_level(n_receipts: int, n_confirmed: int) -> dict:
+    """Classify an agent's assurance level based on receipt history."""
+    wilson = wilson_ci_lower(n_confirmed, n_receipts)
     
-    qualified_level = ATFLevel.PROVISIONAL  # default
     for level in [ATFLevel.VERIFIED, ATFLevel.CONFIRMED, ATFLevel.ALLEGED, ATFLevel.PROVISIONAL]:
-        reqs = LEVEL_REQUIREMENTS[level]
-        if (profile.total_receipts >= reqs["min_receipts"] and
-            ci >= reqs["wilson_ci_floor"] and
-            profile.max_delegation_depth <= reqs["max_delegation_depth"] and
-            profile.unique_counterparties >= reqs["min_counterparties"] and
-            profile.days_active >= reqs["min_days_active"]):
-            qualified_level = level
-            break
+        req = LEVEL_REQUIREMENTS[level]
+        if n_receipts >= req["min_receipts"] and wilson >= req["wilson_ci_floor"]:
+            return {
+                "level": level.name,
+                "n_receipts": n_receipts,
+                "n_confirmed": n_confirmed,
+                "wilson_ci_lower": wilson,
+                "max_delegation_depth": req["max_delegation_depth"],
+                "description": req["description"],
+                "next_level": None
+            }
     
-    # Find what's needed for next level
-    next_level = None
-    gaps = []
-    for level in ATFLevel:
-        if level.value == qualified_level.value + 1:
-            next_level = level
-            reqs = LEVEL_REQUIREMENTS[level]
-            if profile.total_receipts < reqs["min_receipts"]:
-                gaps.append(f"need {reqs['min_receipts'] - profile.total_receipts} more receipts")
-            if ci < reqs["wilson_ci_floor"]:
-                gaps.append(f"Wilson CI {ci:.3f} < {reqs['wilson_ci_floor']}")
-            if profile.unique_counterparties < reqs["min_counterparties"]:
-                gaps.append(f"need {reqs['min_counterparties'] - profile.unique_counterparties} more counterparties")
-            if profile.days_active < reqs["min_days_active"]:
-                gaps.append(f"need {reqs['min_days_active'] - profile.days_active} more active days")
-    
-    return {
-        "agent_id": profile.agent_id,
-        "registry": profile.registry,
-        "level": qualified_level.name,
-        "wilson_ci": round(ci, 4),
-        "fbca_equivalent": LEVEL_REQUIREMENTS[qualified_level]["fbca_equivalent"].name,
-        "next_level": next_level.name if next_level else "MAX",
-        "gaps_to_next": gaps
-    }
+    return {"level": ATFLevel.PROVISIONAL.name, "n_receipts": n_receipts,
+            "wilson_ci_lower": wilson, "description": "Fallback to PROVISIONAL"}
 
 
-def cross_registry_bridge_grade(source: RegistryProfile, target: RegistryProfile) -> dict:
-    """
-    Compute cross-registry bridge assurance level.
-    Bridge = MIN(source, target). Trust laundering upward = impossible.
-    """
-    bridge_level = ATFLevel(min(source.assurance_level.value, target.assurance_level.value))
+def validate_bridge(bridge: CrossRegistryBridge) -> dict:
+    """Validate a cross-registry bridge."""
+    issues = []
     
-    # Bridge hash = hash of both registry policies
-    bridge_hash = hashlib.sha256(
-        f"{source.policy_hash}:{target.policy_hash}".encode()
-    ).hexdigest()[:16]
+    # Bridge level must be MIN of source and target
+    expected = ATFLevel(min(bridge.source.assurance_level.value,
+                           bridge.target.assurance_level.value))
+    if bridge.bridge_level.value > expected.value:
+        issues.append(f"TRUST_LAUNDERING: bridge claims {bridge.bridge_level.name} "
+                      f"but MIN(source,target) = {expected.name}")
+    
+    # Check TTL
+    if bridge.expires_at < time.time():
+        issues.append("EXPIRED: bridge TTL exceeded")
+    
+    # Check DNS TXT records
+    if not bridge.source.dns_txt_record or not bridge.target.dns_txt_record:
+        issues.append("MISSING_DNS: registry must publish _atf TXT record")
     
     return {
-        "source": f"{source.registry_id} ({source.assurance_level.name})",
-        "target": f"{target.registry_id} ({target.assurance_level.name})",
-        "bridge_level": bridge_level.name,
-        "bridge_hash": bridge_hash,
-        "direction": "UNIDIRECTIONAL",
-        "trust_laundering": "IMPOSSIBLE" if bridge_level.value <= min(
-            source.assurance_level.value, target.assurance_level.value
-        ) else "DETECTED",
-        "dns_discovery": {
-            "source_txt": source.dns_txt,
-            "target_txt": target.dns_txt
-        }
+        "valid": len(issues) == 0,
+        "bridge_level": bridge.bridge_level.name,
+        "expected_level": expected.name,
+        "source": f"{bridge.source.registry_id} ({bridge.source.assurance_level.name})",
+        "target": f"{bridge.target.registry_id} ({bridge.target.assurance_level.name})",
+        "issues": issues
     }
-
-
-def generate_dns_txt(registry: RegistryProfile) -> str:
-    """Generate DNS TXT record for ATF registry discovery (RFC 6763 style)."""
-    return (f"_atf._tcp.{registry.domain}. IN TXT "
-           f'"v=ATF1; level={registry.assurance_level.name}; '
-           f'endpoint={registry.endpoint}; '
-           f'policy={registry.policy_hash[:16]}; '
-           f'contact={registry.cross_sign_contact}"')
 
 
 # === Scenarios ===
 
-def scenario_level_assessment():
-    """Assess assurance levels for agents at different trust stages."""
-    print("=== Scenario: Assurance Level Assessment ===")
+def scenario_honest_bridge():
+    """Two registries, different levels, honest bridge."""
+    print("=== Scenario: Honest Cross-Registry Bridge ===")
     
-    profiles = [
-        AgentTrustProfile("kit_fox", "atf-main", 150, 138, 12, 120, 2),
-        AgentTrustProfile("new_agent", "atf-main", 3, 3, 1, 2, 0),
-        AgentTrustProfile("growing_agent", "atf-main", 25, 20, 4, 21, 1),
-        AgentTrustProfile("sybil_bot", "atf-shady", 50, 50, 1, 10, 0),
+    reg_a = RegistryProfile("atf-alpha", "alpha.example.com", ATFLevel.CONFIRMED,
+                           total_agents=500, avg_receipts_per_agent=45.0, avg_wilson_ci=0.78)
+    reg_b = RegistryProfile("atf-beta", "beta.example.com", ATFLevel.ALLEGED,
+                           total_agents=50, avg_receipts_per_agent=12.0, avg_wilson_ci=0.55)
+    
+    bridge = CrossRegistryBridge(source=reg_a, target=reg_b)
+    result = validate_bridge(bridge)
+    
+    print(f"  Source: {result['source']}")
+    print(f"  Target: {result['target']}")
+    print(f"  Bridge level: {result['bridge_level']} (expected: {result['expected_level']})")
+    print(f"  Valid: {result['valid']}")
+    print(f"  DNS TXT (source): {reg_a.dns_txt_record}")
+    print()
+
+
+def scenario_trust_laundering():
+    """Attempt to launder PROVISIONAL into CONFIRMED via bridge."""
+    print("=== Scenario: Trust Laundering Attempt ===")
+    
+    reg_trusted = RegistryProfile("atf-trusted", "trusted.example.com", ATFLevel.VERIFIED,
+                                 total_agents=2000, avg_receipts_per_agent=150.0, avg_wilson_ci=0.94)
+    reg_new = RegistryProfile("atf-new", "new.example.com", ATFLevel.PROVISIONAL,
+                             total_agents=3, avg_receipts_per_agent=2.0, avg_wilson_ci=0.0)
+    
+    # Attacker tries to claim CONFIRMED bridge
+    bridge = CrossRegistryBridge(source=reg_trusted, target=reg_new)
+    bridge.bridge_level = ATFLevel.CONFIRMED  # Laundering attempt!
+    
+    result = validate_bridge(bridge)
+    print(f"  Source: {result['source']}")
+    print(f"  Target: {result['target']}")
+    print(f"  Claimed bridge: {result['bridge_level']}")
+    print(f"  Expected: {result['expected_level']}")
+    print(f"  Valid: {result['valid']}")
+    for issue in result['issues']:
+        print(f"  ISSUE: {issue}")
+    print()
+
+
+def scenario_agent_progression():
+    """Show agent progressing through assurance levels."""
+    print("=== Scenario: Agent Level Progression ===")
+    
+    stages = [
+        (0, 0, "Just created"),
+        (3, 3, "First receipts"),
+        (10, 8, "Building"),
+        (30, 25, "CLT threshold"),
+        (50, 42, "Established"),
+        (100, 92, "Mature"),
+        (200, 185, "Veteran"),
     ]
     
-    for p in profiles:
-        result = assess_level(p)
-        print(f"  {result['agent_id']}: {result['level']} (FBCA: {result['fbca_equivalent']}) "
-              f"CI={result['wilson_ci']}")
-        if result['gaps_to_next']:
-            print(f"    → Next ({result['next_level']}): {', '.join(result['gaps_to_next'])}")
+    for total, confirmed, desc in stages:
+        result = classify_agent_level(total, confirmed)
+        print(f"  n={total:3d} confirmed={confirmed:3d} Wilson={result['wilson_ci_lower']:.3f} "
+              f"→ {result['level']:12s} depth≤{result.get('max_delegation_depth', '?')}  ({desc})")
     print()
 
 
-def scenario_cross_registry_bridge():
-    """Cross-registry bridge with different assurance levels."""
-    print("=== Scenario: Cross-Registry Bridge ===")
-    
-    reg_a = RegistryProfile(
-        "atf-main", "main.atf.example", ATFLevel.VERIFIED,
-        "abc123def456", "https://main.atf.example/api", "admin@main.atf.example"
-    )
-    reg_b = RegistryProfile(
-        "atf-partner", "partner.atf.example", ATFLevel.CONFIRMED,
-        "789xyz012abc", "https://partner.atf.example/api", "ops@partner.atf.example"
-    )
-    reg_c = RegistryProfile(
-        "atf-startup", "startup.atf.example", ATFLevel.ALLEGED,
-        "456def789ghi", "https://startup.atf.example/api", "team@startup.atf.example"
-    )
-    
-    bridges = [
-        cross_registry_bridge_grade(reg_a, reg_b),
-        cross_registry_bridge_grade(reg_a, reg_c),
-        cross_registry_bridge_grade(reg_b, reg_c),
-    ]
-    
-    for b in bridges:
-        print(f"  {b['source']} → {b['target']}")
-        print(f"    Bridge: {b['bridge_level']} ({b['direction']})")
-        print(f"    Laundering: {b['trust_laundering']}")
+def scenario_fbca_mapping():
+    """Map FBCA levels to ATF levels."""
+    print("=== Scenario: FBCA → ATF Level Mapping ===")
+    for fbca, atf in FBCA_TO_ATF.items():
+        req = LEVEL_REQUIREMENTS[atf]
+        print(f"  {fbca.name:12s} → {atf.name:12s}  "
+              f"(n≥{req['min_receipts']}, Wilson≥{req['wilson_ci_floor']:.1f}, depth≤{req['max_delegation_depth']})")
     print()
-
-
-def scenario_dns_discovery():
-    """DNS TXT records for registry discovery."""
-    print("=== Scenario: DNS-SD Discovery (RFC 6763) ===")
-    
-    registries = [
-        RegistryProfile("atf-main", "main.atf.example", ATFLevel.VERIFIED,
-                        "abc123def456", "https://main.atf.example/api", "admin@main.atf.example"),
-        RegistryProfile("atf-partner", "partner.atf.example", ATFLevel.CONFIRMED,
-                        "789xyz012abc", "https://partner.atf.example/api", "ops@partner.atf.example"),
-    ]
-    
-    print("  DNS TXT records for discovery:")
-    for reg in registries:
-        txt = generate_dns_txt(reg)
-        print(f"    {txt}")
-    
-    print()
-    print("  Discovery flow:")
-    print("    1. Query _atf._tcp.<domain> TXT → endpoint + level + contact")
-    print("    2. SMTP bootstrap → first cross-signing handshake")
-    print("    3. Cross-signing ceremony → unidirectional bridge")
-    print("    4. DNSSEC signs TXT → tamper-evident discovery")
-    print("    5. CAA (RFC 8659) parallel: _atf TXT = CAA for registries")
-    print()
-
-
-def scenario_sybil_counterparty_gate():
-    """Sybil caught by counterparty diversity requirement."""
-    print("=== Scenario: Sybil Caught by Counterparty Gate ===")
-    
-    # Perfect record but only 1 counterparty
-    sybil = AgentTrustProfile("sybil_perfect", "atf-shady", 200, 200, 1, 180, 0)
-    result = assess_level(sybil)
-    
-    # Honest agent with diverse counterparties
-    honest = AgentTrustProfile("honest_diverse", "atf-main", 50, 42, 8, 60, 1)
-    honest_result = assess_level(honest)
-    
-    print(f"  Sybil (200 perfect receipts, 1 counterparty): {result['level']}")
-    print(f"    CI={result['wilson_ci']}, gaps: {result['gaps_to_next']}")
-    print(f"  Honest (50 receipts, 8 counterparties): {honest_result['level']}")
-    print(f"    CI={honest_result['wilson_ci']}, gaps: {honest_result['gaps_to_next']}")
-    print(f"  → Counterparty diversity gate catches monoculture attestation")
+    print("  Key: cross-registry bridge inherits LOWER of two floors")
+    print("  FBCA MEDIUM ↔ ATF ALLEGED = bridge at ALLEGED")
     print()
 
 
 if __name__ == "__main__":
-    print("Assurance-Level-Mapper — FBCA-to-ATF Federation Mapping")
-    print("Per santaclawd + DNS-SD (RFC 6763) + CAA (RFC 8659)")
+    print("Assurance Level Mapper — FBCA-to-ATF Cross-Registry Federation")
+    print("Per santaclawd + DNS-SD (RFC 6763) + SRP (RFC 9665)")
     print("=" * 70)
     print()
-    print("Level mapping:")
-    for level, reqs in LEVEL_REQUIREMENTS.items():
-        fbca = reqs["fbca_equivalent"].name
-        print(f"  {level.name:12s} (FBCA: {fbca:12s}) — "
-              f"n≥{reqs['min_receipts']:3d}, CI≥{reqs['wilson_ci_floor']:.2f}, "
-              f"depth≤{reqs['max_delegation_depth']}, "
-              f"counterparties≥{reqs['min_counterparties']:2d}, "
-              f"days≥{reqs['min_days_active']:3d}")
-    print()
-    
-    scenario_level_assessment()
-    scenario_cross_registry_bridge()
-    scenario_dns_discovery()
-    scenario_sybil_counterparty_gate()
+    scenario_fbca_mapping()
+    scenario_honest_bridge()
+    scenario_trust_laundering()
+    scenario_agent_progression()
     
     print("=" * 70)
-    print("KEY INSIGHT: Cross-registry = MIN(source, target).")
-    print("Trust laundering upward structurally impossible.")
-    print("Counterparty diversity gates prevent monoculture attestation.")
-    print("DNS-SD discovery → SMTP bootstrap → cross-signing ceremony.")
+    print("KEY INSIGHTS:")
+    print("  1. Bridge level = MIN(source, target). No trust laundering.")
+    print("  2. DNS TXT for discovery: _atf._tcp.<domain> → endpoint + level")
+    print("  3. Wilson CI is the natural gate between levels")
+    print("  4. FBCA maps cleanly to ATF (4 levels each)")
+    print("  5. Cross-signing ceremony follows SMTP bootstrap")
