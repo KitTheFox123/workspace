@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-custody-transfer-receipt.py — Operator custody transfer for ATF agents.
+custody-transfer-receipt.py — Operator migration protocol for ATF genesis.
 
 Per santaclawd: "what happens when an agent migrates operators? genesis is
 immutable — but key_custodian changed."
 
-DKIM model: new selector published, old stays in DNS during TTL overlap.
-Peppol PKI 2025: dual-cert coexistence window during CA migration.
+DKIM model: new selector, old stays in DNS until TTL. Two keys coexist.
+Peppol PKI 2025: dual-CA coexistence, cross-signed bridge, scheduled sunset.
 
-Custody transfer = signed handoff receipt:
-  1. Old operator signs TRANSFER_INITIATE (I am releasing agent X)
-  2. New operator signs TRANSFER_ACCEPT (I am accepting agent X)
-  3. Both signatures + agent_id + handoff_hash → CUSTODY_TRANSFER receipt
-  4. Old genesis stays valid during overlap_window
-  5. After overlap: old genesis marked SUPERSEDED (not REVOKED — history preserved)
+Protocol:
+  1. CUSTODY_TRANSFER_REQUEST — outgoing operator initiates
+  2. CUSTODY_TRANSFER_ACCEPT — incoming operator co-signs
+  3. COEXISTENCE_WINDOW — both operators valid (dual-key period)
+  4. CUSTODY_TRANSFER_COMPLETE — old operator sunset
+  5. genesis stays immutable — custody_chain is append-only field
 """
 
 import hashlib
@@ -25,276 +25,322 @@ from typing import Optional
 
 
 class TransferState(Enum):
-    INITIATED = "INITIATED"       # Old operator signed release
-    ACCEPTED = "ACCEPTED"         # New operator signed acceptance
-    ACTIVE = "ACTIVE"             # Overlap window — both valid
-    COMPLETED = "COMPLETED"       # Old genesis SUPERSEDED
-    REJECTED = "REJECTED"         # New operator refused
-    EXPIRED = "EXPIRED"           # Overlap window passed without completion
-    DISPUTED = "DISPUTED"         # Disagreement during transfer
+    INITIATED = "INITIATED"          # Outgoing operator requested
+    ACCEPTED = "ACCEPTED"            # Incoming operator agreed
+    COEXISTING = "COEXISTING"        # Both operators valid
+    COMPLETED = "COMPLETED"          # Old operator sunset
+    REJECTED = "REJECTED"            # Incoming operator refused
+    EXPIRED = "EXPIRED"              # Transfer window expired
+    REVOKED = "REVOKED"              # Outgoing operator cancelled
 
 
 # SPEC_CONSTANTS
-OVERLAP_WINDOW_HOURS = 72       # Dual-validity window (Peppol uses 30 days)
-MIN_OVERLAP_HOURS = 24          # Minimum overlap (agent must have continuity)
-MAX_OVERLAP_HOURS = 720         # 30 days max (matches Peppol)
-TRANSFER_TIMEOUT_HOURS = 168    # 7 days to accept before EXPIRED
+COEXISTENCE_WINDOW_DAYS = 30        # Both operators valid
+TRANSFER_TIMEOUT_DAYS = 7           # Accept/reject deadline
+MAX_CUSTODY_CHAIN_LENGTH = 10       # Prevent infinite transfers
+RECEIPT_TYPE = "CUSTODY_TRANSFER"
 
 
 @dataclass
-class OperatorGenesis:
+class CustodyLink:
+    """Single link in custody chain."""
     operator_id: str
-    operator_name: str
-    genesis_hash: str
-    created_at: float
-    status: str = "ACTIVE"  # ACTIVE, SUPERSEDED, REVOKED
+    operator_genesis_hash: str
+    transfer_timestamp: float
+    transfer_receipt_hash: str
+    role: str  # "origin" | "successor"
+    co_signed: bool
 
 
 @dataclass
 class CustodyTransferReceipt:
-    """Bilateral custody transfer receipt."""
-    transfer_id: str
+    """Bilateral receipt for operator migration."""
     agent_id: str
-    old_operator: OperatorGenesis
-    new_operator: OperatorGenesis
-    state: TransferState
+    genesis_hash: str  # Immutable — never changes
+    outgoing_operator_id: str
+    incoming_operator_id: str
+    outgoing_operator_genesis_hash: str
+    incoming_operator_genesis_hash: str
+    transfer_reason: str
     initiated_at: float
-    accepted_at: Optional[float] = None
+    coexistence_start: Optional[float] = None
+    coexistence_end: Optional[float] = None
     completed_at: Optional[float] = None
-    overlap_window_hours: int = OVERLAP_WINDOW_HOURS
-    handoff_hash: str = ""  # hash(old_genesis + new_genesis + agent_id)
-    old_operator_signature: str = ""  # Simulated
-    new_operator_signature: str = ""  # Simulated
-    custody_chain: list = field(default_factory=list)  # History of all operators
-    reason: str = ""
+    state: TransferState = TransferState.INITIATED
+    outgoing_signature: Optional[str] = None
+    incoming_signature: Optional[str] = None
+    custody_chain: list = field(default_factory=list)
+    
+    @property
+    def receipt_hash(self) -> str:
+        content = f"{self.agent_id}:{self.genesis_hash}:{self.outgoing_operator_id}:{self.incoming_operator_id}:{self.initiated_at}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    
+    @property
+    def is_bilateral(self) -> bool:
+        return self.outgoing_signature is not None and self.incoming_signature is not None
 
-    def __post_init__(self):
-        if not self.handoff_hash:
-            self.handoff_hash = self._compute_handoff_hash()
 
-    def _compute_handoff_hash(self) -> str:
-        data = f"{self.old_operator.genesis_hash}:{self.new_operator.genesis_hash}:{self.agent_id}"
-        return hashlib.sha256(data.encode()).hexdigest()[:16]
-
-
-def initiate_transfer(agent_id: str, old_op: OperatorGenesis,
-                       new_op: OperatorGenesis, reason: str = "") -> CustodyTransferReceipt:
-    """Old operator initiates custody transfer."""
-    now = time.time()
-    transfer_id = hashlib.sha256(f"{agent_id}:{now}".encode()).hexdigest()[:12]
-
+def initiate_transfer(agent_id: str, genesis_hash: str,
+                      outgoing_op: str, outgoing_hash: str,
+                      incoming_op: str, incoming_hash: str,
+                      reason: str, existing_chain: list = None) -> CustodyTransferReceipt:
+    """Step 1: Outgoing operator initiates transfer."""
+    chain = existing_chain or []
+    
+    if len(chain) >= MAX_CUSTODY_CHAIN_LENGTH:
+        raise ValueError(f"Custody chain at max length ({MAX_CUSTODY_CHAIN_LENGTH}). "
+                         "Excessive operator changes = instability signal.")
+    
+    # Check for circular transfer (back to previous operator)
+    prev_operators = {link.operator_id for link in chain}
+    if incoming_op in prev_operators:
+        print(f"  ⚠️  WARNING: Circular transfer detected — {incoming_op} was previous custodian")
+    
     receipt = CustodyTransferReceipt(
-        transfer_id=transfer_id,
         agent_id=agent_id,
-        old_operator=old_op,
-        new_operator=new_op,
+        genesis_hash=genesis_hash,
+        outgoing_operator_id=outgoing_op,
+        incoming_operator_id=incoming_op,
+        outgoing_operator_genesis_hash=outgoing_hash,
+        incoming_operator_genesis_hash=incoming_hash,
+        transfer_reason=reason,
+        initiated_at=time.time(),
         state=TransferState.INITIATED,
-        initiated_at=now,
-        reason=reason,
-        old_operator_signature=f"sig_old_{transfer_id[:8]}",
-        custody_chain=[old_op.operator_id]
+        outgoing_signature=hashlib.sha256(f"sign:{outgoing_op}:{time.time()}".encode()).hexdigest()[:16],
+        custody_chain=chain
     )
     return receipt
 
 
 def accept_transfer(receipt: CustodyTransferReceipt) -> CustodyTransferReceipt:
-    """New operator accepts custody transfer. Overlap window begins."""
+    """Step 2: Incoming operator accepts and co-signs."""
     if receipt.state != TransferState.INITIATED:
-        raise ValueError(f"Cannot accept transfer in state {receipt.state}")
-
+        raise ValueError(f"Cannot accept transfer in state {receipt.state.value}")
+    
     now = time.time()
-    elapsed_hours = (now - receipt.initiated_at) / 3600
-
-    if elapsed_hours > TRANSFER_TIMEOUT_HOURS:
+    if now - receipt.initiated_at > TRANSFER_TIMEOUT_DAYS * 86400:
         receipt.state = TransferState.EXPIRED
         return receipt
-
-    receipt.accepted_at = now
-    receipt.state = TransferState.ACTIVE  # Both operators valid
-    receipt.new_operator_signature = f"sig_new_{receipt.transfer_id[:8]}"
-    receipt.custody_chain.append(receipt.new_operator.operator_id)
+    
+    receipt.incoming_signature = hashlib.sha256(
+        f"sign:{receipt.incoming_operator_id}:{now}".encode()
+    ).hexdigest()[:16]
+    receipt.state = TransferState.ACCEPTED
+    receipt.coexistence_start = now
+    receipt.coexistence_end = now + COEXISTENCE_WINDOW_DAYS * 86400
     return receipt
 
 
 def complete_transfer(receipt: CustodyTransferReceipt) -> CustodyTransferReceipt:
-    """Complete transfer after overlap window. Old genesis → SUPERSEDED."""
-    if receipt.state != TransferState.ACTIVE:
-        raise ValueError(f"Cannot complete transfer in state {receipt.state}")
-
+    """Step 4: Sunset old operator after coexistence window."""
+    if receipt.state not in (TransferState.ACCEPTED, TransferState.COEXISTING):
+        raise ValueError(f"Cannot complete transfer in state {receipt.state.value}")
+    
+    if not receipt.is_bilateral:
+        raise ValueError("Cannot complete unilateral transfer — both signatures required")
+    
     now = time.time()
-    if receipt.accepted_at is None:
-        raise ValueError("Transfer not yet accepted")
-
-    elapsed_hours = (now - receipt.accepted_at) / 3600
-
-    if elapsed_hours < MIN_OVERLAP_HOURS:
-        print(f"  WARNING: Only {elapsed_hours:.1f}h elapsed, minimum is {MIN_OVERLAP_HOURS}h")
-        # Allow but warn
-
     receipt.completed_at = now
     receipt.state = TransferState.COMPLETED
-    receipt.old_operator.status = "SUPERSEDED"  # NOT revoked — history preserved
+    
+    # Append to custody chain
+    receipt.custody_chain.append(CustodyLink(
+        operator_id=receipt.incoming_operator_id,
+        operator_genesis_hash=receipt.incoming_operator_genesis_hash,
+        transfer_timestamp=now,
+        transfer_receipt_hash=receipt.receipt_hash,
+        role="successor",
+        co_signed=True
+    ))
+    
     return receipt
 
 
-def validate_transfer(receipt: CustodyTransferReceipt) -> dict:
-    """Validate custody transfer receipt integrity."""
+def validate_custody_chain(chain: list, genesis_hash: str) -> dict:
+    """Validate integrity of full custody chain."""
     issues = []
-    grade = "A"
-
-    # Check handoff hash
-    expected = receipt._compute_handoff_hash()
-    if receipt.handoff_hash != expected:
-        issues.append("HANDOFF_HASH_MISMATCH")
-        grade = "F"
-
-    # Check signatures present
-    if not receipt.old_operator_signature:
-        issues.append("MISSING_OLD_OPERATOR_SIGNATURE")
-        grade = "F"
-    if receipt.state in (TransferState.ACTIVE, TransferState.COMPLETED):
-        if not receipt.new_operator_signature:
-            issues.append("MISSING_NEW_OPERATOR_SIGNATURE")
-            grade = "F"
-
-    # Check self-transfer (same operator = suspicious)
-    if receipt.old_operator.operator_id == receipt.new_operator.operator_id:
-        issues.append("SELF_TRANSFER_DETECTED")
-        grade = "D"
-
-    # Check custody chain continuity
-    if len(receipt.custody_chain) > 0:
-        if receipt.custody_chain[0] != receipt.old_operator.operator_id:
-            issues.append("CUSTODY_CHAIN_DISCONTINUITY")
-            grade = "D"
-
-    # Check overlap window bounds
-    if receipt.overlap_window_hours < MIN_OVERLAP_HOURS:
-        issues.append(f"OVERLAP_BELOW_MINIMUM ({receipt.overlap_window_hours}h < {MIN_OVERLAP_HOURS}h)")
-        grade = "D"
-    if receipt.overlap_window_hours > MAX_OVERLAP_HOURS:
-        issues.append(f"OVERLAP_ABOVE_MAXIMUM ({receipt.overlap_window_hours}h > {MAX_OVERLAP_HOURS}h)")
-        grade = "D"
-
-    # SUPERSEDED vs REVOKED check
-    if receipt.state == TransferState.COMPLETED:
-        if receipt.old_operator.status == "REVOKED":
-            issues.append("OLD_OPERATOR_REVOKED_NOT_SUPERSEDED — history should be preserved")
-            if grade > "C":
-                grade = "C"
-
+    
+    if not chain:
+        return {"valid": True, "length": 0, "issues": [], "grade": "A"}
+    
+    if len(chain) > MAX_CUSTODY_CHAIN_LENGTH:
+        issues.append(f"Chain exceeds max length ({len(chain)} > {MAX_CUSTODY_CHAIN_LENGTH})")
+    
+    # Check for unsigned transfers
+    unsigned = [i for i, link in enumerate(chain) if not link.co_signed]
+    if unsigned:
+        issues.append(f"Unsigned transfers at positions: {unsigned}")
+    
+    # Check for circular custody
+    operators = [link.operator_id for link in chain]
+    if len(operators) != len(set(operators)):
+        issues.append("Circular custody detected — operator appears multiple times")
+    
+    # Check temporal ordering
+    for i in range(1, len(chain)):
+        if chain[i].transfer_timestamp <= chain[i-1].transfer_timestamp:
+            issues.append(f"Temporal ordering violation at position {i}")
+    
+    # Grade
     if not issues:
-        issues = ["CLEAN"]
-
+        grade = "A"
+    elif any("unsigned" in i.lower() for i in issues):
+        grade = "D"  # Unsigned = unverifiable
+    elif any("circular" in i.lower() for i in issues):
+        grade = "C"  # Circular = instability
+    else:
+        grade = "B"
+    
     return {
-        "transfer_id": receipt.transfer_id,
-        "state": receipt.state.value,
-        "grade": grade,
+        "valid": len(issues) == 0,
+        "length": len(chain),
         "issues": issues,
-        "handoff_hash": receipt.handoff_hash,
-        "custody_chain_length": len(receipt.custody_chain),
-        "signatures": {
-            "old_operator": bool(receipt.old_operator_signature),
-            "new_operator": bool(receipt.new_operator_signature)
-        }
+        "grade": grade,
+        "current_operator": chain[-1].operator_id if chain else None,
+        "total_transfers": len(chain)
     }
 
 
 # === Scenarios ===
 
 def scenario_clean_transfer():
-    """Normal operator migration."""
-    print("=== Scenario: Clean Custody Transfer ===")
-    old_op = OperatorGenesis("op_alpha", "Alpha Corp", "genesis_aaa111", time.time() - 86400*90)
-    new_op = OperatorGenesis("op_beta", "Beta Labs", "genesis_bbb222", time.time())
-
-    receipt = initiate_transfer("kit_fox", old_op, new_op, reason="operator_migration")
-    print(f"  Initiated: {receipt.state.value}")
-
+    """Normal operator migration — bilateral, clean."""
+    print("=== Scenario: Clean Operator Transfer ===")
+    
+    receipt = initiate_transfer(
+        "kit_fox", "genesis_abc123",
+        "operator_alpha", "op_alpha_hash",
+        "operator_beta", "op_beta_hash",
+        "Planned migration to new infrastructure"
+    )
+    print(f"  1. Initiated: {receipt.state.value} (outgoing signed: {receipt.outgoing_signature is not None})")
+    
     receipt = accept_transfer(receipt)
-    print(f"  Accepted: {receipt.state.value} (overlap window started)")
-
+    print(f"  2. Accepted: {receipt.state.value} (bilateral: {receipt.is_bilateral})")
+    print(f"     Coexistence window: {COEXISTENCE_WINDOW_DAYS} days")
+    
     receipt = complete_transfer(receipt)
-    print(f"  Completed: {receipt.state.value}")
-    print(f"  Old operator status: {receipt.old_operator.status}")
-    print(f"  Custody chain: {receipt.custody_chain}")
-
-    result = validate_transfer(receipt)
-    print(f"  Validation: Grade {result['grade']}, {result['issues']}")
-    print()
-
-
-def scenario_self_transfer():
-    """Same operator on both sides = suspicious."""
-    print("=== Scenario: Self-Transfer (Suspicious) ===")
-    op = OperatorGenesis("op_shady", "Shady Inc", "genesis_xxx", time.time())
-    new_op = OperatorGenesis("op_shady", "Shady Inc v2", "genesis_yyy", time.time())
-
-    receipt = initiate_transfer("sybil_agent", op, new_op)
-    receipt = accept_transfer(receipt)
-    receipt = complete_transfer(receipt)
-
-    result = validate_transfer(receipt)
-    print(f"  Validation: Grade {result['grade']}, {result['issues']}")
+    print(f"  3. Completed: {receipt.state.value}")
+    print(f"     Custody chain length: {len(receipt.custody_chain)}")
+    
+    validation = validate_custody_chain(receipt.custody_chain, "genesis_abc123")
+    print(f"  Validation: grade={validation['grade']}, valid={validation['valid']}")
     print()
 
 
 def scenario_rejected_transfer():
-    """New operator refuses custody."""
+    """Incoming operator refuses — transfer fails gracefully."""
     print("=== Scenario: Rejected Transfer ===")
-    old_op = OperatorGenesis("op_alpha", "Alpha Corp", "genesis_aaa", time.time())
-    new_op = OperatorGenesis("op_gamma", "Gamma Ltd", "genesis_ggg", time.time())
-
-    receipt = initiate_transfer("agent_x", old_op, new_op)
+    
+    receipt = initiate_transfer(
+        "suspicious_agent", "genesis_def456",
+        "operator_alpha", "op_alpha_hash",
+        "operator_gamma", "op_gamma_hash",
+        "Unknown reason"
+    )
+    print(f"  1. Initiated: {receipt.state.value}")
+    
     receipt.state = TransferState.REJECTED
-    receipt.new_operator_signature = ""
-
-    result = validate_transfer(receipt)
-    print(f"  State: {receipt.state.value}")
-    print(f"  Old operator status: {receipt.old_operator.status} (unchanged — still ACTIVE)")
-    print(f"  Validation: Grade {result['grade']}, {result['issues']}")
+    print(f"  2. Rejected by incoming operator")
+    print(f"     Result: agent stays with {receipt.outgoing_operator_id}")
+    print(f"     No custody chain change")
     print()
 
 
 def scenario_multi_hop_custody():
-    """Agent transferred through 3 operators — full chain."""
+    """Agent transfers through 3 operators — chain grows."""
     print("=== Scenario: Multi-Hop Custody Chain ===")
-    ops = [
-        OperatorGenesis("op_1", "Original", "gen_001", time.time() - 86400*180),
-        OperatorGenesis("op_2", "Second", "gen_002", time.time() - 86400*90),
-        OperatorGenesis("op_3", "Current", "gen_003", time.time()),
+    
+    chain = [
+        CustodyLink("op_alpha", "hash_a", time.time() - 86400*90, "r001", "origin", True),
     ]
-
-    # First transfer
-    r1 = initiate_transfer("agent_y", ops[0], ops[1], "acquisition")
+    
+    # Transfer 1: alpha → beta
+    r1 = initiate_transfer("agent_x", "genesis_ghi789",
+                           "op_alpha", "hash_a", "op_beta", "hash_b",
+                           "Scaling", chain)
     r1 = accept_transfer(r1)
     r1 = complete_transfer(r1)
-
-    # Second transfer
-    r2 = initiate_transfer("agent_y", ops[1], ops[2], "restructuring")
-    r2.custody_chain = r1.custody_chain.copy()  # Carry forward chain
+    chain = r1.custody_chain
+    print(f"  Transfer 1: alpha→beta (chain length: {len(chain)})")
+    
+    # Transfer 2: beta → gamma
+    r2 = initiate_transfer("agent_x", "genesis_ghi789",
+                           "op_beta", "hash_b", "op_gamma", "hash_c",
+                           "Operator sunset", chain)
     r2 = accept_transfer(r2)
     r2 = complete_transfer(r2)
+    chain = r2.custody_chain
+    print(f"  Transfer 2: beta→gamma (chain length: {len(chain)})")
+    
+    validation = validate_custody_chain(chain, "genesis_ghi789")
+    print(f"  Full chain validation: grade={validation['grade']}, "
+          f"current={validation['current_operator']}")
+    print(f"  genesis_hash UNCHANGED throughout: genesis_ghi789")
+    print()
 
-    print(f"  Full custody chain: {r2.custody_chain}")
-    print(f"  Operator statuses: {[o.status for o in ops]}")
-    result = validate_transfer(r2)
-    print(f"  Validation: Grade {result['grade']}, {result['issues']}")
-    print(f"  Key: SUPERSEDED not REVOKED — provenance preserved")
+
+def scenario_circular_transfer():
+    """Agent returns to previous operator — warning."""
+    print("=== Scenario: Circular Transfer (Warning) ===")
+    
+    chain = [
+        CustodyLink("op_alpha", "hash_a", time.time() - 86400*60, "r001", "origin", True),
+        CustodyLink("op_beta", "hash_b", time.time() - 86400*30, "r002", "successor", True),
+    ]
+    
+    # Try to transfer back to alpha
+    print("  Transferring back to op_alpha (previous custodian)...")
+    r = initiate_transfer("agent_y", "genesis_jkl012",
+                          "op_beta", "hash_b", "op_alpha", "hash_a",
+                          "Return to original operator", chain)
+    r = accept_transfer(r)
+    r = complete_transfer(r)
+    
+    validation = validate_custody_chain(r.custody_chain, "genesis_jkl012")
+    print(f"  Validation: grade={validation['grade']}, issues={validation['issues']}")
+    print(f"  Circular custody is a WARNING not a REJECT")
+    print()
+
+
+def scenario_dkim_parallel():
+    """Show DKIM selector rotation as exact parallel."""
+    print("=== Scenario: DKIM Selector Rotation Parallel ===")
+    print("  DKIM: old selector stays in DNS until TTL expires")
+    print("  ATF:  old operator stays valid during coexistence window")
+    print()
+    print("  DKIM selector rotation:")
+    print("    1. Add new selector to DNS (s2._domainkey.example.com)")
+    print("    2. Start signing with new selector")
+    print("    3. Old selector still validates in-flight messages")
+    print("    4. After TTL, remove old selector")
+    print()
+    print("  ATF custody transfer:")
+    print("    1. CUSTODY_TRANSFER_REQUEST (bilateral)")
+    print("    2. Both operators valid during coexistence")
+    print("    3. Receipts from EITHER operator valid")
+    print("    4. After window, old operator sunset")
+    print()
+    print(f"  Coexistence window: {COEXISTENCE_WINDOW_DAYS} days (SPEC_CONSTANT)")
+    print(f"  Transfer timeout: {TRANSFER_TIMEOUT_DAYS} days")
+    print(f"  Max chain length: {MAX_CUSTODY_CHAIN_LENGTH}")
     print()
 
 
 if __name__ == "__main__":
-    print("Custody Transfer Receipt — ATF Operator Migration")
-    print("Per santaclawd: genesis is immutable, custody is not")
-    print("DKIM model: old selector stays during TTL overlap")
-    print("=" * 60)
+    print("Custody Transfer Receipt — Operator Migration Protocol for ATF")
+    print("Per santaclawd: genesis immutable, custody_chain is append-only")
+    print("=" * 65)
     print()
     scenario_clean_transfer()
-    scenario_self_transfer()
     scenario_rejected_transfer()
     scenario_multi_hop_custody()
-    print("=" * 60)
-    print("KEY: SUPERSEDED not REVOKED. History is provenance.")
-    print("Overlap window (72h default) = DKIM selector coexistence.")
-    print("Self-transfer detected. Custody chain = audit trail.")
+    scenario_circular_transfer()
+    scenario_dkim_parallel()
+    
+    print("=" * 65)
+    print("KEY INSIGHT: genesis stays IMMUTABLE. Custody is a CHAIN not a field.")
+    print("DKIM selector rotation = exact parallel. Dual-key coexistence window.")
+    print("Bilateral receipt = BOTH operators must sign the handoff.")
+    print("Unilateral transfer = REJECTED (Axiom 1 violation).")
