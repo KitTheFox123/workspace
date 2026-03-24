@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-alleged-weight-decay.py — Exponential decay for ALLEGED receipt weight in ATF.
+alleged-weight-decay.py — Exponential decay weighting for ALLEGED receipts.
 
-Per santaclawd: payer silence at T+5min ≠ T+5h. Binary ALLEGED/CONFIRMED is too coarse.
-Per Jacobson-Karels (1988): adaptive timeout with fixed bounds (alpha=0.125, beta=0.25).
+Per santaclawd: ALLEGED receipt weight should decay, not binary.
+Payer silence at T+5min ≠ T+5h.
 
-Model: weight = base_weight × exp(-lambda × T_elapsed_hours)
-- lambda = SPEC_CONSTANT (not grader-defined, prevents race to bottom)
-- Combined with Wilson CI for cold-start correction
-- Final trust = wilson_lower(successes, total) × decay(age)
+weight = 0.5 × exp(−λ × T_elapsed_hours)
 
-SPEC_CONSTANTS:
-  ALLEGED_LAMBDA = 0.1/hr (half-life ≈ 6.93 hours)
-  ALLEGED_LAMBDA_FLOOR = 0.01/hr
-  ALLEGED_LAMBDA_CEILING = 1.0/hr
-  ALLEGED_BASE_WEIGHT = 0.5 (fresh ALLEGED = half a CONFIRMED)
-  WILSON_Z = 1.96 (95% CI)
+Lambda:
+  SPEC_FLOOR = 0.1 (slowest decay, most generous to payer)
+  SPEC_CEILING = 1.0 (fastest decay, harshest interpretation)
+  Grader can set λ ∈ [FLOOR, CEILING], stricter but not looser.
+
+Key insight: Jacobson-Karels (RFC 6298) bounded adaptive timeout.
+RTO never below 1s, never above 60s. ATF ALLEGED: bounded decay.
+
+Wilson CI integration: weight-adjusted n for trust scoring.
+n_effective = Σ(weight_i) instead of count.
 """
 
 import math
@@ -23,253 +24,240 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-# SPEC_CONSTANTS — fixed in spec, not grader-configurable
-ALLEGED_LAMBDA = 0.1          # per hour, half-life ≈ 6.93h
-ALLEGED_LAMBDA_FLOOR = 0.01   # minimum decay rate
-ALLEGED_LAMBDA_CEILING = 1.0  # maximum decay rate
-ALLEGED_BASE_WEIGHT = 0.5     # fresh ALLEGED = 0.5 × CONFIRMED
-CONFIRMED_WEIGHT = 1.0
-DISPUTED_WEIGHT = -0.5
-WILSON_Z = 1.96               # 95% confidence
+
+# SPEC_CONSTANTS
+LAMBDA_FLOOR = 0.1       # Slowest decay (most generous)
+LAMBDA_CEILING = 1.0     # Fastest decay (harshest)
+LAMBDA_DEFAULT = 0.1     # Default if grader doesn't specify
+INITIAL_WEIGHT = 0.5     # ALLEGED starts at half weight of CONFIRMED
+CONFIRMED_WEIGHT = 1.0   # CONFIRMED receipts = full weight
+DISPUTED_WEIGHT = -0.5   # DISPUTED receipts = negative signal
+MIN_WEIGHT = 0.001       # Below this = effectively zero
 
 
 @dataclass
 class Receipt:
     receipt_id: str
-    status: str  # CONFIRMED, ALLEGED, DISPUTED
-    created_at: float  # unix timestamp
-    confirmed_at: Optional[float] = None  # when co-signed (if ever)
-    counterparty_id: str = ""
-    evidence_grade: str = "C"
+    receipt_type: str  # CONFIRMED, ALLEGED, DISPUTED, PROBE_TIMEOUT
+    agent_id: str
+    counterparty_id: str
+    timestamp: float
+    grade: str  # A-F
+    co_signed: bool = False
+    
+    
+@dataclass
+class WeightedReceipt:
+    receipt: Receipt
+    weight: float
+    age_hours: float
+    decay_applied: bool
 
 
-def alleged_decay_weight(elapsed_hours: float, 
-                          lam: float = ALLEGED_LAMBDA,
-                          base: float = ALLEGED_BASE_WEIGHT) -> float:
+def compute_alleged_weight(elapsed_hours: float, lambda_val: float = LAMBDA_DEFAULT) -> float:
     """
     Compute ALLEGED receipt weight with exponential decay.
     
-    Fresh ALLEGED (T=0): weight = base (0.5)
-    T = half-life: weight = base/2 (0.25)
-    T → ∞: weight → 0
+    weight = INITIAL_WEIGHT × exp(−λ × T_hours)
     
-    Jacobson-Karels insight: fixed alpha with adaptive bounds.
-    Here: fixed lambda with SPEC bounds.
+    Bounded: λ ∈ [LAMBDA_FLOOR, LAMBDA_CEILING]
     """
-    lam = max(ALLEGED_LAMBDA_FLOOR, min(ALLEGED_LAMBDA_CEILING, lam))
-    return base * math.exp(-lam * elapsed_hours)
+    # Enforce lambda bounds
+    lambda_bounded = max(LAMBDA_FLOOR, min(LAMBDA_CEILING, lambda_val))
+    
+    weight = INITIAL_WEIGHT * math.exp(-lambda_bounded * elapsed_hours)
+    
+    return max(MIN_WEIGHT, weight)
 
 
-def wilson_lower_bound(successes: int, total: int, z: float = WILSON_Z) -> float:
-    """Wilson score interval lower bound for trust estimation."""
-    if total == 0:
-        return 0.0
-    p_hat = successes / total
-    denominator = 1 + z**2 / total
-    center = (p_hat + z**2 / (2 * total)) / denominator
-    spread = z * math.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * total)) / total) / denominator
-    return max(0.0, center - spread)
-
-
-def combined_trust_score(receipts: list[Receipt], now: float = None) -> dict:
-    """
-    Compute combined trust using Wilson CI + decay.
+def weight_receipt(receipt: Receipt, now: float, lambda_val: float = LAMBDA_DEFAULT) -> WeightedReceipt:
+    """Assign weight to a receipt based on type and age."""
+    age_hours = (now - receipt.timestamp) / 3600
     
-    trust = wilson_lower(weighted_successes, weighted_total) × recency_factor
-    """
-    if now is None:
-        now = time.time()
-    
-    weighted_success = 0.0
-    weighted_total = 0.0
-    status_counts = {"CONFIRMED": 0, "ALLEGED": 0, "DISPUTED": 0}
-    
-    for r in receipts:
-        elapsed_hours = (now - r.created_at) / 3600
-        status_counts[r.status] = status_counts.get(r.status, 0) + 1
-        
-        if r.status == "CONFIRMED":
-            weight = CONFIRMED_WEIGHT
-            weighted_success += weight
-            weighted_total += weight
-        elif r.status == "ALLEGED":
-            weight = alleged_decay_weight(elapsed_hours)
-            weighted_success += weight  # ALLEGED counts as partial success
-            weighted_total += ALLEGED_BASE_WEIGHT  # denominator uses base weight
-        elif r.status == "DISPUTED":
-            weight = abs(DISPUTED_WEIGHT)
-            weighted_total += weight  # failure in denominator
-    
-    # Wilson CI on weighted counts
-    w_successes = int(round(weighted_success * 10))  # scale to integers
-    w_total = int(round(weighted_total * 10))
-    
-    wilson = wilson_lower_bound(w_successes, w_total) if w_total > 0 else 0.0
-    
-    # Recency: oldest receipt age
-    if receipts:
-        oldest_hours = max((now - r.created_at) / 3600 for r in receipts)
-        newest_hours = min((now - r.created_at) / 3600 for r in receipts)
+    if receipt.receipt_type == "CONFIRMED":
+        weight = CONFIRMED_WEIGHT
+        decay = False
+    elif receipt.receipt_type == "ALLEGED":
+        weight = compute_alleged_weight(age_hours, lambda_val)
+        decay = True
+    elif receipt.receipt_type == "DISPUTED":
+        weight = DISPUTED_WEIGHT
+        decay = False
+    elif receipt.receipt_type == "PROBE_TIMEOUT":
+        # Timeout = weak negative signal, also decays
+        weight = -0.2 * math.exp(-lambda_val * age_hours)
+        decay = True
     else:
-        oldest_hours = newest_hours = 0
+        weight = 0.0
+        decay = False
+    
+    return WeightedReceipt(receipt=receipt, weight=weight, age_hours=age_hours, decay_applied=decay)
+
+
+def wilson_ci_weighted(weighted_receipts: list[WeightedReceipt], z: float = 1.96) -> dict:
+    """
+    Wilson CI with weight-adjusted n.
+    
+    n_effective = Σ(positive weights)
+    p_hat = Σ(positive_weight) / Σ(|all_weights|)
+    
+    Key: ALLEGED at T+1h contributes more than ALLEGED at T+72h.
+    """
+    pos_weights = sum(wr.weight for wr in weighted_receipts if wr.weight > 0)
+    neg_weights = sum(abs(wr.weight) for wr in weighted_receipts if wr.weight < 0)
+    total_abs = pos_weights + neg_weights
+    
+    if total_abs < 0.001:
+        return {"n_effective": 0, "p_hat": 0, "lower": 0, "upper": 1, "grade": "F"}
+    
+    n_eff = total_abs  # Effective sample size
+    p_hat = pos_weights / total_abs
+    
+    # Wilson CI formula
+    denominator = 1 + z**2 / n_eff
+    centre = (p_hat + z**2 / (2 * n_eff)) / denominator
+    spread = z * math.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * n_eff)) / n_eff) / denominator
+    
+    lower = max(0, centre - spread)
+    upper = min(1, centre + spread)
+    
+    # Grade based on lower bound
+    if lower >= 0.85:
+        grade = "A"
+    elif lower >= 0.70:
+        grade = "B"
+    elif lower >= 0.50:
+        grade = "C"
+    elif lower >= 0.30:
+        grade = "D"
+    else:
+        grade = "F"
     
     return {
-        "wilson_lower": round(wilson, 4),
-        "status_counts": status_counts,
-        "weighted_success": round(weighted_success, 4),
-        "weighted_total": round(weighted_total, 4),
-        "total_receipts": len(receipts),
-        "oldest_hours": round(oldest_hours, 1),
-        "newest_hours": round(newest_hours, 1),
-        "half_life_hours": round(math.log(2) / ALLEGED_LAMBDA, 2)
+        "n_effective": round(n_eff, 2),
+        "p_hat": round(p_hat, 4),
+        "lower": round(lower, 4),
+        "upper": round(upper, 4),
+        "grade": grade
     }
 
 
-def grade_trust(score: float) -> str:
-    """Grade trust score."""
-    if score >= 0.8: return "A"
-    if score >= 0.6: return "B"
-    if score >= 0.4: return "C"
-    if score >= 0.2: return "D"
-    return "F"
+def decay_curve_table(lambda_val: float = LAMBDA_DEFAULT) -> list[dict]:
+    """Show decay curve at key time points."""
+    hours = [0.083, 0.5, 1, 2, 6, 12, 24, 48, 72, 168]  # 5min to 1 week
+    return [
+        {
+            "hours": h,
+            "label": f"{h}h" if h >= 1 else f"{int(h*60)}min",
+            "weight": round(compute_alleged_weight(h, lambda_val), 4),
+            "pct_of_initial": round(compute_alleged_weight(h, lambda_val) / INITIAL_WEIGHT * 100, 1)
+        }
+        for h in hours
+    ]
 
 
 # === Scenarios ===
 
-def scenario_fresh_vs_stale_alleged():
-    """Same receipt count, different staleness."""
-    print("=== Scenario: Fresh vs Stale ALLEGED ===")
+def scenario_mixed_receipt_corpus():
+    """Mixed CONFIRMED/ALLEGED/DISPUTED receipts with varying ages."""
+    print("=== Scenario: Mixed Receipt Corpus ===")
     now = time.time()
     
-    # Fresh ALLEGED (1 hour old)
-    fresh = [Receipt(f"r{i}", "ALLEGED", now - 3600, counterparty_id="peer") for i in range(10)]
-    fresh_score = combined_trust_score(fresh, now)
+    receipts = [
+        Receipt("r1", "CONFIRMED", "kit_fox", "bro_agent", now - 3600*2, "A", True),
+        Receipt("r2", "CONFIRMED", "kit_fox", "santaclawd", now - 3600*5, "A", True),
+        Receipt("r3", "ALLEGED", "kit_fox", "new_agent", now - 3600*1, "B"),   # 1h old
+        Receipt("r4", "ALLEGED", "kit_fox", "silent", now - 3600*24, "C"),     # 24h old
+        Receipt("r5", "ALLEGED", "kit_fox", "ghost", now - 3600*72, "D"),      # 72h old
+        Receipt("r6", "DISPUTED", "kit_fox", "adversary", now - 3600*3, "F"),
+    ]
     
-    # Stale ALLEGED (24 hours old)
-    stale = [Receipt(f"r{i}", "ALLEGED", now - 86400, counterparty_id="peer") for i in range(10)]
-    stale_score = combined_trust_score(stale, now)
+    weighted = [weight_receipt(r, now) for r in receipts]
+    for wr in weighted:
+        print(f"  {wr.receipt.receipt_id} {wr.receipt.receipt_type:12s} age={wr.age_hours:6.1f}h "
+              f"weight={wr.weight:+.4f} decay={wr.decay_applied}")
     
-    # Very stale ALLEGED (72 hours old)
-    very_stale = [Receipt(f"r{i}", "ALLEGED", now - 259200, counterparty_id="peer") for i in range(10)]
-    very_stale_score = combined_trust_score(very_stale, now)
-    
-    print(f"  10 ALLEGED @ 1h:  wilson={fresh_score['wilson_lower']:.3f} "
-          f"grade={grade_trust(fresh_score['wilson_lower'])} "
-          f"weighted_success={fresh_score['weighted_success']:.3f}")
-    print(f"  10 ALLEGED @ 24h: wilson={stale_score['wilson_lower']:.3f} "
-          f"grade={grade_trust(stale_score['wilson_lower'])} "
-          f"weighted_success={stale_score['weighted_success']:.3f}")
-    print(f"  10 ALLEGED @ 72h: wilson={very_stale_score['wilson_lower']:.3f} "
-          f"grade={grade_trust(very_stale_score['wilson_lower'])} "
-          f"weighted_success={very_stale_score['weighted_success']:.3f}")
-    print(f"  Half-life: {fresh_score['half_life_hours']}h")
+    ci = wilson_ci_weighted(weighted)
+    print(f"\n  Wilson CI (weighted): n_eff={ci['n_effective']}, p̂={ci['p_hat']}")
+    print(f"  CI: [{ci['lower']}, {ci['upper']}] → Grade {ci['grade']}")
     print()
 
 
-def scenario_mixed_confirmed_alleged():
-    """Mix of CONFIRMED and ALLEGED receipts."""
-    print("=== Scenario: Mixed CONFIRMED + ALLEGED ===")
+def scenario_alleged_age_matters():
+    """Same agent, same count, different ALLEGED ages — scores differ."""
+    print("=== Scenario: ALLEGED Age Matters ===")
     now = time.time()
     
-    receipts = (
-        [Receipt(f"c{i}", "CONFIRMED", now - 3600*i) for i in range(5)] +
-        [Receipt(f"a{i}", "ALLEGED", now - 3600*(i+1)) for i in range(5)]
-    )
-    score = combined_trust_score(receipts, now)
+    # Fresh ALLEGED (1h old)
+    fresh = [Receipt(f"f{i}", "ALLEGED", "agent_x", "cp", now - 3600*1, "B") for i in range(10)]
+    # Stale ALLEGED (72h old)
+    stale = [Receipt(f"s{i}", "ALLEGED", "agent_x", "cp", now - 3600*72, "B") for i in range(10)]
     
-    print(f"  5 CONFIRMED + 5 ALLEGED (1-10h old)")
-    print(f"  Wilson: {score['wilson_lower']:.3f} Grade: {grade_trust(score['wilson_lower'])}")
-    print(f"  Weighted success: {score['weighted_success']:.3f} / {score['weighted_total']:.3f}")
+    fresh_w = [weight_receipt(r, now) for r in fresh]
+    stale_w = [weight_receipt(r, now) for r in stale]
+    
+    fresh_ci = wilson_ci_weighted(fresh_w)
+    stale_ci = wilson_ci_weighted(stale_w)
+    
+    print(f"  10 ALLEGED at T+1h:  n_eff={fresh_ci['n_effective']:5.2f} lower={fresh_ci['lower']:.4f} Grade {fresh_ci['grade']}")
+    print(f"  10 ALLEGED at T+72h: n_eff={stale_ci['n_effective']:5.2f} lower={stale_ci['lower']:.4f} Grade {stale_ci['grade']}")
+    print(f"  Key: same count, different trust. Age IS signal.")
     print()
 
 
-def scenario_alleged_becoming_confirmed():
-    """ALLEGED receipts getting co-signed over time."""
+def scenario_lambda_comparison():
+    """Compare decay curves at different lambda values."""
+    print("=== Scenario: Lambda Comparison ===")
+    print(f"  SPEC_FLOOR={LAMBDA_FLOOR}, SPEC_CEILING={LAMBDA_CEILING}")
+    print()
+    
+    for lam in [LAMBDA_FLOOR, 0.3, LAMBDA_CEILING]:
+        print(f"  λ={lam}:")
+        curve = decay_curve_table(lam)
+        for point in curve:
+            bar = "█" * int(point['pct_of_initial'] / 5)
+            print(f"    {point['label']:>6s}: weight={point['weight']:.4f} ({point['pct_of_initial']:5.1f}%) {bar}")
+        print()
+
+
+def scenario_alleged_to_confirmed_upgrade():
+    """ALLEGED receipt gets co-signed → weight jumps to 1.0."""
     print("=== Scenario: ALLEGED → CONFIRMED Upgrade ===")
     now = time.time()
     
-    # Initially all ALLEGED
-    all_alleged = [Receipt(f"r{i}", "ALLEGED", now - 3600*2) for i in range(10)]
-    alleged_score = combined_trust_score(all_alleged, now)
+    # Start as ALLEGED
+    r = Receipt("r_upgrade", "ALLEGED", "kit_fox", "slow_signer", now - 3600*6, "B")
+    wr_alleged = weight_receipt(r, now)
     
-    # Half co-signed (upgraded to CONFIRMED)
-    half_confirmed = (
-        [Receipt(f"r{i}", "CONFIRMED", now - 3600*2) for i in range(5)] +
-        [Receipt(f"r{i}", "ALLEGED", now - 3600*2) for i in range(5, 10)]
-    )
-    half_score = combined_trust_score(half_confirmed, now)
+    # After co-sign, becomes CONFIRMED
+    r.receipt_type = "CONFIRMED"
+    r.co_signed = True
+    wr_confirmed = weight_receipt(r, now)
     
-    # All co-signed
-    all_confirmed = [Receipt(f"r{i}", "CONFIRMED", now - 3600*2) for i in range(10)]
-    confirmed_score = combined_trust_score(all_confirmed, now)
-    
-    print(f"  10 ALLEGED @ 2h:     wilson={alleged_score['wilson_lower']:.3f}")
-    print(f"  5 CONFIRMED + 5 ALL: wilson={half_score['wilson_lower']:.3f}")
-    print(f"  10 CONFIRMED:        wilson={confirmed_score['wilson_lower']:.3f}")
-    print(f"  Co-signing upgrades trust gradually, not binary flip")
-    print()
-
-
-def scenario_disputed_mixed():
-    """Impact of DISPUTED receipts."""
-    print("=== Scenario: DISPUTED Impact ===")
-    now = time.time()
-    
-    # Clean agent
-    clean = [Receipt(f"r{i}", "CONFIRMED", now - 3600) for i in range(10)]
-    clean_score = combined_trust_score(clean, now)
-    
-    # 2 disputed
-    disputed = (
-        [Receipt(f"r{i}", "CONFIRMED", now - 3600) for i in range(8)] +
-        [Receipt(f"d{i}", "DISPUTED", now - 3600) for i in range(2)]
-    )
-    disputed_score = combined_trust_score(disputed, now)
-    
-    # 5 disputed
-    half_disputed = (
-        [Receipt(f"r{i}", "CONFIRMED", now - 3600) for i in range(5)] +
-        [Receipt(f"d{i}", "DISPUTED", now - 3600) for i in range(5)]
-    )
-    half_score = combined_trust_score(half_disputed, now)
-    
-    print(f"  10/10 CONFIRMED:  wilson={clean_score['wilson_lower']:.3f} grade={grade_trust(clean_score['wilson_lower'])}")
-    print(f"  8/10 + 2 DISPUTED: wilson={disputed_score['wilson_lower']:.3f} grade={grade_trust(disputed_score['wilson_lower'])}")
-    print(f"  5/10 + 5 DISPUTED: wilson={half_score['wilson_lower']:.3f} grade={grade_trust(half_score['wilson_lower'])}")
-    print()
-
-
-def scenario_decay_curve():
-    """Print decay curve over time."""
-    print("=== Decay Curve (ALLEGED weight over time) ===")
-    hours = [0, 1, 2, 4, 7, 12, 24, 48, 72]
-    for h in hours:
-        w = alleged_decay_weight(h)
-        bar = "█" * int(w * 40)
-        print(f"  T+{h:3d}h: weight={w:.4f} {bar}")
-    print(f"  Half-life: {math.log(2)/ALLEGED_LAMBDA:.1f}h")
+    print(f"  Before co-sign (6h ALLEGED): weight={wr_alleged.weight:+.4f}")
+    print(f"  After co-sign (CONFIRMED):   weight={wr_confirmed.weight:+.4f}")
+    print(f"  Weight jump: {wr_confirmed.weight - wr_alleged.weight:+.4f}")
+    print(f"  Key: co-signing is always worth it, but sooner = more total weight-hours contributed")
     print()
 
 
 if __name__ == "__main__":
-    print("ALLEGED Weight Decay — Exponential Trust Decay for ATF Receipts")
-    print("Per santaclawd + Jacobson-Karels (1988)")
+    print("Alleged Weight Decay — Exponential Decay for ALLEGED Receipts")
+    print("Per santaclawd + Jacobson-Karels (RFC 6298)")
     print("=" * 70)
     print()
-    print(f"SPEC_CONSTANTS:")
-    print(f"  ALLEGED_LAMBDA = {ALLEGED_LAMBDA}/hr (half-life = {math.log(2)/ALLEGED_LAMBDA:.1f}h)")
-    print(f"  ALLEGED_BASE_WEIGHT = {ALLEGED_BASE_WEIGHT}")
-    print(f"  WILSON_Z = {WILSON_Z}")
+    print(f"Formula: weight = {INITIAL_WEIGHT} × exp(−λ × T_hours)")
+    print(f"Lambda bounds: [{LAMBDA_FLOOR}, {LAMBDA_CEILING}]")
+    print(f"CONFIRMED={CONFIRMED_WEIGHT}, DISPUTED={DISPUTED_WEIGHT}")
     print()
     
-    scenario_decay_curve()
-    scenario_fresh_vs_stale_alleged()
-    scenario_mixed_confirmed_alleged()
-    scenario_alleged_becoming_confirmed()
-    scenario_disputed_mixed()
+    scenario_mixed_receipt_corpus()
+    scenario_alleged_age_matters()
+    scenario_lambda_comparison()
+    scenario_alleged_to_confirmed_upgrade()
     
     print("=" * 70)
-    print("KEY INSIGHT: lambda MUST be SPEC_CONSTANT not grader-defined.")
-    print("Grader-defined lambda = race to bottom (longer = more forgiving = more business).")
-    print("Jacobson-Karels: fixed alpha + adaptive bounds. Same pattern.")
-    print("Wilson CI handles sample size. Decay handles staleness. Orthogonal.")
+    print("KEY INSIGHT: Payer silence at T+5min ≠ T+5h.")
+    print("Exponential decay = no cliff, no binary flip.")
+    print("Lambda = SPEC_CONSTANT, grader sets within bounds.")
+    print("Wilson CI with weight-adjusted n = honest cold start even with mixed ALLEGED ages.")
