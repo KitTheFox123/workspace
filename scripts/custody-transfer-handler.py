@@ -1,327 +1,348 @@
 #!/usr/bin/env python3
 """
-custody-transfer-handler.py — Operator succession for ATF genesis receipts.
+custody-transfer-handler.py — ATF operator custody transfer with dark operator path.
 
-Per santaclawd: CUSTODY_TRANSFER ≠ reanchor. Succession, not identity change.
-DKIM key rotation (M3AAWG 2019): new selector published BEFORE old removed.
-ICANN Transfer Policy: 5-day ACK window, silence = consent to transfer.
+Per santaclawd: what happens when old operator goes dark during CUSTODY_TRANSFER?
+DKIM has no answer — DNS TTL is the implicit timeout. ATF needs explicit.
 
-Dark operator path: old custodian unresponsive → timeout → unilateral transfer
-with proof-of-control + registry witness.
+Two paths:
+  CLEAN:  dual-signature (old + new custodian). CUSTODY_TRANSFERRED grade.
+  LAPSED: old operator unresponsive after CUSTODY_TRANSFER_TIMEOUT.
+          New custodian submits proof_of_control + 3 independent witness attestations.
+          CUSTODY_LAPSED grade (weaker than TRANSFERRED, stronger than REANCHORED).
 
-Three transfer modes:
-  COOPERATIVE  — Both sign overlap window (DKIM rotation model)
-  TIMEOUT      — Old custodian dark, 30d timeout, proof-of-control
-  EMERGENCY    — Key compromise, immediate with registry witness quorum
+Parallels:
+  - DKIM key rotation (M3AAWG 2019): new selector published BEFORE old removed
+  - DoD PKI key escrow (NIST SP 800-57): recovery agent holds escrow copy
+  - X.509 CA key compromise: cross-signed bridge cert revoked, new issued
+  - Domain transfer (ICANN): 5-day lock, auth code, registrar cooperation
 """
 
 import hashlib
-import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-# SPEC_CONSTANTS (not impl-defined — DigiNoort lesson)
-CUSTODY_TIMEOUT_DAYS = 30       # Dark operator timeout
-OVERLAP_WINDOW_DAYS = 7         # Dual-signature overlap (M3AAWG: 2x TTL)
-EMERGENCY_QUORUM = 3            # Registry witnesses for emergency transfer
-ACK_WINDOW_DAYS = 5             # ICANN model: silence = consent after 5 days
-PROOF_OF_CONTROL_METHODS = ["smtp_reachable", "dns_txt", "operator_genesis_hash"]
-
-
-class TransferMode(Enum):
-    COOPERATIVE = "COOPERATIVE"   # Both custodians sign
-    TIMEOUT = "TIMEOUT"           # Old custodian dark
-    EMERGENCY = "EMERGENCY"       # Key compromise
-
-
 class TransferState(Enum):
-    INITIATED = "INITIATED"       # New custodian requests
-    ACK_PENDING = "ACK_PENDING"   # Waiting for old custodian ACK
-    OVERLAP = "OVERLAP"           # Both active (dual-signature window)
-    COMPLETED = "COMPLETED"       # Transfer done
-    TIMEOUT_PENDING = "TIMEOUT_PENDING"  # Old custodian dark, counting down
-    EMERGENCY_REVIEW = "EMERGENCY_REVIEW"  # Registry witness quorum
-    REJECTED = "REJECTED"         # Old custodian explicitly rejected
-    FAILED = "FAILED"             # Transfer failed
+    INITIATED = "INITIATED"           # New custodian requested
+    DUAL_SIGNED = "DUAL_SIGNED"       # Both parties signed (clean path)
+    TIMEOUT_PENDING = "TIMEOUT_PENDING"  # Waiting for old operator response
+    LAPSED = "LAPSED"                 # Old operator dark, timeout expired
+    TRANSFERRED = "TRANSFERRED"       # Clean transfer complete
+    REJECTED = "REJECTED"             # Transfer denied
+    DISPUTED = "DISPUTED"             # Conflicting claims
+
+
+class TransferGrade(Enum):
+    CUSTODY_TRANSFERRED = "CUSTODY_TRANSFERRED"   # Clean dual-signature (A)
+    CUSTODY_LAPSED = "CUSTODY_LAPSED"             # Dark operator timeout (B)
+    CUSTODY_CONTESTED = "CUSTODY_CONTESTED"       # Disputed transfer (D)
+    CUSTODY_INVALID = "CUSTODY_INVALID"           # Failed validation (F)
+
+
+# SPEC_CONSTANTS
+CUSTODY_TRANSFER_TIMEOUT_DAYS = 30    # SPEC_DEFAULT, genesis overridable (stricter only)
+MIN_WITNESS_ATTESTATIONS = 3          # For lapsed path
+WITNESS_DIVERSITY_MIN = 0.5           # Simpson diversity on witness set
+OVERLAP_WINDOW_DAYS = 7               # Dual-signature overlap period
+MAX_TRANSFER_CHAIN_DEPTH = 3          # Prevent cascading transfers
 
 
 @dataclass
-class CustodyTransfer:
+class CustodyTransferRequest:
     agent_id: str
     old_operator_id: str
     new_operator_id: str
-    mode: TransferMode
-    state: TransferState
-    initiated_at: float
-    old_ack_at: Optional[float] = None
-    overlap_start: Optional[float] = None
-    completed_at: Optional[float] = None
-    proof_of_control: list = field(default_factory=list)
-    witness_signatures: list = field(default_factory=list)
-    transfer_hash: str = ""
-    
-    def __post_init__(self):
-        h = hashlib.sha256(
-            f"{self.agent_id}:{self.old_operator_id}:{self.new_operator_id}:{self.initiated_at}"
-            .encode()
-        ).hexdigest()[:16]
-        self.transfer_hash = h
+    requested_at: float
+    reason: str  # "migration", "acquisition", "recovery", "dispute"
+    proof_of_control: Optional[str] = None  # Hash of control proof
+    old_operator_signature: Optional[str] = None
+    new_operator_signature: Optional[str] = None
+    witness_attestations: list = field(default_factory=list)
+    genesis_timeout_days: int = CUSTODY_TRANSFER_TIMEOUT_DAYS
 
 
 @dataclass 
+class WitnessAttestation:
+    witness_id: str
+    operator_id: str  # Witness's operator (for diversity check)
+    attestation_hash: str
+    timestamp: float
+    verification_method: str  # "direct_contact", "genesis_audit", "behavioral"
+
+
+@dataclass
 class TransferResult:
-    transfer: CustodyTransfer
-    grade: str
-    warnings: list
-    receipt_chain_status: str  # PRESERVED / TAINTED / BROKEN
+    state: TransferState
+    grade: TransferGrade
+    path: str  # "clean" or "lapsed"
+    warnings: list = field(default_factory=list)
+    details: dict = field(default_factory=dict)
 
 
-def validate_proof_of_control(proofs: list[str]) -> tuple[bool, list[str]]:
-    """Validate proof-of-control methods."""
-    valid = []
-    for p in proofs:
-        if p in PROOF_OF_CONTROL_METHODS:
-            valid.append(p)
-    # Need at least 2 different methods
-    return len(valid) >= 2, valid
+def compute_witness_diversity(attestations: list[WitnessAttestation]) -> float:
+    """Simpson diversity index on witness operator set."""
+    if not attestations:
+        return 0.0
+    operators = [a.operator_id for a in attestations]
+    n = len(operators)
+    if n <= 1:
+        return 0.0
+    freq = {}
+    for op in operators:
+        freq[op] = freq.get(op, 0) + 1
+    simpson = sum(f * (f - 1) for f in freq.values()) / (n * (n - 1))
+    return round(1.0 - simpson, 4)  # 1 - Simpson = diversity
 
 
-def process_cooperative_transfer(transfer: CustodyTransfer) -> TransferResult:
-    """
-    COOPERATIVE: Both custodians available.
-    DKIM model: new selector published, overlap window, old selector removed.
-    """
+def validate_clean_transfer(req: CustodyTransferRequest) -> TransferResult:
+    """Validate dual-signature (clean) custody transfer."""
     warnings = []
     
-    if transfer.old_ack_at is None:
-        return TransferResult(transfer, "F", ["Old custodian has not acknowledged"], "BROKEN")
+    if not req.old_operator_signature:
+        return TransferResult(
+            state=TransferState.REJECTED,
+            grade=TransferGrade.CUSTODY_INVALID,
+            path="clean",
+            warnings=["Missing old operator signature"],
+            details={"reason": "dual_signature_incomplete"}
+        )
     
-    # Check overlap window
-    if transfer.overlap_start is None:
-        warnings.append("No overlap window — receipts during transition may be unverifiable")
-        chain_status = "TAINTED"
-    else:
-        overlap_duration = (transfer.completed_at or time.time()) - transfer.overlap_start
-        overlap_days = overlap_duration / 86400
-        if overlap_days < OVERLAP_WINDOW_DAYS:
-            warnings.append(f"Overlap {overlap_days:.1f}d < {OVERLAP_WINDOW_DAYS}d minimum")
-            chain_status = "TAINTED"
-        else:
-            chain_status = "PRESERVED"
+    if not req.new_operator_signature:
+        return TransferResult(
+            state=TransferState.REJECTED,
+            grade=TransferGrade.CUSTODY_INVALID,
+            path="clean",
+            warnings=["Missing new operator signature"],
+            details={"reason": "dual_signature_incomplete"}
+        )
     
-    # Both signed = Grade A
-    grade = "A" if not warnings else "B"
-    return TransferResult(transfer, grade, warnings, chain_status)
+    if req.old_operator_id == req.new_operator_id:
+        warnings.append("Self-transfer detected (same operator)")
+    
+    return TransferResult(
+        state=TransferState.TRANSFERRED,
+        grade=TransferGrade.CUSTODY_TRANSFERRED,
+        path="clean",
+        warnings=warnings,
+        details={
+            "dual_signed": True,
+            "overlap_window_days": OVERLAP_WINDOW_DAYS,
+            "old_selector_ttl": f"{OVERLAP_WINDOW_DAYS}d"
+        }
+    )
 
 
-def process_timeout_transfer(transfer: CustodyTransfer) -> TransferResult:
-    """
-    TIMEOUT: Old custodian dark (unresponsive).
-    ICANN model: 5-day ACK window, then countdown to CUSTODY_TIMEOUT.
-    """
-    warnings = []
+def validate_lapsed_transfer(req: CustodyTransferRequest) -> TransferResult:
+    """Validate dark-operator (lapsed) custody transfer."""
     now = time.time()
-    
-    # Check if ACK window expired
-    ack_deadline = transfer.initiated_at + (ACK_WINDOW_DAYS * 86400)
-    if now < ack_deadline:
-        return TransferResult(transfer, "F", 
-            [f"ACK window not expired ({ACK_WINDOW_DAYS}d). Wait."], "BROKEN")
-    
-    # Check if timeout expired
-    timeout_deadline = transfer.initiated_at + (CUSTODY_TIMEOUT_DAYS * 86400)
-    if now < timeout_deadline:
-        days_remaining = (timeout_deadline - now) / 86400
-        return TransferResult(transfer, "F",
-            [f"Timeout not expired. {days_remaining:.1f}d remaining."], "BROKEN")
-    
-    # Validate proof of control
-    valid, methods = validate_proof_of_control(transfer.proof_of_control)
-    if not valid:
-        warnings.append(f"Insufficient proof-of-control: {methods}. Need 2+ methods.")
-        return TransferResult(transfer, "F", warnings, "BROKEN")
-    
-    # Timeout transfer = Grade C (weaker than cooperative)
-    warnings.append("Unilateral transfer — old custodian unresponsive")
-    warnings.append(f"Proof-of-control: {methods}")
-    return TransferResult(transfer, "C", warnings, "TAINTED")
-
-
-def process_emergency_transfer(transfer: CustodyTransfer) -> TransferResult:
-    """
-    EMERGENCY: Key compromise. Immediate with registry witness quorum.
-    """
     warnings = []
     
-    # Check witness quorum
-    if len(transfer.witness_signatures) < EMERGENCY_QUORUM:
-        return TransferResult(transfer, "F",
-            [f"Insufficient witnesses: {len(transfer.witness_signatures)}/{EMERGENCY_QUORUM}"],
-            "BROKEN")
+    # Check timeout
+    elapsed_days = (now - req.requested_at) / 86400
+    timeout = req.genesis_timeout_days
     
-    # Validate proof of control
-    valid, methods = validate_proof_of_control(transfer.proof_of_control)
-    if not valid:
-        return TransferResult(transfer, "F",
-            [f"Insufficient proof-of-control: {methods}"], "BROKEN")
+    if elapsed_days < timeout:
+        return TransferResult(
+            state=TransferState.TIMEOUT_PENDING,
+            grade=TransferGrade.CUSTODY_INVALID,
+            path="lapsed",
+            warnings=[f"Timeout not reached: {elapsed_days:.1f}/{timeout}d"],
+            details={"days_remaining": round(timeout - elapsed_days, 1)}
+        )
     
-    warnings.append("Emergency transfer — key compromise suspected")
-    warnings.append(f"Witnesses: {len(transfer.witness_signatures)}")
-    warnings.append(f"Proof-of-control: {methods}")
+    # Check proof of control
+    if not req.proof_of_control:
+        warnings.append("CRITICAL: No proof of control submitted")
+        return TransferResult(
+            state=TransferState.REJECTED,
+            grade=TransferGrade.CUSTODY_INVALID,
+            path="lapsed",
+            warnings=warnings,
+            details={"reason": "no_proof_of_control"}
+        )
     
-    # Emergency = Grade B (quorum compensates for no cooperation)
-    return TransferResult(transfer, "B", warnings, "TAINTED")
+    # Check witness attestations
+    if len(req.witness_attestations) < MIN_WITNESS_ATTESTATIONS:
+        warnings.append(f"Insufficient witnesses: {len(req.witness_attestations)}/{MIN_WITNESS_ATTESTATIONS}")
+        return TransferResult(
+            state=TransferState.REJECTED,
+            grade=TransferGrade.CUSTODY_INVALID,
+            path="lapsed",
+            warnings=warnings,
+            details={"reason": "insufficient_witnesses"}
+        )
+    
+    # Check witness diversity
+    diversity = compute_witness_diversity(req.witness_attestations)
+    if diversity < WITNESS_DIVERSITY_MIN:
+        warnings.append(f"Low witness diversity: {diversity:.3f} < {WITNESS_DIVERSITY_MIN}")
+        return TransferResult(
+            state=TransferState.REJECTED,
+            grade=TransferGrade.CUSTODY_CONTESTED,
+            path="lapsed",
+            warnings=warnings,
+            details={"reason": "monoculture_witnesses", "diversity": diversity}
+        )
+    
+    # Check for conflicting claims (new operator == old operator's associate)
+    new_op_is_witness = any(
+        a.operator_id == req.new_operator_id for a in req.witness_attestations
+    )
+    if new_op_is_witness:
+        warnings.append("New operator is also a witness — self-attestation risk")
+    
+    return TransferResult(
+        state=TransferState.LAPSED,
+        grade=TransferGrade.CUSTODY_LAPSED,
+        path="lapsed",
+        warnings=warnings,
+        details={
+            "timeout_days": timeout,
+            "elapsed_days": round(elapsed_days, 1),
+            "witness_count": len(req.witness_attestations),
+            "witness_diversity": diversity,
+            "proof_of_control": req.proof_of_control[:16] + "..."
+        }
+    )
 
 
-def process_transfer(transfer: CustodyTransfer) -> TransferResult:
-    """Route to appropriate transfer handler."""
-    if transfer.mode == TransferMode.COOPERATIVE:
-        return process_cooperative_transfer(transfer)
-    elif transfer.mode == TransferMode.TIMEOUT:
-        return process_timeout_transfer(transfer)
-    elif transfer.mode == TransferMode.EMERGENCY:
-        return process_emergency_transfer(transfer)
+def process_transfer(req: CustodyTransferRequest) -> TransferResult:
+    """Route to clean or lapsed path based on old operator availability."""
+    if req.old_operator_signature:
+        return validate_clean_transfer(req)
     else:
-        return TransferResult(transfer, "F", ["Unknown transfer mode"], "BROKEN")
+        return validate_lapsed_transfer(req)
 
 
 # === Scenarios ===
 
-def scenario_cooperative():
-    """Clean cooperative transfer — both custodians sign."""
-    print("=== Scenario: Cooperative Transfer (DKIM Rotation Model) ===")
+def run_scenarios():
     now = time.time()
     
-    t = CustodyTransfer(
+    # Scenario 1: Clean dual-signature transfer
+    print("=== Scenario 1: Clean Dual-Signature Transfer ===")
+    req = CustodyTransferRequest(
         agent_id="kit_fox",
-        old_operator_id="operator_alpha",
-        new_operator_id="operator_beta",
-        mode=TransferMode.COOPERATIVE,
-        state=TransferState.COMPLETED,
-        initiated_at=now - 86400*14,
-        old_ack_at=now - 86400*13,
-        overlap_start=now - 86400*10,
-        completed_at=now - 86400*3,
+        old_operator_id="operator_a",
+        new_operator_id="operator_b",
+        requested_at=now - 86400 * 3,
+        reason="migration",
+        old_operator_signature="sig_old_abc123",
+        new_operator_signature="sig_new_def456"
     )
-    
-    result = process_transfer(t)
-    print(f"  Grade: {result.grade}")
-    print(f"  Chain: {result.receipt_chain_status}")
-    print(f"  Warnings: {result.warnings}")
+    result = process_transfer(req)
+    print(f"  State: {result.state.value}")
+    print(f"  Grade: {result.grade.value}")
+    print(f"  Path: {result.path}")
+    print(f"  Details: {result.details}")
     print()
-
-
-def scenario_dark_operator():
-    """Old operator unresponsive — timeout path."""
-    print("=== Scenario: Dark Operator (ICANN Timeout Model) ===")
-    now = time.time()
     
-    t = CustodyTransfer(
-        agent_id="orphaned_agent",
+    # Scenario 2: Dark operator — timeout not reached
+    print("=== Scenario 2: Dark Operator — Timeout Pending ===")
+    req = CustodyTransferRequest(
+        agent_id="orphan_agent",
         old_operator_id="dark_operator",
         new_operator_id="rescue_operator",
-        mode=TransferMode.TIMEOUT,
-        state=TransferState.TIMEOUT_PENDING,
-        initiated_at=now - 86400*35,  # 35 days ago (past 30d timeout)
-        proof_of_control=["smtp_reachable", "dns_txt"],
+        requested_at=now - 86400 * 15,  # 15 days
+        reason="recovery",
+        proof_of_control="proof_hash_abc",
+        witness_attestations=[
+            WitnessAttestation("w1", "op_x", "att1", now, "direct_contact"),
+            WitnessAttestation("w2", "op_y", "att2", now, "genesis_audit"),
+            WitnessAttestation("w3", "op_z", "att3", now, "behavioral"),
+        ]
     )
-    
-    result = process_transfer(t)
-    print(f"  Grade: {result.grade}")
-    print(f"  Chain: {result.receipt_chain_status}")
-    print(f"  Warnings: {result.warnings}")
+    result = process_transfer(req)
+    print(f"  State: {result.state.value}")
+    print(f"  Grade: {result.grade.value}")
+    print(f"  Days remaining: {result.details.get('days_remaining', 'N/A')}")
     print()
-
-
-def scenario_dark_operator_too_early():
-    """Timeout not yet expired."""
-    print("=== Scenario: Dark Operator (Too Early) ===")
-    now = time.time()
     
-    t = CustodyTransfer(
-        agent_id="impatient_agent",
-        old_operator_id="slow_operator",
-        new_operator_id="eager_operator",
-        mode=TransferMode.TIMEOUT,
-        state=TransferState.TIMEOUT_PENDING,
-        initiated_at=now - 86400*10,  # Only 10 days ago
-        proof_of_control=["smtp_reachable", "dns_txt"],
+    # Scenario 3: Dark operator — timeout reached, valid witnesses
+    print("=== Scenario 3: Dark Operator — Lapsed Transfer (Valid) ===")
+    req = CustodyTransferRequest(
+        agent_id="orphan_agent",
+        old_operator_id="dark_operator",
+        new_operator_id="rescue_operator",
+        requested_at=now - 86400 * 35,  # 35 days (past timeout)
+        reason="recovery",
+        proof_of_control="proof_hash_abc123def456",
+        witness_attestations=[
+            WitnessAttestation("w1", "op_x", "att1", now, "direct_contact"),
+            WitnessAttestation("w2", "op_y", "att2", now, "genesis_audit"),
+            WitnessAttestation("w3", "op_z", "att3", now, "behavioral"),
+        ]
     )
-    
-    result = process_transfer(t)
-    print(f"  Grade: {result.grade}")
-    print(f"  Chain: {result.receipt_chain_status}")
-    print(f"  Warnings: {result.warnings}")
+    result = process_transfer(req)
+    print(f"  State: {result.state.value}")
+    print(f"  Grade: {result.grade.value}")
+    print(f"  Path: {result.path}")
+    print(f"  Details: {result.details}")
     print()
-
-
-def scenario_emergency():
-    """Key compromise — emergency with witness quorum."""
-    print("=== Scenario: Emergency Transfer (Key Compromise) ===")
-    now = time.time()
     
-    t = CustodyTransfer(
-        agent_id="compromised_agent",
-        old_operator_id="hacked_operator",
-        new_operator_id="clean_operator",
-        mode=TransferMode.EMERGENCY,
-        state=TransferState.EMERGENCY_REVIEW,
-        initiated_at=now - 86400*1,
-        proof_of_control=["smtp_reachable", "operator_genesis_hash"],
-        witness_signatures=["witness_1", "witness_2", "witness_3"],
+    # Scenario 4: Monoculture witnesses (same operator = sybil)
+    print("=== Scenario 4: Monoculture Witnesses (Sybil Attack) ===")
+    req = CustodyTransferRequest(
+        agent_id="target_agent",
+        old_operator_id="dark_operator",
+        new_operator_id="attacker",
+        requested_at=now - 86400 * 35,
+        reason="recovery",
+        proof_of_control="fake_proof_hash",
+        witness_attestations=[
+            WitnessAttestation("w1", "attacker_op", "att1", now, "direct_contact"),
+            WitnessAttestation("w2", "attacker_op", "att2", now, "genesis_audit"),
+            WitnessAttestation("w3", "attacker_op", "att3", now, "behavioral"),
+        ]
     )
-    
-    result = process_transfer(t)
-    print(f"  Grade: {result.grade}")
-    print(f"  Chain: {result.receipt_chain_status}")
+    result = process_transfer(req)
+    print(f"  State: {result.state.value}")
+    print(f"  Grade: {result.grade.value}")
     print(f"  Warnings: {result.warnings}")
+    print(f"  Diversity: {result.details.get('diversity', 'N/A')}")
     print()
-
-
-def scenario_insufficient_proof():
-    """Timeout transfer but only one proof method."""
-    print("=== Scenario: Insufficient Proof-of-Control ===")
-    now = time.time()
     
-    t = CustodyTransfer(
-        agent_id="weak_claim_agent",
-        old_operator_id="dark_op",
+    # Scenario 5: No proof of control
+    print("=== Scenario 5: No Proof of Control ===")
+    req = CustodyTransferRequest(
+        agent_id="target_agent",
+        old_operator_id="dark_operator",
         new_operator_id="claimant",
-        mode=TransferMode.TIMEOUT,
-        state=TransferState.TIMEOUT_PENDING,
-        initiated_at=now - 86400*35,
-        proof_of_control=["smtp_reachable"],  # Only 1 method
+        requested_at=now - 86400 * 40,
+        reason="recovery",
+        witness_attestations=[
+            WitnessAttestation("w1", "op_a", "att1", now, "behavioral"),
+            WitnessAttestation("w2", "op_b", "att2", now, "behavioral"),
+            WitnessAttestation("w3", "op_c", "att3", now, "behavioral"),
+        ]
     )
-    
-    result = process_transfer(t)
-    print(f"  Grade: {result.grade}")
-    print(f"  Chain: {result.receipt_chain_status}")
-    print(f"  Warnings: {result.warnings}")
+    result = process_transfer(req)
+    print(f"  State: {result.state.value}")
+    print(f"  Grade: {result.grade.value}")
+    print(f"  Reason: {result.details.get('reason', 'N/A')}")
     print()
 
 
 if __name__ == "__main__":
-    print("Custody Transfer Handler — Operator Succession for ATF")
-    print("Per santaclawd: CUSTODY_TRANSFER ≠ reanchor. Succession not identity change.")
-    print("DKIM rotation (M3AAWG 2019) + ICANN Transfer Policy models.")
-    print("=" * 70)
+    print("Custody Transfer Handler — Dark Operator Path for ATF")
+    print("Per santaclawd: DKIM has no answer for dark operators. ATF does.")
+    print("=" * 65)
     print()
-    scenario_cooperative()
-    scenario_dark_operator()
-    scenario_dark_operator_too_early()
-    scenario_emergency()
-    scenario_insufficient_proof()
-    
-    print("=" * 70)
-    print("SPEC_CONSTANTS:")
-    print(f"  CUSTODY_TIMEOUT = {CUSTODY_TIMEOUT_DAYS}d")
+    print(f"SPEC_CONSTANTS:")
+    print(f"  CUSTODY_TRANSFER_TIMEOUT = {CUSTODY_TRANSFER_TIMEOUT_DAYS}d")
+    print(f"  MIN_WITNESS_ATTESTATIONS = {MIN_WITNESS_ATTESTATIONS}")
+    print(f"  WITNESS_DIVERSITY_MIN = {WITNESS_DIVERSITY_MIN}")
     print(f"  OVERLAP_WINDOW = {OVERLAP_WINDOW_DAYS}d")
-    print(f"  ACK_WINDOW = {ACK_WINDOW_DAYS}d (ICANN model)")
-    print(f"  EMERGENCY_QUORUM = {EMERGENCY_QUORUM} witnesses")
-    print(f"  PROOF_METHODS = {PROOF_OF_CONTROL_METHODS}")
     print()
-    print("KEY: timeout N = SPEC_CONSTANT not registry-configurable.")
-    print("impl-defined timeouts = DigiNoort repeated.")
+    run_scenarios()
+    print("=" * 65)
+    print("KEY INSIGHTS:")
+    print("  1. Clean path (dual-sig) = CUSTODY_TRANSFERRED (Grade A)")
+    print("  2. Lapsed path (timeout) = CUSTODY_LAPSED (Grade B)")  
+    print("  3. Monoculture witnesses = REJECTED (sybil detection)")
+    print("  4. No proof of control = REJECTED (claim without evidence)")
+    print("  5. Timeout IS authorization — silence after 30d = implicit consent")
+    print("  6. DKIM parallel: DNS TTL is implicit timeout. ATF makes it explicit.")
