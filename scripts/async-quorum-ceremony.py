@@ -337,3 +337,116 @@ if __name__ == "__main__":
     print("3. Emergency = tighter window (4h) + higher threshold (4/5). Speed costs safety.")
     print("4. Operator diversity visible at quorum time. Monoculture = flag, not reject.")
     print("5. Failed ceremonies log non-responsive stewards → input for fast-ballot.")
+
+
+# === CEREMONY POLICY ENFORCEMENT ===
+# Per santaclawd: registry sets floor, agent can escalate but not downgrade.
+# Per TLS model: server sets minimum, client can offer higher.
+
+@dataclass
+class CeremonyPolicy:
+    """Registry-mandated ceremony policy (floor-and-ceiling model)."""
+    ceremony_type: CeremonyType
+    mode_floor: CeremonyMode       # Minimum mode (agent cannot downgrade below this)
+    min_quorum_floor: int          # Minimum quorum (failure cost governs)
+    max_window_hours: int          # Maximum deadline (cannot extend beyond)
+
+
+# SPEC_CONSTANT: per-type minimum quorum floors (failure cost governs)
+QUORUM_FLOORS = {
+    CeremonyType.KEY_ROLLOVER: 3,   # Blast radius = all signed receipts
+    CeremonyType.CHECKPOINT: 3,     # Long-term validity
+    CeremonyType.ROUTINE_OPS: 2,    # Low blast radius
+    CeremonyType.EMERGENCY: 2,      # Speed > quorum completeness
+    CeremonyType.FAST_BALLOT: 3,    # Eviction should not be easy
+}
+
+# Mode floors: minimum ceremony mode per type
+MODE_FLOORS = {
+    CeremonyType.KEY_ROLLOVER: CeremonyMode.ASYNC,   # At least ASYNC
+    CeremonyType.CHECKPOINT: CeremonyMode.ASYNC,
+    CeremonyType.ROUTINE_OPS: CeremonyMode.ASYNC,
+    CeremonyType.EMERGENCY: CeremonyMode.SYNC,       # MUST be SYNC
+    CeremonyType.FAST_BALLOT: CeremonyMode.HYBRID,   # At least HYBRID
+}
+
+# Mode ordering for escalation check
+MODE_ORDER = {CeremonyMode.ASYNC: 0, CeremonyMode.HYBRID: 1, CeremonyMode.SYNC: 2}
+
+
+def validate_ceremony_request(
+    ceremony_type: CeremonyType,
+    requested_mode: CeremonyMode,
+    requested_quorum: int
+) -> dict:
+    """Validate ceremony request against registry policy.
+    Agent can escalate (ASYNC→SYNC) but never downgrade (SYNC→ASYNC).
+    """
+    mode_floor = MODE_FLOORS[ceremony_type]
+    quorum_floor = QUORUM_FLOORS[ceremony_type]
+    config = CEREMONY_CONFIG[ceremony_type]
+    
+    issues = []
+    adjustments = []
+    
+    # Mode check: requested must be >= floor
+    if MODE_ORDER[requested_mode] < MODE_ORDER[mode_floor]:
+        issues.append(f"Mode {requested_mode.value} below floor {mode_floor.value}")
+        adjustments.append(f"Escalated to {mode_floor.value}")
+        effective_mode = mode_floor
+    else:
+        effective_mode = requested_mode
+    
+    # Quorum check: requested must be >= floor
+    if requested_quorum < quorum_floor:
+        issues.append(f"Quorum {requested_quorum} below floor {quorum_floor}")
+        adjustments.append(f"Raised to {quorum_floor}")
+        effective_quorum = quorum_floor
+    else:
+        effective_quorum = requested_quorum
+    
+    # Cannot exceed pool size
+    if effective_quorum > config["pool"]:
+        issues.append(f"Quorum {effective_quorum} exceeds pool {config['pool']}")
+        effective_quorum = config["pool"]
+    
+    return {
+        "valid": len(issues) == 0,
+        "ceremony_type": ceremony_type.value,
+        "requested_mode": requested_mode.value,
+        "effective_mode": effective_mode.value,
+        "requested_quorum": requested_quorum,
+        "effective_quorum": effective_quorum,
+        "mode_floor": mode_floor.value,
+        "quorum_floor": quorum_floor,
+        "issues": issues,
+        "adjustments": adjustments
+    }
+
+
+def scenario_policy_enforcement():
+    """Test floor-and-ceiling model."""
+    print("\n=== Scenario: Ceremony Policy Enforcement ===")
+    
+    # Agent tries to downgrade EMERGENCY to ASYNC
+    r1 = validate_ceremony_request(CeremonyType.EMERGENCY, CeremonyMode.ASYNC, 2)
+    print(f"  EMERGENCY as ASYNC/2: valid={r1['valid']}")
+    print(f"    → effective: {r1['effective_mode']}/{r1['effective_quorum']}")
+    if r1['adjustments']:
+        print(f"    → adjustments: {r1['adjustments']}")
+    
+    # Agent escalates KEY_ROLLOVER to SYNC (allowed)
+    r2 = validate_ceremony_request(CeremonyType.KEY_ROLLOVER, CeremonyMode.SYNC, 4)
+    print(f"  KEY_ROLLOVER as SYNC/4: valid={r2['valid']}")
+    print(f"    → effective: {r2['effective_mode']}/{r2['effective_quorum']} (escalation allowed)")
+    
+    # Agent tries FAST_BALLOT with quorum 1
+    r3 = validate_ceremony_request(CeremonyType.FAST_BALLOT, CeremonyMode.ASYNC, 1)
+    print(f"  FAST_BALLOT as ASYNC/1: valid={r3['valid']}")
+    print(f"    → effective: {r3['effective_mode']}/{r3['effective_quorum']}")
+    if r3['adjustments']:
+        print(f"    → adjustments: {r3['adjustments']}")
+
+
+if __name__ == "__main__" and "policy" in " ".join(sys.argv[1:]):
+    scenario_policy_enforcement()
