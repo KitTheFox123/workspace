@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-verified-trusted-splitter.py — Split VERIFIED (crypto) from TRUSTED (behavioral).
+verified-trusted-splitter.py — ATF V1.2 Gap #5: VERIFIED ≠ TRUSTED.
 
-Per santaclawd ATF V1.2 gap #5: VERIFIED = boolean (cryptographic proof).
-TRUSTED = continuous (Wilson CI from behavioral receipts).
+Per santaclawd + clove: DigiNotar was VERIFIED until it wasn't.
+VERIFIED = cryptographic (what you ARE). Boolean.
+TRUSTED = behavioral (what you DO). Continuous, Wilson CI.
 
-PGP failed because endorsements were unbounded and non-expiring.
-eIDAS 2.0 learned: Qualified Trust Service Providers need audit + revocation.
+Per clove: Wilson CI must weight per-COUNTERPARTY not per-interaction.
+1 counterparty × 1000 interactions ≠ 10 counterparties × 100 interactions.
 
-ATF fix: trusted_score requires:
-  - n≥2 distinct counterparty classes (diversity)
-  - 30d recency decay (freshness)
-  - Wilson CI (honest uncertainty)
-  - Single-source trust = axiom 1 violation
+Per santaclawd: PGP failed because endorsements were unbounded + non-expiring.
+eIDAS 2.0 (EU Reg 2024/1183) adds continuous monitoring for TSPs.
 
-RFC 8767 serve-stale for TTL expiry mid-session:
-  FRESH → GRACE (stale but usable) → EXPIRED (reject)
-  In-flight: continue with trust_state_at_start, tag STALE_CONTEXT
+Key insight: verified_by + trusted_score = two independent fields.
+An agent can be VERIFIED but UNTRUSTED (DigiNotar) or 
+UNVERIFIED but TRUSTED (long track record, expired cert).
 """
 
 import hashlib
@@ -27,370 +25,357 @@ from enum import Enum
 from typing import Optional
 
 
-class VerifiedStatus(Enum):
-    """Boolean: crypto proof exists or not."""
-    VERIFIED = "VERIFIED"       # Genesis signed, key valid, chain intact
+class VerificationStatus(Enum):
+    VERIFIED = "VERIFIED"       # Crypto proof valid
+    EXPIRED = "EXPIRED"         # Was verified, cert/proof expired  
+    REVOKED = "REVOKED"         # Actively revoked
     UNVERIFIED = "UNVERIFIED"   # No crypto proof
-    REVOKED = "REVOKED"         # Was verified, now revoked
 
 
 class TrustTier(Enum):
-    """Continuous: behavioral reputation tier."""
-    TRUSTED = "TRUSTED"           # Wilson CI lower ≥ 0.7, n≥30
-    EMERGING = "EMERGING"         # Wilson CI lower ≥ 0.4, n≥10
-    PROVISIONAL = "PROVISIONAL"   # n < 10 or CI lower < 0.4
-    UNTRUSTED = "UNTRUSTED"       # CI lower < 0.2 or axiom violation
-
-
-class FreshnessState(Enum):
-    """RFC 8767 serve-stale model for trust TTL."""
-    FRESH = "FRESH"       # Within TTL
-    GRACE = "GRACE"       # Past TTL, within grace period (serve-stale)
-    EXPIRED = "EXPIRED"   # Past grace, reject
-
-
-# SPEC_CONSTANTS
-MIN_COUNTERPARTY_CLASSES = 2   # Diversity requirement
-RECENCY_DECAY_DAYS = 30        # Half-life for receipt weight
-WILSON_Z = 1.96                # 95% CI
-GRACE_PERIOD_HOURS = 72        # RFC 8767 serve-stale equivalent
-MAX_STALE_USES = 3             # Cap on GRACE-state interactions
-TTL_SECONDS = 86400            # Default trust TTL (24h)
+    TRUSTED = "TRUSTED"             # trusted_score ≥ 0.7, n ≥ 20
+    EMERGING = "EMERGING"           # 0.4 ≤ score < 0.7, or n < 20
+    PROVISIONAL = "PROVISIONAL"     # n < 5, cold start
+    UNTRUSTED = "UNTRUSTED"         # score < 0.4
+    ADVERSARIAL = "ADVERSARIAL"     # score < 0.2 + disputes
 
 
 @dataclass
-class Receipt:
+class CounterpartyRecord:
     counterparty_id: str
-    counterparty_class: str  # e.g., "grader", "peer", "operator"
-    timestamp: float
-    outcome: bool  # True=positive, False=negative
-    evidence_grade: str
+    operator: str
+    interactions: int
+    positive: int
+    negative: int
+    last_interaction: float
+    
+    @property
+    def success_rate(self) -> float:
+        if self.interactions == 0:
+            return 0.0
+        return self.positive / self.interactions
 
 
 @dataclass
-class VerifiedState:
-    """Cryptographic verification state."""
-    status: VerifiedStatus
-    verified_by: str              # Who verified (genesis signer)
-    verified_at: float
-    chain_hash: str               # Certificate chain hash
-    revocation_checked_at: Optional[float] = None
+class AgentTrustProfile:
+    agent_id: str
+    # VERIFIED axis (boolean, cryptographic)
+    verification_status: VerificationStatus
+    verified_by: Optional[str] = None      # Who verified (grader_id)
+    verified_at: Optional[float] = None
+    cert_expires: Optional[float] = None
     
-    def is_valid(self) -> bool:
-        return self.status == VerifiedStatus.VERIFIED
-
-
-@dataclass
-class TrustedState:
-    """Behavioral trust state from receipts."""
-    score: float                  # Wilson CI lower bound
-    ci_width: float               # CI width (epistemic uncertainty)
-    receipt_count: int
-    counterparty_classes: set
-    last_receipt_at: float
-    tier: TrustTier
-    freshness: FreshnessState
-    stale_uses: int = 0
+    # TRUSTED axis (continuous, behavioral)
+    counterparty_records: list[CounterpartyRecord] = field(default_factory=list)
     
-    def is_actionable(self) -> bool:
-        """Can this trust state be used for decisions?"""
-        return self.freshness in (FreshnessState.FRESH, FreshnessState.GRACE)
+    def total_interactions(self) -> int:
+        return sum(r.interactions for r in self.counterparty_records)
+    
+    def total_positive(self) -> int:
+        return sum(r.positive for r in self.counterparty_records)
+    
+    def unique_counterparties(self) -> int:
+        return len(self.counterparty_records)
+    
+    def unique_operators(self) -> int:
+        return len(set(r.operator for r in self.counterparty_records))
 
 
-def wilson_ci(positive: int, total: int, z: float = WILSON_Z) -> tuple[float, float]:
-    """Wilson score confidence interval."""
+def wilson_ci_lower(positive: int, total: int, z: float = 1.96) -> float:
+    """Wilson score interval lower bound."""
     if total == 0:
-        return (0.0, 0.0)
+        return 0.0
     p = positive / total
-    denom = 1 + z*z / total
-    center = (p + z*z / (2*total)) / denom
-    spread = z * math.sqrt((p*(1-p) + z*z/(4*total)) / total) / denom
-    return (max(0, center - spread), min(1, center + spread))
+    denominator = 1 + z**2 / total
+    center = p + z**2 / (2 * total)
+    spread = z * math.sqrt((p * (1-p) + z**2 / (4*total)) / total)
+    return (center - spread) / denominator
 
 
-def recency_weight(receipt_time: float, now: float, half_life_days: float = RECENCY_DECAY_DAYS) -> float:
-    """Exponential decay weight for receipt recency."""
-    age_days = (now - receipt_time) / 86400
-    return math.exp(-0.693 * age_days / half_life_days)  # ln(2) ≈ 0.693
+def simpson_diversity(records: list[CounterpartyRecord]) -> float:
+    """Simpson diversity index on counterparty set."""
+    total = sum(r.interactions for r in records)
+    if total <= 1:
+        return 0.0
+    return 1.0 - sum((r.interactions / total)**2 for r in records)
 
 
-def compute_trusted_state(receipts: list[Receipt], now: Optional[float] = None) -> TrustedState:
+def recency_weight(timestamp: float, half_life_days: float = 30.0) -> float:
+    """Exponential recency decay."""
+    age_days = (time.time() - timestamp) / 86400
+    return math.exp(-0.693 * age_days / half_life_days)
+
+
+def compute_trusted_score(profile: AgentTrustProfile) -> dict:
     """
-    Compute behavioral trust state from receipts.
+    Compute trusted_score with counterparty diversity weighting.
     
-    PGP fix: requires counterparty diversity + recency decay + Wilson CI.
+    Key: weight per-counterparty, not per-interaction.
+    1 counterparty × 1000 = low diversity, capped.
+    10 counterparties × 100 = high diversity, full score.
     """
-    now = now or time.time()
+    records = profile.counterparty_records
+    if not records:
+        return {
+            "trusted_score": 0.0,
+            "tier": TrustTier.PROVISIONAL.value,
+            "n_eff": 0,
+            "diversity": 0.0,
+            "counterparty_count": 0,
+            "operator_count": 0
+        }
     
-    if not receipts:
-        return TrustedState(
-            score=0.0, ci_width=1.0, receipt_count=0,
-            counterparty_classes=set(), last_receipt_at=0,
-            tier=TrustTier.PROVISIONAL, freshness=FreshnessState.EXPIRED
-        )
+    # Per-counterparty Wilson CI scores
+    cp_scores = []
+    for r in records:
+        wilson = wilson_ci_lower(r.positive, r.interactions)
+        recency = recency_weight(r.last_interaction)
+        cp_scores.append({
+            "counterparty": r.counterparty_id,
+            "wilson": round(wilson, 4),
+            "recency": round(recency, 4),
+            "weighted": round(wilson * recency, 4),
+            "n": r.interactions
+        })
     
-    # Recency-weighted positive/total
-    weighted_positive = 0.0
-    weighted_total = 0.0
-    classes = set()
+    # Diversity-weighted aggregate
+    diversity = simpson_diversity(records)
+    n_counterparties = len(records)
+    n_operators = profile.unique_operators()
     
-    for r in receipts:
-        w = recency_weight(r.timestamp, now)
-        weighted_total += w
-        if r.outcome:
-            weighted_positive += w
-        classes.add(r.counterparty_class)
+    # Effective n: unique counterparties weighted by operator diversity
+    # Same operator = 0.5 effective counterparty (correlated)
+    operator_counts = {}
+    for r in records:
+        operator_counts[r.operator] = operator_counts.get(r.operator, 0) + 1
     
-    # Effective sample size (sum of weights)
-    n_eff = int(weighted_total)
-    n_pos = int(weighted_positive)
+    n_eff = 0
+    for r in records:
+        # First from each operator = 1.0, subsequent = 0.5
+        if operator_counts[r.operator] > 1:
+            n_eff += 0.5  # Correlated witness
+        else:
+            n_eff += 1.0  # Independent witness
     
-    # Wilson CI on weighted counts
-    lower, upper = wilson_ci(n_pos, max(n_eff, 1))
-    ci_width = upper - lower
+    # Aggregate score: mean of per-counterparty Wilson CIs
+    if cp_scores:
+        raw_score = sum(s["weighted"] for s in cp_scores) / len(cp_scores)
+    else:
+        raw_score = 0.0
     
-    # Diversity check: single-source = axiom 1 violation
-    if len(classes) < MIN_COUNTERPARTY_CLASSES and len(receipts) >= 10:
-        # Penalize: cap score at PROVISIONAL ceiling
-        lower = min(lower, 0.39)
+    # Diversity penalty: single-source capped at Grade C (0.6)
+    SINGLE_SOURCE_CAP = 0.6
+    if n_operators < 2:
+        raw_score = min(raw_score, SINGLE_SOURCE_CAP)
     
-    # Determine tier
-    if lower >= 0.7 and n_eff >= 30:
+    # Cold start ceiling (Wilson CI on aggregate)
+    total_pos = profile.total_positive()
+    total_n = profile.total_interactions()
+    ceiling = wilson_ci_lower(total_pos, total_n)
+    
+    trusted_score = min(raw_score, ceiling)
+    
+    # Tier assignment
+    if total_n < 5:
+        tier = TrustTier.PROVISIONAL
+    elif trusted_score >= 0.7 and n_eff >= 3:
         tier = TrustTier.TRUSTED
-    elif lower >= 0.4 and n_eff >= 10:
+    elif trusted_score >= 0.4:
         tier = TrustTier.EMERGING
-    elif lower < 0.2 or (len(classes) < MIN_COUNTERPARTY_CLASSES and n_eff >= 20):
+    elif trusted_score >= 0.2:
         tier = TrustTier.UNTRUSTED
     else:
-        tier = TrustTier.PROVISIONAL
+        tier = TrustTier.ADVERSARIAL
     
-    # Freshness (RFC 8767 serve-stale)
-    last_receipt = max(r.timestamp for r in receipts)
-    age = now - last_receipt
-    if age <= TTL_SECONDS:
-        freshness = FreshnessState.FRESH
-    elif age <= TTL_SECONDS + GRACE_PERIOD_HOURS * 3600:
-        freshness = FreshnessState.GRACE
-    else:
-        freshness = FreshnessState.EXPIRED
-    
-    return TrustedState(
-        score=round(lower, 4),
-        ci_width=round(ci_width, 4),
-        receipt_count=len(receipts),
-        counterparty_classes=classes,
-        last_receipt_at=last_receipt,
-        tier=tier,
-        freshness=freshness
-    )
-
-
-def split_verified_trusted(verified: VerifiedState, trusted: TrustedState) -> dict:
-    """
-    Final assessment combining both dimensions.
-    
-    VERIFIED + TRUSTED = full trust
-    VERIFIED + PROVISIONAL = crypto OK, no behavioral evidence
-    UNVERIFIED + TRUSTED = behavioral OK, no crypto proof (PGP failure mode)
-    """
-    combined = {
-        "verified": verified.status.value,
-        "verified_by": verified.verified_by,
-        "trusted_score": trusted.score,
-        "trusted_tier": trusted.tier.value,
-        "freshness": trusted.freshness.value,
-        "counterparty_diversity": len(trusted.counterparty_classes),
-        "receipt_count": trusted.receipt_count,
-        "ci_width": trusted.ci_width,
+    return {
+        "trusted_score": round(trusted_score, 4),
+        "tier": tier.value,
+        "n_eff": round(n_eff, 1),
+        "diversity": round(diversity, 4),
+        "counterparty_count": n_counterparties,
+        "operator_count": n_operators,
+        "ceiling": round(ceiling, 4),
+        "per_counterparty": cp_scores
     }
+
+
+def compute_composite(profile: AgentTrustProfile) -> dict:
+    """Composite assessment: VERIFIED × TRUSTED."""
+    trust = compute_trusted_score(profile)
     
-    # Assessment
-    if verified.is_valid() and trusted.tier == TrustTier.TRUSTED:
-        combined["assessment"] = "FULL_TRUST"
-        combined["action"] = "ACCEPT"
-    elif verified.is_valid() and trusted.tier in (TrustTier.PROVISIONAL, TrustTier.EMERGING):
-        combined["assessment"] = "VERIFIED_UNRATED"
-        combined["action"] = "ACCEPT_WITH_MONITORING"
-    elif not verified.is_valid() and trusted.tier == TrustTier.TRUSTED:
-        combined["assessment"] = "TRUSTED_UNVERIFIED"
-        combined["action"] = "WARN"  # PGP failure mode
-    elif verified.status == VerifiedStatus.REVOKED:
-        combined["assessment"] = "REVOKED"
-        combined["action"] = "REJECT"
+    # Matrix:
+    # VERIFIED + TRUSTED = Full trust
+    # VERIFIED + UNTRUSTED = DigiNotar (valid cert, bad behavior)
+    # UNVERIFIED + TRUSTED = Expired cert, good track record
+    # UNVERIFIED + UNTRUSTED = Unknown
+    
+    v = profile.verification_status
+    t = trust["tier"]
+    
+    if v == VerificationStatus.VERIFIED and t in ("TRUSTED", "EMERGING"):
+        composite = "FULL_TRUST"
+    elif v == VerificationStatus.VERIFIED and t in ("UNTRUSTED", "ADVERSARIAL"):
+        composite = "DIGINOTAR"  # Valid but dangerous
+    elif v == VerificationStatus.VERIFIED and t == "PROVISIONAL":
+        composite = "VERIFIED_COLD_START"
+    elif v in (VerificationStatus.EXPIRED, VerificationStatus.UNVERIFIED) and t == "TRUSTED":
+        composite = "TRUST_ON_REPUTATION"  # Good history, needs re-verification
+    elif v == VerificationStatus.REVOKED:
+        composite = "REVOKED"
     else:
-        combined["assessment"] = "UNKNOWN"
-        combined["action"] = "REJECT"
+        composite = "UNKNOWN"
     
-    # Freshness override
-    if trusted.freshness == FreshnessState.EXPIRED:
-        combined["action"] = "REJECT_STALE"
-    elif trusted.freshness == FreshnessState.GRACE:
-        combined["stale_warning"] = True
-        combined["stale_uses_remaining"] = MAX_STALE_USES - trusted.stale_uses
-    
-    return combined
+    return {
+        "agent_id": profile.agent_id,
+        "verified": v.value,
+        "verified_by": profile.verified_by,
+        "trusted_score": trust["trusted_score"],
+        "trust_tier": trust["tier"],
+        "composite": composite,
+        "diversity": trust["diversity"],
+        "n_eff": trust["n_eff"],
+        "recommendation": {
+            "FULL_TRUST": "Accept interactions at face value",
+            "DIGINOTAR": "CAUTION: valid credentials but poor behavioral history",
+            "VERIFIED_COLD_START": "Accept with monitoring, build trust",
+            "TRUST_ON_REPUTATION": "Accept but request re-verification",
+            "REVOKED": "REJECT all interactions",
+            "UNKNOWN": "PROVISIONAL: require operator endorsement"
+        }.get(composite, "UNKNOWN")
+    }
 
 
 # === Scenarios ===
 
-def scenario_full_trust():
-    """Agent with crypto + behavioral trust."""
-    print("=== Scenario: Full Trust (VERIFIED + TRUSTED) ===")
+def scenario_diginotar():
+    """Verified but untrusted — DigiNotar pattern."""
+    print("=== Scenario: DigiNotar — VERIFIED but UNTRUSTED ===")
     now = time.time()
     
-    verified = VerifiedState(
-        status=VerifiedStatus.VERIFIED,
-        verified_by="operator_genesis",
-        verified_at=now - 86400*30,
-        chain_hash="abc123"
+    profile = AgentTrustProfile(
+        agent_id="diginotar_agent",
+        verification_status=VerificationStatus.VERIFIED,
+        verified_by="trusted_grader",
+        verified_at=now - 86400*30
     )
-    
-    receipts = [
-        Receipt(f"cp_{i%5}", ["grader", "peer", "operator"][i%3], 
-                now - 86400*(30-i), True, "A")
-        for i in range(35)
+    profile.counterparty_records = [
+        CounterpartyRecord("victim_1", "op_a", 50, 15, 35, now - 86400),
+        CounterpartyRecord("victim_2", "op_b", 30, 8, 22, now - 86400*2),
     ]
     
-    trusted = compute_trusted_state(receipts, now)
-    result = split_verified_trusted(verified, trusted)
-    
-    print(f"  Verified: {result['verified']}")
-    print(f"  Trusted: {result['trusted_tier']} (score={result['trusted_score']}, n={result['receipt_count']})")
-    print(f"  Diversity: {result['counterparty_diversity']} classes")
-    print(f"  Freshness: {result['freshness']}")
-    print(f"  Assessment: {result['assessment']} → {result['action']}")
+    result = compute_composite(profile)
+    print(f"  Verified: {result['verified']}, Trust: {result['trusted_score']:.3f} ({result['trust_tier']})")
+    print(f"  Composite: {result['composite']}")
+    print(f"  Recommendation: {result['recommendation']}")
     print()
 
 
-def scenario_verified_unrated():
-    """Crypto OK but no behavioral history. santaclawd gap #5."""
-    print("=== Scenario: Verified but Unrated (Gap #5) ===")
+def scenario_healthy_agent():
+    """Verified + trusted — full trust."""
+    print("=== Scenario: Healthy Agent — VERIFIED + TRUSTED ===")
     now = time.time()
     
-    verified = VerifiedState(
-        status=VerifiedStatus.VERIFIED,
-        verified_by="operator_genesis",
-        verified_at=now - 86400,
-        chain_hash="def456"
+    profile = AgentTrustProfile(
+        agent_id="kit_fox",
+        verification_status=VerificationStatus.VERIFIED,
+        verified_by="bro_agent",
+        verified_at=now - 86400*10
     )
+    profile.counterparty_records = [
+        CounterpartyRecord("santaclawd", "op_santa", 100, 95, 5, now),
+        CounterpartyRecord("funwolf", "op_fun", 80, 76, 4, now - 86400),
+        CounterpartyRecord("clove", "op_clove", 60, 57, 3, now - 86400*2),
+        CounterpartyRecord("alphasenpai", "op_alpha", 40, 38, 2, now - 86400*3),
+    ]
     
-    trusted = compute_trusted_state([], now)
-    result = split_verified_trusted(verified, trusted)
-    
-    print(f"  Verified: {result['verified']}")
-    print(f"  Trusted: {result['trusted_tier']} (score={result['trusted_score']}, n={result['receipt_count']})")
-    print(f"  Assessment: {result['assessment']} → {result['action']}")
-    print(f"  Key: perfect credentials + zero receipts = VERIFIED but unrated")
+    result = compute_composite(profile)
+    trust = compute_trusted_score(profile)
+    print(f"  Verified: {result['verified']}, Trust: {result['trusted_score']:.3f} ({result['trust_tier']})")
+    print(f"  Composite: {result['composite']}")
+    print(f"  Diversity: {trust['diversity']:.3f}, n_eff: {trust['n_eff']}")
+    print(f"  Operators: {trust['operator_count']}")
     print()
 
 
-def scenario_pgp_failure():
-    """Behavioral trust from single source — axiom 1 violation."""
-    print("=== Scenario: PGP Failure Mode (Single-Source Trust) ===")
+def scenario_single_source():
+    """1000 interactions, 1 counterparty — capped."""
+    print("=== Scenario: Single-Source — 1×1000 vs 10×100 ===")
     now = time.time()
     
-    verified = VerifiedState(
-        status=VerifiedStatus.UNVERIFIED,
-        verified_by="",
-        verified_at=0,
-        chain_hash=""
+    # Single source
+    single = AgentTrustProfile(
+        agent_id="single_source",
+        verification_status=VerificationStatus.VERIFIED,
+        verified_by="grader_x"
     )
-    
-    # 50 receipts all from same counterparty class
-    receipts = [
-        Receipt("same_peer", "peer", now - 86400*i, True, "B")
-        for i in range(50)
+    single.counterparty_records = [
+        CounterpartyRecord("only_friend", "op_only", 1000, 950, 50, now)
     ]
     
-    trusted = compute_trusted_state(receipts, now)
-    result = split_verified_trusted(verified, trusted)
+    # Diverse
+    diverse = AgentTrustProfile(
+        agent_id="diverse_agent",
+        verification_status=VerificationStatus.VERIFIED,
+        verified_by="grader_x"
+    )
+    diverse.counterparty_records = [
+        CounterpartyRecord(f"cp_{i}", f"op_{i}", 100, 95, 5, now - 86400*i)
+        for i in range(10)
+    ]
     
-    print(f"  Verified: {result['verified']}")
-    print(f"  Trusted: {result['trusted_tier']} (score={result['trusted_score']}, n={result['receipt_count']})")
-    print(f"  Diversity: {result['counterparty_diversity']} class (INSUFFICIENT)")
-    print(f"  Assessment: {result['assessment']} → {result['action']}")
-    print(f"  Key: 50 positive receipts but single class = capped at PROVISIONAL")
+    single_result = compute_trusted_score(single)
+    diverse_result = compute_trusted_score(diverse)
+    
+    print(f"  Single (1×1000): score={single_result['trusted_score']:.3f}, "
+          f"tier={single_result['tier']}, diversity={single_result['diversity']:.3f}, "
+          f"n_eff={single_result['n_eff']}")
+    print(f"  Diverse (10×100): score={diverse_result['trusted_score']:.3f}, "
+          f"tier={diverse_result['tier']}, diversity={diverse_result['diversity']:.3f}, "
+          f"n_eff={diverse_result['n_eff']}")
+    print(f"  Single-source cap: {single_result['trusted_score']:.3f} ≤ 0.60")
     print()
 
 
-def scenario_stale_grace():
-    """RFC 8767 serve-stale: trust expires mid-session."""
-    print("=== Scenario: Stale Grace Period (RFC 8767) ===")
+def scenario_expired_but_trusted():
+    """Cert expired, good behavioral history."""
+    print("=== Scenario: Expired Cert — TRUST_ON_REPUTATION ===")
     now = time.time()
     
-    verified = VerifiedState(
-        status=VerifiedStatus.VERIFIED,
-        verified_by="operator_genesis",
-        verified_at=now - 86400*60,
-        chain_hash="ghi789"
+    profile = AgentTrustProfile(
+        agent_id="veteran_agent",
+        verification_status=VerificationStatus.EXPIRED,
+        verified_by="old_grader",
+        verified_at=now - 86400*365,
+        cert_expires=now - 86400*30
     )
-    
-    # Last receipt 2 days ago (past 24h TTL, within 72h grace)
-    receipts = [
-        Receipt(f"cp_{i%4}", ["grader", "peer", "operator"][i%3],
-                now - 86400*2 - 3600*i, True, "A")
-        for i in range(30)
+    profile.counterparty_records = [
+        CounterpartyRecord(f"cp_{i}", f"op_{i}", 200, 190, 10, now - 86400*i)
+        for i in range(5)
     ]
     
-    trusted = compute_trusted_state(receipts, now)
-    result = split_verified_trusted(verified, trusted)
-    
-    print(f"  Verified: {result['verified']}")
-    print(f"  Trusted: {result['trusted_tier']} (score={result['trusted_score']})")
-    print(f"  Freshness: {result['freshness']}")
-    print(f"  Stale warning: {result.get('stale_warning', False)}")
-    print(f"  Uses remaining: {result.get('stale_uses_remaining', 'N/A')}")
-    print(f"  Assessment: {result['assessment']} → {result['action']}")
-    print(f"  Key: GRACE = continue but warn. Stale data > no data (RFC 8767)")
-    print()
-
-
-def scenario_recency_decay():
-    """Old receipts decay — prevents stale reputation."""
-    print("=== Scenario: Recency Decay (30d half-life) ===")
-    now = time.time()
-    
-    verified = VerifiedState(
-        status=VerifiedStatus.VERIFIED,
-        verified_by="operator_genesis",
-        verified_at=now - 86400*180,
-        chain_hash="jkl012"
-    )
-    
-    # All receipts 90+ days old
-    receipts = [
-        Receipt(f"cp_{i%4}", ["grader", "peer"][i%2],
-                now - 86400*90 - 3600*i, True, "A")
-        for i in range(40)
-    ]
-    
-    trusted = compute_trusted_state(receipts, now)
-    result = split_verified_trusted(verified, trusted)
-    
-    print(f"  Verified: {result['verified']}")
-    print(f"  40 receipts, all 90+ days old")
-    print(f"  Trusted: {result['trusted_tier']} (score={result['trusted_score']})")
-    print(f"  Freshness: {result['freshness']}")
-    print(f"  Assessment: {result['assessment']} → {result['action']}")
-    print(f"  Key: 30d half-life means 90d receipts have weight ~0.125")
+    result = compute_composite(profile)
+    print(f"  Verified: {result['verified']}, Trust: {result['trusted_score']:.3f} ({result['trust_tier']})")
+    print(f"  Composite: {result['composite']}")
+    print(f"  Recommendation: {result['recommendation']}")
     print()
 
 
 if __name__ == "__main__":
-    print("Verified-Trusted Splitter — VERIFIED (crypto) vs TRUSTED (behavioral)")
-    print("Per santaclawd ATF V1.2 gap #5 + RFC 8767 serve-stale")
+    print("Verified-Trusted Splitter — ATF V1.2 Gap #5")
+    print("Per santaclawd + clove: VERIFIED ≠ TRUSTED")
+    print("eIDAS 2.0 (EU Reg 2024/1183): continuous monitoring for TSPs")
     print("=" * 70)
     print()
     
-    scenario_full_trust()
-    scenario_verified_unrated()
-    scenario_pgp_failure()
-    scenario_stale_grace()
-    scenario_recency_decay()
+    scenario_diginotar()
+    scenario_healthy_agent()
+    scenario_single_source()
+    scenario_expired_but_trusted()
     
     print("=" * 70)
-    print("KEY INSIGHT: PGP failed because endorsements were unbounded + non-expiring.")
-    print("ATF fix: Wilson CI + counterparty diversity + recency decay.")
-    print("VERIFIED = boolean (crypto). TRUSTED = continuous (behavioral).")
-    print("Single-source trust = axiom 1 violation, regardless of volume.")
-    print("RFC 8767 serve-stale: GRACE period prevents hard failures on TTL expiry.")
+    print("KEY INSIGHTS:")
+    print("1. VERIFIED (boolean, crypto) and TRUSTED (continuous, behavioral) are INDEPENDENT")
+    print("2. DigiNotar was VERIFIED until compromise — behavior caught it, not crypto")
+    print("3. Single-source trust capped at 0.60 — diversity is load-bearing")
+    print("4. Per-counterparty Wilson CI, not per-interaction — 1×1000 ≠ 10×100")
+    print("5. Expired cert + good history = TRUST_ON_REPUTATION (re-verify, don't reject)")
