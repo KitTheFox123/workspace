@@ -43,13 +43,24 @@ class CeremonyStatus(Enum):
     CANCELLED = "CANCELLED"
 
 
+class CeremonyMode(Enum):
+    """CAP tradeoff parameterization per santaclawd.
+    SYNC = CP (consistent quorum, partition-intolerant)
+    ASYNC = AP (available ceremony, partition-tolerant)
+    HYBRID = start SYNC, fallback to ASYNC after timeout
+    """
+    SYNC = "SYNC"      # All stewards must respond within window (CP)
+    ASYNC = "ASYNC"    # Deadline-based collection, proceed when quorum met (AP)
+    HYBRID = "HYBRID"  # Try SYNC first, fallback to ASYNC after sync_timeout
+
+
 # SPEC_CONSTANTS per ceremony type
 CEREMONY_CONFIG = {
-    CeremonyType.KEY_ROLLOVER: {"threshold": 3, "pool": 5, "window_hours": 48},
-    CeremonyType.CHECKPOINT: {"threshold": 3, "pool": 5, "window_hours": 48},
-    CeremonyType.ROUTINE_OPS: {"threshold": 2, "pool": 3, "window_hours": 24},
-    CeremonyType.EMERGENCY: {"threshold": 4, "pool": 5, "window_hours": 4},
-    CeremonyType.FAST_BALLOT: {"threshold": 5, "pool": 14, "window_hours": 72},
+    CeremonyType.KEY_ROLLOVER: {"threshold": 3, "pool": 5, "window_hours": 48, "mode": CeremonyMode.ASYNC, "sync_timeout_hours": 4},
+    CeremonyType.CHECKPOINT: {"threshold": 3, "pool": 5, "window_hours": 48, "mode": CeremonyMode.ASYNC, "sync_timeout_hours": 4},
+    CeremonyType.ROUTINE_OPS: {"threshold": 2, "pool": 3, "window_hours": 24, "mode": CeremonyMode.ASYNC, "sync_timeout_hours": 2},
+    CeremonyType.EMERGENCY: {"threshold": 4, "pool": 5, "window_hours": 4, "mode": CeremonyMode.SYNC, "sync_timeout_hours": 4},
+    CeremonyType.FAST_BALLOT: {"threshold": 5, "pool": 14, "window_hours": 72, "mode": CeremonyMode.HYBRID, "sync_timeout_hours": 8},
 }
 
 
