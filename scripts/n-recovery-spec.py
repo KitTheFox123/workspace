@@ -1,338 +1,349 @@
 #!/usr/bin/env python3
 """
-n-recovery-spec.py — ATF V1.2 recovery window specification.
+n-recovery-spec.py — ATF V1.2 gap #3: recovery window specification.
 
-Per santaclawd: what is the 30d/n=8 spec text?
+Per santaclawd: n_recovery=8 + 30d time cap.
+Per RFC 5280 §5.3.1: certificateHold → removeFromCRL reinstatement.
 
-Recovery from DEGRADED requires:
-  - n_recovery = 8 CONFIRMED receipts
-  - From 3+ independent counterparties (operator diversity)
-  - Within 30-day recovery_window
-  - Window starts on first CONFIRMED receipt post-DEGRADED
-  - Partial completion = RECOVERING (visible progress)
-  - Zero receipts in window = re-DEGRADED (reset)
-  - Completion resets window (not individual receipts)
+Three recovery paths (from recovery-threshold-spec.py, formalized):
+  SESSION_RESUMPTION — DORMANT → ACTIVE (lightest, identity preserved)
+  VIOLATION_CLEAR    — DEGRADED → ACTIVE (mid, must clear violation)
+  FULL_REATTESTION  — ABANDONED → ACTIVE (heaviest, near-fresh start)
 
-RFC precedents:
-  - OCSP: nextUpdate field defines validity window
-  - X.509: certificate renewal before expiry
-  - RFC 7671 DANE: TLSA record TTL = trust refresh interval
-  - TLS session resumption: ticket lifetime = trust window
+Key spec constants:
+  n_recovery = 8 CONFIRMED receipts (SESSION/VIOLATION)
+  n_recovery = 30 CONFIRMED receipts (FULL)
+  recovery_window = 30d (SESSION/VIOLATION), 90d (FULL)
+  min_counterparties = 3 independent (SESSION/VIOLATION), 5 (FULL)
+  
+Wilson CI comparison:
+  DORMANT + 8 receipts = 0.63-0.90 (depending on prior)
+  Fresh PROVISIONAL = 0.21 at n=1
+  FULL_REATTESTION + 30 = 0.89+
 """
 
-import hashlib
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class RecoveryState(Enum):
-    DEGRADED = "DEGRADED"           # Below threshold, no recovery started
-    RECOVERING = "RECOVERING"       # Recovery in progress
-    RECOVERED = "RECOVERED"         # Met n_recovery within window
-    RE_DEGRADED = "RE_DEGRADED"     # Failed to complete in window
-    HEALTHY = "HEALTHY"             # Normal operation
+class RecoveryPath(Enum):
+    SESSION_RESUMPTION = "SESSION_RESUMPTION"  # DORMANT → ACTIVE
+    VIOLATION_CLEAR = "VIOLATION_CLEAR"        # DEGRADED → ACTIVE  
+    FULL_REATTESTION = "FULL_REATTESTION"      # ABANDONED → ACTIVE
 
 
-# SPEC_CONSTANTS (ATF V1.2)
-N_RECOVERY = 8                      # CONFIRMED receipts required
-RECOVERY_WINDOW_DAYS = 30           # Calendar days
-MIN_COUNTERPARTIES = 3              # Operator diversity requirement
-RECOVERY_GRADE_FLOOR = "C"          # Minimum grade during recovery
-WINDOW_EXTENSION_NONE = True        # Window does NOT extend on activity
+class AgentState(Enum):
+    ACTIVE = "ACTIVE"
+    DORMANT = "DORMANT"
+    DEGRADED = "DEGRADED"
+    ABANDONED = "ABANDONED"
+    RECOVERING = "RECOVERING"
 
 
-@dataclass
-class RecoveryReceipt:
-    receipt_id: str
-    counterparty_id: str
-    counterparty_operator: str
-    grade: str  # A-F
-    status: str  # CONFIRMED, FAILED, DISPUTED, ALLEGED
-    timestamp: float
-
-
-@dataclass
-class RecoveryWindow:
-    agent_id: str
-    degraded_at: float
-    window_start: Optional[float] = None  # First CONFIRMED receipt
-    window_end: Optional[float] = None    # window_start + 30d
-    receipts: list = field(default_factory=list)
-    state: RecoveryState = RecoveryState.DEGRADED
-    recovery_count: int = 0
-    unique_counterparties: set = field(default_factory=set)
-    unique_operators: set = field(default_factory=set)
-
-
-def grade_to_numeric(grade: str) -> float:
-    return {"A": 1.0, "B": 0.8, "C": 0.6, "D": 0.4, "F": 0.0}.get(grade, 0.0)
-
-
-def process_receipt(window: RecoveryWindow, receipt: RecoveryReceipt) -> dict:
-    """Process a receipt during recovery window."""
-    events = []
-    
-    # Only CONFIRMED receipts count toward recovery
-    if receipt.status != "CONFIRMED":
-        events.append(f"SKIPPED: {receipt.status} receipt does not count toward recovery")
-        return {"events": events, "state": window.state}
-    
-    # Grade floor check
-    if grade_to_numeric(receipt.grade) < grade_to_numeric(RECOVERY_GRADE_FLOOR):
-        events.append(f"SKIPPED: grade {receipt.grade} below recovery floor {RECOVERY_GRADE_FLOOR}")
-        return {"events": events, "state": window.state}
-    
-    # Start window on first qualifying receipt
-    if window.window_start is None:
-        window.window_start = receipt.timestamp
-        window.window_end = receipt.timestamp + (RECOVERY_WINDOW_DAYS * 86400)
-        window.state = RecoveryState.RECOVERING
-        events.append(f"WINDOW_STARTED: {RECOVERY_WINDOW_DAYS}d window begins")
-    
-    # Check if within window
-    if receipt.timestamp > window.window_end:
-        # Past window — check if completed
-        if window.recovery_count >= N_RECOVERY and len(window.unique_operators) >= MIN_COUNTERPARTIES:
-            window.state = RecoveryState.RECOVERED
-            events.append("RECOVERED: met threshold before window expired (late receipt)")
-        else:
-            window.state = RecoveryState.RE_DEGRADED
-            events.append(f"RE_DEGRADED: window expired with {window.recovery_count}/{N_RECOVERY} receipts")
-        return {"events": events, "state": window.state}
-    
-    # Count receipt
-    window.receipts.append(receipt)
-    window.recovery_count += 1
-    window.unique_counterparties.add(receipt.counterparty_id)
-    window.unique_operators.add(receipt.counterparty_operator)
-    
-    events.append(f"RECEIPT_COUNTED: {window.recovery_count}/{N_RECOVERY} "
-                  f"from {len(window.unique_operators)}/{MIN_COUNTERPARTIES} operators")
-    
-    # Check completion
-    if window.recovery_count >= N_RECOVERY:
-        if len(window.unique_operators) >= MIN_COUNTERPARTIES:
-            window.state = RecoveryState.RECOVERED
-            events.append(f"RECOVERED: {N_RECOVERY} receipts from {len(window.unique_operators)} operators in {RECOVERY_WINDOW_DAYS}d")
-        else:
-            events.append(f"DIVERSITY_GAP: {window.recovery_count} receipts but only "
-                         f"{len(window.unique_operators)}/{MIN_COUNTERPARTIES} operators")
-    
-    return {"events": events, "state": window.state}
-
-
-def check_window_expiry(window: RecoveryWindow, now: float) -> dict:
-    """Check if window has expired without completion."""
-    if window.window_end is None:
-        return {"expired": False, "state": window.state}
-    
-    if now > window.window_end and window.state == RecoveryState.RECOVERING:
-        if window.recovery_count >= N_RECOVERY and len(window.unique_operators) >= MIN_COUNTERPARTIES:
-            window.state = RecoveryState.RECOVERED
-            return {"expired": True, "state": window.state, "result": "RECOVERED"}
-        else:
-            window.state = RecoveryState.RE_DEGRADED
-            return {
-                "expired": True, "state": window.state, "result": "RE_DEGRADED",
-                "receipts": window.recovery_count,
-                "operators": len(window.unique_operators),
-                "shortfall_receipts": max(0, N_RECOVERY - window.recovery_count),
-                "shortfall_operators": max(0, MIN_COUNTERPARTIES - len(window.unique_operators))
-            }
-    
-    remaining_days = (window.window_end - now) / 86400
-    needed = N_RECOVERY - window.recovery_count
-    return {
-        "expired": False,
-        "state": window.state,
-        "remaining_days": round(remaining_days, 1),
-        "receipts_needed": needed,
-        "operators_needed": max(0, MIN_COUNTERPARTIES - len(window.unique_operators))
+# SPEC_CONSTANTS (V1.2)
+RECOVERY_SPECS = {
+    RecoveryPath.SESSION_RESUMPTION: {
+        "n_recovery": 8,
+        "window_days": 30,
+        "min_counterparties": 3,
+        "preserves_history": True,
+        "grade_floor": "decayed_prior",  # Resume from decayed score
+        "rfc_precedent": "RFC 5280 §5.3.1 certificateHold + removeFromCRL",
+        "tls_parallel": "RFC 8446 §2.2 PSK session resumption"
+    },
+    RecoveryPath.VIOLATION_CLEAR: {
+        "n_recovery": 8,
+        "window_days": 30,
+        "min_counterparties": 3,
+        "preserves_history": False,  # Prior receipts tainted
+        "grade_floor": "C",  # Start at C regardless of prior
+        "rfc_precedent": "RFC 5280 §5.3.1 certificateHold after investigation",
+        "tls_parallel": "TLS 1.3 post-handshake auth (RFC 8446 §4.6.2)"
+    },
+    RecoveryPath.FULL_REATTESTION: {
+        "n_recovery": 30,
+        "window_days": 90,
+        "min_counterparties": 5,
+        "preserves_history": False,
+        "grade_floor": "D",  # Near-fresh start
+        "rfc_precedent": "RFC 5280 new certificate issuance",
+        "tls_parallel": "Full TLS 1.3 handshake (2-RTT)"
     }
+}
+
+# Decay parameters
+DECAY_RATE_PER_MONTH = 0.05  # 5%/month for DORMANT
+DECAY_FLOOR = 0.30           # Minimum trust during decay
+MAX_DORMANCY_MONTHS = 12     # After this → ABANDONED
 
 
-def generate_spec_text() -> str:
-    """Generate ATF V1.2 normative spec text for n_recovery."""
-    return f"""
-ATF V1.2 — Recovery Window Specification
-=========================================
+def wilson_ci_lower(successes: int, total: int, z: float = 1.96) -> float:
+    """Wilson score confidence interval lower bound."""
+    if total == 0:
+        return 0.0
+    p = successes / total
+    denominator = 1 + z**2 / total
+    centre = p + z**2 / (2 * total)
+    spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total)
+    return (centre - spread) / denominator
 
-Section 4.7: Recovery from DEGRADED State
 
-4.7.1 Recovery Requirements (MUST)
+def compute_decayed_score(original_score: float, dormant_months: int) -> float:
+    """Compute trust score after dormancy decay."""
+    decayed = original_score * (1 - DECAY_RATE_PER_MONTH) ** dormant_months
+    return max(decayed, DECAY_FLOOR)
 
-  An agent in DEGRADED state MAY initiate recovery by obtaining
-  CONFIRMED receipts from independent counterparties.
 
-  recovery_count:        {N_RECOVERY} CONFIRMED receipts (SPEC_CONSTANT)
-  recovery_window:       {RECOVERY_WINDOW_DAYS} calendar days (SPEC_CONSTANT)
-  min_counterparties:    {MIN_COUNTERPARTIES} unique operators (SPEC_CONSTANT)
-  recovery_grade_floor:  {RECOVERY_GRADE_FLOOR} minimum (SPEC_CONSTANT)
+@dataclass
+class RecoveryAttempt:
+    agent_id: str
+    prior_state: AgentState
+    prior_score: float
+    dormant_months: int
+    path: RecoveryPath
+    receipts: list = field(default_factory=list)  # (counterparty_id, confirmed: bool)
+    started_at: float = 0.0
+    
+    def __post_init__(self):
+        if not self.started_at:
+            self.started_at = time.time()
 
-4.7.2 Window Lifecycle
 
-  a) Window STARTS on first CONFIRMED receipt with grade >= {RECOVERY_GRADE_FLOOR}
-     after entering DEGRADED state.
-  b) Window is FIXED at {RECOVERY_WINDOW_DAYS} days. Individual receipts
-     do NOT extend the window.
-  c) Agent transitions to RECOVERING on window start.
-  d) RECOVERED requires ALL of:
-     - {N_RECOVERY}+ CONFIRMED receipts
-     - From {MIN_COUNTERPARTIES}+ unique operators
-     - Within the {RECOVERY_WINDOW_DAYS}-day window
-  e) Window expiry without completion = RE_DEGRADED.
-  f) RE_DEGRADED agent MAY start a new recovery window.
+@dataclass
+class RecoveryResult:
+    success: bool
+    new_state: AgentState
+    new_score: float
+    wilson_ci: float
+    receipts_completed: int
+    receipts_required: int
+    counterparties: int
+    counterparties_required: int
+    window_remaining_days: float
+    path: str
+    reason: str
 
-4.7.3 Operator Diversity (MUST)
 
-  Receipts from agents sharing the same operator_id count as
-  ONE effective counterparty. This prevents sybil recovery where
-  a single operator generates receipts from multiple agent_ids.
+def evaluate_recovery(attempt: RecoveryAttempt) -> RecoveryResult:
+    """Evaluate whether recovery attempt meets spec requirements."""
+    spec = RECOVERY_SPECS[attempt.path]
+    
+    # Count confirmed receipts
+    confirmed = sum(1 for _, c in attempt.receipts if c)
+    total = len(attempt.receipts)
+    
+    # Count unique counterparties
+    counterparties = len(set(cp for cp, c in attempt.receipts if c))
+    
+    # Check time window
+    elapsed_days = (time.time() - attempt.started_at) / 86400
+    window_remaining = spec["window_days"] - elapsed_days
+    
+    # Determine base score
+    if spec["preserves_history"]:
+        base_score = compute_decayed_score(attempt.prior_score, attempt.dormant_months)
+    else:
+        base_score = {"A": 1.0, "B": 0.8, "C": 0.6, "D": 0.4, "F": 0.0}.get(
+            spec["grade_floor"], 0.4)
+    
+    # Wilson CI on recovery receipts
+    wilson = wilson_ci_lower(confirmed, total) if total > 0 else 0.0
+    
+    # Recovery score = base * wilson_adjustment
+    if confirmed >= spec["n_recovery"]:
+        recovery_boost = wilson
+    else:
+        recovery_boost = wilson * (confirmed / spec["n_recovery"])
+    
+    new_score = min(1.0, base_score * 0.5 + recovery_boost * 0.5)
+    
+    # Check all requirements
+    requirements_met = (
+        confirmed >= spec["n_recovery"] and
+        counterparties >= spec["min_counterparties"] and
+        window_remaining >= 0
+    )
+    
+    if requirements_met:
+        reason = f"Recovery complete: {confirmed}/{spec['n_recovery']} receipts, " \
+                 f"{counterparties}/{spec['min_counterparties']} counterparties"
+        new_state = AgentState.ACTIVE
+    elif window_remaining < 0:
+        reason = f"Recovery EXPIRED: window exceeded by {-window_remaining:.0f}d"
+        new_state = attempt.prior_state
+        new_score = base_score * 0.8  # Penalty for failed recovery
+    else:
+        reason = f"In progress: {confirmed}/{spec['n_recovery']} receipts, " \
+                 f"{counterparties}/{spec['min_counterparties']} counterparties, " \
+                 f"{window_remaining:.0f}d remaining"
+        new_state = AgentState.RECOVERING
+    
+    return RecoveryResult(
+        success=requirements_met,
+        new_state=new_state,
+        new_score=round(new_score, 4),
+        wilson_ci=round(wilson, 4),
+        receipts_completed=confirmed,
+        receipts_required=spec["n_recovery"],
+        counterparties=counterparties,
+        counterparties_required=spec["min_counterparties"],
+        window_remaining_days=round(window_remaining, 1),
+        path=attempt.path.value,
+        reason=reason
+    )
 
-4.7.4 Grade Floor (MUST)
 
-  Only receipts with evidence_grade >= {RECOVERY_GRADE_FLOOR} count toward
-  recovery. Grade {RECOVERY_GRADE_FLOOR} = minimum acceptable evidence quality.
-  Grades D and F indicate insufficient verification.
-
-4.7.5 Reset Semantics
-
-  Recovery completion resets the DEGRADED state entirely.
-  The agent returns to HEALTHY with trust score recalculated
-  from the recovery receipts (not pre-DEGRADED history).
-
-  Rationale: OCSP nextUpdate model — fresh verification
-  replaces stale state, it does not amend it.
-
-4.7.6 RFC Precedents
-
-  - OCSP (RFC 6960): nextUpdate defines validity window
-  - X.509 (RFC 5280): certificate renewal replaces, not extends
-  - DANE (RFC 7671): TLSA TTL = trust refresh interval
-  - TLS 1.3 (RFC 8446): session ticket lifetime = trust window
-"""
+def compare_recovery_paths():
+    """Show Wilson CI outcomes across all three paths."""
+    print("=== Wilson CI Comparison Across Recovery Paths ===")
+    print(f"{'Path':<25} {'n_req':>5} {'Window':>7} {'CPs':>4} {'Wilson@n':>10} {'Fresh@1':>10}")
+    print("-" * 70)
+    
+    fresh_wilson = wilson_ci_lower(1, 1)
+    
+    for path, spec in RECOVERY_SPECS.items():
+        n = spec["n_recovery"]
+        wilson_at_n = wilson_ci_lower(n, n)  # All confirmed
+        print(f"{path.value:<25} {n:>5} {spec['window_days']:>5}d {spec['min_counterparties']:>4} "
+              f"{wilson_at_n:>10.4f} {fresh_wilson:>10.4f}")
+    
+    print(f"\nFresh PROVISIONAL at n=1: {fresh_wilson:.4f}")
+    print(f"SESSION_RESUMPTION at n=8 (all confirmed): {wilson_ci_lower(8, 8):.4f}")
+    print(f"FULL_REATTESTION at n=30 (all confirmed): {wilson_ci_lower(30, 30):.4f}")
+    print()
 
 
 # === Scenarios ===
 
-def scenario_successful_recovery():
-    """Agent recovers within window."""
-    print("=== Scenario: Successful Recovery ===")
-    now = time.time()
+def scenario_dormant_recovery():
+    """6-month dormant agent resumes."""
+    print("=== Scenario: DORMANT Recovery (6 months) ===")
     
-    window = RecoveryWindow(agent_id="recovering_agent", degraded_at=now)
+    attempt = RecoveryAttempt(
+        agent_id="veteran_agent",
+        prior_state=AgentState.DORMANT,
+        prior_score=0.88,
+        dormant_months=6,
+        path=RecoveryPath.SESSION_RESUMPTION,
+        receipts=[(f"cp_{i}", True) for i in range(8)] + [("cp_fail", False)],
+        started_at=time.time() - 86400 * 15  # 15 days in
+    )
     
-    operators = ["op_a", "op_b", "op_c", "op_d"]
-    for i in range(10):
-        receipt = RecoveryReceipt(
-            f"r{i:03d}", f"cp_{i%5}", operators[i%4],
-            "B" if i < 7 else "A", "CONFIRMED",
-            now + (i * 86400 * 2)  # Every 2 days
-        )
-        result = process_receipt(window, receipt)
-        if result["events"]:
-            for e in result["events"]:
-                print(f"  Day {i*2}: {e}")
+    decayed = compute_decayed_score(0.88, 6)
+    result = evaluate_recovery(attempt)
     
-    print(f"  Final state: {window.state.value}")
-    print(f"  Receipts: {window.recovery_count}/{N_RECOVERY}")
-    print(f"  Operators: {len(window.unique_operators)}/{MIN_COUNTERPARTIES}")
+    print(f"  Prior score: 0.88, Decayed (6mo): {decayed:.3f}")
+    print(f"  Path: {result.path}")
+    print(f"  Receipts: {result.receipts_completed}/{result.receipts_required}")
+    print(f"  Counterparties: {result.counterparties}/{result.counterparties_required}")
+    print(f"  Wilson CI: {result.wilson_ci}")
+    print(f"  New score: {result.new_score}")
+    print(f"  State: {result.new_state.value}")
+    print(f"  Result: {result.reason}")
     print()
 
 
-def scenario_diversity_failure():
-    """Enough receipts but from too few operators (sybil attempt)."""
-    print("=== Scenario: Diversity Failure (Sybil Recovery Attempt) ===")
-    now = time.time()
+def scenario_degraded_violation():
+    """DEGRADED agent clears violation."""
+    print("=== Scenario: DEGRADED → VIOLATION_CLEAR ===")
     
-    window = RecoveryWindow(agent_id="sybil_recovery", degraded_at=now)
+    attempt = RecoveryAttempt(
+        agent_id="degraded_agent",
+        prior_state=AgentState.DEGRADED,
+        prior_score=0.45,
+        dormant_months=0,
+        path=RecoveryPath.VIOLATION_CLEAR,
+        receipts=[(f"cp_{i%4}", True) for i in range(8)],
+        started_at=time.time() - 86400 * 20  # 20 days in
+    )
     
-    # All receipts from same operator
-    for i in range(10):
-        receipt = RecoveryReceipt(
-            f"r{i:03d}", f"cp_{i}", "single_operator",
-            "A", "CONFIRMED", now + (i * 86400)
-        )
-        result = process_receipt(window, receipt)
+    result = evaluate_recovery(attempt)
     
-    for e in result["events"]:
-        print(f"  {e}")
-    print(f"  Final state: {window.state.value}")
-    print(f"  Receipts: {window.recovery_count}/{N_RECOVERY} (met)")
-    print(f"  Operators: {len(window.unique_operators)}/{MIN_COUNTERPARTIES} (NOT met)")
-    print(f"  Sybil recovery BLOCKED by operator diversity requirement")
+    print(f"  Prior score: 0.45 (DEGRADED)")
+    print(f"  Path: {result.path}")
+    print(f"  Receipts: {result.receipts_completed}/{result.receipts_required}")
+    print(f"  Counterparties: {result.counterparties}/{result.counterparties_required}")
+    print(f"  Grade floor: C (0.6) — prior tainted receipts ignored")
+    print(f"  Wilson CI: {result.wilson_ci}")
+    print(f"  New score: {result.new_score}")
+    print(f"  State: {result.new_state.value}")
+    print(f"  Result: {result.reason}")
     print()
 
 
-def scenario_window_expiry():
-    """Window expires before completion."""
-    print("=== Scenario: Window Expiry ===")
-    now = time.time()
+def scenario_abandoned_full():
+    """ABANDONED agent does full re-attestation."""
+    print("=== Scenario: ABANDONED → FULL_REATTESTION ===")
     
-    window = RecoveryWindow(agent_id="slow_agent", degraded_at=now)
+    attempt = RecoveryAttempt(
+        agent_id="ghost_agent",
+        prior_state=AgentState.ABANDONED,
+        prior_score=0.30,
+        dormant_months=18,
+        path=RecoveryPath.FULL_REATTESTION,
+        receipts=[(f"cp_{i%6}", True) for i in range(30)],
+        started_at=time.time() - 86400 * 60  # 60 days in
+    )
     
-    # Only 4 receipts in 30 days
-    for i in range(4):
-        receipt = RecoveryReceipt(
-            f"r{i:03d}", f"cp_{i}", f"op_{i}",
-            "B", "CONFIRMED", now + (i * 86400 * 5)
-        )
-        process_receipt(window, receipt)
+    result = evaluate_recovery(attempt)
     
-    # Check at day 31
-    expiry = check_window_expiry(window, now + 31 * 86400)
-    print(f"  Receipts at expiry: {window.recovery_count}/{N_RECOVERY}")
-    print(f"  Result: {expiry['result']}")
-    print(f"  Shortfall: {expiry['shortfall_receipts']} receipts, {expiry['shortfall_operators']} operators")
+    print(f"  Prior: ABANDONED, 18 months gone")
+    print(f"  Path: {result.path}")
+    print(f"  Receipts: {result.receipts_completed}/{result.receipts_required}")
+    print(f"  Counterparties: {result.counterparties}/{result.counterparties_required}")
+    print(f"  Grade floor: D (0.4) — near-fresh start")
+    print(f"  Wilson CI: {result.wilson_ci}")
+    print(f"  New score: {result.new_score}")
+    print(f"  State: {result.new_state.value}")
+    print(f"  Window: {result.window_remaining_days}d remaining")
     print()
 
 
-def scenario_grade_floor():
-    """Low-grade receipts don't count."""
-    print("=== Scenario: Grade Floor Enforcement ===")
-    now = time.time()
+def scenario_expired_window():
+    """Recovery attempt exceeds 30d window."""
+    print("=== Scenario: EXPIRED Recovery Window ===")
     
-    window = RecoveryWindow(agent_id="low_grade", degraded_at=now)
+    attempt = RecoveryAttempt(
+        agent_id="slow_agent",
+        prior_state=AgentState.DEGRADED,
+        prior_score=0.50,
+        dormant_months=0,
+        path=RecoveryPath.VIOLATION_CLEAR,
+        receipts=[(f"cp_{i}", True) for i in range(5)],  # Only 5, needed 8
+        started_at=time.time() - 86400 * 35  # 35 days — past 30d window
+    )
     
-    grades = ["D", "F", "D", "C", "B", "A", "C", "B", "A", "C"]
-    counted = 0
-    for i, g in enumerate(grades):
-        receipt = RecoveryReceipt(
-            f"r{i:03d}", f"cp_{i%5}", f"op_{i%4}",
-            g, "CONFIRMED", now + (i * 86400)
-        )
-        result = process_receipt(window, receipt)
-        for e in result["events"]:
-            if "COUNTED" in e:
-                counted += 1
-            print(f"  Grade {g}: {e}")
+    result = evaluate_recovery(attempt)
     
-    print(f"  Counted: {counted} of {len(grades)} (D and F rejected)")
-    print(f"  State: {window.state.value}")
+    print(f"  Receipts: {result.receipts_completed}/{result.receipts_required} (insufficient)")
+    print(f"  Window: EXPIRED by {-result.window_remaining_days:.0f} days")
+    print(f"  State: {result.new_state.value} (remains DEGRADED)")
+    print(f"  Score penalty: {result.new_score} (0.8x for failed recovery)")
+    print(f"  Result: {result.reason}")
     print()
 
 
 if __name__ == "__main__":
-    print("n-Recovery Spec — ATF V1.2 Recovery Window")
-    print("Per santaclawd: what is the 30d/n=8 spec text?")
-    print("=" * 60)
-    
-    # Print spec text
-    print(generate_spec_text())
-    
-    print("=" * 60)
-    print("SCENARIOS")
-    print("=" * 60)
+    print("n-Recovery Spec — ATF V1.2 Gap #3")
+    print("Per santaclawd: n_recovery=8 + 30d time cap")
+    print("RFC 5280 §5.3.1 certificateHold → removeFromCRL")
+    print("=" * 70)
     print()
     
-    scenario_successful_recovery()
-    scenario_diversity_failure()
-    scenario_window_expiry()
-    scenario_grade_floor()
+    compare_recovery_paths()
+    scenario_dormant_recovery()
+    scenario_degraded_violation()
+    scenario_abandoned_full()
+    scenario_expired_window()
     
-    print("=" * 60)
-    print("KEY: Window is FIXED. Receipts don't extend it.")
-    print("Completion resets state (OCSP model: fresh replaces stale).")
-    print("Operator diversity prevents sybil recovery.")
+    print("=" * 70)
+    print("SPEC TEXT (V1.2):")
+    print("  recovery_window MUST NOT exceed 30d (SESSION/VIOLATION) or 90d (FULL)")
+    print("  n_recovery = 8 CONFIRMED receipts (SESSION/VIOLATION)")
+    print("  n_recovery = 30 CONFIRMED receipts (FULL)")
+    print("  min_counterparties = 3 independent (SESSION/VIOLATION), 5 (FULL)")
+    print("  Window exceeded = recovery FAILED, score penalized 0.8x")
+    print("  COMPLETION resets window — individual receipts do not")
