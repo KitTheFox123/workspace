@@ -2,324 +2,355 @@
 """
 ttl-mid-session-handler.py — Handle _atf TTL expiry during active sessions.
 
-Per santaclawd V1.2: what happens when _atf TTL expires mid-session?
-Per clove: RFC 8767 serve-stale model for graceful degradation.
+Per santaclawd: what happens when _atf TTL expires mid-session?
+Per clove: RFC 8767 serve-stale = graceful degradation over hard failure.
 
-Three states: FRESH → STALE → EXPIRED
-- FRESH: TTL valid, full trust operations
-- STALE: TTL expired, grace period active, operations continue with STALE flag
-- EXPIRED: grace period over, hard fail on new operations, in-flight complete
+Three states:
+  FRESH   — TTL valid, full trust
+  STALE   — TTL expired, within grace period (serve-stale)
+  EXPIRED — Past grace period, hard fail
 
-Key insight: eIDAS 2.0 QTSPs require periodic re-assessment (24 months).
-PGP failed because endorsements never expired. Indefinite trust = no trust.
+RFC 8767 (March 2020): DNS serve-stale caps at 7 days.
+ATF V1.2: stale cap = min(3x original TTL, 72h).
+
+Key: in-flight requests complete with STALE flag.
+New requests after EXPIRED = hard fail.
+Stale receipts are DEGRADED not INVALID.
 """
 
-import hashlib
 import time
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class TrustState(Enum):
-    FRESH = "FRESH"         # TTL valid
-    STALE = "STALE"         # TTL expired, within grace
-    EXPIRED = "EXPIRED"     # Grace over, hard fail
-    REVALIDATED = "REVALIDATED"  # Re-queried and fresh again
+class TrustFreshness(Enum):
+    FRESH = "FRESH"       # Within TTL
+    STALE = "STALE"       # TTL expired, within grace
+    EXPIRED = "EXPIRED"   # Past grace, hard fail
 
 
-class TransactionState(Enum):
-    ACTIVE = "ACTIVE"       # In progress
-    COMPLETED = "COMPLETED" # Finished under original trust
-    STALE_COMPLETED = "STALE_COMPLETED"  # Finished under STALE trust
-    REJECTED = "REJECTED"   # Rejected due to EXPIRED
+class SessionAction(Enum):
+    PROCEED = "PROCEED"           # Normal operation
+    PROCEED_DEGRADED = "PROCEED_DEGRADED"  # Continue with downgraded grade
+    COMPLETE_STALE = "COMPLETE_STALE"      # Finish in-flight, mark stale
+    HARD_FAIL = "HARD_FAIL"       # Reject new requests
+    REVALIDATE = "REVALIDATE"     # Trigger inline revalidation
 
 
-# SPEC_CONSTANTS (per ATF V1.2)
-DEFAULT_TTL_SECONDS = 3600          # 1 hour
-GRACE_PERIOD_SECONDS = 300          # 5 minutes serve-stale
-MAX_STALE_TRANSACTIONS = 3          # RFC 8767 inspired limit
-REVALIDATION_TIMEOUT_SECONDS = 10   # Max time to re-query
-MIN_TTL_SECONDS = 60                # Floor (genesis constant)
-MAX_TTL_SECONDS = 86400             # Ceiling (24h)
+# SPEC_CONSTANTS (V1.2)
+STALE_CAP_MULTIPLIER = 3          # Max stale = 3x original TTL
+STALE_CAP_MAX_HOURS = 72          # Absolute max stale period
+GRADE_DEGRADATION_STALE = 1       # Degrade by 1 grade level during STALE
+GRADE_DEGRADATION_EXPIRED = None  # EXPIRED = no grade, REJECT
+MAX_INFLIGHT_COMPLETION_SEC = 300 # 5 min to complete in-flight after EXPIRED
+REVALIDATION_ATTEMPT_INTERVAL = 60  # Try revalidation every 60s during STALE
+
+
+GRADE_ORDER = ["A", "B", "C", "D", "F"]
 
 
 @dataclass
 class TrustRecord:
     agent_id: str
-    counterparty_id: str
     trust_score: float
-    issued_at: float
-    ttl_seconds: int
-    grace_seconds: int = GRACE_PERIOD_SECONDS
-    state: TrustState = TrustState.FRESH
-    stale_transaction_count: int = 0
-    last_revalidation_attempt: Optional[float] = None
-    revalidation_success: Optional[bool] = None
+    evidence_grade: str
+    ttl_seconds: int          # Original TTL from _atf record
+    fetched_at: float         # When trust data was fetched
+    counterparty_classes: int # Number of distinct counterparty classes
     
     @property
     def expires_at(self) -> float:
-        return self.issued_at + self.ttl_seconds
+        return self.fetched_at + self.ttl_seconds
     
     @property
-    def grace_expires_at(self) -> float:
-        return self.expires_at + self.grace_seconds
+    def stale_cap_seconds(self) -> int:
+        return min(
+            self.ttl_seconds * STALE_CAP_MULTIPLIER,
+            STALE_CAP_MAX_HOURS * 3600
+        )
     
-    def current_state(self, now: float) -> TrustState:
-        if now < self.expires_at:
-            return TrustState.FRESH
-        elif now < self.grace_expires_at:
-            return TrustState.STALE
-        else:
-            return TrustState.EXPIRED
+    @property
+    def hard_expires_at(self) -> float:
+        return self.expires_at + self.stale_cap_seconds
 
 
 @dataclass
-class Transaction:
-    tx_id: str
+class Session:
+    session_id: str
     trust_record: TrustRecord
     started_at: float
-    trust_state_at_start: TrustState
-    state: TransactionState = TransactionState.ACTIVE
-    completed_at: Optional[float] = None
-    stale_flag: bool = False
+    requests_total: int = 0
+    requests_stale: int = 0
+    requests_rejected: int = 0
+    last_revalidation_attempt: float = 0.0
+    revalidation_success: bool = False
+    in_flight: list = field(default_factory=list)
 
 
 @dataclass
-class SessionAudit:
-    """Audit trail for TTL events during session."""
-    events: list = field(default_factory=list)
-    
-    def log(self, event_type: str, details: dict):
-        self.events.append({
-            "timestamp": time.time(),
-            "type": event_type,
-            "details": details
-        })
+class Request:
+    request_id: str
+    started_at: float
+    completed_at: Optional[float] = None
+    freshness_at_start: Optional[TrustFreshness] = None
+    grade_applied: Optional[str] = None
+    action: Optional[SessionAction] = None
 
 
-def evaluate_transaction(trust: TrustRecord, tx_id: str, now: float,
-                         audit: SessionAudit) -> Transaction:
-    """Evaluate whether a new transaction should proceed."""
-    state = trust.current_state(now)
-    trust.state = state
+def get_freshness(trust: TrustRecord, now: float) -> TrustFreshness:
+    """Determine trust freshness at a point in time."""
+    if now <= trust.expires_at:
+        return TrustFreshness.FRESH
+    elif now <= trust.hard_expires_at:
+        return TrustFreshness.STALE
+    else:
+        return TrustFreshness.EXPIRED
+
+
+def degrade_grade(grade: str, levels: int) -> str:
+    """Degrade a letter grade by N levels."""
+    idx = GRADE_ORDER.index(grade) if grade in GRADE_ORDER else len(GRADE_ORDER) - 1
+    new_idx = min(idx + levels, len(GRADE_ORDER) - 1)
+    return GRADE_ORDER[new_idx]
+
+
+def handle_request(session: Session, request: Request, now: float) -> dict:
+    """
+    Handle an incoming request given current trust freshness.
     
-    if state == TrustState.FRESH:
-        tx = Transaction(tx_id, trust, now, state)
-        audit.log("TX_ACCEPTED", {"tx_id": tx_id, "trust_state": "FRESH",
-                                   "trust_score": trust.trust_score})
-        return tx
+    RFC 8767 model: serve stale data rather than fail.
+    ATF extension: degrade grade during stale, hard fail after.
+    """
+    freshness = get_freshness(session.trust_record, now)
+    request.freshness_at_start = freshness
+    session.requests_total += 1
     
-    elif state == TrustState.STALE:
-        # Serve-stale: allow with limits
-        if trust.stale_transaction_count >= MAX_STALE_TRANSACTIONS:
-            tx = Transaction(tx_id, trust, now, state, TransactionState.REJECTED)
-            audit.log("TX_REJECTED", {"tx_id": tx_id, "reason": "MAX_STALE_EXCEEDED",
-                                       "stale_count": trust.stale_transaction_count})
-            return tx
+    if freshness == TrustFreshness.FRESH:
+        request.grade_applied = session.trust_record.evidence_grade
+        request.action = SessionAction.PROCEED
+        return {
+            "action": SessionAction.PROCEED.value,
+            "freshness": freshness.value,
+            "grade": request.grade_applied,
+            "ttl_remaining": int(session.trust_record.expires_at - now),
+            "note": "Normal operation"
+        }
+    
+    elif freshness == TrustFreshness.STALE:
+        session.requests_stale += 1
+        degraded_grade = degrade_grade(
+            session.trust_record.evidence_grade,
+            GRADE_DEGRADATION_STALE
+        )
+        request.grade_applied = degraded_grade
         
-        trust.stale_transaction_count += 1
-        tx = Transaction(tx_id, trust, now, state, stale_flag=True)
-        audit.log("TX_STALE_ACCEPTED", {
-            "tx_id": tx_id, "trust_state": "STALE",
-            "stale_count": trust.stale_transaction_count,
-            "grace_remaining": round(trust.grace_expires_at - now, 1)
-        })
-        return tx
+        # Try revalidation if interval elapsed
+        should_revalidate = (
+            now - session.last_revalidation_attempt >= REVALIDATION_ATTEMPT_INTERVAL
+        )
+        
+        if should_revalidate:
+            session.last_revalidation_attempt = now
+            request.action = SessionAction.REVALIDATE
+            stale_remaining = int(session.trust_record.hard_expires_at - now)
+            return {
+                "action": SessionAction.PROCEED_DEGRADED.value,
+                "freshness": freshness.value,
+                "grade": degraded_grade,
+                "original_grade": session.trust_record.evidence_grade,
+                "stale_remaining": stale_remaining,
+                "revalidation_triggered": True,
+                "note": f"Serve-stale (RFC 8767). Grade degraded {session.trust_record.evidence_grade}→{degraded_grade}. Revalidation triggered."
+            }
+        else:
+            request.action = SessionAction.PROCEED_DEGRADED
+            stale_remaining = int(session.trust_record.hard_expires_at - now)
+            return {
+                "action": SessionAction.PROCEED_DEGRADED.value,
+                "freshness": freshness.value,
+                "grade": degraded_grade,
+                "original_grade": session.trust_record.evidence_grade,
+                "stale_remaining": stale_remaining,
+                "revalidation_triggered": False,
+                "note": f"Serve-stale. Grade degraded. Next revalidation in {int(REVALIDATION_ATTEMPT_INTERVAL - (now - session.last_revalidation_attempt))}s."
+            }
     
     else:  # EXPIRED
-        tx = Transaction(tx_id, trust, now, state, TransactionState.REJECTED)
-        audit.log("TX_REJECTED", {"tx_id": tx_id, "reason": "TRUST_EXPIRED",
-                                   "expired_since": round(now - trust.grace_expires_at, 1)})
-        return tx
+        session.requests_rejected += 1
+        
+        # Check for in-flight requests that can complete
+        in_flight_completing = [
+            r for r in session.in_flight
+            if r.completed_at is None and (now - r.started_at) < MAX_INFLIGHT_COMPLETION_SEC
+        ]
+        
+        request.action = SessionAction.HARD_FAIL
+        request.grade_applied = None
+        
+        return {
+            "action": SessionAction.HARD_FAIL.value,
+            "freshness": freshness.value,
+            "grade": None,
+            "in_flight_completing": len(in_flight_completing),
+            "expired_since": int(now - session.trust_record.hard_expires_at),
+            "note": "TTL + grace expired. New requests rejected. In-flight may complete within 5min window."
+        }
 
 
-def attempt_revalidation(trust: TrustRecord, now: float,
-                         audit: SessionAudit, success: bool = True) -> TrustRecord:
-    """Attempt inline revalidation of expired/stale trust."""
-    trust.last_revalidation_attempt = now
-    
-    if success:
-        # Reset to FRESH with new TTL
-        trust.issued_at = now
-        trust.state = TrustState.FRESH
-        trust.stale_transaction_count = 0
-        trust.revalidation_success = True
-        audit.log("REVALIDATION_SUCCESS", {
-            "agent_id": trust.agent_id,
-            "new_expires_at": trust.expires_at,
-            "trust_score": trust.trust_score
-        })
-    else:
-        trust.revalidation_success = False
-        audit.log("REVALIDATION_FAILED", {
-            "agent_id": trust.agent_id,
-            "reason": "DNS_TIMEOUT_OR_NXDOMAIN",
-            "fallback": "SERVE_STALE" if trust.current_state(now) == TrustState.STALE else "HARD_FAIL"
-        })
-    
-    return trust
-
-
-def session_summary(audit: SessionAudit) -> dict:
-    """Summarize session trust events."""
-    events = audit.events
-    accepted = sum(1 for e in events if e['type'] in ('TX_ACCEPTED', 'TX_STALE_ACCEPTED'))
-    rejected = sum(1 for e in events if e['type'] == 'TX_REJECTED')
-    stale = sum(1 for e in events if e['type'] == 'TX_STALE_ACCEPTED')
-    revalidations = sum(1 for e in events if 'REVALIDATION' in e['type'])
+def session_summary(session: Session) -> dict:
+    """Summary of session trust handling."""
+    now = time.time()
+    freshness = get_freshness(session.trust_record, now)
     
     return {
-        "total_events": len(events),
-        "transactions_accepted": accepted,
-        "transactions_rejected": rejected,
-        "stale_transactions": stale,
-        "revalidation_attempts": revalidations,
-        "trust_degradation_events": sum(1 for e in events if e['type'] == 'TX_REJECTED')
+        "session_id": session.session_id,
+        "agent": session.trust_record.agent_id,
+        "current_freshness": freshness.value,
+        "original_ttl": session.trust_record.ttl_seconds,
+        "stale_cap": session.trust_record.stale_cap_seconds,
+        "requests_total": session.requests_total,
+        "requests_fresh": session.requests_total - session.requests_stale - session.requests_rejected,
+        "requests_stale": session.requests_stale,
+        "requests_rejected": session.requests_rejected,
+        "stale_ratio": round(session.requests_stale / max(session.requests_total, 1), 3)
     }
 
 
 # === Scenarios ===
 
 def scenario_normal_session():
-    """All transactions within TTL — no issues."""
-    print("=== Scenario: Normal Session (All FRESH) ===")
+    """Session within TTL — all requests FRESH."""
+    print("=== Scenario: Normal Session (within TTL) ===")
     now = time.time()
-    audit = SessionAudit()
     
-    trust = TrustRecord("kit_fox", "bro_agent", 0.92, now, DEFAULT_TTL_SECONDS)
+    trust = TrustRecord("bro_agent", 0.92, "A", 3600, now - 1000, 5)
+    session = Session("sess_001", trust, now)
     
-    for i in range(5):
-        tx = evaluate_transaction(trust, f"tx_{i}", now + i * 60, audit)
-        print(f"  tx_{i}: {tx.trust_state_at_start.value} → {tx.state.value}")
+    for i in range(3):
+        req = Request(f"req_{i}", now + i*100)
+        result = handle_request(session, req, now + i*100)
+        print(f"  Request {i}: {result['action']} grade={result['grade']} "
+              f"TTL remaining={result.get('ttl_remaining', 'N/A')}s")
     
-    summary = session_summary(audit)
-    print(f"  Summary: {summary['transactions_accepted']} accepted, {summary['transactions_rejected']} rejected")
+    print(f"  Summary: {session.requests_total} total, {session.requests_stale} stale")
     print()
 
 
 def scenario_ttl_expires_mid_session():
-    """TTL expires during active session — serve-stale kicks in."""
-    print("=== Scenario: TTL Expires Mid-Session (Serve-Stale) ===")
+    """TTL expires during active session — transitions FRESH→STALE→EXPIRED."""
+    print("=== Scenario: TTL Expires Mid-Session ===")
     now = time.time()
-    audit = SessionAudit()
     
-    trust = TrustRecord("kit_fox", "bro_agent", 0.92, now, 600, grace_seconds=120)  # 10min TTL, 2min grace
+    # TTL already 50 minutes old (10 min remaining)
+    trust = TrustRecord("new_agent", 0.75, "B", 3600, now - 3000, 3)
+    session = Session("sess_002", trust, now)
     
-    # 5 transactions: 3 FRESH, 2 STALE, then 1 EXPIRED
-    times = [now + 300, now + 500, now + 590, now + 610, now + 650, now + 700, now + 750]
-    for i, t in enumerate(times):
-        tx = evaluate_transaction(trust, f"tx_{i}", t, audit)
-        state = trust.current_state(t)
-        elapsed = t - now
-        print(f"  tx_{i} @{elapsed:.0f}s: {state.value} → {tx.state.value}"
-              f"{' [STALE FLAG]' if tx.stale_flag else ''}")
+    # Request while FRESH (10 min remaining)
+    req1 = Request("req_fresh", now)
+    r1 = handle_request(session, req1, now)
+    print(f"  t=0: {r1['action']} grade={r1['grade']} freshness={r1['freshness']}")
     
-    summary = session_summary(audit)
-    print(f"  Summary: {summary['transactions_accepted']} accepted, "
-          f"{summary['stale_transactions']} stale, {summary['transactions_rejected']} rejected")
+    # Request after TTL expires (STALE, within grace)
+    req2 = Request("req_stale", now + 700)
+    r2 = handle_request(session, req2, now + 700)
+    print(f"  t=700s: {r2['action']} grade={r2['grade']} freshness={r2['freshness']} "
+          f"stale_remaining={r2.get('stale_remaining', 'N/A')}s")
+    
+    # Request deep in stale period
+    req3 = Request("req_deep_stale", now + 5000)
+    r3 = handle_request(session, req3, now + 5000)
+    print(f"  t=5000s: {r3['action']} grade={r3['grade']} freshness={r3['freshness']}")
+    
+    # Request after hard expiry (3x TTL = 10800s from fetch, fetch was 3000s ago)
+    # hard_expires = now - 3000 + 3600 + min(3*3600, 72*3600) = now + 600 + 10800 = now + 11400
+    req4 = Request("req_expired", now + 8500)
+    r4 = handle_request(session, req4, now + 8500)
+    print(f"  t=8500s: {r4['action']} freshness={r4['freshness']} "
+          f"note={r4.get('note', '')[:60]}")
+    
+    summary = session_summary(session)
+    print(f"  Summary: {summary['requests_total']} total, {summary['requests_stale']} stale, "
+          f"{summary['requests_rejected']} rejected")
     print()
 
 
-def scenario_revalidation_success():
-    """TTL expires, inline revalidation succeeds."""
-    print("=== Scenario: Inline Revalidation Success ===")
+def scenario_short_ttl_high_value():
+    """Short TTL (5 min) on high-value interaction — stale cap matters."""
+    print("=== Scenario: Short TTL High-Value (5 min) ===")
     now = time.time()
-    audit = SessionAudit()
     
-    trust = TrustRecord("kit_fox", "santaclawd", 0.95, now, 300, grace_seconds=60)  # 5min TTL
+    trust = TrustRecord("high_value_agent", 0.95, "A", 300, now - 310, 8)
+    session = Session("sess_003", trust, now)
     
-    # Transaction during FRESH
-    tx1 = evaluate_transaction(trust, "tx_1", now + 200, audit)
-    print(f"  tx_1 @200s: {tx1.trust_state_at_start.value} → {tx1.state.value}")
+    # Already STALE (10s past TTL)
+    req1 = Request("req_stale_1", now)
+    r1 = handle_request(session, req1, now)
+    print(f"  t=0 (10s past TTL): {r1['action']} grade={r1['grade']} "
+          f"stale_remaining={r1.get('stale_remaining', 'N/A')}s")
     
-    # TTL expires, one STALE transaction
-    tx2 = evaluate_transaction(trust, "tx_2", now + 310, audit)
-    print(f"  tx_2 @310s: {tx2.trust_state_at_start.value} → {tx2.state.value} [STALE]")
+    # Stale cap = min(3*300, 72*3600) = 900s
+    # Hard expires at = now - 310 + 300 + 900 = now + 890
+    req2 = Request("req_near_expiry", now + 880)
+    r2 = handle_request(session, req2, now + 880)
+    print(f"  t=880s (10s before hard expiry): {r2['action']} grade={r2['grade']}")
     
-    # Revalidate inline
-    trust = attempt_revalidation(trust, now + 315, audit, success=True)
-    print(f"  Revalidation @315s: SUCCESS → new TTL")
+    req3 = Request("req_expired", now + 900)
+    r3 = handle_request(session, req3, now + 900)
+    print(f"  t=900s (hard expired): {r3['action']} freshness={r3['freshness']}")
     
-    # New transaction is FRESH again
-    tx3 = evaluate_transaction(trust, "tx_3", now + 320, audit)
-    print(f"  tx_3 @320s: {tx3.trust_state_at_start.value} → {tx3.state.value}")
-    
-    summary = session_summary(audit)
-    print(f"  Summary: {summary['transactions_accepted']} accepted, "
-          f"{summary['revalidation_attempts']} revalidations")
+    print(f"  Key: 5min TTL → 15min stale cap. Short-lived trust = short stale window.")
     print()
 
 
-def scenario_revalidation_failure():
-    """TTL expires, revalidation fails, hard fail after grace."""
-    print("=== Scenario: Revalidation Failure → Hard Fail ===")
+def scenario_revalidation_during_stale():
+    """Revalidation triggered during STALE period."""
+    print("=== Scenario: Revalidation During STALE ===")
     now = time.time()
-    audit = SessionAudit()
     
-    trust = TrustRecord("kit_fox", "unreliable", 0.60, now, 300, grace_seconds=60)
+    trust = TrustRecord("flaky_agent", 0.60, "C", 1800, now - 1900, 2)
+    session = Session("sess_004", trust, now)
     
-    # FRESH transaction
-    tx1 = evaluate_transaction(trust, "tx_1", now + 250, audit)
-    print(f"  tx_1 @250s: {tx1.trust_state_at_start.value}")
+    # First STALE request triggers revalidation
+    req1 = Request("req_reval_1", now)
+    r1 = handle_request(session, req1, now)
+    print(f"  t=0: {r1['action']} revalidation={r1.get('revalidation_triggered', False)}")
     
-    # TTL expires, try revalidation — fails
-    trust = attempt_revalidation(trust, now + 310, audit, success=False)
-    print(f"  Revalidation @310s: FAILED")
+    # Second request within revalidation interval — no retrigger
+    req2 = Request("req_reval_2", now + 30)
+    r2 = handle_request(session, req2, now + 30)
+    print(f"  t=30s: {r2['action']} revalidation={r2.get('revalidation_triggered', False)}")
     
-    # STALE transaction (within grace)
-    tx2 = evaluate_transaction(trust, "tx_2", now + 320, audit)
-    print(f"  tx_2 @320s: {trust.current_state(now + 320).value} → {tx2.state.value}")
+    # Third request after interval — retrigger
+    req3 = Request("req_reval_3", now + 70)
+    r3 = handle_request(session, req3, now + 70)
+    print(f"  t=70s: {r3['action']} revalidation={r3.get('revalidation_triggered', False)}")
     
-    # Past grace — hard fail
-    tx3 = evaluate_transaction(trust, "tx_3", now + 400, audit)
-    print(f"  tx_3 @400s: {trust.current_state(now + 400).value} → {tx3.state.value}")
-    
-    summary = session_summary(audit)
-    print(f"  Summary: {summary['transactions_accepted']} accepted, "
-          f"{summary['transactions_rejected']} rejected")
-    print()
-
-
-def scenario_max_stale_limit():
-    """Hit MAX_STALE_TRANSACTIONS limit during grace period."""
-    print(f"=== Scenario: Max Stale Limit ({MAX_STALE_TRANSACTIONS} transactions) ===")
-    now = time.time()
-    audit = SessionAudit()
-    
-    trust = TrustRecord("kit_fox", "slow_agent", 0.75, now, 300, grace_seconds=120)
-    
-    # Exhaust stale allowance
-    for i in range(MAX_STALE_TRANSACTIONS + 2):
-        t = now + 310 + (i * 10)  # All during STALE period
-        tx = evaluate_transaction(trust, f"tx_{i}", t, audit)
-        print(f"  tx_{i}: stale_count={trust.stale_transaction_count} → {tx.state.value}")
-    
-    summary = session_summary(audit)
-    print(f"  Result: {summary['transactions_accepted']} accepted, "
-          f"{summary['transactions_rejected']} rejected (max stale = {MAX_STALE_TRANSACTIONS})")
+    print(f"  Key: revalidation attempted every {REVALIDATION_ATTEMPT_INTERVAL}s during STALE.")
     print()
 
 
 if __name__ == "__main__":
-    print("TTL Mid-Session Handler — RFC 8767 Serve-Stale for ATF")
-    print("Per santaclawd V1.2 + clove RFC 8767 + eIDAS 2.0 re-assessment")
+    print("TTL Mid-Session Handler — RFC 8767 Serve-Stale for ATF V1.2")
+    print("Per santaclawd + clove")
     print("=" * 70)
     print()
-    print(f"SPEC_CONSTANTS: TTL={DEFAULT_TTL_SECONDS}s, Grace={GRACE_PERIOD_SECONDS}s, "
-          f"Max-Stale={MAX_STALE_TRANSACTIONS}")
+    print(f"FRESH → STALE (grace = min(3x TTL, {STALE_CAP_MAX_HOURS}h)) → EXPIRED (hard fail)")
+    print(f"In-flight completion window: {MAX_INFLIGHT_COMPLETION_SEC}s")
+    print(f"Grade degradation during STALE: -{GRADE_DEGRADATION_STALE} level")
+    print(f"Revalidation interval: {REVALIDATION_ATTEMPT_INTERVAL}s")
     print()
     
     scenario_normal_session()
     scenario_ttl_expires_mid_session()
-    scenario_revalidation_success()
-    scenario_revalidation_failure()
-    scenario_max_stale_limit()
+    scenario_short_ttl_high_value()
+    scenario_revalidation_during_stale()
     
     print("=" * 70)
     print("KEY INSIGHTS:")
-    print("1. FRESH→STALE→EXPIRED = bounded degradation (not binary)")
-    print("2. In-flight completes under STALE flag (no mid-transaction kill)")
-    print("3. MAX_STALE_TRANSACTIONS = RFC 8767 serve-stale limit")
-    print("4. Revalidation inline when possible, hard fail when not")
-    print("5. PGP failed because trust never expired. Expiry IS the feature.")
+    print("1. Stale receipts are DEGRADED not INVALID (they document what happened)")
+    print("2. Stale cap prevents indefinite trust on dead data")
+    print("3. In-flight requests complete; new requests after EXPIRED fail")
+    print("4. Revalidation attempted periodically during STALE")
+    print("5. Short TTL → short stale window (proportional grace)")
