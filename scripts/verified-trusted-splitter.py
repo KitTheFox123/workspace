@@ -1,401 +1,330 @@
 #!/usr/bin/env python3
 """
-verified-trusted-splitter.py — ATF V1.2 gap #5: VERIFIED vs TRUSTED distinction.
+verified-trusted-splitter.py — ATF V1.2 gap #5: VERIFIED ≠ TRUSTED.
 
-Per santaclawd: conflating cryptographic identity with behavioral trust is how
-trust systems fail. DigiNotar was VERIFIED (valid cert) but not TRUSTWORTHY
-(compromised, issuing rogue certs).
+Per santaclawd: conflating cryptographic verification with social trust
+is how trust systems fail. PGP Web of Trust died from this confusion.
 
-Two orthogonal dimensions:
-  VERIFIED  — Boolean. Cryptographic proof of identity (DANE/SVCB/key binding).
-  TRUSTED   — Continuous [0,1]. Behavioral evidence (Wilson CI, co-sign rate, receipts).
+VERIFIED = cryptographic binding (identity proven, key bound, cert valid)
+TRUSTED  = social reputation (receipts earned, attesters diverse, Wilson CI above floor)
 
-Receipt carries both: verified_method + trusted_score.
-Neither implies the other.
+Per Gómez (Blockstand, April 2025): eIDAS 2.0 splits Qualified Trust Service Provider
+(cryptographic) from trust framework (social governance).
+
+Two receipt fields:
+  verified_method: DANE | DKIM | CERT_CHAIN | TOFU | NONE
+  trust_score: Wilson CI lower bound [0, 1]
 """
 
 import hashlib
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
-import math
 
 
-class VerifiedMethod(Enum):
-    """How identity was cryptographically verified."""
-    DANE = "DANE"               # DNSSEC + TLSA (strongest)
-    SVCB = "SVCB"               # DNS Service Binding (no DNSSEC)
-    CT_LOG = "CT_LOG"           # Certificate Transparency lookup
-    KEY_PINNING = "KEY_PINNING" # Pre-shared key pin
-    TOFU = "TOFU"               # Trust on first use
-    NONE = "NONE"               # Unverified
+class VerificationMethod(Enum):
+    """Cryptographic verification methods — ordered by strength."""
+    DANE = "DANE"              # DNSSEC + TLSA (RFC 7671)
+    CERT_CHAIN = "CERT_CHAIN"  # X.509 chain to trusted root
+    DKIM = "DKIM"              # DomainKeys (RFC 6376)
+    TOFU = "TOFU"              # Trust On First Use (SSH model)
+    SELF_SIGNED = "SELF_SIGNED"  # Self-signed cert, no chain
+    NONE = "NONE"              # No cryptographic verification
 
 
-class TrustTier(Enum):
-    """Behavioral trust classification."""
-    ESTABLISHED = "ESTABLISHED"  # Wilson CI lower >= 0.7, n >= 30
-    EMERGING = "EMERGING"        # Wilson CI lower >= 0.4, n >= 10
-    PROVISIONAL = "PROVISIONAL"  # Wilson CI lower < 0.4 or n < 10
-    DORMANT = "DORMANT"          # Inactive > 30 days
-    UNTRUSTED = "UNTRUSTED"      # Wilson CI lower < 0.2 or axiom violation
+class TrustBasis(Enum):
+    """What the trust score is based on."""
+    BEHAVIORAL = "behavioral"       # Receipt history
+    DELEGATED = "delegated"         # Inherited from delegation chain
+    CROSS_REGISTRY = "cross_registry"  # Bridge from another registry
+    COLD_START = "cold_start"       # Wilson CI at low n
 
 
-# Grade penalties for discovery method (SPEC_CONSTANTS)
-VERIFICATION_PENALTIES = {
-    VerifiedMethod.DANE: 0,       # Full DNSSEC chain
-    VerifiedMethod.SVCB: -1,      # DNS but no DNSSEC
-    VerifiedMethod.CT_LOG: -2,    # Certificate Transparency fallback
-    VerifiedMethod.KEY_PINNING: -1,  # Manual pin (trusted but brittle)
-    VerifiedMethod.TOFU: -3,      # Trust on first use (weakest)
-    VerifiedMethod.NONE: -5,      # No verification = maximum penalty
+# Verification grade: maps method to letter grade
+VERIFICATION_GRADES = {
+    VerificationMethod.DANE: "A",           # DNSSEC chain verified
+    VerificationMethod.CERT_CHAIN: "A-",    # Trusted root but no DNSSEC
+    VerificationMethod.DKIM: "B",           # Domain-bound but weaker
+    VerificationMethod.TOFU: "C",           # First-use only
+    VerificationMethod.SELF_SIGNED: "D",    # No external validation
+    VerificationMethod.NONE: "F",           # Unverified
+}
+
+# Grade penalties for discovery mode
+DISCOVERY_PENALTIES = {
+    "DANE": 0,       # Full DNSSEC chain
+    "SVCB": -1,      # DNS but no DNSSEC
+    "CT_FALLBACK": -2,  # Certificate Transparency only
+    "NONE": -3,      # No discovery mechanism
 }
 
 
 @dataclass
-class VerificationState:
-    """Cryptographic verification status — binary."""
-    method: VerifiedMethod
+class VerificationRecord:
+    """Cryptographic verification state — binary, not scored."""
+    agent_id: str
+    method: VerificationMethod
     verified_at: float
-    key_hash: str
-    cert_chain_valid: bool
-    dnssec_validated: bool = False
-    ct_logged: bool = False
+    cert_fingerprint: Optional[str] = None
+    dns_record: Optional[str] = None
+    chain_depth: int = 0
+    grade: str = ""
     
-    @property
-    def is_verified(self) -> bool:
-        return self.method != VerifiedMethod.NONE and self.cert_chain_valid
-    
-    @property
-    def grade_penalty(self) -> int:
-        return VERIFICATION_PENALTIES[self.method]
+    def __post_init__(self):
+        if not self.grade:
+            self.grade = VERIFICATION_GRADES.get(self.method, "F")
 
 
 @dataclass
-class TrustState:
-    """Behavioral trust status — continuous."""
-    total_receipts: int
-    confirmed_receipts: int
-    unique_counterparties: int
-    wilson_ci_lower: float
-    co_sign_rate: float
-    last_receipt_at: float
-    correction_frequency: float = 0.0
-    axiom_violations: int = 0
+class TrustRecord:
+    """Social trust score — continuous, earned over time."""
+    agent_id: str
+    receipts_positive: int = 0
+    receipts_negative: int = 0
+    receipts_total: int = 0
+    attester_count: int = 0
+    attester_diversity: float = 0.0  # Simpson index
+    wilson_ci_lower: float = 0.0
+    trust_basis: TrustBasis = TrustBasis.COLD_START
+    last_receipt_at: float = 0.0
+
+
+@dataclass
+class AgentTrustProfile:
+    """Combined verification + trust profile."""
+    agent_id: str
+    verification: VerificationRecord
+    trust: TrustRecord
+    composite_label: str = ""  # e.g., "VERIFIED_TRUSTED", "VERIFIED_UNTRUSTED"
     
-    @property
-    def tier(self) -> TrustTier:
-        if self.axiom_violations > 0:
-            return TrustTier.UNTRUSTED
-        
-        days_inactive = (time.time() - self.last_receipt_at) / 86400
-        if days_inactive > 30:
-            return TrustTier.DORMANT
-        
-        if self.wilson_ci_lower >= 0.7 and self.total_receipts >= 30:
-            return TrustTier.ESTABLISHED
-        elif self.wilson_ci_lower >= 0.4 and self.total_receipts >= 10:
-            return TrustTier.EMERGING
-        else:
-            return TrustTier.PROVISIONAL
+    def __post_init__(self):
+        if not self.composite_label:
+            v = self.verification.method != VerificationMethod.NONE
+            t = self.trust.wilson_ci_lower >= 0.5
+            if v and t:
+                self.composite_label = "VERIFIED_TRUSTED"
+            elif v and not t:
+                self.composite_label = "VERIFIED_UNTRUSTED"
+            elif not v and t:
+                self.composite_label = "UNVERIFIED_TRUSTED"
+            else:
+                self.composite_label = "UNVERIFIED_UNTRUSTED"
 
 
-def wilson_ci_lower(successes: int, total: int, z: float = 1.96) -> float:
-    """Wilson score interval lower bound."""
+def wilson_ci_lower(pos: int, total: int, z: float = 1.96) -> float:
+    """Wilson score confidence interval — lower bound."""
     if total == 0:
         return 0.0
-    p = successes / total
+    phat = pos / total
     denominator = 1 + z**2 / total
-    center = p + z**2 / (2 * total)
-    spread = z * math.sqrt(p * (1 - p) / total + z**2 / (4 * total**2))
-    return max(0, (center - spread) / denominator)
+    centre = phat + z**2 / (2 * total)
+    spread = z * math.sqrt((phat * (1 - phat) + z**2 / (4 * total)) / total)
+    return max(0, (centre - spread) / denominator)
 
 
-@dataclass
-class SplitReceipt:
-    """Receipt with VERIFIED and TRUSTED as separate fields."""
-    agent_id: str
-    receipt_hash: str
-    timestamp: float
-    
-    # Verification (binary)
-    verified_method: VerifiedMethod
-    verified: bool
-    verification_penalty: int
-    
-    # Trust (continuous)
-    trusted_score: float
-    trust_tier: TrustTier
-    trust_n: int
-    
-    # Composite
-    effective_grade: str  # A-F incorporating both dimensions
-    
-    @property
-    def is_diginot(self) -> bool:
-        """Verified but not trusted — the DigiNotar pattern."""
-        return self.verified and self.trusted_score < 0.3
-    
-    @property
-    def is_dark_horse(self) -> bool:
-        """Trusted but weakly verified — needs upgrade."""
-        return not self.verified and self.trusted_score >= 0.7
+def simpson_diversity(attester_counts: dict[str, int]) -> float:
+    """Simpson's Diversity Index for attester distribution."""
+    total = sum(attester_counts.values())
+    if total <= 1:
+        return 0.0
+    return 1.0 - sum((c/total)**2 for c in attester_counts.values())
 
 
-def compute_effective_grade(verification: VerificationState, trust: TrustState) -> str:
-    """
-    Composite grade from both dimensions.
+def compute_trust(receipts: list[dict]) -> TrustRecord:
+    """Compute trust record from receipt history."""
+    pos = sum(1 for r in receipts if r.get('outcome') == 'positive')
+    neg = sum(1 for r in receipts if r.get('outcome') == 'negative')
+    total = len(receipts)
     
-    Matrix:
-                    VERIFIED    UNVERIFIED
-    ESTABLISHED     A           B (upgrade verification!)
-    EMERGING        B           C
-    PROVISIONAL     C           D
-    DORMANT         C-          D
-    UNTRUSTED       F           F
-    """
-    tier = trust.tier
-    verified = verification.is_verified
+    # Count attester diversity
+    attester_counts = {}
+    for r in receipts:
+        a = r.get('attester', 'unknown')
+        attester_counts[a] = attester_counts.get(a, 0) + 1
     
-    grade_map = {
-        (True, TrustTier.ESTABLISHED): "A",
-        (True, TrustTier.EMERGING): "B",
-        (True, TrustTier.PROVISIONAL): "C",
-        (True, TrustTier.DORMANT): "C",
-        (True, TrustTier.UNTRUSTED): "F",
-        (False, TrustTier.ESTABLISHED): "B",  # Dark horse
-        (False, TrustTier.EMERGING): "C",
-        (False, TrustTier.PROVISIONAL): "D",
-        (False, TrustTier.DORMANT): "D",
-        (False, TrustTier.UNTRUSTED): "F",
-    }
+    diversity = simpson_diversity(attester_counts)
+    wci = wilson_ci_lower(pos, total)
     
-    base = grade_map.get((verified, tier), "F")
+    basis = TrustBasis.COLD_START if total < 5 else TrustBasis.BEHAVIORAL
     
-    # Apply verification penalty
-    penalty = verification.grade_penalty
-    grade_order = ["A", "B", "C", "D", "F"]
-    idx = grade_order.index(base)
-    adjusted_idx = min(len(grade_order) - 1, max(0, idx + abs(penalty) // 2))
-    
-    return grade_order[adjusted_idx]
-
-
-def create_split_receipt(
-    agent_id: str,
-    verification: VerificationState,
-    trust: TrustState
-) -> SplitReceipt:
-    """Create a receipt with split VERIFIED/TRUSTED fields."""
-    now = time.time()
-    receipt_hash = hashlib.sha256(
-        f"{agent_id}:{now}:{verification.method.value}:{trust.wilson_ci_lower}".encode()
-    ).hexdigest()[:16]
-    
-    grade = compute_effective_grade(verification, trust)
-    
-    return SplitReceipt(
-        agent_id=agent_id,
-        receipt_hash=receipt_hash,
-        timestamp=now,
-        verified_method=verification.method,
-        verified=verification.is_verified,
-        verification_penalty=verification.grade_penalty,
-        trusted_score=trust.wilson_ci_lower,
-        trust_tier=trust.tier,
-        trust_n=trust.total_receipts,
-        effective_grade=grade
+    return TrustRecord(
+        agent_id=receipts[0].get('agent_id', '') if receipts else '',
+        receipts_positive=pos,
+        receipts_negative=neg,
+        receipts_total=total,
+        attester_count=len(attester_counts),
+        attester_diversity=round(diversity, 4),
+        wilson_ci_lower=round(wci, 4),
+        trust_basis=basis,
+        last_receipt_at=max((r.get('timestamp', 0) for r in receipts), default=0)
     )
+
+
+def should_interact(profile: AgentTrustProfile, min_verification: str = "C",
+                     min_trust: float = 0.3) -> dict:
+    """Decision function: should I interact with this agent?"""
+    grade_order = ["A", "A-", "B", "C", "D", "F"]
+    v_grade = profile.verification.grade
+    v_passes = grade_order.index(v_grade) <= grade_order.index(min_verification)
+    t_passes = profile.trust.wilson_ci_lower >= min_trust
+    
+    if v_passes and t_passes:
+        decision = "PROCEED"
+        reason = f"Verified ({v_grade}) and trusted ({profile.trust.wilson_ci_lower:.2f})"
+    elif v_passes and not t_passes:
+        decision = "PROCEED_WITH_CAUTION"
+        reason = f"Verified ({v_grade}) but low trust ({profile.trust.wilson_ci_lower:.2f}). New or underperforming."
+    elif not v_passes and t_passes:
+        decision = "VERIFY_FIRST"
+        reason = f"Trusted ({profile.trust.wilson_ci_lower:.2f}) but weak verification ({v_grade}). Upgrade identity binding."
+    else:
+        decision = "REJECT"
+        reason = f"Neither verified ({v_grade}) nor trusted ({profile.trust.wilson_ci_lower:.2f})."
+    
+    return {
+        "decision": decision,
+        "reason": reason,
+        "verification_grade": v_grade,
+        "trust_score": profile.trust.wilson_ci_lower,
+        "composite_label": profile.composite_label,
+        "attester_diversity": profile.trust.attester_diversity
+    }
 
 
 # === Scenarios ===
 
-def scenario_diginot():
-    """Verified identity but compromised trust — DigiNotar pattern."""
-    print("=== Scenario: DigiNotar Pattern (Verified ≠ Trusted) ===")
+def scenario_pgp_failure_mode():
+    """PGP Web of Trust failure: high verification, no trust distinction."""
+    print("=== Scenario: PGP Failure Mode (Conflated) ===")
+    print("  PGP treated key signing AS trust. Result: key-signing parties")
+    print("  produced VERIFIED identities with ZERO behavioral trust.")
+    print()
+    
     now = time.time()
+    # Agent with strong crypto but no receipts
+    verification = VerificationRecord("pgp_ghost", VerificationMethod.CERT_CHAIN, now,
+                                       cert_fingerprint="abc123", chain_depth=3)
+    trust = TrustRecord("pgp_ghost")  # Zero receipts
+    profile = AgentTrustProfile("pgp_ghost", verification, trust)
     
-    verification = VerificationState(
-        method=VerifiedMethod.DANE,
-        verified_at=now,
-        key_hash="abc123",
-        cert_chain_valid=True,
-        dnssec_validated=True,
-        ct_logged=True
-    )
-    
-    trust = TrustState(
-        total_receipts=50,
-        confirmed_receipts=10,  # 20% confirmed — terrible
-        unique_counterparties=3,
-        wilson_ci_lower=wilson_ci_lower(10, 50),
-        co_sign_rate=0.20,
-        last_receipt_at=now,
-        axiom_violations=0
-    )
-    
-    receipt = create_split_receipt("diginot_agent", verification, trust)
-    
-    print(f"  Verified: {receipt.verified} (method: {receipt.verified_method.value})")
-    print(f"  Trusted: {receipt.trusted_score:.3f} (tier: {receipt.trust_tier.value})")
-    print(f"  Grade: {receipt.effective_grade}")
-    print(f"  DigiNotar pattern: {receipt.is_diginot}")
-    print(f"  KEY INSIGHT: DANE-verified, DNSSEC-validated, CT-logged —")
-    print(f"  but only 20% co-sign rate. Identity proven, behavior suspicious.")
+    result = should_interact(profile)
+    print(f"  Label: {profile.composite_label}")
+    print(f"  Decision: {result['decision']}")
+    print(f"  Reason: {result['reason']}")
+    print(f"  → PGP would say 'TRUSTED'. ATF says 'PROCEED_WITH_CAUTION'.")
     print()
 
 
-def scenario_dark_horse():
-    """Trusted behavior but weak verification — needs upgrade."""
-    print("=== Scenario: Dark Horse (Trusted but Unverified) ===")
+def scenario_eidas_split():
+    """eIDAS 2.0 model: QTSP (crypto) separate from trust framework (social)."""
+    print("=== Scenario: eIDAS 2.0 Split (VERIFIED + TRUSTED) ===")
     now = time.time()
     
-    verification = VerificationState(
-        method=VerifiedMethod.TOFU,
-        verified_at=now - 86400*60,
-        key_hash="def456",
-        cert_chain_valid=False,  # TOFU = no cert chain
-        dnssec_validated=False
-    )
+    # Established agent: DANE-verified + strong receipt history
+    verification = VerificationRecord("established_agent", VerificationMethod.DANE, now,
+                                       dns_record="_atf.agent.example.com")
+    receipts = [
+        {"agent_id": "established_agent", "outcome": "positive", "attester": f"attester_{i%8}",
+         "timestamp": now - 86400 * (30 - i)}
+        for i in range(30)
+    ]
+    # Add 2 negative
+    receipts[10]["outcome"] = "negative"
+    receipts[20]["outcome"] = "negative"
     
-    trust = TrustState(
-        total_receipts=100,
-        confirmed_receipts=92,
-        unique_counterparties=15,
-        wilson_ci_lower=wilson_ci_lower(92, 100),
-        co_sign_rate=0.92,
-        last_receipt_at=now
-    )
+    trust = compute_trust(receipts)
+    profile = AgentTrustProfile("established_agent", verification, trust)
+    result = should_interact(profile)
     
-    receipt = create_split_receipt("dark_horse_agent", verification, trust)
-    
-    print(f"  Verified: {receipt.verified} (method: {receipt.verified_method.value})")
-    print(f"  Trusted: {receipt.trusted_score:.3f} (tier: {receipt.trust_tier.value})")
-    print(f"  Grade: {receipt.effective_grade}")
-    print(f"  Dark horse: {receipt.is_dark_horse}")
-    print(f"  KEY INSIGHT: 92% co-sign rate, 15 unique counterparties —")
-    print(f"  but only TOFU verification. Behavior excellent, identity weak.")
-    print(f"  Recommendation: upgrade to DANE for Grade A.")
+    print(f"  Verification: {verification.method.value} (grade {verification.grade})")
+    print(f"  Trust: Wilson CI={trust.wilson_ci_lower:.4f}, n={trust.receipts_total}, "
+          f"diversity={trust.attester_diversity:.4f}")
+    print(f"  Label: {profile.composite_label}")
+    print(f"  Decision: {result['decision']}")
     print()
 
 
-def scenario_full_trust():
-    """Both verified and trusted — Grade A."""
-    print("=== Scenario: Full Trust (Verified + Trusted) ===")
+def scenario_tofu_newcomer():
+    """SSH-style TOFU: weak verification, building trust."""
+    print("=== Scenario: TOFU Newcomer ===")
     now = time.time()
     
-    verification = VerificationState(
-        method=VerifiedMethod.DANE,
-        verified_at=now,
-        key_hash="ghi789",
-        cert_chain_valid=True,
-        dnssec_validated=True,
-        ct_logged=True
-    )
+    verification = VerificationRecord("new_agent", VerificationMethod.TOFU, now)
+    receipts = [
+        {"agent_id": "new_agent", "outcome": "positive", "attester": f"a{i}",
+         "timestamp": now - 86400 * i}
+        for i in range(3)
+    ]
+    trust = compute_trust(receipts)
+    profile = AgentTrustProfile("new_agent", verification, trust)
+    result = should_interact(profile)
     
-    trust = TrustState(
-        total_receipts=200,
-        confirmed_receipts=185,
-        unique_counterparties=25,
-        wilson_ci_lower=wilson_ci_lower(185, 200),
-        co_sign_rate=0.925,
-        last_receipt_at=now,
-        correction_frequency=0.15
-    )
-    
-    receipt = create_split_receipt("kit_fox", verification, trust)
-    
-    print(f"  Verified: {receipt.verified} (method: {receipt.verified_method.value})")
-    print(f"  Trusted: {receipt.trusted_score:.3f} (tier: {receipt.trust_tier.value})")
-    print(f"  Grade: {receipt.effective_grade}")
-    print(f"  Both dimensions satisfied. This is the target state.")
+    print(f"  Verification: {verification.method.value} (grade {verification.grade})")
+    print(f"  Trust: Wilson CI={trust.wilson_ci_lower:.4f}, n={trust.receipts_total} (cold start)")
+    print(f"  Label: {profile.composite_label}")
+    print(f"  Decision: {result['decision']}")
+    print(f"  → Weak crypto but building trust. Upgrade verification path available.")
     print()
 
 
-def scenario_newcomer():
-    """New agent — provisional in both dimensions."""
-    print("=== Scenario: Newcomer (Cold Start) ===")
+def scenario_high_trust_no_crypto():
+    """Agent with reputation but no identity binding."""
+    print("=== Scenario: Reputation Without Identity (Sybil Risk) ===")
     now = time.time()
     
-    verification = VerificationState(
-        method=VerifiedMethod.SVCB,
-        verified_at=now,
-        key_hash="jkl012",
-        cert_chain_valid=True,
-        dnssec_validated=False
-    )
+    verification = VerificationRecord("reputable_ghost", VerificationMethod.NONE, now)
+    receipts = [
+        {"agent_id": "reputable_ghost", "outcome": "positive", "attester": f"a{i%12}",
+         "timestamp": now - 86400 * i}
+        for i in range(50)
+    ]
+    trust = compute_trust(receipts)
+    profile = AgentTrustProfile("reputable_ghost", verification, trust)
+    result = should_interact(profile)
     
-    trust = TrustState(
-        total_receipts=2,
-        confirmed_receipts=2,
-        unique_counterparties=1,
-        wilson_ci_lower=wilson_ci_lower(2, 2),
-        co_sign_rate=1.0,
-        last_receipt_at=now
-    )
-    
-    receipt = create_split_receipt("newcomer", verification, trust)
-    
-    print(f"  Verified: {receipt.verified} (method: {receipt.verified_method.value})")
-    print(f"  Trusted: {receipt.trusted_score:.3f} (tier: {receipt.trust_tier.value})")
-    print(f"  Grade: {receipt.effective_grade}")
-    print(f"  Wilson CI at n=2: ceiling is {trust.wilson_ci_lower:.3f}")
-    print(f"  Natural anti-sybil: perfect record + low n = limited trust.")
+    print(f"  Verification: {verification.method.value} (grade {verification.grade})")
+    print(f"  Trust: Wilson CI={trust.wilson_ci_lower:.4f}, n={trust.receipts_total}, "
+          f"diversity={trust.attester_diversity:.4f}")
+    print(f"  Label: {profile.composite_label}")
+    print(f"  Decision: {result['decision']}")
+    print(f"  → High trust but UNVERIFIED. Identity could be anyone. Sybil risk.")
     print()
 
 
-def scenario_axiom_violation():
-    """Axiom violation trumps everything."""
-    print("=== Scenario: Axiom Violation (Override) ===")
-    now = time.time()
-    
-    verification = VerificationState(
-        method=VerifiedMethod.DANE,
-        verified_at=now,
-        key_hash="mno345",
-        cert_chain_valid=True,
-        dnssec_validated=True
-    )
-    
-    trust = TrustState(
-        total_receipts=150,
-        confirmed_receipts=140,
-        unique_counterparties=20,
-        wilson_ci_lower=wilson_ci_lower(140, 150),
-        co_sign_rate=0.93,
-        last_receipt_at=now,
-        axiom_violations=1  # Self-attestation detected
-    )
-    
-    receipt = create_split_receipt("self_attester", verification, trust)
-    
-    print(f"  Verified: {receipt.verified} (method: {receipt.verified_method.value})")
-    print(f"  Trusted: {receipt.trusted_score:.3f} (tier: {receipt.trust_tier.value})")
-    print(f"  Grade: {receipt.effective_grade}")
-    print(f"  Axiom violation: trust tier forced to UNTRUSTED regardless of score.")
-    print(f"  93% co-sign rate means nothing if you grade yourself.")
+def scenario_decision_matrix():
+    """Full 2x2 matrix: verified×trusted."""
+    print("=== Decision Matrix: VERIFIED × TRUSTED ===")
+    print(f"  {'':20s} {'TRUSTED':>15s} {'UNTRUSTED':>15s}")
+    print(f"  {'VERIFIED':20s} {'PROCEED':>15s} {'CAUTION':>15s}")
+    print(f"  {'UNVERIFIED':20s} {'VERIFY_FIRST':>15s} {'REJECT':>15s}")
+    print()
+    print("  Key insight: two independent dimensions, not one scale.")
+    print("  PGP collapsed them into one. eIDAS 2.0 separates them.")
+    print("  ATF V1.2 MUST separate them: verified_method + trust_score.")
     print()
 
 
 if __name__ == "__main__":
     print("Verified-Trusted Splitter — ATF V1.2 Gap #5")
-    print("Per santaclawd: conflating verified with trusted is how trust systems fail.")
+    print("Per santaclawd + Gómez (Blockstand, April 2025)")
     print("=" * 70)
     print()
-    print("Two dimensions:")
-    print("  VERIFIED = cryptographic (boolean): identity proven, key bound")
-    print("  TRUSTED  = behavioral (continuous): receipts earned, Wilson CI")
+    print("VERIFIED = cryptographic (identity proven, key bound)")
+    print("TRUSTED  = social (receipts earned, attesters diverse)")
+    print("These are DIFFERENT claims. Conflating = PGP death.")
     print()
     
-    scenario_diginot()
-    scenario_dark_horse()
-    scenario_full_trust()
-    scenario_newcomer()
-    scenario_axiom_violation()
+    scenario_decision_matrix()
+    scenario_pgp_failure_mode()
+    scenario_eidas_split()
+    scenario_tofu_newcomer()
+    scenario_high_trust_no_crypto()
     
     print("=" * 70)
-    print("KEY INSIGHT: DigiNotar was VERIFIED but not TRUSTED.")
-    print("TOFU agents can be TRUSTED but not VERIFIED.")
-    print("Neither implies the other. Receipt carries both fields.")
-    print("Composite grade = f(verified_method, trust_tier).")
-    print("Axiom violation overrides everything → Grade F.")
+    print("KEY INSIGHT: Two receipt fields, not one trust score.")
+    print("  verified_method: DANE | CERT_CHAIN | DKIM | TOFU | SELF_SIGNED | NONE")
+    print("  trust_score: Wilson CI lower bound [0, 1]")
+    print("PGP died because key signing WAS trust. Don't repeat.")
+    print("eIDAS 2.0 got this right: QTSP ≠ trust framework.")
