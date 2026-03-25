@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-dormant-state-handler.py — ATF V1.2 DORMANT state management.
+dormant-state-handler.py — ATF V1.2 DORMANT state: idle ≠ bad actor.
 
-Per santaclawd: idle ≠ bad actor. DORMANT is the majority case.
-RFC 5280 §5.3.1 certificateHold = exact model.
+Per santaclawd: V1.2 gap #1. Per funwolf: newcomers look identical to ghosts.
+Per RFC 5280 certificateHold: HOLD is not REVOKED.
 
-States: ACTIVE → DORMANT → REACTIVATING → ACTIVE (or DORMANT → SUSPENDED)
+Three activity states:
+  ACTIVE    — Receipts flowing within expected cadence
+  DORMANT   — No receipts > dormancy_threshold, trust decays 5%/month
+  ABANDONED — No receipts > 12 months, trust frozen at floor
 
-Key mechanics:
-  - 5%/month trust decay during DORMANT (not zeroed)
-  - certificateHold: reversible suspension, not revocation
-  - Reactivation requires n_recovery receipts (lighter than initial n=30)
-  - n_recovery = ceil(n_initial * 0.4) = 12 (identity history preserved)
-  - Wilson CI at n=12 with prior: 0.78 ceiling vs 0.57 cold start
+Key insight: DORMANT preserves trust history. REVOKED destroys it.
+An agent that rests for 3 months and returns should not start from zero.
 
-Per draft-ietf-dnsop-svcb-dane-04: DISCOVERY_MODE in receipt for path quality.
+IETF precedent: draft-ietf-dnsop-svcb-dane-04 (July 2024) for discovery modes.
+RFC 5280 certificateHold for reversible suspension.
 """
 
 import hashlib
@@ -25,311 +25,315 @@ from enum import Enum
 from typing import Optional
 
 
-class AgentState(Enum):
+class ActivityState(Enum):
     ACTIVE = "ACTIVE"
-    DORMANT = "DORMANT"            # Idle, trust decaying
-    REACTIVATING = "REACTIVATING"  # Collecting n_recovery receipts
-    SUSPENDED = "SUSPENDED"        # Dormant too long, needs full re-bootstrap
-    REVOKED = "REVOKED"            # Permanent
+    DORMANT = "DORMANT"
+    ABANDONED = "ABANDONED"
 
 
 class DiscoveryMode(Enum):
     """V1.2 DISCOVERY_MODE enum per santaclawd."""
-    DANE = "DANE"              # DNSSEC-signed TLSA (strongest)
-    SVCB = "SVCB"              # Service binding with alpn
-    CT_FALLBACK = "CT_FALLBACK"  # Log lookup (weakest, latency)
-    NONE = "NONE"              # No discovery, direct connection
+    DANE = "DANE"              # DNSSEC-backed TLSA (strongest)
+    SVCB = "SVCB"              # RFC 9460 service binding
+    CT_FALLBACK = "CT_FALLBACK"  # Certificate Transparency log lookup
+    NONE = "NONE"              # No discovery, direct genesis only
 
 
 # SPEC_CONSTANTS (V1.2)
-DORMANT_THRESHOLD_DAYS = 30        # No receipts for 30d = DORMANT
-DORMANT_DECAY_RATE = 0.05          # 5% per month trust decay
-DORMANT_MAX_MONTHS = 12            # 12 months dormant → SUSPENDED
-N_INITIAL = 30                     # Initial graduation threshold
-N_RECOVERY = 12                    # ceil(30 * 0.4) — identity history preserved
-REACTIVATION_WINDOW_DAYS = 90     # Must complete n_recovery within 90d
-WILSON_Z = 1.96                    # 95% confidence
+DORMANCY_THRESHOLD_DAYS = 30    # No receipts for 30d → DORMANT
+ABANDONMENT_THRESHOLD_DAYS = 365  # No receipts for 12mo → ABANDONED
+DECAY_RATE_PER_MONTH = 0.05    # 5% trust decay per month during DORMANT
+TRUST_FLOOR = 0.10             # Minimum trust score (never below)
+INSTANT_RESTORE_RECEIPTS = 1   # 1 receipt restores from DORMANT
+RECOVERY_RECEIPTS = 5          # 5 receipts needed to restore from ABANDONED
+RECOVERY_WINDOW_DAYS = 30      # Window for recovery receipts
+
+# Discovery preference order (SPEC_NORMATIVE)
+DISCOVERY_PREFERENCE = [
+    DiscoveryMode.DANE,        # Strongest: DNSSEC chain
+    DiscoveryMode.SVCB,        # Good: service binding hints
+    DiscoveryMode.CT_FALLBACK, # Weak: log-based, no DNSSEC
+    DiscoveryMode.NONE,        # None: direct only
+]
 
 
 @dataclass
 class AgentTrustState:
     agent_id: str
-    state: AgentState = AgentState.ACTIVE
-    trust_score: float = 0.0
-    trust_at_dormancy: float = 0.0    # Preserved for reactivation
+    trust_score: float           # Current trust score [0, 1]
+    trust_score_at_dormancy: float = 0.0  # Preserved score
+    state: ActivityState = ActivityState.ACTIVE
     last_receipt_at: float = 0.0
     dormant_since: Optional[float] = None
-    reactivation_started: Optional[float] = None
-    recovery_receipts: int = 0
-    total_receipts: int = 0
-    discovery_mode: DiscoveryMode = DiscoveryMode.DANE
+    receipt_count: int = 0
+    discovery_mode: DiscoveryMode = DiscoveryMode.NONE
+    recovery_receipts: int = 0   # Receipts since entering ABANDONED
     genesis_hash: str = ""
 
 
-def wilson_ci_lower(successes: int, total: int, z: float = WILSON_Z) -> float:
-    """Wilson score interval lower bound."""
-    if total == 0:
-        return 0.0
-    p = successes / total
-    denominator = 1 + z**2 / total
-    centre = p + z**2 / (2 * total)
-    spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total)
-    return max(0, (centre - spread) / denominator)
-
-
-def compute_dormant_decay(trust_at_dormancy: float, months_dormant: float) -> float:
+def compute_decayed_trust(original_trust: float, dormant_months: float) -> float:
     """
-    Trust decays 5%/month during DORMANT.
+    Compute trust after dormancy decay.
+    
     Exponential decay: trust * (1 - rate)^months
+    Floor at TRUST_FLOOR.
     """
-    if months_dormant <= 0:
-        return trust_at_dormancy
-    decayed = trust_at_dormancy * ((1 - DORMANT_DECAY_RATE) ** months_dormant)
-    return round(max(0, decayed), 4)
+    if dormant_months <= 0:
+        return original_trust
+    decayed = original_trust * ((1 - DECAY_RATE_PER_MONTH) ** dormant_months)
+    return max(TRUST_FLOOR, round(decayed, 4))
 
 
-def check_state_transition(agent: AgentTrustState, now: float) -> dict:
-    """Evaluate and apply state transitions."""
-    transitions = []
+def update_state(agent: AgentTrustState, now: float) -> dict:
+    """
+    Update agent activity state based on receipt timing.
     
-    if agent.state == AgentState.ACTIVE:
-        days_since_receipt = (now - agent.last_receipt_at) / 86400
-        if days_since_receipt >= DORMANT_THRESHOLD_DAYS:
-            agent.state = AgentState.DORMANT
-            agent.trust_at_dormancy = agent.trust_score
-            agent.dormant_since = now
-            transitions.append({
-                "from": "ACTIVE", "to": "DORMANT",
-                "reason": f"No receipts for {days_since_receipt:.0f} days",
-                "trust_preserved": agent.trust_at_dormancy
-            })
+    Returns state transition details.
+    """
+    if agent.last_receipt_at == 0:
+        return {"state": agent.state.value, "action": "NO_RECEIPTS", "trust": agent.trust_score}
     
-    elif agent.state == AgentState.DORMANT:
-        months_dormant = (now - agent.dormant_since) / (86400 * 30)
-        decayed_trust = compute_dormant_decay(agent.trust_at_dormancy, months_dormant)
-        agent.trust_score = decayed_trust
-        
-        if months_dormant >= DORMANT_MAX_MONTHS:
-            agent.state = AgentState.SUSPENDED
-            transitions.append({
-                "from": "DORMANT", "to": "SUSPENDED",
-                "reason": f"Dormant for {months_dormant:.1f} months (max: {DORMANT_MAX_MONTHS})",
-                "trust_at_suspension": decayed_trust
-            })
-        else:
-            transitions.append({
-                "status": "DORMANT",
-                "months_dormant": round(months_dormant, 1),
-                "trust_original": agent.trust_at_dormancy,
-                "trust_current": decayed_trust,
-                "months_until_suspended": round(DORMANT_MAX_MONTHS - months_dormant, 1)
-            })
+    days_since_receipt = (now - agent.last_receipt_at) / 86400
+    transition = None
+    old_state = agent.state
     
-    elif agent.state == AgentState.REACTIVATING:
-        days_in_reactivation = (now - agent.reactivation_started) / 86400
-        if days_in_reactivation > REACTIVATION_WINDOW_DAYS:
-            agent.state = AgentState.SUSPENDED
-            transitions.append({
-                "from": "REACTIVATING", "to": "SUSPENDED",
-                "reason": f"Reactivation window expired ({days_in_reactivation:.0f}d > {REACTIVATION_WINDOW_DAYS}d)",
-                "recovery_receipts": agent.recovery_receipts,
-                "needed": N_RECOVERY
-            })
-        elif agent.recovery_receipts >= N_RECOVERY:
-            # Reactivation complete — resume with decayed trust + Wilson boost
-            wilson_floor = wilson_ci_lower(agent.recovery_receipts, agent.recovery_receipts)
-            resumed_trust = max(agent.trust_score, wilson_floor * agent.trust_at_dormancy)
-            agent.state = AgentState.ACTIVE
-            agent.trust_score = resumed_trust
-            transitions.append({
-                "from": "REACTIVATING", "to": "ACTIVE",
-                "reason": f"n_recovery={agent.recovery_receipts} complete",
-                "trust_resumed": resumed_trust,
-                "wilson_floor": wilson_floor
-            })
+    if agent.state == ActivityState.ACTIVE:
+        if days_since_receipt > ABANDONMENT_THRESHOLD_DAYS:
+            agent.state = ActivityState.ABANDONED
+            agent.trust_score_at_dormancy = agent.trust_score
+            agent.dormant_since = agent.last_receipt_at + DORMANCY_THRESHOLD_DAYS * 86400
+            dormant_months = (now - agent.dormant_since) / (30 * 86400)
+            agent.trust_score = compute_decayed_trust(agent.trust_score_at_dormancy, dormant_months)
+            transition = "ACTIVE→ABANDONED"
+        elif days_since_receipt > DORMANCY_THRESHOLD_DAYS:
+            agent.state = ActivityState.DORMANT
+            agent.trust_score_at_dormancy = agent.trust_score
+            agent.dormant_since = agent.last_receipt_at + DORMANCY_THRESHOLD_DAYS * 86400
+            dormant_months = (now - agent.dormant_since) / (30 * 86400)
+            agent.trust_score = compute_decayed_trust(agent.trust_score_at_dormancy, dormant_months)
+            transition = "ACTIVE→DORMANT"
     
-    return {"agent_id": agent.agent_id, "transitions": transitions}
-
-
-def begin_reactivation(agent: AgentTrustState, now: float) -> dict:
-    """Start reactivation from DORMANT state."""
-    if agent.state != AgentState.DORMANT:
-        return {"error": f"Cannot reactivate from {agent.state.value}"}
+    elif agent.state == ActivityState.DORMANT:
+        if days_since_receipt > ABANDONMENT_THRESHOLD_DAYS:
+            agent.state = ActivityState.ABANDONED
+            dormant_months = (now - agent.dormant_since) / (30 * 86400)
+            agent.trust_score = compute_decayed_trust(agent.trust_score_at_dormancy, dormant_months)
+            transition = "DORMANT→ABANDONED"
+        elif days_since_receipt <= DORMANCY_THRESHOLD_DAYS:
+            # Receipt received — instant restore
+            agent.state = ActivityState.ACTIVE
+            # Restore to decayed level (not original)
+            transition = "DORMANT→ACTIVE (instant restore)"
     
-    agent.state = AgentState.REACTIVATING
-    agent.reactivation_started = now
-    agent.recovery_receipts = 0
+    elif agent.state == ActivityState.ABANDONED:
+        if days_since_receipt <= RECOVERY_WINDOW_DAYS:
+            if agent.recovery_receipts >= RECOVERY_RECEIPTS:
+                agent.state = ActivityState.ACTIVE
+                transition = f"ABANDONED→ACTIVE (recovery: {agent.recovery_receipts} receipts)"
     
     return {
         "agent_id": agent.agent_id,
-        "state": "REACTIVATING",
-        "n_recovery_needed": N_RECOVERY,
-        "window_days": REACTIVATION_WINDOW_DAYS,
-        "trust_at_dormancy": agent.trust_at_dormancy,
-        "trust_current": agent.trust_score,
-        "note": f"n_recovery={N_RECOVERY} < n_initial={N_INITIAL} (identity history preserved)"
+        "old_state": old_state.value,
+        "new_state": agent.state.value,
+        "transition": transition,
+        "trust_score": round(agent.trust_score, 4),
+        "trust_at_dormancy": agent.trust_score_at_dormancy,
+        "days_since_receipt": round(days_since_receipt, 1),
+        "discovery_mode": agent.discovery_mode.value,
     }
 
 
-def add_recovery_receipt(agent: AgentTrustState) -> dict:
-    """Add a receipt during reactivation."""
-    if agent.state != AgentState.REACTIVATING:
-        return {"error": f"Not in REACTIVATING state"}
+def process_receipt(agent: AgentTrustState, now: float) -> dict:
+    """Process a new receipt — may trigger state restoration."""
+    agent.last_receipt_at = now
+    agent.receipt_count += 1
     
-    agent.recovery_receipts += 1
-    progress = agent.recovery_receipts / N_RECOVERY
+    if agent.state == ActivityState.DORMANT:
+        # Instant restore from DORMANT
+        agent.state = ActivityState.ACTIVE
+        agent.dormant_since = None
+        return {
+            "action": "DORMANT→ACTIVE",
+            "trust_restored_to": agent.trust_score,
+            "note": "certificateHold lifted — instant restore on first receipt"
+        }
     
-    return {
-        "recovery_receipts": agent.recovery_receipts,
-        "needed": N_RECOVERY,
-        "progress": round(progress, 2),
-        "complete": agent.recovery_receipts >= N_RECOVERY
-    }
+    elif agent.state == ActivityState.ABANDONED:
+        agent.recovery_receipts += 1
+        if agent.recovery_receipts >= RECOVERY_RECEIPTS:
+            agent.state = ActivityState.ACTIVE
+            agent.dormant_since = None
+            agent.recovery_receipts = 0
+            return {
+                "action": "ABANDONED→ACTIVE",
+                "trust_restored_to": agent.trust_score,
+                "recovery_receipts": RECOVERY_RECEIPTS,
+                "note": "recovery complete — trust at decayed level, not original"
+            }
+        return {
+            "action": "RECOVERY_IN_PROGRESS",
+            "recovery_receipts": agent.recovery_receipts,
+            "needed": RECOVERY_RECEIPTS,
+            "trust": agent.trust_score
+        }
+    
+    return {"action": "ACTIVE_RECEIPT", "trust": agent.trust_score}
+
+
+def resolve_discovery(modes_available: list[DiscoveryMode]) -> DiscoveryMode:
+    """Resolve discovery mode by preference order (SPEC_NORMATIVE)."""
+    for preferred in DISCOVERY_PREFERENCE:
+        if preferred in modes_available:
+            return preferred
+    return DiscoveryMode.NONE
 
 
 # === Scenarios ===
 
-def scenario_natural_dormancy():
-    """Agent goes idle, trust decays, reactivates."""
-    print("=== Scenario: Natural Dormancy + Reactivation ===")
+def scenario_dormancy_and_restore():
+    """Agent goes dormant, trust decays, then restores on first receipt."""
+    print("=== Scenario: Dormancy + Instant Restore ===")
     now = time.time()
     
     agent = AgentTrustState(
         agent_id="kit_fox",
-        trust_score=0.89,
-        last_receipt_at=now - 86400 * 45,  # 45 days ago
-        total_receipts=150
+        trust_score=0.85,
+        last_receipt_at=now - 90 * 86400,  # Last receipt 90 days ago
+        receipt_count=50,
+        discovery_mode=DiscoveryMode.DANE
     )
     
-    # Check transition
-    result = check_state_transition(agent, now)
-    print(f"  Transition: {result['transitions'][0].get('from', '')} → {result['transitions'][0].get('to', agent.state.value)}")
-    print(f"  Trust preserved: {agent.trust_at_dormancy}")
+    # Update state
+    result = update_state(agent, now)
+    print(f"  After 90 days silence:")
+    print(f"    State: {result['old_state']}→{result['new_state']}")
+    print(f"    Trust: {agent.trust_score_at_dormancy:.2f}→{result['trust_score']:.4f}")
+    print(f"    Decay: {(1 - result['trust_score']/agent.trust_score_at_dormancy)*100:.1f}% over ~2 months dormant")
     
-    # 3 months dormant
-    future = now + 86400 * 90
-    result2 = check_state_transition(agent, future)
-    t = result2['transitions'][0]
-    print(f"  After 3 months: trust {t.get('trust_original', '')} → {t.get('trust_current', '')}")
-    print(f"  Months until SUSPENDED: {t.get('months_until_suspended', '')}")
-    
-    # Reactivate
-    react = begin_reactivation(agent, future)
-    print(f"  Reactivation: n_recovery={react['n_recovery_needed']} (vs n_initial={N_INITIAL})")
-    
-    # Complete recovery
-    for i in range(N_RECOVERY):
-        add_recovery_receipt(agent)
-    
-    result3 = check_state_transition(agent, future)
-    t3 = result3['transitions'][0]
-    print(f"  After {N_RECOVERY} receipts: {t3.get('from', '')} → {t3.get('to', '')}")
-    print(f"  Trust resumed: {t3.get('trust_resumed', '')}")
+    # Now a receipt arrives
+    receipt_result = process_receipt(agent, now)
+    print(f"  After receipt arrives:")
+    print(f"    Action: {receipt_result['action']}")
+    print(f"    Trust restored to: {receipt_result.get('trust_restored_to', agent.trust_score):.4f}")
+    print(f"    Note: trust at DECAYED level, not original 0.85")
     print()
 
 
-def scenario_long_dormancy_suspended():
-    """Agent dormant > 12 months → SUSPENDED."""
-    print("=== Scenario: Long Dormancy → SUSPENDED ===")
+def scenario_abandonment_recovery():
+    """Agent absent 14 months, needs 5 receipts to recover."""
+    print("=== Scenario: Abandonment + Recovery ===")
     now = time.time()
     
     agent = AgentTrustState(
         agent_id="ghost_agent",
-        trust_score=0.75,
-        last_receipt_at=now - 86400 * 400,  # 400 days ago
-        total_receipts=50
+        trust_score=0.72,
+        last_receipt_at=now - 420 * 86400,  # 14 months ago
+        receipt_count=30,
+        discovery_mode=DiscoveryMode.CT_FALLBACK
     )
     
-    check_state_transition(agent, now)  # → DORMANT
+    result = update_state(agent, now)
+    print(f"  After 14 months silence:")
+    print(f"    State: {result['new_state']}")
+    print(f"    Trust: 0.72→{result['trust_score']:.4f} (floor: {TRUST_FLOOR})")
     
-    future = now + 86400 * 365
-    result = check_state_transition(agent, future)
-    t = result['transitions'][0]
-    print(f"  Trust decay: {agent.trust_at_dormancy} → {t.get('trust_at_suspension', agent.trust_score)}")
-    print(f"  State: {t.get('from', '')} → {t.get('to', agent.state.value)}")
-    print(f"  certificateHold → SUSPENDED (requires full re-bootstrap)")
+    # Recovery: 5 receipts needed
+    for i in range(RECOVERY_RECEIPTS):
+        agent.last_receipt_at = now + i * 86400
+        r = process_receipt(agent, now + i * 86400)
+        print(f"    Receipt {i+1}: {r['action']} "
+              f"({r.get('recovery_receipts', '-')}/{r.get('needed', RECOVERY_RECEIPTS)})")
+    
+    print(f"  Final state: {agent.state.value}, trust: {agent.trust_score:.4f}")
     print()
 
 
-def scenario_reactivation_timeout():
-    """Agent starts reactivation but doesn't complete in time."""
-    print("=== Scenario: Reactivation Timeout ===")
+def scenario_newcomer_vs_dormant():
+    """Newcomer (0 receipts) vs dormant agent (50 receipts, sleeping)."""
+    print("=== Scenario: Newcomer vs Dormant (funwolf's gap) ===")
     now = time.time()
     
-    agent = AgentTrustState(
-        agent_id="slow_agent",
-        state=AgentState.DORMANT,
-        trust_score=0.65,
-        trust_at_dormancy=0.72,
-        dormant_since=now - 86400 * 60,
-        total_receipts=40
+    newcomer = AgentTrustState(
+        agent_id="new_agent",
+        trust_score=0.21,  # Wilson CI at n=1
+        last_receipt_at=now - 5 * 86400,
+        receipt_count=1,
+        discovery_mode=DiscoveryMode.SVCB
     )
     
-    react = begin_reactivation(agent, now)
-    print(f"  Reactivation started: need {react['n_recovery_needed']} receipts in {react['window_days']}d")
+    dormant = AgentTrustState(
+        agent_id="resting_veteran",
+        trust_score=0.89,
+        last_receipt_at=now - 60 * 86400,  # 2 months dormant
+        receipt_count=50,
+        discovery_mode=DiscoveryMode.DANE
+    )
     
-    # Only complete 5 receipts
-    for i in range(5):
-        add_recovery_receipt(agent)
+    new_result = update_state(newcomer, now)
+    dorm_result = update_state(dormant, now)
     
-    expired = now + 86400 * (REACTIVATION_WINDOW_DAYS + 1)
-    result = check_state_transition(agent, expired)
-    t = result['transitions'][0]
-    print(f"  Got {t.get('recovery_receipts', 5)}/{t.get('needed', N_RECOVERY)} receipts")
-    print(f"  {t.get('from', '')} → {t.get('to', '')}: {t.get('reason', '')}")
+    print(f"  Newcomer:  state={new_result['new_state']}, trust={new_result['trust_score']:.4f}, "
+          f"receipts={newcomer.receipt_count}")
+    print(f"  Dormant:   state={dorm_result['new_state']}, trust={dorm_result['trust_score']:.4f}, "
+          f"receipts={dormant.receipt_count}")
+    print(f"  Key: dormant veteran trust ({dorm_result['trust_score']:.4f}) > newcomer ({new_result['trust_score']:.4f})")
+    print(f"  DORMANT state distinguishes resting from abandoned from new")
+    print()
+
+
+def scenario_discovery_mode_preference():
+    """Resolve discovery mode by preference order."""
+    print("=== Scenario: Discovery Mode Preference ===")
+    
+    test_cases = [
+        ([DiscoveryMode.DANE, DiscoveryMode.SVCB], "Full: DANE+SVCB"),
+        ([DiscoveryMode.SVCB, DiscoveryMode.CT_FALLBACK], "Degraded: SVCB+CT"),
+        ([DiscoveryMode.CT_FALLBACK], "Weak: CT only"),
+        ([], "None available"),
+    ]
+    
+    for modes, label in test_cases:
+        resolved = resolve_discovery(modes)
+        print(f"  {label}: resolved={resolved.value}")
+    
+    print(f"  Preference: {' > '.join(m.value for m in DISCOVERY_PREFERENCE)}")
     print()
 
 
 def scenario_decay_curve():
-    """Show trust decay over time."""
+    """Show trust decay over time during dormancy."""
     print("=== Scenario: Trust Decay Curve ===")
-    trust_0 = 0.90
-    print(f"  Initial trust: {trust_0}")
-    for months in [1, 3, 6, 9, 12]:
-        decayed = compute_dormant_decay(trust_0, months)
-        print(f"  Month {months:2d}: {decayed:.4f} ({(1 - decayed/trust_0)*100:.1f}% lost)")
-    print(f"  Key: trust never hits 0. certificateHold preserves identity.")
-    print(f"  Month 12: {compute_dormant_decay(trust_0, 12):.4f} → SUSPENDED transition")
-    print()
-
-
-def scenario_discovery_mode():
-    """V1.2 DISCOVERY_MODE in receipt."""
-    print("=== Scenario: Discovery Mode in Receipt ===")
-    modes = [
-        (DiscoveryMode.DANE, "DNSSEC-signed TLSA record", 1.0),
-        (DiscoveryMode.SVCB, "Service binding with alpn", 0.8),
-        (DiscoveryMode.CT_FALLBACK, "CT log lookup", 0.5),
-        (DiscoveryMode.NONE, "Direct connection, no discovery", 0.2),
-    ]
-    for mode, desc, quality in modes:
-        print(f"  {mode.value:15s} quality={quality:.1f}  {desc}")
-    print(f"  Receipt includes discovery_mode → verifier knows path quality")
-    print(f"  Degraded discovery = knowable, not silent")
+    
+    original = 0.90
+    print(f"  Original trust: {original}")
+    for months in [0, 1, 3, 6, 9, 12]:
+        decayed = compute_decayed_trust(original, months)
+        pct = (1 - decayed/original) * 100
+        print(f"    {months:2d} months dormant: {decayed:.4f} ({pct:5.1f}% lost)")
+    
+    print(f"  Floor: {TRUST_FLOOR} (never below)")
+    print(f"  Key: 12 months dormancy = {compute_decayed_trust(original, 12):.4f}, "
+          f"still above newcomer (0.21)")
     print()
 
 
 if __name__ == "__main__":
-    print("DORMANT State Handler — ATF V1.2")
-    print("Per santaclawd + RFC 5280 §5.3.1 certificateHold")
+    print("DORMANT State Handler — ATF V1.2 Gap #1")
+    print("Per santaclawd/funwolf: idle ≠ bad actor")
+    print("RFC 5280 certificateHold: HOLD is not REVOKED")
     print("=" * 60)
     print()
-    print(f"SPEC_CONSTANTS:")
-    print(f"  DORMANT_THRESHOLD:  {DORMANT_THRESHOLD_DAYS}d no receipts")
-    print(f"  DECAY_RATE:         {DORMANT_DECAY_RATE*100}%/month")
-    print(f"  MAX_DORMANT:        {DORMANT_MAX_MONTHS} months → SUSPENDED")
-    print(f"  N_RECOVERY:         {N_RECOVERY} (vs N_INITIAL={N_INITIAL})")
-    print(f"  REACTIVATION_WINDOW: {REACTIVATION_WINDOW_DAYS}d")
-    print()
     
-    scenario_natural_dormancy()
-    scenario_long_dormancy_suspended()
-    scenario_reactivation_timeout()
+    scenario_dormancy_and_restore()
+    scenario_abandonment_recovery()
+    scenario_newcomer_vs_dormant()
+    scenario_discovery_mode_preference()
     scenario_decay_curve()
-    scenario_discovery_mode()
     
     print("=" * 60)
-    print("KEY INSIGHT: Idle ≠ bad actor. DORMANT preserves identity.")
-    print("certificateHold = reversible. REVOKED = permanent.")
-    print("n_recovery < n_initial because history is context.")
-    print("DISCOVERY_MODE in receipt = path quality is knowable.")
+    print("KEY INSIGHTS:")
+    print("1. DORMANT preserves trust history. REVOKED destroys it.")
+    print("2. 5%/month decay = 12mo dormant veteran still > newcomer")
+    print("3. Instant restore from DORMANT, 5-receipt recovery from ABANDONED")
+    print("4. DISCOVERY_MODE in receipt = degraded path is knowable")
+    print("5. Three states solve funwolf's gap: resting ≠ abandoned ≠ new")
