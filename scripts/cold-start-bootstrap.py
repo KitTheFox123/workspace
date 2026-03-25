@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-cold-start-bootstrap.py — ATF cold-start trust bootstrapping strategies.
+cold-start-bootstrap.py — ATF cold-start trust bootstrapping.
 
-Per santaclawd: "no spec fully solves cold start. spec handles verification (math).
-cannot manufacture receipts."
+Per santaclawd: "spec handles verification (math). cannot manufacture receipts."
+Per Duncan (Brit J Psych 2025): trust learning follows Bayesian updating.
+Per Nature (Sci Rep 2025): passive nodes are load-bearing for network stability.
 
-Per Castagna Lunardi (Frontiers Blockchain, Dec 2025): socio-technical DID
-architecture requires BOTH technical verification AND social trust accumulation.
+Cold start states:
+  UNKNOWN      — No receipts, no identity verification
+  PROVISIONAL  — Verified identity, <N receipts (Wilson CI ceiling applies)
+  EMERGING     — N+ receipts but <K counterparty classes
+  TRUSTED      — K+ counterparty classes, Wilson CI above threshold
 
-Four bootstrap strategies compared:
-  OPERATOR_SEEDED  — X.509 root embed model. Designated stewards at genesis.
-  VOUCHED          — Existing trusted agent co-signs. PGP web of trust.
-  SMTP_REACHABLE   — Domain liveness check. Non-circular external ground truth.
-  SELF_SIGNED      — PROVISIONAL only. Sybil-identical until receipts accumulate.
-
-Key insight: Wilson CI at n=5 caps trust at 0.57. This IS the anti-sybil mechanism.
-No shortcut exists. Patience is a feature, not a bug.
+Key constraint: TRUSTED requires diversity, not volume.
+1 agent x 1000 interactions = n=1 (counterparty diversity)
+10 agents x 100 interactions = n=10
 """
 
 import hashlib
@@ -26,280 +25,286 @@ from enum import Enum
 from typing import Optional
 
 
-class BootstrapMethod(Enum):
-    OPERATOR_SEEDED = "OPERATOR_SEEDED"    # Root CA embed
-    VOUCHED = "VOUCHED"                     # PGP-style co-sign
-    SMTP_REACHABLE = "SMTP_REACHABLE"      # Domain liveness
-    SELF_SIGNED = "SELF_SIGNED"            # Provisional
-
-
 class TrustPhase(Enum):
-    PROVISIONAL = "PROVISIONAL"     # n < 5, ceiling 0.57
-    EMERGING = "EMERGING"           # 5 <= n < 20, ceiling ~0.80
-    ESTABLISHED = "ESTABLISHED"     # 20 <= n < 50, ceiling ~0.93
-    TRUSTED = "TRUSTED"             # n >= 50, ceiling ~0.97
+    UNKNOWN = "UNKNOWN"
+    PROVISIONAL = "PROVISIONAL"
+    EMERGING = "EMERGING"
+    TRUSTED = "TRUSTED"
 
 
 # SPEC_CONSTANTS
-WILSON_Z = 1.96         # 95% confidence
-MIN_DIVERSE_COUNTERPARTIES = 2   # Minimum distinct operators
-SINGLE_SOURCE_CAP = 0.60        # Max trust from single counterparty class
-RECENCY_HALFLIFE_DAYS = 30      # Receipt value decays
-BOOTSTRAP_TIMEOUT_HOURS = 72    # Max time in pure PROVISIONAL
-SYBIL_DETECTION_THRESHOLD = 3   # Max receipts from same operator before cap
+MIN_RECEIPTS_FOR_EMERGING = 5
+MIN_COUNTERPARTY_CLASSES = 2    # Diverse sources required for TRUSTED
+MIN_RECEIPTS_FOR_TRUSTED = 20   # Wilson CI stabilizes around n=20
+WILSON_Z = 1.96                 # 95% confidence
+TRUST_THRESHOLD = 0.70          # Wilson CI lower bound for TRUSTED
+COLD_START_DECAY_DAYS = 90      # Receipts older than this get half weight
+MAX_SINGLE_SOURCE_WEIGHT = 0.40 # No single counterparty > 40% of trust
 
 
 @dataclass
 class Receipt:
+    receipt_id: str
     counterparty_id: str
-    operator: str
-    grade: str  # A-F
+    counterparty_operator: str  # Operator behind counterparty
+    outcome: str  # CONFIRMED, FAILED, DISPUTED
+    grade: str    # A-F
     timestamp: float
-    verified: bool = True
 
 
 @dataclass
-class AgentBootstrap:
+class AgentTrustProfile:
     agent_id: str
-    method: BootstrapMethod
-    genesis_timestamp: float
     receipts: list[Receipt] = field(default_factory=list)
-    operator_id: Optional[str] = None
-    voucher_id: Optional[str] = None
-    smtp_domain: Optional[str] = None
+    identity_verified: bool = False
+    genesis_hash: Optional[str] = None
 
 
-def wilson_ci_lower(successes: int, total: int, z: float = WILSON_Z) -> float:
+def wilson_ci_lower(positive: int, total: int, z: float = WILSON_Z) -> float:
     """Wilson score interval lower bound."""
     if total == 0:
         return 0.0
-    p = successes / total
+    p = positive / total
     denominator = 1 + z**2 / total
     centre = p + z**2 / (2 * total)
     spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total)
     return max(0, (centre - spread) / denominator)
 
 
-def wilson_ci_upper(successes: int, total: int, z: float = WILSON_Z) -> float:
-    """Wilson score interval upper bound."""
-    if total == 0:
-        return 0.0
-    p = successes / total
-    denominator = 1 + z**2 / total
-    centre = p + z**2 / (2 * total)
-    spread = z * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total)
-    return min(1, (centre + spread) / denominator)
-
-
-def grade_to_success(grade: str) -> float:
-    """Convert grade to success probability."""
-    return {"A": 1.0, "B": 0.8, "C": 0.6, "D": 0.3, "F": 0.0}.get(grade, 0.0)
-
-
-def compute_trust(agent: AgentBootstrap) -> dict:
-    """Compute trust score with cold-start constraints."""
-    now = time.time()
+def compute_counterparty_diversity(receipts: list[Receipt]) -> dict:
+    """Compute counterparty diversity metrics."""
+    if not receipts:
+        return {"classes": 0, "simpson": 0, "max_concentration": 1.0, "operators": set()}
     
-    if not agent.receipts:
-        return {
-            "trust_score": 0.0,
-            "wilson_lower": 0.0,
-            "wilson_upper": 0.0,
-            "phase": TrustPhase.PROVISIONAL.value,
-            "n": 0,
-            "diverse_counterparties": 0,
-            "bootstrap_method": agent.method.value,
-            "constraints": ["NO_RECEIPTS"]
-        }
+    # Count by counterparty
+    cp_counts = {}
+    op_set = set()
+    for r in receipts:
+        cp_counts[r.counterparty_id] = cp_counts.get(r.counterparty_id, 0) + 1
+        op_set.add(r.counterparty_operator)
     
-    # Apply recency weighting
-    weighted_successes = 0
-    weighted_total = 0
-    operators = set()
-    counterparties = set()
-    constraints = []
+    total = sum(cp_counts.values())
     
-    for r in agent.receipts:
-        age_days = (now - r.timestamp) / 86400
-        weight = 0.5 ** (age_days / RECENCY_HALFLIFE_DAYS)  # Exponential decay
-        success = grade_to_success(r.grade)
-        weighted_successes += success * weight
-        weighted_total += weight
-        operators.add(r.operator)
-        counterparties.add(r.counterparty_id)
+    # Simpson diversity: 1 - sum(p_i^2)
+    simpson = 1.0 - sum((c/total)**2 for c in cp_counts.values())
     
-    n = len(agent.receipts)
-    diverse = len(operators)
+    # Max concentration
+    max_conc = max(cp_counts.values()) / total
     
-    # Wilson CI on raw counts
-    raw_successes = sum(1 for r in agent.receipts if r.grade in ("A", "B"))
-    lower = wilson_ci_lower(raw_successes, n)
-    upper = wilson_ci_upper(raw_successes, n)
-    
-    # Base trust from weighted average
-    base_trust = weighted_successes / weighted_total if weighted_total > 0 else 0
-    
-    # Apply constraints
-    
-    # 1. Single-source cap
-    operator_counts = {}
-    for r in agent.receipts:
-        operator_counts[r.operator] = operator_counts.get(r.operator, 0) + 1
-    max_from_single = max(operator_counts.values()) / n if n > 0 else 0
-    if max_from_single > 0.7:
-        base_trust = min(base_trust, SINGLE_SOURCE_CAP)
-        constraints.append(f"SINGLE_SOURCE_CAP({max_from_single:.0%}_from_one_operator)")
-    
-    # 2. Diversity requirement
-    if diverse < MIN_DIVERSE_COUNTERPARTIES:
-        base_trust = min(base_trust, 0.50)
-        constraints.append(f"DIVERSITY_FLOOR(need_{MIN_DIVERSE_COUNTERPARTIES}_operators,_have_{diverse})")
-    
-    # 3. Sybil detection — too many from same operator
-    for op, count in operator_counts.items():
-        if count > SYBIL_DETECTION_THRESHOLD and diverse == 1:
-            base_trust = min(base_trust, 0.40)
-            constraints.append(f"SYBIL_SUSPECT({op}:{count}_receipts)")
-    
-    # 4. Wilson ceiling based on n
-    wilson_ceiling = wilson_ci_upper(n, n)  # Best case: all positive
-    base_trust = min(base_trust, wilson_ceiling)
-    
-    # Determine phase
-    if n < 5:
-        phase = TrustPhase.PROVISIONAL
-    elif n < 20:
-        phase = TrustPhase.EMERGING
-    elif n < 50:
-        phase = TrustPhase.ESTABLISHED
-    else:
-        phase = TrustPhase.TRUSTED
-    
-    # Bootstrap method bonus (operator-seeded starts higher)
-    method_floor = {
-        BootstrapMethod.OPERATOR_SEEDED: 0.20,  # Starts with operator trust
-        BootstrapMethod.VOUCHED: 0.15,
-        BootstrapMethod.SMTP_REACHABLE: 0.10,
-        BootstrapMethod.SELF_SIGNED: 0.0
-    }[agent.method]
-    
-    final_trust = max(base_trust, method_floor)
+    # Counterparty classes = unique operators (not just IDs)
+    # Multiple agents from same operator = 1 class
+    op_counts = {}
+    for r in receipts:
+        op_counts[r.counterparty_operator] = op_counts.get(r.counterparty_operator, 0) + 1
     
     return {
-        "trust_score": round(final_trust, 4),
-        "wilson_lower": round(lower, 4),
-        "wilson_upper": round(upper, 4),
-        "wilson_ceiling": round(wilson_ceiling, 4),
-        "phase": phase.value,
-        "n": n,
-        "diverse_counterparties": diverse,
-        "unique_operators": len(operators),
-        "bootstrap_method": agent.method.value,
-        "recency_weighted_score": round(weighted_successes / weighted_total if weighted_total > 0 else 0, 4),
-        "constraints": constraints if constraints else ["NONE"]
+        "classes": len(op_counts),  # Unique operators
+        "unique_counterparties": len(cp_counts),
+        "simpson": round(simpson, 4),
+        "max_concentration": round(max_conc, 4),
+        "operators": op_set,
+        "operator_distribution": op_counts
     }
 
 
-def simulate_growth(agent: AgentBootstrap, receipts_per_day: int, 
-                    days: int, success_rate: float = 0.85,
-                    operators: int = 3) -> list[dict]:
-    """Simulate trust growth over time."""
-    snapshots = []
+def apply_recency_weighting(receipts: list[Receipt]) -> tuple[int, int]:
+    """Weight receipts by recency. Returns (weighted_positive, weighted_total)."""
     now = time.time()
+    positive = 0.0
+    total = 0.0
     
-    for day in range(days):
-        for j in range(receipts_per_day):
-            op = f"op_{(day * receipts_per_day + j) % operators}"
-            grade = "A" if (day * receipts_per_day + j) / (days * receipts_per_day) < success_rate else "C"
-            agent.receipts.append(Receipt(
-                counterparty_id=f"agent_{j % (operators * 2)}",
-                operator=op,
-                grade=grade,
-                timestamp=now - (days - day) * 86400 + j * 3600
-            ))
+    for r in receipts:
+        age_days = (now - r.timestamp) / 86400
+        weight = 0.5 if age_days > COLD_START_DECAY_DAYS else 1.0
         
-        if day % 5 == 0 or day == days - 1:
-            trust = compute_trust(agent)
-            snapshots.append({"day": day, **trust})
+        total += weight
+        if r.outcome == "CONFIRMED":
+            positive += weight
     
-    return snapshots
+    return round(positive), round(total)
+
+
+def classify_phase(profile: AgentTrustProfile) -> dict:
+    """Determine trust phase for an agent."""
+    if not profile.identity_verified:
+        return {
+            "phase": TrustPhase.UNKNOWN,
+            "reason": "Identity not verified",
+            "wilson_ci": 0.0,
+            "diversity": {},
+            "next_step": "Verify identity (genesis + operator)"
+        }
+    
+    receipts = profile.receipts
+    diversity = compute_counterparty_diversity(receipts)
+    pos, total = apply_recency_weighting(receipts)
+    wilson = wilson_ci_lower(pos, total)
+    
+    if total < MIN_RECEIPTS_FOR_EMERGING:
+        return {
+            "phase": TrustPhase.PROVISIONAL,
+            "reason": f"Only {total} receipts (need {MIN_RECEIPTS_FOR_EMERGING}+)",
+            "wilson_ci": round(wilson, 4),
+            "wilson_ceiling": round(wilson_ci_lower(total, total), 4),  # Best possible
+            "diversity": diversity,
+            "next_step": f"Accumulate {MIN_RECEIPTS_FOR_EMERGING - total} more receipts"
+        }
+    
+    if diversity["classes"] < MIN_COUNTERPARTY_CLASSES:
+        return {
+            "phase": TrustPhase.EMERGING,
+            "reason": f"Only {diversity['classes']} counterparty class(es) (need {MIN_COUNTERPARTY_CLASSES}+)",
+            "wilson_ci": round(wilson, 4),
+            "diversity": diversity,
+            "next_step": f"Engage {MIN_COUNTERPARTY_CLASSES - diversity['classes']} more operator(s)",
+            "pgp_warning": diversity["max_concentration"] > MAX_SINGLE_SOURCE_WEIGHT
+        }
+    
+    if total < MIN_RECEIPTS_FOR_TRUSTED or wilson < TRUST_THRESHOLD:
+        return {
+            "phase": TrustPhase.EMERGING,
+            "reason": f"Wilson CI {wilson:.4f} < {TRUST_THRESHOLD} or n={total} < {MIN_RECEIPTS_FOR_TRUSTED}",
+            "wilson_ci": round(wilson, 4),
+            "diversity": diversity,
+            "next_step": f"Accumulate more CONFIRMED receipts (need Wilson >= {TRUST_THRESHOLD})"
+        }
+    
+    # Check single-source concentration
+    single_source_warning = diversity["max_concentration"] > MAX_SINGLE_SOURCE_WEIGHT
+    
+    return {
+        "phase": TrustPhase.TRUSTED,
+        "reason": f"Wilson CI {wilson:.4f} >= {TRUST_THRESHOLD}, {diversity['classes']} classes",
+        "wilson_ci": round(wilson, 4),
+        "diversity": diversity,
+        "single_source_warning": single_source_warning,
+        "next_step": "Maintain diversity and receipt quality"
+    }
 
 
 # === Scenarios ===
 
-def scenario_operator_seeded():
-    """Operator-seeded bootstrap — fastest path."""
-    print("=== Scenario: OPERATOR_SEEDED (X.509 Root Embed) ===")
-    agent = AgentBootstrap("kit_fox", BootstrapMethod.OPERATOR_SEEDED, time.time(),
-                          operator_id="ilya_ops")
-    
-    snapshots = simulate_growth(agent, receipts_per_day=2, days=30, operators=4)
-    for s in snapshots:
-        print(f"  Day {s['day']:2d}: trust={s['trust_score']:.3f} phase={s['phase']:13s} "
-              f"n={s['n']:3d} wilson=[{s['wilson_lower']:.2f},{s['wilson_upper']:.2f}] "
-              f"ops={s['unique_operators']}")
+def scenario_brand_new_agent():
+    """Agent with zero history."""
+    print("=== Scenario: Brand New Agent ===")
+    profile = AgentTrustProfile(agent_id="new_agent", identity_verified=False)
+    result = classify_phase(profile)
+    print(f"  Phase: {result['phase'].value}")
+    print(f"  Reason: {result['reason']}")
+    print(f"  Next: {result['next_step']}")
     print()
 
 
-def scenario_self_signed_honest():
-    """Self-signed honest agent — slow but steady."""
-    print("=== Scenario: SELF_SIGNED (Honest, Diverse) ===")
-    agent = AgentBootstrap("new_honest", BootstrapMethod.SELF_SIGNED, time.time())
-    
-    snapshots = simulate_growth(agent, receipts_per_day=1, days=60, operators=5)
-    for s in snapshots:
-        print(f"  Day {s['day']:2d}: trust={s['trust_score']:.3f} phase={s['phase']:13s} "
-              f"n={s['n']:3d} ceil={s['wilson_ceiling']:.2f} constraints={s['constraints']}")
+def scenario_verified_but_cold():
+    """Verified identity, only 3 receipts."""
+    print("=== Scenario: Verified But Cold ===")
+    now = time.time()
+    profile = AgentTrustProfile(
+        agent_id="cold_agent", identity_verified=True, genesis_hash="abc123",
+        receipts=[
+            Receipt(f"r{i}", f"cp_{i}", f"op_{i}", "CONFIRMED", "B", now)
+            for i in range(3)
+        ]
+    )
+    result = classify_phase(profile)
+    print(f"  Phase: {result['phase'].value}")
+    print(f"  Wilson CI: {result['wilson_ci']} (ceiling: {result.get('wilson_ceiling', 'N/A')})")
+    print(f"  Reason: {result['reason']}")
+    print(f"  Next: {result['next_step']}")
     print()
 
 
-def scenario_sybil_attack():
-    """Sybil: many receipts from single operator."""
-    print("=== Scenario: SYBIL (Single Operator, Many Receipts) ===")
-    agent = AgentBootstrap("sybil_agent", BootstrapMethod.SELF_SIGNED, time.time())
-    
-    # All receipts from one operator
-    snapshots = simulate_growth(agent, receipts_per_day=5, days=20, operators=1)
-    for s in snapshots:
-        print(f"  Day {s['day']:2d}: trust={s['trust_score']:.3f} phase={s['phase']:13s} "
-              f"n={s['n']:3d} ops={s['unique_operators']} constraints={s['constraints']}")
+def scenario_single_source_trap():
+    """1000 receipts but all from one operator — PGP failure mode."""
+    print("=== Scenario: Single Source Trap (PGP Failure) ===")
+    now = time.time()
+    profile = AgentTrustProfile(
+        agent_id="monoculture_agent", identity_verified=True, genesis_hash="def456",
+        receipts=[
+            Receipt(f"r{i}", f"cp_{i%3}", "single_operator", "CONFIRMED", "A", now)
+            for i in range(100)
+        ]
+    )
+    result = classify_phase(profile)
+    print(f"  Phase: {result['phase'].value}")
+    print(f"  Wilson CI: {result['wilson_ci']}")
+    print(f"  Diversity: {result['diversity']['classes']} class(es), Simpson={result['diversity']['simpson']}")
+    print(f"  Max concentration: {result['diversity']['max_concentration']}")
+    print(f"  Reason: {result['reason']}")
+    print(f"  PGP warning: {result.get('pgp_warning', False)}")
     print()
 
 
-def scenario_vouched_then_earned():
-    """Vouched start, then earns own reputation."""
-    print("=== Scenario: VOUCHED (Co-signed, Then Earned) ===")
-    agent = AgentBootstrap("vouched_agent", BootstrapMethod.VOUCHED, time.time(),
-                          voucher_id="established_agent")
+def scenario_healthy_growth():
+    """Diverse counterparties, growing naturally."""
+    print("=== Scenario: Healthy Growth ===")
+    now = time.time()
+    receipts = []
+    for i in range(25):
+        receipts.append(Receipt(
+            f"r{i}", f"cp_{i%8}", f"op_{i%5}",
+            "CONFIRMED" if i % 7 != 0 else "FAILED",
+            "B" if i % 5 != 0 else "C",
+            now - 86400 * (25 - i)
+        ))
     
-    snapshots = simulate_growth(agent, receipts_per_day=2, days=30, operators=3)
-    for s in snapshots:
-        print(f"  Day {s['day']:2d}: trust={s['trust_score']:.3f} phase={s['phase']:13s} "
-              f"n={s['n']:3d} wilson=[{s['wilson_lower']:.2f},{s['wilson_upper']:.2f}]")
+    profile = AgentTrustProfile(
+        agent_id="healthy_agent", identity_verified=True, genesis_hash="ghi789",
+        receipts=receipts
+    )
+    result = classify_phase(profile)
+    print(f"  Phase: {result['phase'].value}")
+    print(f"  Wilson CI: {result['wilson_ci']}")
+    print(f"  Diversity: {result['diversity']['classes']} classes, Simpson={result['diversity']['simpson']}")
+    print(f"  Reason: {result['reason']}")
+    print(f"  Next: {result['next_step']}")
+    print()
+
+
+def scenario_stale_receipts():
+    """All receipts are old — recency decay applies."""
+    print("=== Scenario: Stale Receipts (Recency Decay) ===")
+    now = time.time()
+    old = now - 86400 * 120  # 120 days ago
+    receipts = [
+        Receipt(f"r{i}", f"cp_{i%5}", f"op_{i%3}", "CONFIRMED", "A", old)
+        for i in range(30)
+    ]
+    
+    profile = AgentTrustProfile(
+        agent_id="stale_agent", identity_verified=True, genesis_hash="jkl012",
+        receipts=receipts
+    )
+    result = classify_phase(profile)
+    pos, total = apply_recency_weighting(receipts)
+    print(f"  Phase: {result['phase'].value}")
+    print(f"  Raw receipts: {len(receipts)}, Weighted total: {total} (recency decay)")
+    print(f"  Wilson CI: {result['wilson_ci']}")
+    print(f"  Reason: {result['reason']}")
     print()
 
 
 if __name__ == "__main__":
-    print("Cold-Start Bootstrap — ATF Trust Bootstrapping Strategies")
-    print("Per santaclawd + Castagna Lunardi (Frontiers Blockchain, Dec 2025)")
+    print("Cold-Start Bootstrap — ATF Trust Phase Classification")
+    print("Per santaclawd + Duncan (Brit J Psych 2025) + Nature (Sci Rep 2025)")
     print("=" * 70)
     print()
-    print("Wilson CI ceilings (all-positive):")
-    for n in [1, 5, 10, 20, 30, 50, 100]:
-        ceil = wilson_ci_upper(n, n)
-        floor = wilson_ci_lower(n, n)
-        print(f"  n={n:3d}: ceiling={ceil:.3f}  floor={floor:.3f}")
+    print(f"SPEC_CONSTANTS:")
+    print(f"  MIN_RECEIPTS_EMERGING={MIN_RECEIPTS_FOR_EMERGING}")
+    print(f"  MIN_COUNTERPARTY_CLASSES={MIN_COUNTERPARTY_CLASSES}")
+    print(f"  MIN_RECEIPTS_TRUSTED={MIN_RECEIPTS_FOR_TRUSTED}")
+    print(f"  TRUST_THRESHOLD={TRUST_THRESHOLD}")
+    print(f"  MAX_SINGLE_SOURCE={MAX_SINGLE_SOURCE_WEIGHT}")
     print()
     
-    scenario_operator_seeded()
-    scenario_self_signed_honest()
-    scenario_sybil_attack()
-    scenario_vouched_then_earned()
+    scenario_brand_new_agent()
+    scenario_verified_but_cold()
+    scenario_single_source_trap()
+    scenario_healthy_growth()
+    scenario_stale_receipts()
     
     print("=" * 70)
-    print("KEY INSIGHTS:")
-    print("1. Wilson CI IS the anti-sybil mechanism. n=5 all-positive caps at 0.57.")
-    print("2. Operator diversity is load-bearing. Single-source capped at 0.60.")
-    print("3. OPERATOR_SEEDED starts fastest (0.20 floor) but still needs receipts.")
-    print("4. Sybils get caught: 100 receipts from 1 operator = capped at 0.40.")
-    print("5. Patience is a feature. No honest shortcut past Wilson CI.")
+    print("KEY INSIGHT: TRUSTED requires DIVERSITY not VOLUME.")
+    print("1000 receipts from 1 operator = EMERGING (PGP failure mode).")
+    print("20 receipts from 5 operators = TRUSTED.")
+    print("Cold start is honest: PROVISIONAL is the only truthful initial state.")
