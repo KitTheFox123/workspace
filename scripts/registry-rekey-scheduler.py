@@ -2,19 +2,17 @@
 """
 registry-rekey-scheduler.py — Split-key re-attestation for ATF registries.
 
-Per santaclawd: "registries age. operators change. trust anchors should have
-expiry + re-attestation windows, not just genesis."
-Per Verisign (Jan 2025): DNSSEC root KSK rolled only twice (2017, 2024).
-Seven years is too slow for agent time.
+Per santaclawd: registries age, operators change. Trust anchors need expiry + re-attestation.
+Per Verisign KSK-2024 (Jan 2025): DNSSEC split KSK/ZSK — ceremony key rarely rolls,
+operational key rolls every 90d.
 
-Split-key model (DNSSEC parallel):
-  REGISTRY_ROOT_KEY  — Annual ceremony, multi-witness (= KSK)
-  OPERATIONAL_KEY    — Quarterly automated renewal (= ZSK)
+ATF model:
+  ROOT_KEY       — Annual ceremony, multi-witness attestation (DNSSEC KSK parallel)
+  OPERATIONAL_KEY — Quarterly automatic rotation (DNSSEC ZSK parallel)
+  EMERGENCY_KEY  — 7-day forced rotation on compromise detection
 
-Risk-tiered ceremony frequency:
-  HIGH   — 180d root, 30d operational
-  MEDIUM — 365d root, 90d operational  
-  LOW    — 730d root, 180d operational
+Key insight: DNSSEC has rolled KSK only twice ever (2017, 2025).
+ATF should be 7x faster: annual not "whenever we get around to it."
 """
 
 import hashlib
@@ -25,334 +23,299 @@ from typing import Optional
 
 
 class KeyType(Enum):
-    REGISTRY_ROOT = "REGISTRY_ROOT"    # Ceremony key (KSK equivalent)
-    OPERATIONAL = "OPERATIONAL"         # Automated key (ZSK equivalent)
+    ROOT = "ROOT"                # Ceremony key (identity)
+    OPERATIONAL = "OPERATIONAL"  # Signing key (daily use)
+    EMERGENCY = "EMERGENCY"     # Forced rotation
+
+
+class KeyStatus(Enum):
+    ACTIVE = "ACTIVE"
+    PENDING_ROLLOVER = "PENDING_ROLLOVER"
+    REVOKED = "REVOKED"
+    EXPIRED = "EXPIRED"
 
 
 class RiskTier(Enum):
-    HIGH = "HIGH"       # Financial, identity-critical
-    MEDIUM = "MEDIUM"   # General purpose
-    LOW = "LOW"         # Experimental, low-value
+    HIGH = "HIGH"        # Payment, identity — 180d operational
+    MEDIUM = "MEDIUM"    # General trust — 365d operational
+    LOW = "LOW"          # Discovery, metadata — 730d operational
 
 
-class CeremonyStatus(Enum):
-    SCHEDULED = "SCHEDULED"
-    IN_PROGRESS = "IN_PROGRESS"
-    COMPLETED = "COMPLETED"
-    OVERDUE = "OVERDUE"
-    EMERGENCY = "EMERGENCY"
-
-
-# SPEC_CONSTANTS per risk tier
-REKEY_SCHEDULE = {
-    RiskTier.HIGH: {
-        KeyType.REGISTRY_ROOT: 180,   # days
-        KeyType.OPERATIONAL: 30,
-    },
-    RiskTier.MEDIUM: {
-        KeyType.REGISTRY_ROOT: 365,
-        KeyType.OPERATIONAL: 90,
-    },
-    RiskTier.LOW: {
-        KeyType.REGISTRY_ROOT: 730,
-        KeyType.OPERATIONAL: 180,
-    },
+# SPEC_CONSTANTS
+ROOT_CEREMONY_INTERVAL_DAYS = 365       # Annual (DNSSEC: ~7 years)
+OPERATIONAL_ROTATION_DAYS = {
+    RiskTier.HIGH: 90,      # Quarterly
+    RiskTier.MEDIUM: 180,   # Semi-annual
+    RiskTier.LOW: 365       # Annual
 }
-
-# Ceremony requirements per key type
-CEREMONY_REQUIREMENTS = {
-    KeyType.REGISTRY_ROOT: {
-        "min_witnesses": 4,          # BFT 3f+1, f=1
-        "min_operator_classes": 3,    # Diversity
-        "signed_transcript": True,
-        "advance_notice_days": 30,
-        "overlap_period_days": 14,   # Old key still valid during transition
-    },
-    KeyType.OPERATIONAL: {
-        "min_witnesses": 2,
-        "min_operator_classes": 1,
-        "signed_transcript": False,  # Automated
-        "advance_notice_days": 7,
-        "overlap_period_days": 7,
-    },
-}
-
-OVERDUE_GRACE_DAYS = 30  # Grace period before EMERGENCY
-DNSSEC_KSK_INTERVAL_YEARS = 7  # For comparison
+EMERGENCY_ROTATION_DAYS = 7
+MIN_CEREMONY_WITNESSES = 4             # BFT 3f+1, f=1
+OVERLAP_PERIOD_DAYS = 30               # Both old and new key valid
+DS_PROPAGATION_DAYS = 14               # DS record propagation window
+PRE_PUBLISH_DAYS = 14                  # Publish new key before activation
 
 
 @dataclass
-class Key:
+class RegistryKey:
     key_id: str
     key_type: KeyType
+    registry_id: str
     created_at: float
     expires_at: float
-    ceremony_hash: str  # Links to ceremony transcript
-    operator_id: str
-    active: bool = True
-
-
-@dataclass
-class Registry:
-    registry_id: str
-    risk_tier: RiskTier
-    operator_id: str
-    root_key: Optional[Key] = None
-    operational_key: Optional[Key] = None
-    ceremony_history: list = field(default_factory=list)
-
-
-@dataclass
-class CeremonyRecord:
-    ceremony_id: str
-    key_type: KeyType
-    timestamp: float
-    witnesses: list[str]
-    witness_operators: list[str]
-    old_key_id: Optional[str]
-    new_key_id: str
-    transcript_hash: str
-    status: CeremonyStatus
-
-
-def compute_next_rekey(registry: Registry, key_type: KeyType) -> dict:
-    """Compute when next re-attestation is due."""
-    schedule = REKEY_SCHEDULE[registry.risk_tier]
-    interval_days = schedule[key_type]
+    status: KeyStatus = KeyStatus.ACTIVE
+    fingerprint: str = ""
+    witnesses: list[str] = field(default_factory=list)
+    predecessor_id: Optional[str] = None
     
-    key = registry.root_key if key_type == KeyType.REGISTRY_ROOT else registry.operational_key
+    def __post_init__(self):
+        if not self.fingerprint:
+            self.fingerprint = hashlib.sha256(
+                f"{self.key_id}:{self.registry_id}:{self.created_at}".encode()
+            ).hexdigest()[:16]
+
+
+@dataclass
+class RolloverEvent:
+    old_key_id: str
+    new_key_id: str
+    key_type: KeyType
+    initiated_at: float
+    pre_publish_at: float    # New key published but not yet signing
+    activation_at: float     # New key starts signing
+    revocation_at: float     # Old key revoked
+    status: str = "SCHEDULED"
+    witnesses: list[str] = field(default_factory=list)
+
+
+def compute_next_rotation(key: RegistryKey, risk_tier: RiskTier) -> dict:
+    """Compute when a key needs rotation."""
+    now = time.time()
+    age_days = (now - key.created_at) / 86400
+    
+    if key.key_type == KeyType.ROOT:
+        max_age = ROOT_CEREMONY_INTERVAL_DAYS
+    elif key.key_type == KeyType.OPERATIONAL:
+        max_age = OPERATIONAL_ROTATION_DAYS[risk_tier]
+    else:
+        max_age = EMERGENCY_ROTATION_DAYS
+    
+    remaining_days = max_age - age_days
+    urgency = "OVERDUE" if remaining_days < 0 else \
+              "CRITICAL" if remaining_days < 7 else \
+              "WARNING" if remaining_days < 30 else \
+              "OK"
+    
+    return {
+        "key_id": key.key_id,
+        "key_type": key.key_type.value,
+        "age_days": round(age_days, 1),
+        "max_age_days": max_age,
+        "remaining_days": round(remaining_days, 1),
+        "urgency": urgency,
+        "needs_rotation": remaining_days <= PRE_PUBLISH_DAYS
+    }
+
+
+def plan_rollover(old_key: RegistryKey, risk_tier: RiskTier) -> RolloverEvent:
+    """Plan a key rollover with overlap period."""
     now = time.time()
     
-    if key is None:
-        return {
-            "status": "NO_KEY",
-            "action": "GENESIS_CEREMONY_REQUIRED",
-            "urgency": "CRITICAL"
-        }
+    new_key_id = f"key_{hashlib.sha256(f'{old_key.key_id}:{now}'.encode()).hexdigest()[:8]}"
     
-    days_since_creation = (now - key.created_at) / 86400
-    days_until_expiry = (key.expires_at - now) / 86400
+    pre_publish = now
+    activation = now + PRE_PUBLISH_DAYS * 86400
+    revocation = activation + OVERLAP_PERIOD_DAYS * 86400
     
-    requirements = CEREMONY_REQUIREMENTS[key_type]
-    advance_notice = requirements["advance_notice_days"]
-    
-    if days_until_expiry < 0:
-        overdue_days = abs(days_until_expiry)
-        if overdue_days > OVERDUE_GRACE_DAYS:
-            status = CeremonyStatus.EMERGENCY
+    return RolloverEvent(
+        old_key_id=old_key.key_id,
+        new_key_id=new_key_id,
+        key_type=old_key.key_type,
+        initiated_at=now,
+        pre_publish_at=pre_publish,
+        activation_at=activation,
+        revocation_at=revocation,
+        witnesses=old_key.witnesses
+    )
+
+
+def validate_ceremony(witnesses: list[str], min_witnesses: int = MIN_CEREMONY_WITNESSES) -> dict:
+    """Validate a root key ceremony has sufficient witnesses."""
+    unique_operators = set()
+    for w in witnesses:
+        # Extract operator from witness ID (format: op_name/witness_id)
+        parts = w.split("/")
+        if len(parts) >= 2:
+            unique_operators.add(parts[0])
         else:
-            status = CeremonyStatus.OVERDUE
-    elif days_until_expiry < advance_notice:
-        status = CeremonyStatus.SCHEDULED
-    else:
-        status = CeremonyStatus.COMPLETED  # Current key still valid
+            unique_operators.add(w)
+    
+    has_quorum = len(witnesses) >= min_witnesses
+    has_diversity = len(unique_operators) >= 2  # At least 2 distinct operators
     
     return {
-        "key_type": key_type.value,
-        "risk_tier": registry.risk_tier.value,
-        "interval_days": interval_days,
-        "key_age_days": round(days_since_creation, 1),
-        "days_until_expiry": round(days_until_expiry, 1),
-        "status": status.value,
-        "next_ceremony_window": f"in {max(0, days_until_expiry - advance_notice):.0f} days",
-        "overlap_period_days": requirements["overlap_period_days"],
-        "requirements": requirements
+        "witnesses": len(witnesses),
+        "min_required": min_witnesses,
+        "unique_operators": len(unique_operators),
+        "has_quorum": has_quorum,
+        "has_diversity": has_diversity,
+        "ceremony_valid": has_quorum and has_diversity,
+        "bft_tolerance": (len(witnesses) - 1) // 3  # f in 3f+1
     }
 
 
-def validate_ceremony(ceremony: CeremonyRecord, registry: Registry) -> dict:
-    """Validate a re-attestation ceremony meets requirements."""
-    requirements = CEREMONY_REQUIREMENTS[ceremony.key_type]
+def audit_registry_keys(keys: list[RegistryKey], risk_tier: RiskTier) -> dict:
+    """Full audit of a registry's key health."""
+    results = []
     issues = []
     
-    if len(ceremony.witnesses) < requirements["min_witnesses"]:
-        issues.append(f"Need {requirements['min_witnesses']} witnesses, got {len(ceremony.witnesses)}")
+    active_root = None
+    active_operational = None
     
-    unique_operators = len(set(ceremony.witness_operators))
-    if unique_operators < requirements["min_operator_classes"]:
-        issues.append(f"Need {requirements['min_operator_classes']} operator classes, got {unique_operators}")
+    for key in keys:
+        if key.status != KeyStatus.ACTIVE:
+            continue
+        
+        rotation = compute_next_rotation(key, risk_tier)
+        results.append(rotation)
+        
+        if rotation["urgency"] in ("OVERDUE", "CRITICAL"):
+            issues.append(f"{key.key_type.value} key {key.key_id} is {rotation['urgency']} "
+                         f"(age: {rotation['age_days']}d, max: {rotation['max_age_days']}d)")
+        
+        if key.key_type == KeyType.ROOT:
+            active_root = key
+        elif key.key_type == KeyType.OPERATIONAL:
+            active_operational = key
     
-    if requirements["signed_transcript"] and not ceremony.transcript_hash:
-        issues.append("Signed transcript required for REGISTRY_ROOT ceremony")
+    if not active_root:
+        issues.append("NO ACTIVE ROOT KEY — registry cannot attest")
+    if not active_operational:
+        issues.append("NO ACTIVE OPERATIONAL KEY — registry cannot sign")
     
-    # Check overlap: old key should still be valid
-    if ceremony.old_key_id and registry.root_key:
-        old_key = registry.root_key
-        overlap_remaining = (old_key.expires_at - ceremony.timestamp) / 86400
-        if overlap_remaining < 0:
-            issues.append(f"Old key expired {abs(overlap_remaining):.0f} days before ceremony — gap in trust chain")
+    health = "HEALTHY" if not issues else "DEGRADED" if len(issues) <= 1 else "CRITICAL"
     
     return {
-        "valid": len(issues) == 0,
+        "registry_health": health,
+        "risk_tier": risk_tier.value,
+        "active_keys": len([r for r in results]),
+        "key_rotations": results,
         "issues": issues,
-        "witnesses": len(ceremony.witnesses),
-        "operator_diversity": unique_operators,
-        "ceremony_type": ceremony.key_type.value
-    }
-
-
-def compare_with_dnssec() -> dict:
-    """Compare ATF rekey schedule with DNSSEC."""
-    return {
-        "dnssec_ksk_interval_years": DNSSEC_KSK_INTERVAL_YEARS,
-        "dnssec_zsk_interval_days": 90,
-        "atf_high_root_days": REKEY_SCHEDULE[RiskTier.HIGH][KeyType.REGISTRY_ROOT],
-        "atf_high_operational_days": REKEY_SCHEDULE[RiskTier.HIGH][KeyType.OPERATIONAL],
-        "atf_medium_root_days": REKEY_SCHEDULE[RiskTier.MEDIUM][KeyType.REGISTRY_ROOT],
-        "speedup_vs_dnssec": f"{DNSSEC_KSK_INTERVAL_YEARS * 365 / REKEY_SCHEDULE[RiskTier.MEDIUM][KeyType.REGISTRY_ROOT]:.0f}x faster",
-        "rationale": "Agent time moves faster than DNS time. 7-year KSK rollover = unacceptable for ATF."
+        "dnssec_parallel": {
+            "ksk_equivalent": "ROOT (annual ceremony)",
+            "zsk_equivalent": f"OPERATIONAL ({OPERATIONAL_ROTATION_DAYS[risk_tier]}d rotation)",
+            "verisign_ksk_rolls": "2 in 7 years (2017, 2025)",
+            "atf_target": f"annual root, {OPERATIONAL_ROTATION_DAYS[risk_tier]}d operational"
+        }
     }
 
 
 # === Scenarios ===
 
-def scenario_medium_risk_lifecycle():
-    """Normal medium-risk registry through full rekey cycle."""
-    print("=== Scenario: Medium-Risk Registry Lifecycle ===")
+def scenario_healthy_registry():
+    """Well-maintained registry — all keys fresh."""
+    print("=== Scenario: Healthy Registry (HIGH risk) ===")
     now = time.time()
     
-    registry = Registry("reg_001", RiskTier.MEDIUM, "op_main")
+    keys = [
+        RegistryKey("root_001", KeyType.ROOT, "reg_alpha", now - 86400*120, now + 86400*245,
+                    witnesses=["op_a/w1", "op_b/w2", "op_c/w3", "op_d/w4"]),
+        RegistryKey("op_001", KeyType.OPERATIONAL, "reg_alpha", now - 86400*60, now + 86400*30)
+    ]
     
-    # Genesis key created 300 days ago
-    registry.root_key = Key("root_001", KeyType.REGISTRY_ROOT,
-                           now - 86400*300, now + 86400*65,  # Expires in 65 days
-                           "genesis_hash", "op_main")
-    registry.operational_key = Key("op_001", KeyType.OPERATIONAL,
-                                  now - 86400*80, now + 86400*10,  # Expires in 10 days
-                                  "op_hash", "op_main")
-    
-    root_status = compute_next_rekey(registry, KeyType.REGISTRY_ROOT)
-    op_status = compute_next_rekey(registry, KeyType.OPERATIONAL)
-    
-    print(f"  Root key: {root_status['status']} (expires in {root_status['days_until_expiry']}d)")
-    print(f"  Operational key: {op_status['status']} (expires in {op_status['days_until_expiry']}d)")
-    print(f"  Root ceremony window: {root_status['next_ceremony_window']}")
-    print(f"  Op ceremony window: {op_status['next_ceremony_window']}")
+    audit = audit_registry_keys(keys, RiskTier.HIGH)
+    print(f"  Health: {audit['registry_health']}")
+    for r in audit['key_rotations']:
+        print(f"  {r['key_type']}: age={r['age_days']}d, remaining={r['remaining_days']}d, urgency={r['urgency']}")
+    if audit['issues']:
+        for i in audit['issues']:
+            print(f"  ⚠ {i}")
     print()
 
 
-def scenario_overdue_root():
-    """Root key expired — escalating urgency."""
-    print("=== Scenario: Overdue Root Key ===")
+def scenario_overdue_rotation():
+    """Operational key past rotation date — DEGRADED."""
+    print("=== Scenario: Overdue Rotation (HIGH risk) ===")
     now = time.time()
     
-    registry = Registry("reg_002", RiskTier.HIGH, "op_slow")
+    keys = [
+        RegistryKey("root_002", KeyType.ROOT, "reg_beta", now - 86400*300, now + 86400*65,
+                    witnesses=["op_a/w1", "op_b/w2", "op_c/w3", "op_d/w4"]),
+        RegistryKey("op_002", KeyType.OPERATIONAL, "reg_beta", now - 86400*100, now - 86400*10)
+    ]
     
-    # Root key expired 20 days ago (within grace)
-    registry.root_key = Key("root_old", KeyType.REGISTRY_ROOT,
-                           now - 86400*200, now - 86400*20,
-                           "old_hash", "op_slow")
+    audit = audit_registry_keys(keys, RiskTier.HIGH)
+    print(f"  Health: {audit['registry_health']}")
+    for r in audit['key_rotations']:
+        print(f"  {r['key_type']}: age={r['age_days']}d, remaining={r['remaining_days']}d, urgency={r['urgency']}")
+    for i in audit['issues']:
+        print(f"  ⚠ {i}")
     
-    status = compute_next_rekey(registry, KeyType.REGISTRY_ROOT)
-    print(f"  Status: {status['status']}")
-    print(f"  Days overdue: {abs(status['days_until_expiry']):.0f}")
-    print(f"  Grace period: {OVERDUE_GRACE_DAYS}d")
-    print(f"  Within grace: {abs(status['days_until_expiry']) <= OVERDUE_GRACE_DAYS}")
-    print()
-    
-    # Now 45 days overdue (past grace)
-    registry.root_key.expires_at = now - 86400*45
-    status2 = compute_next_rekey(registry, KeyType.REGISTRY_ROOT)
-    print(f"  After 45 days overdue: {status2['status']}")
-    print(f"  EMERGENCY = all trust from this registry degrades to STALE")
+    # Plan rollover
+    stale_key = keys[1]
+    rollover = plan_rollover(stale_key, RiskTier.HIGH)
+    print(f"  Planned rollover: {rollover.old_key_id} → {rollover.new_key_id}")
+    print(f"  Pre-publish: now, Activation: +{PRE_PUBLISH_DAYS}d, Revocation: +{PRE_PUBLISH_DAYS + OVERLAP_PERIOD_DAYS}d")
     print()
 
 
-def scenario_valid_ceremony():
-    """Proper re-attestation ceremony."""
-    print("=== Scenario: Valid Re-Attestation Ceremony ===")
+def scenario_ceremony_validation():
+    """Root key ceremony — witness quorum check."""
+    print("=== Scenario: Root Key Ceremony Validation ===")
+    
+    # Valid ceremony
+    valid = validate_ceremony(["op_a/w1", "op_b/w2", "op_c/w3", "op_d/w4"])
+    print(f"  4 witnesses, 4 operators: valid={valid['ceremony_valid']}, BFT f={valid['bft_tolerance']}")
+    
+    # Insufficient witnesses
+    insufficient = validate_ceremony(["op_a/w1", "op_b/w2"])
+    print(f"  2 witnesses: valid={insufficient['ceremony_valid']} (need {MIN_CEREMONY_WITNESSES})")
+    
+    # Same operator sybil
+    sybil = validate_ceremony(["op_a/w1", "op_a/w2", "op_a/w3", "op_a/w4"])
+    print(f"  4 witnesses, 1 operator: valid={sybil['ceremony_valid']} (diversity={sybil['has_diversity']})")
+    print()
+
+
+def scenario_risk_tiering():
+    """Different risk tiers get different rotation cadences."""
+    print("=== Scenario: Risk-Tiered Rotation Cadences ===")
     now = time.time()
     
-    registry = Registry("reg_003", RiskTier.MEDIUM, "op_good")
-    registry.root_key = Key("root_old", KeyType.REGISTRY_ROOT,
-                           now - 86400*350, now + 86400*15,  # Expiring soon
-                           "old_hash", "op_good")
+    for tier in RiskTier:
+        key = RegistryKey(f"op_{tier.value}", KeyType.OPERATIONAL, "reg_multi",
+                         now - 86400*100, now + 86400*100)
+        rotation = compute_next_rotation(key, tier)
+        print(f"  {tier.value}: max_age={rotation['max_age_days']}d, "
+              f"remaining={rotation['remaining_days']}d, urgency={rotation['urgency']}")
     
-    ceremony = CeremonyRecord(
-        ceremony_id="ceremony_001",
-        key_type=KeyType.REGISTRY_ROOT,
-        timestamp=now,
-        witnesses=["w1", "w2", "w3", "w4", "w5"],
-        witness_operators=["op_a", "op_b", "op_c", "op_d"],
-        old_key_id="root_old",
-        new_key_id="root_new",
-        transcript_hash=hashlib.sha256(b"ceremony_transcript").hexdigest()[:16],
-        status=CeremonyStatus.COMPLETED
-    )
-    
-    validation = validate_ceremony(ceremony, registry)
-    print(f"  Valid: {validation['valid']}")
-    print(f"  Witnesses: {validation['witnesses']} (need {CEREMONY_REQUIREMENTS[KeyType.REGISTRY_ROOT]['min_witnesses']})")
-    print(f"  Operator diversity: {validation['operator_diversity']} (need {CEREMONY_REQUIREMENTS[KeyType.REGISTRY_ROOT]['min_operator_classes']})")
-    print(f"  Overlap: old key still valid for 15 days — clean transition")
-    print()
-
-
-def scenario_gap_in_trust_chain():
-    """Old key expired before ceremony — trust chain gap."""
-    print("=== Scenario: Trust Chain Gap ===")
-    now = time.time()
-    
-    registry = Registry("reg_004", RiskTier.HIGH, "op_late")
-    registry.root_key = Key("root_expired", KeyType.REGISTRY_ROOT,
-                           now - 86400*200, now - 86400*5,  # Expired 5 days ago
-                           "old_hash", "op_late")
-    
-    ceremony = CeremonyRecord(
-        ceremony_id="ceremony_002",
-        key_type=KeyType.REGISTRY_ROOT,
-        timestamp=now,  # Ceremony happening NOW, after expiry
-        witnesses=["w1", "w2", "w3", "w4"],
-        witness_operators=["op_a", "op_b", "op_c"],
-        old_key_id="root_expired",
-        new_key_id="root_new",
-        transcript_hash=hashlib.sha256(b"late_ceremony").hexdigest()[:16],
-        status=CeremonyStatus.COMPLETED
-    )
-    
-    validation = validate_ceremony(ceremony, registry)
-    print(f"  Valid: {validation['valid']}")
-    for issue in validation['issues']:
-        print(f"  Issue: {issue}")
-    print(f"  KEY: Gap in trust chain = all receipts during gap have no root anchor")
-    print()
-
-
-def scenario_dnssec_comparison():
-    """Compare ATF and DNSSEC rekey schedules."""
-    print("=== Scenario: ATF vs DNSSEC Rekey Schedule ===")
-    comparison = compare_with_dnssec()
-    print(f"  DNSSEC KSK interval: {comparison['dnssec_ksk_interval_years']} years")
-    print(f"  DNSSEC ZSK interval: {comparison['dnssec_zsk_interval_days']} days")
-    print(f"  ATF HIGH root: {comparison['atf_high_root_days']} days")
-    print(f"  ATF HIGH operational: {comparison['atf_high_operational_days']} days")
-    print(f"  ATF MEDIUM root: {comparison['atf_medium_root_days']} days")
-    print(f"  Speedup: {comparison['speedup_vs_dnssec']}")
-    print(f"  Rationale: {comparison['rationale']}")
+    print(f"\n  DNSSEC comparison:")
+    print(f"    ZSK rotation: 90 days (Verisign)")
+    print(f"    KSK rotation: ~7 years (only twice: 2017, 2025)")
+    print(f"    ATF HIGH:     90d operational, 365d root (7x faster than DNSSEC)")
     print()
 
 
 if __name__ == "__main__":
     print("Registry Rekey Scheduler — Split-Key Re-Attestation for ATF")
-    print("Per santaclawd + Verisign (Jan 2025) DNSSEC KSK Rollover")
+    print("Per santaclawd + Verisign KSK-2024 (Jan 2025)")
     print("=" * 70)
     print()
-    print("Split-key model:")
-    for tier in RiskTier:
-        sched = REKEY_SCHEDULE[tier]
-        print(f"  {tier.value}: root={sched[KeyType.REGISTRY_ROOT]}d, operational={sched[KeyType.OPERATIONAL]}d")
+    print("Key hierarchy:")
+    print(f"  ROOT:        {ROOT_CEREMONY_INTERVAL_DAYS}d ceremony, {MIN_CEREMONY_WITNESSES} witnesses")
+    print(f"  OPERATIONAL: {OPERATIONAL_ROTATION_DAYS[RiskTier.HIGH]}d/{OPERATIONAL_ROTATION_DAYS[RiskTier.MEDIUM]}d/{OPERATIONAL_ROTATION_DAYS[RiskTier.LOW]}d (H/M/L)")
+    print(f"  EMERGENCY:   {EMERGENCY_ROTATION_DAYS}d forced")
+    print(f"  Overlap:     {OVERLAP_PERIOD_DAYS}d, Pre-publish: {PRE_PUBLISH_DAYS}d")
     print()
     
-    scenario_medium_risk_lifecycle()
-    scenario_overdue_root()
-    scenario_valid_ceremony()
-    scenario_gap_in_trust_chain()
-    scenario_dnssec_comparison()
+    scenario_healthy_registry()
+    scenario_overdue_rotation()
+    scenario_ceremony_validation()
+    scenario_risk_tiering()
     
     print("=" * 70)
     print("KEY INSIGHTS:")
-    print("1. Split-key: ceremony key (infrequent) + operational key (automated).")
-    print("2. DNSSEC rolled KSK twice in 7 years. ATF: annual or 180d for HIGH risk.")
-    print("3. Overlap period prevents trust chain gaps during transition.")
-    print("4. Overdue grace → EMERGENCY escalation after 30 days.")
-    print("5. Risk-tiered: HIGH registries rotate faster than LOW.")
+    print("1. DNSSEC split KSK/ZSK = ATF split ROOT/OPERATIONAL.")
+    print("2. Verisign rolled KSK twice in 7 years. ATF does it annually — 7x faster.")
+    print("3. Overlap period prevents hard cutover failures (DS propagation window).")
+    print("4. Risk tiering: HIGH (payment) gets 90d rotation, LOW gets 365d.")
+    print("5. Ceremony validation: quorum + operator diversity. Same-operator sybil = invalid.")
