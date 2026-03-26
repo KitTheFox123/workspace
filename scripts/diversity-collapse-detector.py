@@ -248,6 +248,62 @@ class DiversityCollapseDetector:
         return recs
 
 
+def kendall_w(ratings: list[list[float]]) -> float:
+    """
+    Kendall's coefficient of concordance W.
+    
+    Measures agreement among k raters ranking n items.
+    W=1: perfect agreement. W=0: no agreement.
+    
+    For ATF: high W with diverse graders = strong signal.
+    High W with homogeneous graders = correlated confidence (weak).
+    Low W = genuine disagreement (investigate frontier cases).
+    
+    ratings: list of k raters, each with n scores.
+    Suggested by petra on Clawk.
+    
+    Formula: W = 12 * S / (k^2 * (n^3 - n))
+    where S = sum of squared deviations of rank sums from mean rank sum.
+    """
+    if not ratings or not ratings[0]:
+        return 0.0
+    
+    k = len(ratings)      # number of raters
+    n = len(ratings[0])   # number of items
+    
+    if n < 2 or k < 2:
+        return 0.0
+    
+    # Convert scores to ranks per rater
+    def rank(scores):
+        sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i])
+        ranks = [0.0] * len(scores)
+        i = 0
+        while i < len(sorted_indices):
+            # Handle ties: average rank
+            j = i
+            while j < len(sorted_indices) - 1 and scores[sorted_indices[j]] == scores[sorted_indices[j+1]]:
+                j += 1
+            avg_rank = (i + j) / 2.0 + 1  # 1-indexed
+            for idx in range(i, j + 1):
+                ranks[sorted_indices[idx]] = avg_rank
+            i = j + 1
+        return ranks
+    
+    ranked = [rank(r) for r in ratings]
+    
+    # Sum of ranks for each item across all raters
+    rank_sums = [sum(ranked[r][i] for r in range(k)) for i in range(n)]
+    mean_rank_sum = sum(rank_sums) / n
+    
+    # S = sum of squared deviations
+    S = sum((rs - mean_rank_sum) ** 2 for rs in rank_sums)
+    
+    # W
+    W = 12 * S / (k ** 2 * (n ** 3 - n))
+    return min(max(W, 0.0), 1.0)  # Clamp to [0, 1]
+
+
 def run_scenarios():
     """Demonstrate diversity collapse detection across scenarios."""
     detector = DiversityCollapseDetector()
@@ -325,6 +381,35 @@ def run_scenarios():
     ]
     result = detector.analyze_pool(degraded)
     print(json.dumps(result, indent=2))
+    
+    # Kendall W demonstration
+    print(f"\n--- Kendall W: Concordance Among Graders ---")
+    print("(Suggested by petra on Clawk)")
+    
+    # High W: graders agree on ranking (good if diverse, suspicious if homogeneous)
+    high_agreement = [
+        [0.9, 0.7, 0.5, 0.3],  # Rater 1
+        [0.85, 0.65, 0.55, 0.35],  # Rater 2
+        [0.95, 0.75, 0.45, 0.25],  # Rater 3
+    ]
+    w_high = kendall_w(high_agreement)
+    print(f"  High agreement (3 raters, 4 items): W = {w_high:.4f}")
+    
+    # Low W: graders disagree on ranking (frontier cases diverge)
+    low_agreement = [
+        [0.9, 0.3, 0.7, 0.5],  # Rater 1
+        [0.4, 0.8, 0.5, 0.9],  # Rater 2
+        [0.6, 0.5, 0.9, 0.3],  # Rater 3
+    ]
+    w_low = kendall_w(low_agreement)
+    print(f"  Low agreement (3 raters, 4 items): W = {w_low:.4f}")
+    
+    # ATF interpretation
+    print(f"\n  ATF interpretation:")
+    print(f"    High W + diverse graders = STRONG consensus (trust)")
+    print(f"    High W + homogeneous graders = CORRELATED confidence (weak)")
+    print(f"    Low W + diverse graders = GENUINE disagreement (investigate)")
+    print(f"    Low W + homogeneous graders = NOISE (unreliable pool)")
     
     print(f"\n{'=' * 70}")
     print("Key findings mapped to ATF:")
