@@ -1,427 +1,352 @@
 #!/usr/bin/env python3
 """
-grader-independence-scorer.py — Detect correlated graders in ATF quorums.
+grader-independence-scorer.py — Multi-axis grader independence scoring for ATF.
 
-Per santaclawd (ATF V1.2): accuracy floor 0.70 catches BAD graders but NOT
-correlated graders. Two 0.72 graders from the same training distribution =
-one signal, not two. GRADER_INDEPENDENCE_SCORE as quorum pre-condition.
+Per santaclawd: correlated graders = expensive groupthink. Independence must be
+measured across three axes and composited via geometric mean (not arithmetic).
 
-Approach:
-1. Pairwise agreement matrix on DISPUTED cases (not easy ones)
-2. Canary receipts: inject known-difficulty probes, measure disagreement
-3. Kendall's tau on edge case rankings
-4. Simpson diversity on grader provenance (model family, operator, training)
-5. Flag correlated pairs for rotation
+Three independence axes:
+1. Model family (weight 0.5) — different base models (Claude, GPT, Gemini, etc.)
+2. Training set (weight 0.3) — different fine-tuning data / RLHF
+3. Operator (weight 0.2) — different organizations running the graders
+
+Geometric mean: ANY axis at zero kills the composite score.
+Arithmetic mean allows one strong axis to mask weakness.
+
+Canary receipts: synthetic frontier cases injected to measure disagreement surface.
+If graders converge on edge cases they used to disagree on → drift signal.
+Vaughan: drift toward consensus IS the deviance.
 
 Sources:
-- Kendall rank correlation coefficient (1938)
-- Kendall's W concordance for multi-rater agreement
-- Simpson diversity index (1949)
-- Inter-rater reliability: Cohen's kappa, Fleiss' kappa
-- petra: "Cross-grade with held-out adversarial examples"
-- santaclawd: "correlation is invisible without shared adversarial probes"
+- Nature 2025: Wisdom of crowds fails with correlated voters
+- Vaughan (Columbia 2025-26): Normalization of deviance
+- Simpson diversity index for categorical diversity
+- Wilson CI for conservative bounds
 """
 
-import json
 import math
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
 from datetime import datetime, timezone
-
-
-class IndependenceLevel(Enum):
-    INDEPENDENT = "independent"       # tau < 0.3 on edge cases
-    WEAKLY_CORRELATED = "weak"        # 0.3 <= tau < 0.6
-    CORRELATED = "correlated"         # 0.6 <= tau < 0.8
-    STRONGLY_CORRELATED = "strongly_correlated"  # tau >= 0.8
+from typing import Optional
 
 
 @dataclass
 class GraderProfile:
-    """Grader provenance metadata."""
+    """A grader's identity across three independence axes."""
     grader_id: str
-    model_family: str       # e.g., "gpt-4", "claude", "llama"
-    operator_id: str        # Who runs this grader
-    training_epoch: str     # When training data was collected
-    accuracy: float = 0.0
-    
-    @property
-    def provenance_key(self) -> str:
-        """Unique provenance fingerprint."""
-        return f"{self.model_family}:{self.operator_id}:{self.training_epoch}"
+    model_family: str       # e.g., "claude", "gpt", "gemini", "llama"
+    training_set: str       # e.g., "openai_rlhf_v4", "anthropic_hh", "custom_v2"
+    operator: str           # Organization running the grader
+    grades_issued: int = 0
+    canary_responses: dict = field(default_factory=dict)  # canary_id → grade
 
 
 @dataclass
-class GradingResult:
-    """A single grading decision on a receipt."""
-    grader_id: str
-    receipt_id: str
-    grade: float           # 0.0 - 1.0
-    is_canary: bool = False
-    difficulty: str = "normal"  # "easy", "normal", "edge", "adversarial"
+class CanaryReceipt:
+    """Synthetic frontier case for measuring disagreement surface."""
+    canary_id: str
+    description: str
+    expected_variance: float  # How much disagreement we WANT (0-1)
+    grades: dict = field(default_factory=dict)  # grader_id → grade (0.0-1.0)
 
 
 class GraderIndependenceScorer:
     """
-    Measures grader independence for ATF quorum validity.
+    Multi-axis independence scoring with canary-based drift detection.
     
-    Key insight: accuracy alone is insufficient. Two graders with 0.72 accuracy
-    from the same provider = one measurement, not two. Independence requires:
-    1. Provenance diversity (different models, operators, training data)
-    2. Behavioral diversity (different error patterns on edge cases)
-    3. Canary probes (known-difficulty injections to measure correlation)
+    GRADER_INDEPENDENCE_SCORE = geometric_mean(
+        simpson_diversity(model_families)^0.5,
+        simpson_diversity(training_sets)^0.3,
+        simpson_diversity(operators)^0.2
+    )
+    
+    Pre-quorum: admission gate (minimum diversity to participate)
+    Ongoing: deviance-detector monitors convergence drift via canary variance
     """
     
+    # Axis weights (must sum to 1.0)
+    WEIGHT_MODEL = 0.5
+    WEIGHT_TRAINING = 0.3
+    WEIGHT_OPERATOR = 0.2
+    
     # Thresholds
-    MAX_PAIRWISE_TAU = 0.60          # Above this = correlated
-    MIN_PROVENANCE_SIMPSON = 0.40    # Below this = monoculture
-    CANARY_AGREEMENT_THRESHOLD = 0.80  # Canary agreement above this = same distribution
-    MIN_INDEPENDENCE_SCORE = 0.50    # Quorum requires this minimum
+    MIN_INDEPENDENCE_SCORE = 0.30   # Below = reject quorum
+    DRIFT_THRESHOLD = 0.25          # Canary variance drop > 25% = alert
+    MIN_GRADERS_FOR_QUORUM = 3
     
     def __init__(self):
         self.graders: dict[str, GraderProfile] = {}
-        self.results: list[GradingResult] = []
-        self.canary_receipts: set[str] = set()
+        self.canaries: dict[str, CanaryReceipt] = {}
+        self.historical_variance: list[float] = []
+        self.alerts: list[dict] = []
     
     def register_grader(self, profile: GraderProfile):
         self.graders[profile.grader_id] = profile
     
-    def add_result(self, result: GradingResult):
-        self.results.append(result)
-        if result.is_canary:
-            self.canary_receipts.add(result.receipt_id)
+    def add_canary(self, canary: CanaryReceipt):
+        self.canaries[canary.canary_id] = canary
     
-    def kendall_tau(self, rankings_a: list[float], rankings_b: list[float]) -> float:
+    @staticmethod
+    def simpson_diversity(categories: list[str]) -> float:
         """
-        Kendall's tau-b rank correlation.
-        Measures ordinal association between two rankings.
-        tau = (concordant - discordant) / sqrt((n0 - n1)(n0 - n2))
+        Simpson diversity index: 1 - Σ(p_i²)
+        0 = monoculture, approaches 1 = max diversity
         """
-        n = len(rankings_a)
-        if n < 2:
+        if not categories:
             return 0.0
-        
-        concordant = 0
-        discordant = 0
-        ties_a = 0
-        ties_b = 0
-        
-        for i in range(n):
-            for j in range(i + 1, n):
-                diff_a = rankings_a[i] - rankings_a[j]
-                diff_b = rankings_b[i] - rankings_b[j]
-                
-                if diff_a == 0 and diff_b == 0:
-                    ties_a += 1
-                    ties_b += 1
-                elif diff_a == 0:
-                    ties_a += 1
-                elif diff_b == 0:
-                    ties_b += 1
-                elif (diff_a > 0 and diff_b > 0) or (diff_a < 0 and diff_b < 0):
-                    concordant += 1
-                else:
-                    discordant += 1
-        
-        n0 = n * (n - 1) / 2
-        n1 = ties_a
-        n2 = ties_b
-        
-        denom = math.sqrt((n0 - n1) * (n0 - n2))
-        if denom == 0:
-            return 0.0
-        
-        return (concordant - discordant) / denom
-    
-    def simpson_diversity(self, categories: list[str]) -> float:
-        """
-        Simpson's diversity index.
-        D = 1 - sum(n_i * (n_i - 1)) / (N * (N - 1))
-        Higher = more diverse.
-        """
-        if len(categories) < 2:
+        n = len(categories)
+        if n <= 1:
             return 0.0
         
         counts: dict[str, int] = {}
         for c in categories:
             counts[c] = counts.get(c, 0) + 1
         
-        n = len(categories)
-        numerator = sum(count * (count - 1) for count in counts.values())
-        denominator = n * (n - 1)
-        
-        return 1.0 - (numerator / denominator) if denominator > 0 else 0.0
+        sum_sq = sum((count / n) ** 2 for count in counts.values())
+        return 1.0 - sum_sq
     
-    def pairwise_correlation(self, grader_a: str, grader_b: str,
-                              difficulty_filter: Optional[str] = None) -> float:
-        """
-        Compute Kendall's tau between two graders on shared receipts.
-        Optionally filter by difficulty level.
-        """
-        # Find shared receipts
-        results_a = {}
-        results_b = {}
+    def compute_axis_scores(self, grader_ids: list[str]) -> dict[str, float]:
+        """Compute Simpson diversity for each axis."""
+        profiles = [self.graders[gid] for gid in grader_ids if gid in self.graders]
         
-        for r in self.results:
-            if difficulty_filter and r.difficulty != difficulty_filter:
-                continue
-            if r.grader_id == grader_a:
-                results_a[r.receipt_id] = r.grade
-            elif r.grader_id == grader_b:
-                results_b[r.receipt_id] = r.grade
-        
-        shared = sorted(set(results_a.keys()) & set(results_b.keys()))
-        if len(shared) < 3:
-            return 0.0  # Insufficient data
-        
-        rankings_a = [results_a[rid] for rid in shared]
-        rankings_b = [results_b[rid] for rid in shared]
-        
-        return self.kendall_tau(rankings_a, rankings_b)
-    
-    def canary_agreement_rate(self, grader_a: str, grader_b: str) -> float:
-        """
-        Agreement rate on canary receipts specifically.
-        High agreement on canaries = same training distribution.
-        """
-        results_a = {}
-        results_b = {}
-        
-        for r in self.results:
-            if not r.is_canary:
-                continue
-            if r.grader_id == grader_a:
-                results_a[r.receipt_id] = r.grade
-            elif r.grader_id == grader_b:
-                results_b[r.receipt_id] = r.grade
-        
-        shared = set(results_a.keys()) & set(results_b.keys())
-        if not shared:
-            return 0.0
-        
-        agreements = sum(
-            1 for rid in shared
-            if abs(results_a[rid] - results_b[rid]) < 0.1  # Within 0.1 = agreement
-        )
-        
-        return agreements / len(shared)
-    
-    def provenance_diversity(self, grader_ids: list[str]) -> float:
-        """Simpson diversity on grader provenance keys."""
-        keys = []
-        for gid in grader_ids:
-            profile = self.graders.get(gid)
-            if profile:
-                keys.append(profile.provenance_key)
-        return self.simpson_diversity(keys)
-    
-    def score_pair(self, grader_a: str, grader_b: str) -> dict:
-        """
-        Full independence assessment for a grader pair.
-        """
-        # Correlation on all cases
-        tau_all = self.pairwise_correlation(grader_a, grader_b)
-        
-        # Correlation on edge cases specifically
-        tau_edge = self.pairwise_correlation(grader_a, grader_b, "edge")
-        
-        # Canary agreement
-        canary_rate = self.canary_agreement_rate(grader_a, grader_b)
-        
-        # Provenance match
-        profile_a = self.graders.get(grader_a)
-        profile_b = self.graders.get(grader_b)
-        same_provenance = (
-            profile_a and profile_b and
-            profile_a.provenance_key == profile_b.provenance_key
-        )
-        
-        # Independence score: weighted combination
-        # Edge case tau is most important (0.4 weight)
-        # Canary agreement (0.3 weight)
-        # Provenance (0.2 weight)
-        # Overall tau (0.1 weight)
-        independence = 1.0 - (
-            0.4 * abs(tau_edge) +
-            0.3 * canary_rate +
-            0.2 * (1.0 if same_provenance else 0.0) +
-            0.1 * abs(tau_all)
-        )
-        independence = max(0.0, min(1.0, independence))
-        
-        # Classify
-        if abs(tau_edge) >= 0.8:
-            level = IndependenceLevel.STRONGLY_CORRELATED
-        elif abs(tau_edge) >= 0.6:
-            level = IndependenceLevel.CORRELATED
-        elif abs(tau_edge) >= 0.3:
-            level = IndependenceLevel.WEAKLY_CORRELATED
-        else:
-            level = IndependenceLevel.INDEPENDENT
+        if len(profiles) < 2:
+            return {"model": 0.0, "training": 0.0, "operator": 0.0}
         
         return {
-            "grader_a": grader_a,
-            "grader_b": grader_b,
-            "tau_all": round(tau_all, 3),
-            "tau_edge": round(tau_edge, 3),
-            "canary_agreement": round(canary_rate, 3),
-            "same_provenance": same_provenance,
-            "independence_score": round(independence, 3),
-            "level": level.value,
-            "quorum_eligible": independence >= self.MIN_INDEPENDENCE_SCORE,
+            "model": self.simpson_diversity([p.model_family for p in profiles]),
+            "training": self.simpson_diversity([p.training_set for p in profiles]),
+            "operator": self.simpson_diversity([p.operator for p in profiles]),
         }
     
-    def score_quorum(self, grader_ids: list[str]) -> dict:
+    def compute_independence_score(self, grader_ids: list[str]) -> dict:
         """
-        Assess independence of an entire grader quorum.
-        All pairs must be sufficiently independent.
+        Compute weighted geometric mean of axis diversities.
+        
+        Geometric mean: score = Π(axis_i^weight_i)
+        If ANY axis = 0, entire score = 0 (monoculture on any axis kills independence).
         """
-        pairs = []
-        min_independence = 1.0
-        correlated_pairs = []
+        axes = self.compute_axis_scores(grader_ids)
         
-        for i in range(len(grader_ids)):
-            for j in range(i + 1, len(grader_ids)):
-                pair = self.score_pair(grader_ids[i], grader_ids[j])
-                pairs.append(pair)
-                if pair["independence_score"] < min_independence:
-                    min_independence = pair["independence_score"]
-                if not pair["quorum_eligible"]:
-                    correlated_pairs.append((grader_ids[i], grader_ids[j]))
+        # Geometric mean with weights
+        # score = model^0.5 * training^0.3 * operator^0.2
+        if any(v == 0.0 for v in axes.values()):
+            composite = 0.0
+        else:
+            composite = (
+                axes["model"] ** self.WEIGHT_MODEL *
+                axes["training"] ** self.WEIGHT_TRAINING *
+                axes["operator"] ** self.WEIGHT_OPERATOR
+            )
         
-        provenance_div = self.provenance_diversity(grader_ids)
-        
-        quorum_valid = (
-            len(correlated_pairs) == 0 and
-            provenance_div >= self.MIN_PROVENANCE_SIMPSON and
-            min_independence >= self.MIN_INDEPENDENCE_SCORE
-        )
+        meets_threshold = composite >= self.MIN_INDEPENDENCE_SCORE
         
         return {
+            "axes": axes,
+            "composite_score": round(composite, 4),
+            "meets_threshold": meets_threshold,
+            "min_threshold": self.MIN_INDEPENDENCE_SCORE,
+            "method": "weighted_geometric_mean",
             "grader_count": len(grader_ids),
-            "pairs_assessed": len(pairs),
-            "min_independence": round(min_independence, 3),
-            "provenance_diversity": round(provenance_div, 3),
-            "correlated_pairs": correlated_pairs,
-            "quorum_valid": quorum_valid,
-            "rejection_reason": (
-                None if quorum_valid else
-                "correlated_pairs" if correlated_pairs else
-                "low_provenance_diversity" if provenance_div < self.MIN_PROVENANCE_SIMPSON else
-                "low_independence_score"
-            ),
-            "pairs": pairs,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    
+    def compute_canary_variance(self, canary_id: str) -> Optional[float]:
+        """
+        Compute grade variance on a canary receipt.
+        High variance = independent graders (good).
+        Low variance = correlated graders (bad — they agree on edge cases).
+        """
+        canary = self.canaries.get(canary_id)
+        if not canary or len(canary.grades) < 2:
+            return None
+        
+        grades = list(canary.grades.values())
+        mean = sum(grades) / len(grades)
+        variance = sum((g - mean) ** 2 for g in grades) / len(grades)
+        return variance
+    
+    def detect_convergence_drift(self) -> list[dict]:
+        """
+        Monitor canary variance over time for convergence drift.
+        Vaughan: drift toward consensus IS the deviance.
+        
+        If graders start agreeing on frontier cases they used to disagree on,
+        something changed (model update, training contamination, operator collusion).
+        """
+        alerts = []
+        
+        for canary_id, canary in self.canaries.items():
+            current_var = self.compute_canary_variance(canary_id)
+            if current_var is None:
+                continue
+            
+            expected = canary.expected_variance
+            if expected > 0 and current_var < expected * (1 - self.DRIFT_THRESHOLD):
+                drop_pct = (1 - current_var / expected) * 100
+                alert = {
+                    "type": "CONVERGENCE_DRIFT",
+                    "canary_id": canary_id,
+                    "expected_variance": round(expected, 4),
+                    "actual_variance": round(current_var, 4),
+                    "drop_percent": round(drop_pct, 1),
+                    "severity": "HIGH" if drop_pct > 50 else "MEDIUM",
+                    "message": f"Graders converging on '{canary.description}' — "
+                               f"variance dropped {drop_pct:.0f}% from expected",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                alerts.append(alert)
+                self.alerts.append(alert)
+        
+        return alerts
+    
+    def pairwise_agreement_matrix(self, canary_ids: list[str]) -> dict:
+        """
+        Compute pairwise agreement rate between graders on disputed cases.
+        
+        Per santaclawd: Simpson catches static correlation, but the matrix
+        catches graders that diverge on training distributions but still
+        converge on the same edge-case errors.
+        """
+        # Collect all graders that graded at least one canary
+        all_graders = set()
+        for cid in canary_ids:
+            canary = self.canaries.get(cid)
+            if canary:
+                all_graders.update(canary.grades.keys())
+        
+        grader_list = sorted(all_graders)
+        matrix: dict[str, dict[str, float]] = {}
+        
+        for g1 in grader_list:
+            matrix[g1] = {}
+            for g2 in grader_list:
+                if g1 == g2:
+                    matrix[g1][g2] = 1.0
+                    continue
+                
+                # Count canaries where both graded
+                agreements = 0
+                total = 0
+                for cid in canary_ids:
+                    canary = self.canaries.get(cid)
+                    if canary and g1 in canary.grades and g2 in canary.grades:
+                        total += 1
+                        # Agreement = both within 0.1 of each other
+                        if abs(canary.grades[g1] - canary.grades[g2]) < 0.1:
+                            agreements += 1
+                
+                matrix[g1][g2] = round(agreements / total, 3) if total > 0 else 0.0
+        
+        return {
+            "graders": grader_list,
+            "matrix": matrix,
+            "high_correlation_pairs": [
+                (g1, g2, matrix[g1][g2])
+                for g1 in grader_list
+                for g2 in grader_list
+                if g1 < g2 and matrix[g1][g2] > 0.8
+            ],
         }
 
 
 def run_scenarios():
-    """Test scenarios for grader independence detection."""
+    """Test scenarios for grader independence scoring."""
     scorer = GraderIndependenceScorer()
     
-    # Register graders with different provenance
+    print("=" * 70)
+    print("GRADER INDEPENDENCE SCORER — MULTI-AXIS + CANARY DRIFT DETECTION")
+    print("=" * 70)
+    
+    # Register graders with varying diversity
     graders = [
-        GraderProfile("grader_1", "claude", "operator_a", "2026-Q1", 0.78),
-        GraderProfile("grader_2", "gpt-4", "operator_b", "2026-Q1", 0.75),
-        GraderProfile("grader_3", "claude", "operator_a", "2026-Q1", 0.73),  # Same as grader_1!
-        GraderProfile("grader_4", "llama", "operator_c", "2025-Q4", 0.72),
-        GraderProfile("grader_5", "mistral", "operator_d", "2026-Q1", 0.71),
+        GraderProfile("grader_1", "claude", "anthropic_hh", "operator_a"),
+        GraderProfile("grader_2", "gpt", "openai_rlhf", "operator_b"),
+        GraderProfile("grader_3", "gemini", "google_rlaif", "operator_c"),
+        GraderProfile("grader_4", "llama", "meta_rlhf", "operator_d"),
+        # Monoculture graders (same model, same operator)
+        GraderProfile("grader_5", "claude", "anthropic_hh", "operator_a"),
+        GraderProfile("grader_6", "claude", "anthropic_hh", "operator_a"),
     ]
     for g in graders:
         scorer.register_grader(g)
     
-    # Generate grading results
-    import random
-    random.seed(42)
-    
-    receipts = [f"receipt_{i}" for i in range(50)]
-    canaries = [f"canary_{i}" for i in range(10)]
-    edge_cases = [f"edge_{i}" for i in range(15)]
-    
-    # grader_1 and grader_3 are correlated (same model+operator)
-    base_grades = {r: random.random() for r in receipts + canaries + edge_cases}
-    
-    for receipt_id in receipts + canaries + edge_cases:
-        is_canary = receipt_id.startswith("canary_")
-        is_edge = receipt_id.startswith("edge_")
-        difficulty = "canary" if is_canary else ("edge" if is_edge else "normal")
-        
-        base = base_grades[receipt_id]
-        
-        for g in graders:
-            if g.grader_id in ("grader_1", "grader_3"):
-                # Correlated: same base + small noise
-                grade = max(0, min(1, base + random.gauss(0, 0.05)))
-            elif g.grader_id == "grader_2":
-                # Independent: different base pattern
-                grade = max(0, min(1, (1 - base) * 0.6 + base * 0.4 + random.gauss(0, 0.1)))
-            else:
-                # Independent: random with some signal
-                grade = max(0, min(1, base * 0.3 + random.random() * 0.7))
-            
-            scorer.add_result(GradingResult(
-                grader_id=g.grader_id,
-                receipt_id=receipt_id,
-                grade=round(grade, 3),
-                is_canary=is_canary,
-                difficulty=difficulty,
-            ))
-    
-    print("=" * 70)
-    print("GRADER INDEPENDENCE SCORER")
-    print("=" * 70)
-    
-    scenarios = [
-        {
-            "name": "1. Diverse quorum (graders 1, 2, 4) — different provenance",
-            "graders": ["grader_1", "grader_2", "grader_4"],
-            "expect_valid": True,
-        },
-        {
-            "name": "2. Correlated quorum (graders 1, 3) — same model+operator",
-            "graders": ["grader_1", "grader_3", "grader_4"],
-            "expect_valid": False,
-        },
-        {
-            "name": "3. Fully diverse (graders 2, 4, 5) — all different",
-            "graders": ["grader_2", "grader_4", "grader_5"],
-            "expect_valid": True,
-        },
-        {
-            "name": "4. Monoculture (graders 1, 3 only) — same provenance",
-            "graders": ["grader_1", "grader_3"],
-            "expect_valid": False,
-        },
+    # Canary receipts (frontier cases)
+    canaries = [
+        CanaryReceipt("canary_ambiguous", "Ambiguous quality boundary", 0.15,
+                       {"grader_1": 0.7, "grader_2": 0.3, "grader_3": 0.5, "grader_4": 0.6}),
+        CanaryReceipt("canary_edge", "Edge case: minimal but correct", 0.10,
+                       {"grader_1": 0.8, "grader_2": 0.4, "grader_3": 0.6, "grader_4": 0.5}),
+        CanaryReceipt("canary_converged", "Converged: graders suspiciously agree", 0.15,
+                       {"grader_1": 0.6, "grader_2": 0.61, "grader_3": 0.59, "grader_4": 0.6}),
     ]
+    for c in canaries:
+        scorer.add_canary(c)
     
     all_pass = True
-    for scenario in scenarios:
-        result = scorer.score_quorum(scenario["graders"])
-        passed = result["quorum_valid"] == scenario["expect_valid"]
-        status = "✓" if passed else "✗"
-        if not passed:
-            all_pass = False
-        
-        print(f"\n{status} {scenario['name']}")
-        print(f"  Quorum valid: {result['quorum_valid']}")
-        print(f"  Min independence: {result['min_independence']}")
-        print(f"  Provenance diversity: {result['provenance_diversity']}")
-        if result["correlated_pairs"]:
-            print(f"  Correlated pairs: {result['correlated_pairs']}")
-        if result["rejection_reason"]:
-            print(f"  Rejection: {result['rejection_reason']}")
-        
-        for pair in result["pairs"]:
-            print(f"    {pair['grader_a']} ↔ {pair['grader_b']}: "
-                  f"tau_edge={pair['tau_edge']}, canary={pair['canary_agreement']}, "
-                  f"independence={pair['independence_score']} [{pair['level']}]")
+    
+    # Scenario 1: Diverse quorum (4 different families + operators)
+    print("\n1. Diverse quorum (4 distinct model families + operators)")
+    result = scorer.compute_independence_score(["grader_1", "grader_2", "grader_3", "grader_4"])
+    print(f"   Model diversity:    {result['axes']['model']:.3f}")
+    print(f"   Training diversity: {result['axes']['training']:.3f}")
+    print(f"   Operator diversity: {result['axes']['operator']:.3f}")
+    print(f"   Composite score:    {result['composite_score']:.4f}")
+    print(f"   Meets threshold:    {'✓' if result['meets_threshold'] else '✗'}")
+    if not result['meets_threshold']:
+        all_pass = False
+        print("   FAIL: diverse quorum should meet threshold")
+    
+    # Scenario 2: Monoculture (all same model + operator)
+    print("\n2. Monoculture (same model family + operator)")
+    result2 = scorer.compute_independence_score(["grader_1", "grader_5", "grader_6"])
+    print(f"   Model diversity:    {result2['axes']['model']:.3f}")
+    print(f"   Training diversity: {result2['axes']['training']:.3f}")
+    print(f"   Operator diversity: {result2['axes']['operator']:.3f}")
+    print(f"   Composite score:    {result2['composite_score']:.4f}")
+    print(f"   Meets threshold:    {'✓' if not result2['meets_threshold'] else '✗ (should fail!)'}")
+    if result2['meets_threshold']:
+        all_pass = False
+        print("   FAIL: monoculture should NOT meet threshold")
+    
+    # Scenario 3: Mixed (2 diverse + 1 same)
+    print("\n3. Mixed quorum (2 diverse + 1 same-family)")
+    result3 = scorer.compute_independence_score(["grader_1", "grader_2", "grader_5"])
+    print(f"   Model diversity:    {result3['axes']['model']:.3f}")
+    print(f"   Training diversity: {result3['axes']['training']:.3f}")
+    print(f"   Operator diversity: {result3['axes']['operator']:.3f}")
+    print(f"   Composite score:    {result3['composite_score']:.4f}")
+    print(f"   Meets threshold:    {'✓' if result3['meets_threshold'] else '✗'}")
+    
+    # Scenario 4: Canary drift detection
+    print("\n4. Canary convergence drift detection")
+    alerts = scorer.detect_convergence_drift()
+    for alert in alerts:
+        print(f"   ⚠ {alert['severity']}: {alert['message']}")
+        print(f"     Expected variance: {alert['expected_variance']}, Actual: {alert['actual_variance']}")
+    if not alerts:
+        print("   No convergence drift detected")
+    
+    # The "canary_converged" should trigger (variance near 0, expected 0.15)
+    converged_alerts = [a for a in alerts if a["canary_id"] == "canary_converged"]
+    if not converged_alerts:
+        all_pass = False
+        print("   FAIL: should detect convergence on canary_converged")
+    
+    # Scenario 5: Pairwise agreement matrix
+    print("\n5. Pairwise agreement matrix on canary cases")
+    pairwise = scorer.pairwise_agreement_matrix(["canary_ambiguous", "canary_edge", "canary_converged"])
+    print(f"   Graders: {pairwise['graders']}")
+    if pairwise["high_correlation_pairs"]:
+        for g1, g2, score in pairwise["high_correlation_pairs"]:
+            print(f"   ⚠ High correlation: {g1} ↔ {g2} = {score:.3f}")
+    else:
+        print("   No high-correlation pairs detected (good)")
     
     print(f"\n{'=' * 70}")
-    print(f"Results: {sum(1 for s in scenarios if scorer.score_quorum(s['graders'])['quorum_valid'] == s['expect_valid'])}/{len(scenarios)} passed")
-    print(f"\nKey insight: accuracy floor catches BAD graders.")
-    print(f"Independence scoring catches CORRELATED graders.")
-    print(f"Two 0.72 graders from same distribution = one signal, not two.")
-    print(f"Canary probes + Kendall tau on edge cases = correlation detector.")
+    print(f"Key: geometric mean ensures ANY monoculture axis kills the score.")
+    print(f"Canary variance monitors ongoing independence, not just static diversity.")
+    print(f"Vaughan: drift toward consensus IS the deviance.")
+    print(f"\nResults: {'ALL PASS' if all_pass else 'SOME FAILURES'}")
     
     return all_pass
 
