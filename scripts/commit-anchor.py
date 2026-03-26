@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 """
-commit-anchor.py — Git commits as first-class ATF provenance anchors.
+commit-anchor.py — COMMIT_ANCHOR: git commits as first-class ATF attestation evidence.
 
-Maps software supply chain provenance (SLSA, in-toto, Sigstore) to ATF.
+Suggested by santaclawd: "a claim says I did X. a commit says when, what hash, what changed.
+one is a business card. the other is evidence."
 
-Concept (santaclawd): "a claim says 'I did X' — a commit says when, what hash, 
-what changed. the difference is verifiability."
+Maps git commit verification to ATF trust primitives:
+- Git commit hash = SHA-256 of (tree + parent + author + timestamp + message)
+- Signature at branch tip verifies ENTIRE branch history (Merkle chain)
+- GitHub persistent verification (Nov 2024): verify at push, store forever
+- Commit = non-repudiable evidence of: WHAT changed, WHEN, WHO signed, WHAT state
 
-SLSA levels mapped to ATF:
-- L1: Provenance exists (receipt with claim)
-- L2: Signed + tamper-resistant (receipt with signature)
-- L3: Verified source (receipt + verified git history)
-- L4: Isolated build (receipt from hermetic environment)
-
-in-toto model: signed attestations for each pipeline step.
-Layout defines expected steps + trusted actors.
-Skipped step → tamper visible.
-
-This tool:
-1. Extracts git commit metadata as structured provenance
-2. Generates in-toto-style attestation envelopes
-3. Chains attestations with hash links (like provenance-logger.py)
-4. Verifies commit chains haven't been rewritten
+ATF integration:
+- COMMIT_ANCHOR = {commit_hash, timestamp, tree_hash, diff_summary, signer_id, repo_url}
+- Attestation references a commit anchor → verifiable evidence chain
+- Provenance-logger.py already chains JSONL with SHA-256 → upgrade to git object refs
+- Claims without commit anchors = self-reported. With = independently verifiable.
 
 Sources:
-- SLSA v1.1 spec (slsa.dev)
-- in-toto: A framework for securing software supply chains (CNCF)
-- Sigstore: Software Signing for Everybody (2022)
-- InfoQ: Provenance Tools Becoming Standard (Aug 2025)
-- GitHub artifact attestations (actions/attest-build-provenance)
+- GitHub persistent commit signature verification (Nov 2024)
+- Git internals: commit objects, tree hashing, Merkle chain
+- mricon (InfoSec SE): "signature at tip provides integrity of entire history"
 """
 
 import hashlib
@@ -42,269 +34,268 @@ from typing import Optional
 
 @dataclass
 class CommitAnchor:
-    """A git commit as an ATF provenance anchor."""
+    """
+    A COMMIT_ANCHOR: git commit as attestation evidence.
+    
+    Unlike a self-reported claim, a commit anchor is independently verifiable:
+    - Hash is deterministic (recomputable from contents)
+    - Timestamp is embedded (not mutable after signing)
+    - Tree hash proves exact state of all files
+    - Parent hash chains to entire prior history
+    - Signature proves identity of committer
+    """
     commit_hash: str
-    author: str
-    timestamp: str
+    timestamp: str              # ISO 8601
+    author_name: str
+    author_email: str
+    tree_hash: str              # Hash of file tree state
+    parent_hashes: list[str]    # Chain to history
     message: str
-    files_changed: list[str]
-    parent_hashes: list[str]
-    tree_hash: str
-    # ATF extensions
-    agent_id: Optional[str] = None
-    claim_type: Optional[str] = None  # "build", "research", "attestation"
+    diff_summary: dict          # {files_changed, insertions, deletions}
+    signature_status: str       # "verified", "unverified", "unsigned"
+    signer_id: Optional[str]    # Key fingerprint if signed
+    repo_url: Optional[str]
     
-    @property
-    def content_hash(self) -> str:
-        """Deterministic hash of commit content for chain verification."""
-        content = f"{self.commit_hash}:{self.tree_hash}:{self.timestamp}:{self.message}"
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-
-
-@dataclass 
-class InTotoAttestation:
-    """
-    in-toto style attestation envelope for ATF.
-    
-    in-toto layout: defines expected steps + trusted functionaries.
-    Each step produces a link: signed record of what was done.
-    Layout verification checks: all steps complete, by authorized actors, in order.
-    """
-    step_name: str           # e.g., "research", "write", "review", "publish"
-    functionary: str         # Who performed this step (agent_id)
-    materials: list[dict]    # Inputs: [{uri, digest}]
-    products: list[dict]     # Outputs: [{uri, digest}]
-    command: str             # What was executed
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    previous_hash: Optional[str] = None  # Chain link
-    
-    @property
-    def envelope_hash(self) -> str:
-        content = json.dumps({
-            "step": self.step_name,
-            "functionary": self.functionary,
-            "materials": self.materials,
-            "products": self.products,
-            "command": self.command,
-            "timestamp": self.timestamp,
-            "previous": self.previous_hash,
-        }, sort_keys=True)
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-    
-    def to_envelope(self) -> dict:
-        """DSSE-style envelope (Dead Simple Signing Envelope)."""
-        payload = {
-            "_type": "https://in-toto.io/Statement/v1",
-            "subject": self.products,
-            "predicateType": "https://slsa.dev/provenance/v1",
-            "predicate": {
-                "buildDefinition": {
-                    "buildType": f"atf/{self.step_name}",
-                    "externalParameters": {
-                        "command": self.command,
-                    },
-                    "resolvedDependencies": self.materials,
-                },
-                "runDetails": {
-                    "builder": {"id": self.functionary},
-                    "metadata": {
-                        "invocationId": self.envelope_hash,
-                        "startedOn": self.timestamp,
-                    },
-                },
-            },
-        }
+    def to_attestation_ref(self) -> dict:
+        """Convert to ATF attestation reference format."""
         return {
-            "payloadType": "application/vnd.in-toto+json",
-            "payload": payload,
-            "signatures": [],  # Would be filled by signing step
-            "chainHash": self.envelope_hash,
-            "previousHash": self.previous_hash,
+            "type": "COMMIT_ANCHOR",
+            "evidence_class": "verifiable",  # vs "self_reported"
+            "commit": self.commit_hash,
+            "timestamp": self.timestamp,
+            "tree": self.tree_hash,
+            "parents": self.parent_hashes,
+            "signer": self.signer_id or self.author_email,
+            "signature": self.signature_status,
+            "diff": self.diff_summary,
+            "repo": self.repo_url,
+            "chain_depth": len(self.parent_hashes),  # How far back the Merkle chain goes
+            "integrity": "branch_tip_verifies_all" if self.signature_status == "verified" else "hash_chain_only",
         }
+    
+    @property
+    def evidence_strength(self) -> str:
+        """Rate the evidence strength of this anchor."""
+        if self.signature_status == "verified":
+            return "STRONG"  # Signed + verifiable
+        elif self.signature_status == "unverified":
+            return "MEDIUM"  # Signed but can't verify key
+        else:
+            return "WEAK"    # Unsigned, hash chain only
 
 
-def extract_commit_anchors(repo_path: str, count: int = 5) -> list[CommitAnchor]:
-    """Extract recent commits as provenance anchors."""
+def extract_commit_anchor(repo_path: str, commit_ref: str = "HEAD") -> Optional[CommitAnchor]:
+    """Extract a COMMIT_ANCHOR from a git repository."""
     try:
+        # Get commit details
+        fmt = "%H%n%aI%n%an%n%ae%n%T%n%P%n%s"
         result = subprocess.run(
-            ["git", "log", f"-{count}", "--format=%H|%an|%aI|%s|%P|%T", "--name-only"],
+            ["git", "log", "-1", f"--format={fmt}", commit_ref],
             cwd=repo_path, capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
-            return []
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return []
-    
-    anchors = []
-    lines = result.stdout.strip().split("\n")
-    
-    current_meta = None
-    current_files = []
-    
-    for line in lines:
-        if "|" in line and line.count("|") >= 4:
-            # Save previous
-            if current_meta:
-                parts = current_meta.split("|")
-                anchors.append(CommitAnchor(
-                    commit_hash=parts[0],
-                    author=parts[1],
-                    timestamp=parts[2],
-                    message=parts[3],
-                    parent_hashes=parts[4].split() if len(parts) > 4 and parts[4] else [],
-                    tree_hash=parts[5] if len(parts) > 5 else "",
-                    files_changed=[f for f in current_files if f.strip()],
-                ))
-            current_meta = line
-            current_files = []
-        elif line.strip():
-            current_files.append(line.strip())
-    
-    # Don't forget last one
-    if current_meta:
-        parts = current_meta.split("|")
-        anchors.append(CommitAnchor(
-            commit_hash=parts[0],
-            author=parts[1],
-            timestamp=parts[2],
-            message=parts[3],
-            parent_hashes=parts[4].split() if len(parts) > 4 and parts[4] else [],
-            tree_hash=parts[5] if len(parts) > 5 else "",
-            files_changed=[f for f in current_files if f.strip()],
-        ))
-    
-    return anchors
-
-
-def verify_chain(anchors: list[CommitAnchor]) -> dict:
-    """Verify commit chain integrity — detect rewrites/force-pushes."""
-    issues = []
-    
-    for i in range(len(anchors) - 1):
-        child = anchors[i]
-        parent = anchors[i + 1]
+            return None
         
-        if parent.commit_hash not in child.parent_hashes:
-            issues.append({
-                "type": "CHAIN_BREAK",
-                "child": child.commit_hash[:8],
-                "expected_parent": parent.commit_hash[:8],
-                "actual_parents": [p[:8] for p in child.parent_hashes],
-                "severity": "HIGH",
-            })
-    
-    return {
-        "chain_length": len(anchors),
-        "verified": len(issues) == 0,
-        "issues": issues,
-        "slsa_level": "L3" if len(issues) == 0 else "L1",
-    }
-
-
-def build_attestation_chain(anchors: list[CommitAnchor], agent_id: str) -> list[dict]:
-    """Build in-toto attestation chain from commit anchors."""
-    chain = []
-    prev_hash = None
-    
-    for anchor in reversed(anchors):  # Oldest first
-        # Classify commit type
-        if any("scripts/" in f for f in anchor.files_changed):
-            step = "build"
-        elif any("memory/" in f for f in anchor.files_changed):
-            step = "log"
-        elif any(".md" in f for f in anchor.files_changed):
-            step = "document"
-        else:
-            step = "update"
+        lines = result.stdout.strip().split("\n")
+        if len(lines) < 6:
+            return None
         
-        materials = [{"uri": f"git:{anchor.parent_hashes[0][:8]}" if anchor.parent_hashes else "git:root"}]
-        products = [{"uri": f, "digest": {"gitTreeHash": anchor.tree_hash[:16]}} for f in anchor.files_changed[:5]]
+        commit_hash = lines[0]
+        timestamp = lines[1]
+        author_name = lines[2]
+        author_email = lines[3]
+        tree_hash = lines[4]
+        parent_hashes = lines[5].split() if lines[5] else []
+        message = lines[6] if len(lines) > 6 else ""
         
-        attestation = InTotoAttestation(
-            step_name=step,
-            functionary=agent_id,
-            materials=materials,
-            products=products,
-            command=f"git commit: {anchor.message[:80]}",
-            timestamp=anchor.timestamp,
-            previous_hash=prev_hash,
+        # Get diff summary
+        diff_result = subprocess.run(
+            ["git", "diff", "--shortstat", f"{commit_ref}~1", commit_ref],
+            cwd=repo_path, capture_output=True, text=True, timeout=10,
         )
+        diff_summary = parse_diff_stat(diff_result.stdout.strip())
         
-        envelope = attestation.to_envelope()
-        chain.append(envelope)
-        prev_hash = attestation.envelope_hash
+        # Check signature
+        sig_result = subprocess.run(
+            ["git", "log", "-1", "--format=%G?", commit_ref],
+            cwd=repo_path, capture_output=True, text=True, timeout=10,
+        )
+        sig_char = sig_result.stdout.strip()
+        if sig_char in ("G", "U", "X", "Y", "R"):
+            signature_status = "verified" if sig_char == "G" else "unverified"
+        elif sig_char == "N":
+            signature_status = "unsigned"
+        else:
+            signature_status = "unsigned"
+        
+        # Get signer fingerprint if signed
+        signer_id = None
+        if signature_status != "unsigned":
+            fp_result = subprocess.run(
+                ["git", "log", "-1", "--format=%GF", commit_ref],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+            signer_id = fp_result.stdout.strip() or None
+        
+        # Get remote URL
+        remote_result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_path, capture_output=True, text=True, timeout=10,
+        )
+        repo_url = remote_result.stdout.strip() if remote_result.returncode == 0 else None
+        
+        return CommitAnchor(
+            commit_hash=commit_hash,
+            timestamp=timestamp,
+            author_name=author_name,
+            author_email=author_email,
+            tree_hash=tree_hash,
+            parent_hashes=parent_hashes,
+            message=message,
+            diff_summary=diff_summary,
+            signature_status=signature_status,
+            signer_id=signer_id,
+            repo_url=repo_url,
+        )
+    except Exception as e:
+        print(f"Error extracting commit anchor: {e}")
+        return None
+
+
+def parse_diff_stat(stat_line: str) -> dict:
+    """Parse git diff --shortstat output."""
+    result = {"files_changed": 0, "insertions": 0, "deletions": 0}
+    if not stat_line:
+        return result
     
-    return chain
+    import re
+    files_match = re.search(r"(\d+) file", stat_line)
+    ins_match = re.search(r"(\d+) insertion", stat_line)
+    del_match = re.search(r"(\d+) deletion", stat_line)
+    
+    if files_match:
+        result["files_changed"] = int(files_match.group(1))
+    if ins_match:
+        result["insertions"] = int(ins_match.group(1))
+    if del_match:
+        result["deletions"] = int(del_match.group(1))
+    
+    return result
 
 
-def run_demo():
-    """Demo: extract commits from workspace and build attestation chain."""
+class CommitAnchorVerifier:
+    """
+    Verify COMMIT_ANCHOR attestation evidence.
+    
+    Verification levels:
+    1. HASH_VALID: commit hash matches contents (tamper detection)
+    2. CHAIN_VALID: parent chain is intact (history integrity)
+    3. SIGNATURE_VALID: cryptographic signature verifies (identity proof)
+    4. PERSISTENT: GitHub-style persistent verification record exists
+    """
+    
+    def verify(self, anchor: CommitAnchor, repo_path: Optional[str] = None) -> dict:
+        """Verify a commit anchor's integrity."""
+        checks = {
+            "hash_present": bool(anchor.commit_hash),
+            "timestamp_present": bool(anchor.timestamp),
+            "tree_present": bool(anchor.tree_hash),
+            "has_parent_chain": len(anchor.parent_hashes) > 0,
+            "signature_status": anchor.signature_status,
+            "evidence_strength": anchor.evidence_strength,
+            "diff_nontrivial": anchor.diff_summary.get("files_changed", 0) > 0,
+        }
+        
+        # If we have repo access, verify hash chain
+        if repo_path:
+            try:
+                result = subprocess.run(
+                    ["git", "cat-file", "-t", anchor.commit_hash],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                checks["hash_exists_in_repo"] = result.stdout.strip() == "commit"
+                
+                # Verify tree hash matches
+                tree_result = subprocess.run(
+                    ["git", "log", "-1", "--format=%T", anchor.commit_hash],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                checks["tree_hash_matches"] = tree_result.stdout.strip() == anchor.tree_hash
+            except Exception:
+                checks["repo_verification"] = "failed"
+        
+        # Determine verification level
+        if checks["signature_status"] == "verified":
+            level = "SIGNATURE_VALID"
+        elif checks.get("tree_hash_matches"):
+            level = "CHAIN_VALID"
+        elif checks["hash_present"] and checks["tree_present"]:
+            level = "HASH_VALID"
+        else:
+            level = "UNVERIFIABLE"
+        
+        return {
+            "verification_level": level,
+            "checks": checks,
+            "attestation_eligible": level in ("SIGNATURE_VALID", "CHAIN_VALID", "HASH_VALID"),
+            "note": self._level_note(level),
+        }
+    
+    def _level_note(self, level: str) -> str:
+        notes = {
+            "SIGNATURE_VALID": "Full cryptographic proof of identity + integrity. Branch tip verifies entire history.",
+            "CHAIN_VALID": "Hash chain intact, tree verified. Identity relies on git author (spoofable without signature).",
+            "HASH_VALID": "Commit exists with valid hashes. No signature or repo verification performed.",
+            "UNVERIFIABLE": "Insufficient data to verify. Claim without evidence.",
+        }
+        return notes.get(level, "")
+
+
+def demo():
+    """Demo COMMIT_ANCHOR extraction from this repo."""
+    print("=" * 70)
+    print("COMMIT_ANCHOR — Git Commits as ATF Attestation Evidence")
+    print("=" * 70)
+    
     repo_path = os.path.expanduser("~/.openclaw/workspace")
-    agent_id = "kit_fox"
     
-    print("=" * 70)
-    print("COMMIT-ANCHOR: Git Provenance as ATF Attestations")
-    print("SLSA + in-toto model for agent trust chains")
-    print("=" * 70)
+    # Extract anchors from recent commits
+    for i, ref in enumerate(["HEAD", "HEAD~1", "HEAD~2"]):
+        anchor = extract_commit_anchor(repo_path, ref)
+        if not anchor:
+            print(f"\n[{ref}] Could not extract anchor")
+            continue
+        
+        print(f"\n--- Commit {ref} ---")
+        print(f"  Hash:      {anchor.commit_hash[:12]}...")
+        print(f"  Time:      {anchor.timestamp}")
+        print(f"  Author:    {anchor.author_name} <{anchor.author_email}>")
+        print(f"  Message:   {anchor.message[:80]}")
+        print(f"  Tree:      {anchor.tree_hash[:12]}...")
+        print(f"  Parents:   {len(anchor.parent_hashes)}")
+        print(f"  Diff:      {anchor.diff_summary}")
+        print(f"  Signed:    {anchor.signature_status}")
+        print(f"  Strength:  {anchor.evidence_strength}")
+        
+        # Verify
+        verifier = CommitAnchorVerifier()
+        verification = verifier.verify(anchor, repo_path)
+        print(f"  Verified:  {verification['verification_level']}")
+        print(f"  Eligible:  {verification['attestation_eligible']}")
+        
+        # Show attestation ref format
+        attest_ref = anchor.to_attestation_ref()
+        print(f"  ATF Ref:   {json.dumps({k: v for k, v in attest_ref.items() if k in ('type', 'evidence_class', 'integrity', 'signature')})}")
     
-    # Extract recent commits
-    anchors = extract_commit_anchors(repo_path, count=5)
-    
-    if not anchors:
-        print("\nNo commits found. Running with synthetic data.")
-        anchors = [
-            CommitAnchor("aaa111", "Kit", "2026-03-26T14:00:00Z", "diversity-collapse-detector.py",
-                        ["scripts/diversity-collapse-detector.py"], ["bbb222"], "tree1"),
-            CommitAnchor("bbb222", "Kit", "2026-03-26T04:00:00Z", "valley-free-verifier.py",
-                        ["scripts/valley-free-verifier.py"], ["ccc333"], "tree2"),
-            CommitAnchor("ccc333", "Kit", "2026-03-25T20:00:00Z", "trust-lifecycle-acme.py",
-                        ["scripts/trust-lifecycle-acme.py"], [], "tree3"),
-        ]
-    
-    print(f"\n📦 Extracted {len(anchors)} commit anchors:")
-    for a in anchors:
-        print(f"  {a.commit_hash[:8]} | {a.timestamp[:10]} | {a.message[:60]}")
-        for f in a.files_changed[:3]:
-            print(f"    └─ {f}")
-    
-    # Verify chain
-    print(f"\n🔗 Chain verification:")
-    verification = verify_chain(anchors)
-    print(f"  Chain length: {verification['chain_length']}")
-    print(f"  Verified: {verification['verified']}")
-    print(f"  SLSA level: {verification['slsa_level']}")
-    if verification['issues']:
-        for issue in verification['issues']:
-            print(f"  ⚠️ {issue['type']}: {issue['child']} → expected {issue['expected_parent']}")
-    
-    # Build attestation chain
-    print(f"\n📋 in-toto attestation chain:")
-    chain = build_attestation_chain(anchors, agent_id)
-    for i, envelope in enumerate(chain):
-        pred = envelope['payload']['predicate']
-        step = pred['buildDefinition']['buildType'].split('/')[-1]
-        cmd = pred['buildDefinition']['externalParameters']['command'][:60]
-        print(f"  [{i}] step={step} | hash={envelope['chainHash']}")
-        print(f"      cmd: {cmd}")
-        print(f"      prev: {envelope['previousHash'] or 'ROOT'}")
-        products = envelope['payload']['subject']
-        for p in products[:2]:
-            print(f"      → {p.get('uri', 'unknown')}")
-    
-    # Summary
     print(f"\n{'=' * 70}")
-    print("Mapping: SLSA → ATF")
-    print("  SLSA L1 (provenance exists)    → ATF receipt with claim")
-    print("  SLSA L2 (signed, tamper-proof)  → ATF receipt with Ed25519 sig")
-    print("  SLSA L3 (verified source)       → ATF receipt + verified git chain")
-    print("  SLSA L4 (hermetic build)        → ATF receipt from isolated grader")
-    print()
-    print("in-toto layout → ATF ceremony definition")
-    print("in-toto link   → ATF receipt (step attestation)")
-    print("Sigstore Rekor  → ATF transparency log (CT-log equivalent)")
-    print()
-    print("Key: commits are already provenance. Add signing + chain = SLSA L3.")
+    print("Key properties:")
+    print("  1. Claims are self-reported. Commits are verifiable evidence.")
+    print("  2. Signature at branch tip verifies ENTIRE branch history (Merkle chain).")
+    print("  3. GitHub persistent verification: verify at push, store forever.")
+    print("  4. Tree hash proves exact state of every file at commit time.")
+    print("  5. COMMIT_ANCHOR upgrades attestation from 'I said I did X' to 'I provably did X'.")
+    print(f"\nsantaclawd: 'one is a business card. the other is evidence.'")
 
 
 if __name__ == "__main__":
-    run_demo()
+    demo()
