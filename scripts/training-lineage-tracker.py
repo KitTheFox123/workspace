@@ -1,306 +1,301 @@
 #!/usr/bin/env python3
 """
-training-lineage-tracker.py — TRAINING_LINEAGE attestation for ATF grader diversity.
+training-lineage-tracker.py — Training lineage diversity scoring for ATF grader pools.
 
-Problem (santaclawd, Mar 26): 2 model families + 2 operators looks diverse but shared
-RLHF preference corpus creates isomorphism. Fine-tuned on same human preference data
-= convergent behavior despite different architectures.
+Problem (santaclawd, Mar 26): shared RLHF preference data creates isomorphism
+even across different model families. Two graders from different providers but
+same RLHF corpus = correlated failure modes = false consensus.
 
-Kirk et al (2023, Meta): RLHF significantly reduces output diversity compared to SFT.
-Same preference corpus → convergent outputs across model families.
+Kirk et al. 2023 (arXiv 2310.06452): RLHF significantly reduces output diversity
+vs SFT. Shared preference corpus = shared bias surface.
 
-Solution: Track training lineage in attestation metadata. Effective diversity = f(model
-family, training data provenance, operator independence). Simpson diversity applied to
-lineage vectors, not just operator/family counts.
+Solution: Track training lineage (base model family, fine-tuning corpus, RLHF source)
+as first-class attestation metadata. Compute effective diversity of grader pools
+accounting for shared ancestry — like phylogenetic diversity in ecology.
 
-Three isomorphism channels:
-1. Coercion: shared RLHF preference datasets (e.g., Anthropic HH, OpenAI)
-2. Convergent: similar architectures reaching similar optima independently
-3. Contamination: post-training on shared synthetic data / distillation
+Parallel: Faith's Phylogenetic Diversity (PD) — biodiversity measured by total
+branch length in evolutionary tree. Two species from same genus contribute less
+diversity than two from different families. Same for agents: two Claude variants
+contribute less diversity than Claude + Llama.
 
 Sources:
-- Kirk et al 2023 (arXiv 2310.06452): RLHF reduces output diversity
-- santaclawd: shared RLHF = isomorphic graders
-- funwolf: diversity must bottom out somewhere
-- Nature 2025: correlated voters = expensive groupthink
+- Kirk et al. 2023 (arXiv 2310.06452): RLHF reduces diversity
+- Faith 1992: Phylogenetic Diversity
+- DiMaggio & Powell 1983: Institutional Isomorphism (3 channels)
+- santaclawd: RLHF creates isomorphism even across model families
 """
 
 import json
-import hashlib
+import math
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Optional
 from datetime import datetime, timezone
 
 
-class IsomorphismChannel(Enum):
-    """How training isomorphism propagates."""
-    COERCION = "coercion"           # Shared RLHF/preference data
-    CONVERGENT = "convergent"       # Architecture similarity → similar optima
-    CONTAMINATION = "contamination" # Shared synthetic/distillation data
-    INDEPENDENT = "independent"     # No known shared lineage
-
-
 @dataclass
 class TrainingLineage:
-    """Training provenance for a grader agent."""
+    """Training lineage declaration for an agent/grader."""
     agent_id: str
-    model_family: str              # e.g., "claude", "gpt", "llama", "mistral"
-    model_version: str             # e.g., "opus-4.6", "4o", "3.1-70B"
-    operator_id: str               # Who runs this agent
-    
-    # Training data provenance
-    base_training: str             # Pre-training corpus identifier
-    rlhf_dataset: Optional[str]    # RLHF preference dataset (if known)
-    fine_tune_dataset: Optional[str] = None  # Task-specific fine-tuning data
-    distilled_from: Optional[str] = None     # If distilled from larger model
-    
-    # Metadata
-    declared_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    base_model_family: str           # e.g., "claude", "llama", "gpt", "gemini"
+    base_model_version: str          # e.g., "opus-4.6", "3.3-70b"
+    fine_tuning_corpus: list[str]    # Named datasets used for SFT
+    rlhf_source: list[str]          # Named preference datasets/annotator pools
+    operator_id: str                 # Who operates this agent
+    training_date: Optional[str] = None
     
     @property
     def lineage_hash(self) -> str:
-        """Hash of training lineage for comparison."""
-        components = f"{self.model_family}:{self.base_training}:{self.rlhf_dataset}:{self.fine_tune_dataset}:{self.distilled_from}"
-        return hashlib.sha256(components.encode()).hexdigest()[:16]
+        """Deterministic hash of training lineage for comparison."""
+        components = sorted([
+            f"family:{self.base_model_family}",
+            f"version:{self.base_model_version}",
+            f"sft:{','.join(sorted(self.fine_tuning_corpus))}",
+            f"rlhf:{','.join(sorted(self.rlhf_source))}",
+        ])
+        return "|".join(components)
 
 
 @dataclass
-class DiversityAssessment:
-    """Assessment of grader pool diversity accounting for training lineage."""
-    pool_size: int
-    unique_families: int
-    unique_operators: int
-    unique_lineages: int
-    effective_diversity: float      # Simpson diversity on lineage vectors
-    isomorphism_pairs: list[tuple[str, str, str]]  # (agent_a, agent_b, channel)
-    effective_graders: float        # Adjusted count after isomorphism discount
-    assessment: str
+class IsomorphismScore:
+    """Pairwise isomorphism between two agents."""
+    agent_a: str
+    agent_b: str
+    family_shared: bool         # Same base model family
+    version_shared: bool        # Same base model version
+    sft_overlap: float          # Jaccard similarity of SFT corpora
+    rlhf_overlap: float         # Jaccard similarity of RLHF sources
+    operator_shared: bool       # Same operator
+    composite_score: float      # 0.0 = fully independent, 1.0 = identical
+    
+    @property
+    def channel(self) -> str:
+        """DiMaggio & Powell isomorphism channel."""
+        if self.operator_shared:
+            return "coercive"       # Same org forces same practices
+        elif self.rlhf_overlap > 0.5:
+            return "mimetic"        # Different orgs, same training signal
+        elif self.family_shared:
+            return "normative"      # Same professional norms (model family)
+        return "independent"
+
+
+def jaccard(a: list[str], b: list[str]) -> float:
+    """Jaccard similarity between two sets."""
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 0.0
+    intersection = len(sa & sb)
+    union = len(sa | sb)
+    return intersection / union if union > 0 else 0.0
 
 
 class TrainingLineageTracker:
     """
-    Tracks and assesses grader training lineage for ATF diversity requirements.
+    Tracks training lineage and computes effective diversity of grader pools.
     
-    Key insight: 2 model families + 2 operators can still be 1 effective grader
-    if they share RLHF preference data (Kirk et al 2023).
+    Key insight: 2 model families from same RLHF corpus = 1 effective family.
+    Diversity must account for shared ancestry at EVERY level:
+    - Base model family (genotype)
+    - Fine-tuning corpus (phenotype development)
+    - RLHF preferences (behavioral shaping)
+    - Operator (organizational culture)
     """
-    
-    # Known RLHF dataset families (shared preference corpora)
-    KNOWN_RLHF_FAMILIES = {
-        "anthropic_hh": ["claude"],
-        "openai_prefs": ["gpt"],
-        "open_assistant": ["llama", "mistral", "falcon"],
-        "ultrafeedback": ["llama", "mistral", "zephyr"],
-        "nectar": ["llama", "mistral"],
-    }
-    
-    # Isomorphism discount factors
-    SHARED_RLHF_DISCOUNT = 0.5    # 50% effective diversity loss for shared RLHF
-    SHARED_FAMILY_DISCOUNT = 0.3   # 30% for same model family, different operator
-    DISTILLATION_DISCOUNT = 0.7    # 70% for teacher-student relationship
     
     def __init__(self):
         self.lineages: dict[str, TrainingLineage] = {}
+        # Weights for composite isomorphism score
+        self.weights = {
+            "family": 0.25,     # Same model family
+            "version": 0.10,    # Same specific version
+            "sft": 0.20,        # Shared SFT corpus
+            "rlhf": 0.30,       # Shared RLHF source (highest weight per Kirk et al.)
+            "operator": 0.15,   # Same operator
+        }
     
     def register(self, lineage: TrainingLineage):
-        """Register a grader's training lineage."""
+        """Register an agent's training lineage."""
         self.lineages[lineage.agent_id] = lineage
     
-    def detect_isomorphism(self, agent_a: str, agent_b: str) -> tuple[IsomorphismChannel, float]:
-        """
-        Detect isomorphism between two graders.
-        Returns: (channel, discount_factor)
-        discount_factor: 1.0 = fully independent, 0.0 = identical
-        """
-        la = self.lineages.get(agent_a)
-        lb = self.lineages.get(agent_b)
+    def pairwise_isomorphism(self, agent_a: str, agent_b: str) -> IsomorphismScore:
+        """Compute pairwise isomorphism between two agents."""
+        la = self.lineages[agent_a]
+        lb = self.lineages[agent_b]
         
-        if not la or not lb:
-            return IsomorphismChannel.INDEPENDENT, 1.0
+        family_shared = la.base_model_family == lb.base_model_family
+        version_shared = la.base_model_version == lb.base_model_version
+        sft_overlap = jaccard(la.fine_tuning_corpus, lb.fine_tuning_corpus)
+        rlhf_overlap = jaccard(la.rlhf_source, lb.rlhf_source)
+        operator_shared = la.operator_id == lb.operator_id
         
-        # Check distillation (strongest isomorphism)
-        if la.distilled_from and la.distilled_from == lb.model_version:
-            return IsomorphismChannel.CONTAMINATION, self.DISTILLATION_DISCOUNT
-        if lb.distilled_from and lb.distilled_from == la.model_version:
-            return IsomorphismChannel.CONTAMINATION, self.DISTILLATION_DISCOUNT
+        # Composite score: weighted sum
+        composite = (
+            self.weights["family"] * (1.0 if family_shared else 0.0) +
+            self.weights["version"] * (1.0 if version_shared else 0.0) +
+            self.weights["sft"] * sft_overlap +
+            self.weights["rlhf"] * rlhf_overlap +
+            self.weights["operator"] * (1.0 if operator_shared else 0.0)
+        )
         
-        # Check shared RLHF dataset (Kirk et al: reduces diversity)
-        if la.rlhf_dataset and lb.rlhf_dataset and la.rlhf_dataset == lb.rlhf_dataset:
-            return IsomorphismChannel.COERCION, self.SHARED_RLHF_DISCOUNT
-        
-        # Check same model family (convergent optima)
-        if la.model_family == lb.model_family:
-            return IsomorphismChannel.CONVERGENT, self.SHARED_FAMILY_DISCOUNT
-        
-        # Check lineage hash collision
-        if la.lineage_hash == lb.lineage_hash:
-            return IsomorphismChannel.CONTAMINATION, 0.1  # Near-identical
-        
-        return IsomorphismChannel.INDEPENDENT, 1.0
+        return IsomorphismScore(
+            agent_a=agent_a,
+            agent_b=agent_b,
+            family_shared=family_shared,
+            version_shared=version_shared,
+            sft_overlap=sft_overlap,
+            rlhf_overlap=rlhf_overlap,
+            operator_shared=operator_shared,
+            composite_score=round(composite, 3),
+        )
     
-    def simpson_diversity(self, categories: list[str]) -> float:
-        """Simpson's Diversity Index: 1 - Σ(p_i²)."""
-        if not categories:
-            return 0.0
-        n = len(categories)
-        counts: dict[str, int] = {}
-        for c in categories:
-            counts[c] = counts.get(c, 0) + 1
-        return 1.0 - sum((count / n) ** 2 for count in counts.values())
+    def effective_diversity(self, agent_ids: list[str]) -> dict:
+        """
+        Compute effective diversity of a grader pool.
+        
+        Faith's PD adapted: total phylogenetic branch length, where
+        shared training lineage = shared branches = reduced diversity.
+        
+        Returns effective_n: how many truly independent graders this pool
+        represents, accounting for isomorphism.
+        """
+        n = len(agent_ids)
+        if n <= 1:
+            return {
+                "pool_size": n,
+                "effective_n": n,
+                "diversity_ratio": 1.0,
+                "isomorphism_channel_counts": {},
+                "pairwise_scores": [],
+            }
+        
+        # Compute all pairwise isomorphism scores
+        pairs = []
+        total_isomorphism = 0.0
+        channel_counts = {"coercive": 0, "mimetic": 0, "normative": 0, "independent": 0}
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                score = self.pairwise_isomorphism(agent_ids[i], agent_ids[j])
+                pairs.append(score)
+                total_isomorphism += score.composite_score
+                channel_counts[score.channel] += 1
+        
+        # Effective N: pool size discounted by average pairwise isomorphism
+        # At 0 isomorphism: effective_n = n
+        # At 1.0 isomorphism: effective_n = 1
+        num_pairs = n * (n - 1) / 2
+        avg_isomorphism = total_isomorphism / num_pairs if num_pairs > 0 else 0
+        
+        # Formula: effective_n = n * (1 - avg_isomorphism) + avg_isomorphism
+        # This ensures: n agents at 0 iso = n, n agents at 1.0 iso = 1
+        effective_n = n * (1 - avg_isomorphism) + avg_isomorphism
+        effective_n = max(1.0, effective_n)  # Floor at 1
+        
+        return {
+            "pool_size": n,
+            "effective_n": round(effective_n, 2),
+            "diversity_ratio": round(effective_n / n, 3),
+            "avg_isomorphism": round(avg_isomorphism, 3),
+            "dominant_channel": max(channel_counts, key=channel_counts.get),
+            "isomorphism_channel_counts": channel_counts,
+            "pairwise_scores": [
+                {
+                    "agents": [s.agent_a, s.agent_b],
+                    "score": s.composite_score,
+                    "channel": s.channel,
+                }
+                for s in pairs
+            ],
+        }
     
-    def assess_pool(self, agent_ids: list[str]) -> DiversityAssessment:
+    def pool_passes_diversity_gate(self, agent_ids: list[str], min_effective_n: float = 2.0) -> tuple[bool, str]:
         """
-        Assess diversity of a grader pool accounting for training lineage.
+        Check if a grader pool meets minimum effective diversity.
         
-        Raw diversity (families × operators) overstates actual diversity
-        when training data is shared. This adjusts using isomorphism detection.
+        Per ATF: TRUSTED requires diversity not volume.
+        1000 receipts from 1 operator = EMERGING (PGP failure).
         """
-        lineages = [self.lineages[a] for a in agent_ids if a in self.lineages]
+        result = self.effective_diversity(agent_ids)
         
-        if not lineages:
-            return DiversityAssessment(
-                pool_size=len(agent_ids),
-                unique_families=0, unique_operators=0, unique_lineages=0,
-                effective_diversity=0.0, isomorphism_pairs=[],
-                effective_graders=0.0,
-                assessment="NO_LINEAGE_DATA"
-            )
+        if result["effective_n"] >= min_effective_n:
+            return True, f"PASS: effective_n={result['effective_n']} >= {min_effective_n}"
         
-        families = list(set(l.model_family for l in lineages))
-        operators = list(set(l.operator_id for l in lineages))
-        lineage_hashes = list(set(l.lineage_hash for l in lineages))
-        
-        # Simpson diversity on lineage hashes
-        all_hashes = [l.lineage_hash for l in lineages]
-        diversity = self.simpson_diversity(all_hashes)
-        
-        # Detect pairwise isomorphism
-        iso_pairs = []
-        discount_matrix: dict[str, float] = {a: 1.0 for a in agent_ids}
-        
-        checked = set()
-        for i, a in enumerate(agent_ids):
-            for j, b in enumerate(agent_ids):
-                if i >= j:
-                    continue
-                pair_key = (min(a, b), max(a, b))
-                if pair_key in checked:
-                    continue
-                checked.add(pair_key)
-                
-                channel, factor = self.detect_isomorphism(a, b)
-                if channel != IsomorphismChannel.INDEPENDENT:
-                    iso_pairs.append((a, b, channel.value))
-                    # Apply discount to the less-established agent
-                    discount_matrix[b] = min(discount_matrix[b], factor)
-        
-        effective = sum(discount_matrix.values())
-        
-        # Assessment
-        iso_ratio = len(iso_pairs) / max(1, len(checked)) if checked else 0
-        
-        if effective <= 2.0 and len(iso_pairs) >= 2:
-            assessment = "INSUFFICIENT — effective graders < 2, pool is isomorphic"
-        elif diversity < 0.5:
-            assessment = "LOW — Simpson diversity below 0.5, high lineage concentration"
-        elif iso_ratio > 0.3 or len(iso_pairs) >= len(agent_ids) - 1:
-            assessment = "MODERATE — significant lineage overlap, effective diversity reduced"
-        elif len(iso_pairs) > 0:
-            assessment = "MODERATE — some lineage overlap detected"
-        else:
-            assessment = "ADEQUATE — diverse training lineage, low isomorphism"
-        
-        return DiversityAssessment(
-            pool_size=len(agent_ids),
-            unique_families=len(families),
-            unique_operators=len(operators),
-            unique_lineages=len(lineage_hashes),
-            effective_diversity=round(diversity, 3),
-            isomorphism_pairs=iso_pairs,
-            effective_graders=round(effective, 2),
-            assessment=assessment,
+        return False, (
+            f"FAIL: effective_n={result['effective_n']} < {min_effective_n}. "
+            f"dominant isomorphism channel: {result['dominant_channel']}. "
+            f"avg_isomorphism: {result['avg_isomorphism']}"
         )
 
 
 def run_scenarios():
-    """Demonstrate training lineage tracking for ATF grader diversity."""
+    """Test scenarios for training lineage diversity."""
     tracker = TrainingLineageTracker()
     
-    # Register graders with varying lineage
-    graders = [
-        TrainingLineage("grader_alpha", "claude", "opus-4.6", "operator_1",
-                        "anthropic_corpus_v3", "anthropic_hh"),
-        TrainingLineage("grader_beta", "gpt", "4o", "operator_2",
-                        "openai_corpus_v2", "openai_prefs"),
-        TrainingLineage("grader_gamma", "llama", "3.1-70B", "operator_3",
-                        "meta_corpus_v1", "ultrafeedback"),
-        TrainingLineage("grader_delta", "mistral", "large-2", "operator_4",
-                        "mistral_corpus_v1", "ultrafeedback"),  # Same RLHF as gamma!
-        TrainingLineage("grader_epsilon", "llama", "3.1-8B", "operator_5",
-                        "meta_corpus_v1", "ultrafeedback",
-                        distilled_from="3.1-70B"),  # Distilled from gamma's base!
+    # Register agents with various lineages
+    agents = [
+        TrainingLineage("grader_1", "claude", "opus-4.6", ["helpsteer2", "oasst2"], ["anthropic_rlhf_v3"], "operator_a"),
+        TrainingLineage("grader_2", "claude", "sonnet-4.5", ["helpsteer2", "oasst2"], ["anthropic_rlhf_v3"], "operator_a"),
+        TrainingLineage("grader_3", "llama", "3.3-70b", ["ultrachat", "slimorca"], ["llama_rlhf_v2"], "operator_b"),
+        TrainingLineage("grader_4", "gpt", "4o-mini", ["webgpt", "oasst2"], ["openai_rlhf_v4"], "operator_c"),
+        TrainingLineage("grader_5", "llama", "3.3-70b", ["helpsteer2", "oasst2"], ["anthropic_rlhf_v3"], "operator_d"),  # Llama fine-tuned on Anthropic data!
     ]
     
-    for g in graders:
-        tracker.register(g)
+    for a in agents:
+        tracker.register(a)
     
     print("=" * 70)
-    print("TRAINING LINEAGE TRACKER — ATF GRADER DIVERSITY ASSESSMENT")
+    print("TRAINING LINEAGE DIVERSITY TRACKER")
     print("=" * 70)
     
     scenarios = [
         {
-            "name": "1. Fully diverse pool (alpha + beta + gamma)",
-            "pool": ["grader_alpha", "grader_beta", "grader_gamma"],
-            "expected_assessment": "ADEQUATE",
+            "name": "1. Monoculture: same family, same operator",
+            "agents": ["grader_1", "grader_2"],
+            "expect_pass": False,
         },
         {
-            "name": "2. Shared RLHF (gamma + delta: both ultrafeedback)",
-            "pool": ["grader_alpha", "grader_gamma", "grader_delta"],
-            "expected_assessment": "MODERATE",
+            "name": "2. Diverse pool: Claude + Llama + GPT",
+            "agents": ["grader_1", "grader_3", "grader_4"],
+            "expect_pass": True,
         },
         {
-            "name": "3. Distillation chain (gamma + epsilon: teacher-student)",
-            "pool": ["grader_alpha", "grader_gamma", "grader_epsilon"],
-            "expected_assessment": "MODERATE",
+            "name": "3. Hidden isomorphism: Llama fine-tuned on Anthropic RLHF",
+            "agents": ["grader_1", "grader_5"],
+            "expect_pass": False,
         },
         {
-            "name": "4. Monoculture (all ultrafeedback RLHF)",
-            "pool": ["grader_gamma", "grader_delta", "grader_epsilon"],
-            "expected_assessment": "INSUFFICIENT",
-        },
-        {
-            "name": "5. Maximum diversity (all 5 graders)",
-            "pool": ["grader_alpha", "grader_beta", "grader_gamma", "grader_delta", "grader_epsilon"],
-            "expected_assessment": "MODERATE",  # iso pairs drag it down
+            "name": "4. Full pool (5 graders)",
+            "agents": ["grader_1", "grader_2", "grader_3", "grader_4", "grader_5"],
+            "expect_pass": True,
         },
     ]
     
     all_pass = True
     for scenario in scenarios:
-        result = tracker.assess_pool(scenario["pool"])
-        match = result.assessment.startswith(scenario["expected_assessment"])
-        if not match:
+        result = tracker.effective_diversity(scenario["agents"])
+        passes, reason = tracker.pool_passes_diversity_gate(scenario["agents"])
+        
+        status = "✓" if (passes == scenario["expect_pass"]) else "✗"
+        if passes != scenario["expect_pass"]:
             all_pass = False
-        status = "✓" if match else "✗"
         
         print(f"\n{status} {scenario['name']}")
-        print(f"  Pool: {scenario['pool']}")
-        print(f"  Families: {result.unique_families}, Operators: {result.unique_operators}, Lineages: {result.unique_lineages}")
-        print(f"  Simpson diversity: {result.effective_diversity}")
-        print(f"  Effective graders: {result.effective_graders} / {result.pool_size}")
-        if result.isomorphism_pairs:
-            for a, b, ch in result.isomorphism_pairs:
-                print(f"  ⚠ Isomorphism: {a} ↔ {b} ({ch})")
-        print(f"  Assessment: {result.assessment}")
+        print(f"  Pool: {scenario['agents']}")
+        print(f"  Effective N: {result['effective_n']} / {result['pool_size']} (ratio: {result['diversity_ratio']})")
+        print(f"  Avg isomorphism: {result['avg_isomorphism']}")
+        print(f"  Dominant channel: {result['dominant_channel']}")
+        print(f"  Gate: {reason}")
+        
+        if result["pairwise_scores"]:
+            print(f"  Pairwise:")
+            for p in result["pairwise_scores"]:
+                print(f"    {p['agents'][0]} ↔ {p['agents'][1]}: {p['score']} ({p['channel']})")
     
     print(f"\n{'=' * 70}")
-    passed = sum(1 for s in scenarios if tracker.assess_pool(s["pool"]).assessment.startswith(s["expected_assessment"]))
-    print(f"Results: {passed}/{len(scenarios)} passed")
-    print(f"\nKey insight (Kirk et al 2023): RLHF reduces output diversity.")
-    print(f"2 families sharing RLHF data ≈ 1.5 effective families.")
-    print(f"TRAINING_LINEAGE in attestation = required for real diversity measurement.")
+    print(f"Results: {sum(1 for s in scenarios if (tracker.pool_passes_diversity_gate(s['agents'])[0] == s['expect_pass']))} / {len(scenarios)} passed")
+    
+    print(f"\nKey: RLHF source has highest weight (0.30) per Kirk et al. 2023.")
+    print(f"grader_5 (Llama + Anthropic RLHF) is isomorphic with grader_1 (Claude + Anthropic RLHF)")
+    print(f"despite different model families. The RLHF corpus IS the shared bias surface.")
     
     return all_pass
 
