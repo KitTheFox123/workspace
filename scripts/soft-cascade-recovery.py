@@ -1,279 +1,343 @@
 #!/usr/bin/env python3
 """
-soft-cascade-recovery.py — Model soft trust degradation and recovery strategies.
+soft-cascade-recovery.py — Circuit breaker pattern for ATF trust recovery.
 
-Santaclawd's open question: When trust degrades partially (not revoked, just eroded),
-what triggers re-attestation? Passive auto-clear vs active re-attestation?
+Maps Netflix Hystrix / resilience4j circuit breaker to agent trust lifecycle:
+- CLOSED = trusted (requests flow normally)
+- OPEN = revoked (all requests blocked)
+- HALF-OPEN = soft cascade recovery (probe requests allowed)
 
-This simulator models both approaches and measures outcomes:
-- False restoration rate (trust restored to unworthy agents)
-- Recovery latency (time for worthy agents to recover)
-- Coordination overhead (re-attestation requests generated)
+The key insight from santaclawd's SOFT_CASCADE question:
+When trust degrades partially — not revoked, just eroded — what triggers
+re-attestation? This implements ACTIVE re-attestation via probe challenges,
+not passive time-heal.
 
-Answer: Active re-attestation as default. NIST 800-63B §6.1.4: renewal SHOULD happen
-BEFORE expiration. Trust NEVER auto-heals. Grace period for coordination, but
-absence of renewal IS the signal.
+Why active > passive:
+- Passive (time-heal) = letting expired certs auto-renew without challenge
+- Active (probe) = circuit breaker HALF-OPEN state: exactly ONE request 
+  passes through. If it succeeds → back to CLOSED. If it fails → back to OPEN.
+- Hystrix proved this at Netflix scale: probe-based recovery is the only 
+  pattern that avoids thundering herd on recovery.
 
-Three recovery strategies:
-1. PASSIVE: Trust auto-recovers after cooldown period (time heals)
-2. ACTIVE: Trust restored only via explicit re-attestation 
-3. HYBRID: Grace period (passive), then requires active re-attestation
+Recovery escalation:
+1. DEGRADED: trust score below threshold but above revocation
+2. HALF-OPEN: one probe challenge issued per probe_interval
+3. PROBE_PASS → RECOVERING → CLOSED (trust score gradually restored)
+4. PROBE_FAIL → OPEN (fully revoked, requires manual re-attestation)
 
 Sources:
-- NIST SP 800-63B §6.1.4 (Authenticator Renewal)
-- NIST SP 800-63-4 (supersedes, Aug 2025)
-- Let's Encrypt 90d→45d→6d cert lifecycle
-- RFC 6960 (OCSP), RFC 5280 §5 (CRL)
+- Netflix Hystrix circuit breaker (Nygard, "Release It!", 2007/2018)
+- Microsoft Azure circuit breaker pattern guide
+- Resilience4j CircuitBreaker implementation
+- ATF SOFT_CASCADE discussion (santaclawd, March 2026)
 """
 
-import random
-import statistics
+import json
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Callable
 
 
-class RecoveryStrategy(Enum):
-    PASSIVE = "passive"     # Time heals all wounds
-    ACTIVE = "active"       # Must explicitly re-attest
-    HYBRID = "hybrid"       # Grace period, then active required
-
-
-class AgentType(Enum):
-    HONEST = "honest"       # Legitimately degraded, will re-earn trust
-    MALICIOUS = "malicious"  # Shouldn't be trusted, will exploit auto-recovery
-    DORMANT = "dormant"     # Inactive, trust degraded due to absence
+class TrustState(Enum):
+    CLOSED = "CLOSED"           # Fully trusted
+    DEGRADED = "DEGRADED"       # Trust eroding, monitoring
+    HALF_OPEN = "HALF_OPEN"     # Probing for recovery
+    RECOVERING = "RECOVERING"   # Probe passed, rebuilding
+    OPEN = "OPEN"               # Revoked
 
 
 @dataclass
-class Agent:
-    agent_id: str
-    agent_type: AgentType
-    trust_score: float = 1.0
-    degraded_at: Optional[int] = None   # Tick when trust was degraded
-    recovered_at: Optional[int] = None  # Tick when trust was restored
-    re_attestation_requests: int = 0    # How many times re-attestation was requested
+class ProbeChallenge:
+    """A challenge issued to test if trust should be restored."""
+    challenge_id: str
+    challenge_type: str  # CAPABILITY_PROBE, HISTORY_VERIFY, LIVE_ATTESTATION
+    issued_at: str
+    deadline: str
+    payload: dict = field(default_factory=dict)
     
-    def degrade(self, tick: int, amount: float = 0.4):
-        """Partially degrade trust."""
-        self.trust_score = max(0.0, self.trust_score - amount)
-        self.degraded_at = tick
-        self.recovered_at = None
-    
-    def recover(self, tick: int):
-        """Restore trust."""
-        self.trust_score = 1.0
-        self.recovered_at = tick
+    @property
+    def is_expired(self) -> bool:
+        return datetime.now(timezone.utc).isoformat() > self.deadline
+
+
+@dataclass
+class ProbeResult:
+    """Result of a probe challenge."""
+    challenge_id: str
+    passed: bool
+    score: float  # 0.0-1.0
+    evidence: str
+    evaluated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass 
-class SimConfig:
-    strategy: RecoveryStrategy
-    n_agents: int = 100
-    n_ticks: int = 200
-    degradation_rate: float = 0.1      # Fraction degraded per tick
-    passive_cooldown: int = 20         # Ticks before passive recovery
-    grace_period: int = 10             # Hybrid grace period ticks
-    re_attestation_success_rate: float = 0.8  # Probability re-attestation succeeds
-    malicious_fraction: float = 0.15   # Fraction of agents that are malicious
-    dormant_fraction: float = 0.10     # Fraction that go dormant
-    trust_threshold: float = 0.7       # Below this = considered degraded
+class TrustRecord:
+    """Trust state for an agent relationship."""
+    agent_id: str
+    counterparty_id: str
+    state: TrustState = TrustState.CLOSED
+    trust_score: float = 1.0
+    
+    # Thresholds
+    degraded_threshold: float = 0.7
+    revocation_threshold: float = 0.3
+    recovery_target: float = 0.8
+    
+    # Circuit breaker params
+    failure_count: int = 0
+    failure_threshold: int = 3      # Failures before OPEN
+    probe_interval_s: int = 300     # Seconds between probes in HALF_OPEN
+    recovery_increment: float = 0.1 # Trust restored per successful probe
+    max_probe_failures: int = 2     # Consecutive probe failures before OPEN
+    
+    # Timing
+    state_changed_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_probe_at: Optional[str] = None
+    probe_failure_streak: int = 0
+    
+    # History
+    transitions: list[dict] = field(default_factory=list)
+    probes: list[dict] = field(default_factory=list)
 
 
-@dataclass
-class SimResult:
-    strategy: str
-    false_restorations: int = 0        # Malicious agents falsely restored
-    honest_recoveries: int = 0         # Honest agents correctly restored  
-    honest_recovery_ticks: list = field(default_factory=list)  # Recovery latency
-    total_re_attestation_requests: int = 0
-    trust_at_end: list = field(default_factory=list)
-    degradation_events: int = 0
+class SoftCascadeRecovery:
+    """
+    Circuit breaker for agent trust with probe-based recovery.
     
-    @property
-    def false_restoration_rate(self) -> float:
-        total = self.false_restorations + self.honest_recoveries
-        return self.false_restorations / total if total > 0 else 0.0
+    State machine:
+    CLOSED → (trust_score < degraded_threshold) → DEGRADED
+    DEGRADED → (trust_score < revocation_threshold OR failure_count >= threshold) → OPEN
+    DEGRADED → (probe_interval elapsed) → HALF_OPEN
+    HALF_OPEN → (probe passes) → RECOVERING
+    HALF_OPEN → (probe fails) → OPEN (if streak >= max_probe_failures) else stays HALF_OPEN
+    RECOVERING → (trust_score >= recovery_target) → CLOSED
+    RECOVERING → (probe fails) → DEGRADED
+    OPEN → (manual re-attestation) → HALF_OPEN
+    """
     
-    @property
-    def avg_recovery_latency(self) -> float:
-        return statistics.mean(self.honest_recovery_ticks) if self.honest_recovery_ticks else 0.0
+    def __init__(self):
+        self.records: dict[str, TrustRecord] = {}
+        self.event_log: list[dict] = []
     
-    @property
-    def median_recovery_latency(self) -> float:
-        return statistics.median(self.honest_recovery_ticks) if self.honest_recovery_ticks else 0.0
-
-
-class SoftCascadeSimulator:
-    """Simulate soft trust degradation and recovery under different strategies."""
+    def _key(self, agent: str, counterparty: str) -> str:
+        return f"{agent}:{counterparty}"
     
-    def __init__(self, config: SimConfig, seed: int = 42):
-        self.config = config
-        self.rng = random.Random(seed)
-        self.agents: list[Agent] = []
-        self.result = SimResult(strategy=config.strategy.value)
+    def get_or_create(self, agent: str, counterparty: str) -> TrustRecord:
+        key = self._key(agent, counterparty)
+        if key not in self.records:
+            self.records[key] = TrustRecord(agent_id=agent, counterparty_id=counterparty)
+        return self.records[key]
     
-    def setup(self):
-        """Initialize agent population."""
-        n_malicious = int(self.config.n_agents * self.config.malicious_fraction)
-        n_dormant = int(self.config.n_agents * self.config.dormant_fraction)
-        n_honest = self.config.n_agents - n_malicious - n_dormant
+    def _transition(self, record: TrustRecord, new_state: TrustState, reason: str):
+        old_state = record.state
+        record.state = new_state
+        record.state_changed_at = datetime.now(timezone.utc).isoformat()
         
-        self.agents = []
-        for i in range(n_honest):
-            self.agents.append(Agent(f"honest_{i}", AgentType.HONEST))
-        for i in range(n_malicious):
-            self.agents.append(Agent(f"malicious_{i}", AgentType.MALICIOUS))
-        for i in range(n_dormant):
-            self.agents.append(Agent(f"dormant_{i}", AgentType.DORMANT))
+        entry = {
+            "from": old_state.value,
+            "to": new_state.value,
+            "reason": reason,
+            "trust_score": round(record.trust_score, 4),
+            "timestamp": record.state_changed_at,
+        }
+        record.transitions.append(entry)
+        self.event_log.append({
+            "agent": record.agent_id,
+            "counterparty": record.counterparty_id,
+            **entry,
+        })
+    
+    def record_failure(self, agent: str, counterparty: str, severity: float = 0.1) -> TrustRecord:
+        """Record a trust-degrading event."""
+        record = self.get_or_create(agent, counterparty)
+        record.trust_score = max(0.0, record.trust_score - severity)
+        record.failure_count += 1
         
-        self.rng.shuffle(self.agents)
-    
-    def tick(self, t: int):
-        """Process one simulation tick."""
-        # 1. Randomly degrade some agents
-        for agent in self.agents:
-            if agent.trust_score >= self.config.trust_threshold:
-                if self.rng.random() < self.config.degradation_rate:
-                    agent.degrade(t)
-                    self.result.degradation_events += 1
+        # State transitions based on thresholds
+        if record.state == TrustState.CLOSED:
+            if record.trust_score < record.degraded_threshold:
+                self._transition(record, TrustState.DEGRADED, 
+                    f"trust_score={record.trust_score:.2f} < degraded_threshold={record.degraded_threshold}")
         
-        # 2. Apply recovery strategy
-        for agent in self.agents:
-            if agent.trust_score < self.config.trust_threshold and agent.degraded_at is not None:
-                ticks_degraded = t - agent.degraded_at
-                
-                if self.config.strategy == RecoveryStrategy.PASSIVE:
-                    self._passive_recovery(agent, t, ticks_degraded)
-                elif self.config.strategy == RecoveryStrategy.ACTIVE:
-                    self._active_recovery(agent, t, ticks_degraded)
-                elif self.config.strategy == RecoveryStrategy.HYBRID:
-                    self._hybrid_recovery(agent, t, ticks_degraded)
+        if record.state == TrustState.DEGRADED:
+            if record.trust_score < record.revocation_threshold:
+                self._transition(record, TrustState.OPEN,
+                    f"trust_score={record.trust_score:.2f} < revocation_threshold={record.revocation_threshold}")
+            elif record.failure_count >= record.failure_threshold:
+                self._transition(record, TrustState.OPEN,
+                    f"failure_count={record.failure_count} >= threshold={record.failure_threshold}")
+        
+        if record.state == TrustState.RECOVERING:
+            self._transition(record, TrustState.DEGRADED,
+                f"failure during recovery: trust_score={record.trust_score:.2f}")
+        
+        return record
     
-    def _passive_recovery(self, agent: Agent, t: int, ticks_degraded: int):
-        """Passive: auto-recover after cooldown, no verification."""
-        if ticks_degraded >= self.config.passive_cooldown:
-            agent.recover(t)
-            if agent.agent_type == AgentType.MALICIOUS:
-                self.result.false_restorations += 1
-            elif agent.agent_type == AgentType.HONEST:
-                self.result.honest_recoveries += 1
-                self.result.honest_recovery_ticks.append(ticks_degraded)
-            # Dormant agents recover too (problematic — they haven't proven anything)
+    def initiate_probe(self, agent: str, counterparty: str) -> Optional[TrustRecord]:
+        """Transition to HALF_OPEN and issue a probe challenge."""
+        record = self.get_or_create(agent, counterparty)
+        
+        if record.state == TrustState.DEGRADED:
+            self._transition(record, TrustState.HALF_OPEN,
+                "probe_interval elapsed, issuing challenge")
+            record.last_probe_at = datetime.now(timezone.utc).isoformat()
+            return record
+        elif record.state == TrustState.OPEN:
+            # Manual re-attestation request → allow probe
+            self._transition(record, TrustState.HALF_OPEN,
+                "manual re-attestation requested")
+            record.last_probe_at = datetime.now(timezone.utc).isoformat()
+            record.probe_failure_streak = 0
+            return record
+        
+        return None
     
-    def _active_recovery(self, agent: Agent, t: int, ticks_degraded: int):
-        """Active: must request and pass re-attestation."""
-        # Agents request re-attestation periodically
-        if ticks_degraded > 0 and ticks_degraded % 5 == 0:
-            agent.re_attestation_requests += 1
-            self.result.total_re_attestation_requests += 1
+    def process_probe_result(self, agent: str, counterparty: str, 
+                              passed: bool, score: float = 0.0) -> TrustRecord:
+        """Process the result of a probe challenge."""
+        record = self.get_or_create(agent, counterparty)
+        
+        record.probes.append({
+            "passed": passed,
+            "score": round(score, 4),
+            "state_at_probe": record.state.value,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        
+        if record.state != TrustState.HALF_OPEN:
+            return record
+        
+        if passed:
+            record.probe_failure_streak = 0
+            record.trust_score = min(1.0, record.trust_score + record.recovery_increment)
             
-            if agent.agent_type == AgentType.HONEST:
-                # Honest agents pass re-attestation with high probability
-                if self.rng.random() < self.config.re_attestation_success_rate:
-                    agent.recover(t)
-                    self.result.honest_recoveries += 1
-                    self.result.honest_recovery_ticks.append(ticks_degraded)
-            
-            elif agent.agent_type == AgentType.MALICIOUS:
-                # Malicious agents have much lower pass rate
-                if self.rng.random() < 0.15:  # 15% chance of fooling re-attestation
-                    agent.recover(t)
-                    self.result.false_restorations += 1
-            
-            # Dormant agents don't request re-attestation (they're inactive)
-    
-    def _hybrid_recovery(self, agent: Agent, t: int, ticks_degraded: int):
-        """Hybrid: grace period (partial passive recovery), then active required."""
-        if ticks_degraded <= self.config.grace_period:
-            # During grace period: minor trust improvement but NOT full recovery
-            agent.trust_score = min(agent.trust_score + 0.02, self.config.trust_threshold - 0.05)
+            if record.trust_score >= record.recovery_target:
+                self._transition(record, TrustState.CLOSED,
+                    f"probe passed, trust_score={record.trust_score:.2f} >= target={record.recovery_target}")
+                record.failure_count = 0
+            else:
+                self._transition(record, TrustState.RECOVERING,
+                    f"probe passed, trust_score={record.trust_score:.2f}, recovering toward {record.recovery_target}")
         else:
-            # After grace period: active re-attestation required
-            self._active_recovery(agent, t, ticks_degraded)
-    
-    def run(self) -> SimResult:
-        """Run full simulation."""
-        self.setup()
-        for t in range(self.config.n_ticks):
-            self.tick(t)
+            record.probe_failure_streak += 1
+            
+            if record.probe_failure_streak >= record.max_probe_failures:
+                self._transition(record, TrustState.OPEN,
+                    f"probe_failure_streak={record.probe_failure_streak} >= max={record.max_probe_failures}")
+            else:
+                # Stay HALF_OPEN, will retry at next probe interval
+                self.event_log.append({
+                    "agent": record.agent_id,
+                    "counterparty": record.counterparty_id,
+                    "event": "PROBE_FAILED",
+                    "streak": record.probe_failure_streak,
+                    "remaining_attempts": record.max_probe_failures - record.probe_failure_streak,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
         
-        self.result.trust_at_end = [a.trust_score for a in self.agents]
-        return self.result
+        return record
+    
+    def continue_recovery(self, agent: str, counterparty: str, 
+                           probe_passed: bool, score: float = 0.0) -> TrustRecord:
+        """Continue recovery with subsequent probes."""
+        record = self.get_or_create(agent, counterparty)
+        
+        if record.state != TrustState.RECOVERING:
+            return record
+        
+        if probe_passed:
+            record.trust_score = min(1.0, record.trust_score + record.recovery_increment)
+            
+            if record.trust_score >= record.recovery_target:
+                self._transition(record, TrustState.CLOSED,
+                    f"recovery complete, trust_score={record.trust_score:.2f}")
+                record.failure_count = 0
+        else:
+            self._transition(record, TrustState.DEGRADED,
+                f"probe failed during recovery, trust_score={record.trust_score:.2f}")
+        
+        return record
 
 
-def run_comparison():
-    """Compare all three recovery strategies."""
+def run_scenarios():
+    """Demonstrate soft cascade recovery patterns."""
+    scr = SoftCascadeRecovery()
+    
     print("=" * 70)
-    print("SOFT CASCADE RECOVERY — STRATEGY COMPARISON")
+    print("SOFT CASCADE RECOVERY — Circuit Breaker for Agent Trust")
     print("=" * 70)
-    print(f"\nConfig: 100 agents (15% malicious, 10% dormant, 75% honest)")
-    print(f"200 ticks, 10% degradation rate per tick")
-    print()
     
-    strategies = [
-        RecoveryStrategy.PASSIVE,
-        RecoveryStrategy.ACTIVE,
-        RecoveryStrategy.HYBRID,
-    ]
+    # Scenario 1: Gradual degradation → probe → recovery
+    print("\n--- Scenario 1: Degradation → Probe → Recovery ---")
+    agent, cp = "agent_alpha", "registry_beta"
     
-    results = {}
-    for strategy in strategies:
-        config = SimConfig(strategy=strategy)
-        sim = SoftCascadeSimulator(config, seed=42)
-        result = sim.run()
-        results[strategy.value] = result
+    # Gradual trust erosion
+    for i in range(4):
+        r = scr.record_failure(agent, cp, severity=0.1)
+        print(f"  Failure {i+1}: score={r.trust_score:.2f}, state={r.state.value}")
     
-    # Print comparison table
-    header = f"{'Metric':<35} {'PASSIVE':>10} {'ACTIVE':>10} {'HYBRID':>10}"
-    print(header)
-    print("-" * 70)
+    # Initiate probe
+    r = scr.initiate_probe(agent, cp)
+    print(f"  → Probe initiated: state={r.state.value}")
     
-    metrics = [
-        ("False restoration rate", lambda r: f"{r.false_restoration_rate:.1%}"),
-        ("False restorations (count)", lambda r: f"{r.false_restorations}"),
-        ("Honest recoveries", lambda r: f"{r.honest_recoveries}"),
-        ("Avg recovery latency (ticks)", lambda r: f"{r.avg_recovery_latency:.1f}"),
-        ("Median recovery latency", lambda r: f"{r.median_recovery_latency:.1f}"),
-        ("Re-attestation requests", lambda r: f"{r.total_re_attestation_requests}"),
-        ("Degradation events", lambda r: f"{r.degradation_events}"),
-    ]
+    # Probe passes
+    r = scr.process_probe_result(agent, cp, passed=True, score=0.85)
+    print(f"  → Probe passed: score={r.trust_score:.2f}, state={r.state.value}")
     
-    for name, fn in metrics:
-        row = f"{name:<35}"
-        for s in ["passive", "active", "hybrid"]:
-            row += f" {fn(results[s]):>10}"
-        print(row)
+    # Continue recovery
+    r = scr.continue_recovery(agent, cp, probe_passed=True, score=0.9)
+    print(f"  → Recovery probe: score={r.trust_score:.2f}, state={r.state.value}")
     
-    print()
+    # Scenario 2: Degradation → probe fails → OPEN → manual re-attestation
+    print("\n--- Scenario 2: Probe Failure → Revocation → Manual Recovery ---")
+    agent2, cp2 = "agent_gamma", "bridge_delta"
     
-    # Determine winner
-    passive_fr = results["passive"].false_restoration_rate
-    active_fr = results["active"].false_restoration_rate
-    hybrid_fr = results["hybrid"].false_restoration_rate
+    for i in range(4):
+        r = scr.record_failure(agent2, cp2, severity=0.1)
+    print(f"  After 4 failures: score={r.trust_score:.2f}, state={r.state.value}")
     
-    print("ANALYSIS:")
-    print(f"  Passive: Lowest latency but highest false restoration rate ({passive_fr:.1%})")
-    print(f"    → Malicious agents auto-recover. Time does NOT verify competence.")
-    print(f"  Active: Lowest false restoration rate ({active_fr:.1%}) but coordination cost")
-    print(f"    → {results['active'].total_re_attestation_requests} re-attestation requests generated")
-    print(f"  Hybrid: Balanced — grace absorbs transient failures, active catches real threats")
-    print(f"    → {hybrid_fr:.1%} false restoration rate")
+    r = scr.initiate_probe(agent2, cp2)
+    print(f"  → Probe initiated: state={r.state.value}")
     
-    print()
-    print("RECOMMENDATION: ACTIVE as default (NIST 800-63B §6.1.4)")
-    print("  - Renewal SHOULD happen BEFORE expiration")
-    print("  - Passive auto-clear = implicit trust without evidence")
-    print("  - Absence of renewal IS the signal")
-    print("  - Grace period acceptable for coordination overhead")
-    print("  - Trust NEVER auto-heals. You re-earn it or it stays degraded.")
+    # Two consecutive probe failures → OPEN
+    r = scr.process_probe_result(agent2, cp2, passed=False, score=0.2)
+    print(f"  → Probe 1 failed: state={r.state.value}, streak={r.probe_failure_streak}")
     
-    # The key insight
-    print()
-    print("KEY INSIGHT: The question isn't passive vs active.")
-    print("It's whether SILENCE means 'still trusted' or 'status unknown'.")
-    print("Short TTL answers this: silence = expired. No news IS bad news.")
+    r = scr.process_probe_result(agent2, cp2, passed=False, score=0.1)
+    print(f"  → Probe 2 failed: state={r.state.value} (revoked)")
+    
+    # Manual re-attestation
+    r = scr.initiate_probe(agent2, cp2)
+    print(f"  → Manual re-attestation: state={r.state.value}")
+    
+    r = scr.process_probe_result(agent2, cp2, passed=True, score=0.9)
+    print(f"  → Re-attestation passed: score={r.trust_score:.2f}, state={r.state.value}")
+    
+    # Scenario 3: Catastrophic failure → immediate OPEN
+    print("\n--- Scenario 3: Catastrophic Failure → Immediate OPEN ---")
+    agent3, cp3 = "agent_epsilon", "registry_zeta"
+    
+    r = scr.record_failure(agent3, cp3, severity=0.8)  # Severe breach
+    print(f"  Catastrophic failure: score={r.trust_score:.2f}, state={r.state.value}")
+    
+    # Summary
+    print(f"\n{'=' * 70}")
+    print("Event Log:")
+    for event in scr.event_log:
+        if "from" in event:
+            print(f"  [{event['agent']}→{event['counterparty']}] "
+                  f"{event['from']} → {event['to']} "
+                  f"(score={event['trust_score']:.2f}): {event['reason']}")
+    
+    print(f"\nCircuit breaker pattern applied to trust:")
+    print(f"  CLOSED=trusted, OPEN=revoked, HALF-OPEN=probe recovery")
+    print(f"  Active > passive: probe challenges, not time-heal")
+    print(f"  Probe failure streak → OPEN (no infinite retries)")
+    print(f"  Recovery is incremental (0.1 per probe), not instant")
+    print(f"  Thundering herd prevention: one probe at a time")
 
 
 if __name__ == "__main__":
-    run_comparison()
+    run_scenarios()
