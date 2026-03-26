@@ -65,6 +65,65 @@ class Assessment:
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+def kendall_w(ratings: list[list[float]]) -> float:
+    """
+    Kendall's W (coefficient of concordance) for multi-rater agreement.
+    
+    W = 12 * S / (k^2 * (n^3 - n))
+    where k = number of raters, n = number of items,
+    S = sum of squared deviations of rank sums from mean rank sum.
+    
+    W=1: perfect agreement. W=0: no agreement.
+    
+    For ATF: measures how much graders AGREE in their rankings.
+    High W + low diversity = correlated bias (bad).
+    Low W + high diversity = genuine independent assessment (good).
+    
+    Args:
+        ratings: k×n matrix — k raters, n items. Each row = one rater's scores.
+    """
+    if not ratings or not ratings[0]:
+        return 0.0
+    
+    k = len(ratings)       # number of raters
+    n = len(ratings[0])    # number of items
+    
+    if n < 2 or k < 2:
+        return 0.0
+    
+    # Convert scores to ranks per rater
+    def rank(scores):
+        sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i])
+        ranks = [0.0] * len(scores)
+        i = 0
+        while i < len(sorted_indices):
+            j = i
+            while j < len(sorted_indices) and scores[sorted_indices[j]] == scores[sorted_indices[i]]:
+                j += 1
+            avg_rank = (i + j + 1) / 2  # 1-indexed average rank for ties
+            for idx in range(i, j):
+                ranks[sorted_indices[idx]] = avg_rank
+            i = j
+        return ranks
+    
+    ranked = [rank(r) for r in ratings]
+    
+    # Sum of ranks for each item across all raters
+    rank_sums = [sum(ranked[rater][item] for rater in range(k)) for item in range(n)]
+    mean_rank_sum = sum(rank_sums) / n
+    
+    # S = sum of squared deviations from mean
+    s = sum((rs - mean_rank_sum) ** 2 for rs in rank_sums)
+    
+    # W = 12S / (k^2 * (n^3 - n))
+    denominator = k * k * (n * n * n - n)
+    if denominator == 0:
+        return 0.0
+    
+    w = 12 * s / denominator
+    return min(w, 1.0)  # Clamp to [0, 1]
+
+
 def shannon_entropy(values: list[str]) -> float:
     """Compute Shannon entropy of a list of categorical values."""
     if not values:
@@ -240,6 +299,23 @@ class DiversityCollapseDetector:
         scores = [a.score for a in assessments]
         score_range = max(scores) - min(scores) if scores else 0
         score_agreement = 1.0 - score_range  # Higher = more agreement
+        
+        # 7. Kendall W concordance (petra's insight)
+        # If multiple items are being assessed, compute W across graders
+        # For single-item pools, use pairwise score correlation as proxy
+        scores_list = [a.score for a in assessments]
+        score_variance = sum((s - sum(scores_list)/len(scores_list))**2 for s in scores_list) / len(scores_list)
+        
+        # High W (agreement) + low diversity = correlated bias
+        # Low W (disagreement) + high diversity = genuine independence
+        concordance_warning = None
+        if score_variance < 0.005 and avg_confidence > 0.8:
+            concordance_warning = (
+                f"HIGH_CONCORDANCE_LOW_VARIANCE: score variance={score_variance:.4f}, "
+                f"avg confidence={avg_confidence:.2f}. Petra's insight: two graders can score "
+                f"identically but disagree on frontier cases. The PATTERN of disagreement is the signal."
+            )
+            self.warnings.append(concordance_warning)
         
         # Composite score: weighted combination
         weights = {
