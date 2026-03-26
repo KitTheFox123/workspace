@@ -89,6 +89,53 @@ def normalized_entropy(values: list[str]) -> float:
     return shannon_entropy(values) / max_entropy
 
 
+def kendall_w(rankings: list[list[float]]) -> float:
+    """
+    Kendall's coefficient of concordance (W).
+    
+    Measures agreement among multiple raters ranking the same items.
+    W = 0: no agreement. W = 1: perfect agreement.
+    
+    For ATF: high W among graders sharing training lineage = correlated assessment.
+    Low W across diverse graders with similar final scores = genuine convergence.
+    
+    Args:
+        rankings: List of rankings, one per rater. Each ranking is scores for N items.
+    """
+    if len(rankings) < 2 or len(rankings[0]) < 2:
+        return 0.0
+    
+    k = len(rankings)   # Number of raters
+    n = len(rankings[0])  # Number of items
+    
+    # Convert scores to ranks
+    def to_ranks(scores):
+        sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i])
+        ranks = [0.0] * len(scores)
+        for rank, idx in enumerate(sorted_indices):
+            ranks[idx] = rank + 1
+        return ranks
+    
+    ranked = [to_ranks(r) for r in rankings]
+    
+    # Sum of ranks for each item
+    rank_sums = [sum(ranked[j][i] for j in range(k)) for i in range(n)]
+    
+    # Mean rank sum
+    mean_rank_sum = sum(rank_sums) / n
+    
+    # S = sum of squared deviations
+    S = sum((rs - mean_rank_sum) ** 2 for rs in rank_sums)
+    
+    # Maximum possible S
+    S_max = (k ** 2 * (n ** 3 - n)) / 12
+    
+    if S_max == 0:
+        return 0.0
+    
+    return S / S_max
+
+
 class DiversityCollapseDetector:
     """
     Detect diversity collapse in grader attestation pools.
@@ -188,6 +235,12 @@ class DiversityCollapseDetector:
         family_entropy = normalized_entropy(families)
         unique_families = len(set(families))
         
+        # 7. Kendall W concordance (if multiple items scored)
+        # For single-item pools, use pairwise score agreement as proxy
+        scores = [a.score for a in assessments]
+        score_range = max(scores) - min(scores) if scores else 0
+        score_agreement = 1.0 - score_range  # Higher = more agreement
+        
         # Composite score: weighted combination
         weights = {
             "lineage": 0.35,    # Most important (Kirk et al)
@@ -226,6 +279,8 @@ class DiversityCollapseDetector:
                 "avg_confidence": round(avg_confidence, 4),
                 "score_entropy": round(score_entropy, 4),
                 "full_template_fraction": round(full_template_fraction, 4),
+                "score_range": round(score_range, 4),
+                "score_agreement": round(score_agreement, 4),
             },
             "warnings": self.warnings,
             "recommendations": self._recommendations(),
@@ -418,6 +473,29 @@ def run_scenarios():
     print("- Template monoculture degrades pool even with diverse model families")
     print("- OPERATOR_CONFIG is attestation-relevant: prompt + temp + template style")
     print("- Two Claudes with different configs > two models with same RLHF")
+    
+    # Kendall W demonstration
+    print(f"\n--- Kendall W Concordance Demo ---")
+    
+    # High agreement (correlated graders)
+    correlated = [
+        [0.9, 0.8, 0.7, 0.6],  # Grader 1
+        [0.9, 0.8, 0.7, 0.5],  # Grader 2 (nearly identical ranking)
+        [0.8, 0.9, 0.7, 0.6],  # Grader 3 (slight swap at top)
+    ]
+    w_corr = kendall_w(correlated)
+    print(f"Correlated graders (same RLHF): W = {w_corr:.3f}")
+    
+    # Low agreement (diverse graders)
+    diverse = [
+        [0.9, 0.3, 0.7, 0.6],  # Grader 1
+        [0.4, 0.8, 0.5, 0.9],  # Grader 2 (different ranking)
+        [0.6, 0.6, 0.9, 0.3],  # Grader 3 (yet another ranking)
+    ]
+    w_div = kendall_w(diverse)
+    print(f"Diverse graders (different lineages): W = {w_div:.3f}")
+    print(f"Interpretation: W > 0.7 with shared lineage = correlated collapse")
+    print(f"               W < 0.5 with similar final scores = genuine convergence")
 
 
 if __name__ == "__main__":
