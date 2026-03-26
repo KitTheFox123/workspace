@@ -1,348 +1,340 @@
 #!/usr/bin/env python3
 """
-soft-cascade-recovery.py — Soft trust degradation & recovery for ATF.
+soft-cascade-recovery.py — Simulate trust degradation and recovery strategies.
 
-Addresses santaclawd's ATF gap: "When trust degrades partially — not revoked, 
-just eroded — what triggers re-attestation?"
+Maps the death of OCSP to agent trust recovery:
+- Let's Encrypt killed OCSP (Dec 2024), Google following (H2 2025)
+- Replacement: short-lived certs (90d → 47d → 6d!)
+- Key insight (Feisty Duck): "with short-lived certificates, we finally have a
+  plausible revocation story, even if it doesn't involve any revocation"
 
-Answer: ACTIVE re-attestation is the default. TLS precedent is definitive:
-- CA/B Forum SC-081v3 (Apr 2025): 47-day cert max by 2029
-- Google killing OCSP (H2 2025): short-lived certs replace revocation
-- Let's Encrypt: 90d → 6d certs available now
+ATF SOFT_CASCADE problem (santaclawd):
+When trust degrades PARTIALLY — not revoked, just eroded — what triggers
+re-attestation? Two strategies:
+1. PASSIVE: time heals, auto-clear after cool-off period
+2. ACTIVE: agent must pass capability probe to restore
 
-Passive auto-clear (time heals) is the old CRL model — slow, inconsistent,
-ignored by relying parties. Trust must be ACTIVELY renewed.
+This simulator compares strategies across scenarios:
+- Soft-fail (OCSP model): ignore degradation = zero security value
+- Passive recovery: auto-restore after TTL expires = trust inflation
+- Active recovery (ACME model): challenge required = strongest signal
+- Hybrid: passive for minor erosion, active for significant degradation
 
-Trust states (not binary):
-  FULL → GRACE → DEGRADED → PROBATION → EXPIRED
-
-Transitions:
-  FULL → GRACE: TTL approaching expiry, agent warned
-  GRACE → DEGRADED: TTL expired, no renewal attempt
-  DEGRADED → PROBATION: Agent requests re-attestation
-  PROBATION → FULL: Re-attestation succeeds
-  DEGRADED → EXPIRED: No re-attestation within grace period
-  EXPIRED → PROBATION: Agent requests reinstatement (harder)
-
-Key insight: "you do not revoke trust, you re-earn it" (santaclawd).
-Short TTL killed CRL for TLS certs. Same principle kills revocation lists
-for agent trust. Revocation is just the absence of renewal.
+Key finding from OCSP history: soft-fail was WORSE than no checking.
+"If you're under active attack, attackers can simply block your OCSP
+attempts and carry on." (Ristić, 2025)
 
 Sources:
-- CA/B Forum SC-081v3 (2025): https://cabforum.org/2025/04/11/ballot-sc081v3/
-- Google OCSP deprecation (Apr 2025): https://pki.goog/updates/april2025-ocsp-notice.html
-- RSAC "Trust on a Timer" (Sep 2025)
-- Let's Encrypt short-lived certs (2025)
+- Ristić, "The Slow Death of OCSP" (Feisty Duck, Jan 2025)
+- Google Trust Services OCSP deprecation (Apr 2025)
+- Let's Encrypt OCSP end-of-life (Dec 2024)
+- CA/Browser Forum SC-063v4: short-lived certs + optional OCSP (Aug 2023)
+- RFC 8555: ACME protocol (Let's Encrypt automation)
 """
 
-import json
+import random
+import statistics
 from dataclasses import dataclass, field
 from enum import Enum
-from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 
 class TrustState(Enum):
-    FULL = "FULL"              # Active, recently attested
-    GRACE = "GRACE"            # TTL approaching, renewal window open
-    DEGRADED = "DEGRADED"      # TTL expired, not yet re-attested
-    PROBATION = "PROBATION"    # Re-attestation in progress
-    EXPIRED = "EXPIRED"        # Dead trust, requires full reinstatement
+    FULL = "full"           # Active, recently attested
+    DEGRADED = "degraded"   # Partially eroded, still functional
+    EXPIRED = "expired"     # TTL exceeded, needs renewal
+    REVOKED = "revoked"     # Explicitly revoked
+    CHALLENGED = "challenged"  # Undergoing re-attestation
 
 
-class ChallengeType(Enum):
-    """Re-attestation challenges, escalating with degradation depth."""
-    RENEWAL = "renewal"              # Simple: prove you're still operational
-    CAPABILITY_PROBE = "capability"  # Medium: demonstrate competence
-    FULL_REINSTATEMENT = "reinstate" # Hard: multi-attester, from scratch
+class RecoveryStrategy(Enum):
+    SOFT_FAIL = "soft_fail"       # Ignore degradation (OCSP browser model)
+    PASSIVE = "passive"           # Auto-restore after cool-off
+    ACTIVE = "active"             # Challenge required (ACME model)
+    HYBRID = "hybrid"             # Passive for minor, active for major
+
+
+class EventType(Enum):
+    ATTESTATION_SUCCESS = "attest_ok"
+    ATTESTATION_FAIL = "attest_fail"
+    COMPLAINT = "complaint"
+    TIMEOUT = "timeout"
+    CHALLENGE_PASS = "challenge_pass"
+    CHALLENGE_FAIL = "challenge_fail"
+    ATTACK = "attack"             # Malicious actor exploiting degraded trust
 
 
 @dataclass
-class TrustCredential:
-    """A trust credential with soft-cascade lifecycle."""
+class TrustRecord:
     agent_id: str
-    attester_id: str
-    scope: str                  # What this trust covers
-    state: TrustState = TrustState.FULL
-    issued_at: Optional[datetime] = None
-    ttl_hours: float = 72.0     # Default 72h (3 days)
-    grace_fraction: float = 0.2 # Grace period = 20% of TTL
-    degradation_history: list = field(default_factory=list)
-    renewal_count: int = 0
-    last_renewal: Optional[datetime] = None
-    
-    def __post_init__(self):
-        if self.issued_at is None:
-            self.issued_at = datetime.now(timezone.utc)
-        self.last_renewal = self.issued_at
+    trust_score: float          # 0.0 to 1.0
+    state: TrustState
+    ttl_remaining: int          # Ticks until expiry
+    degradation_count: int = 0  # Number of erosion events
+    recovery_count: int = 0     # Number of successful recoveries
+    exploited_count: int = 0    # Times trust was exploited while degraded
     
     @property
-    def expires_at(self) -> datetime:
-        return self.last_renewal + timedelta(hours=self.ttl_hours)
-    
-    @property
-    def grace_starts(self) -> datetime:
-        grace_hours = self.ttl_hours * (1 - self.grace_fraction)
-        return self.last_renewal + timedelta(hours=grace_hours)
-    
-    @property
-    def degradation_deadline(self) -> datetime:
-        """After expiry, agent has 2x TTL to request re-attestation before EXPIRED."""
-        return self.expires_at + timedelta(hours=self.ttl_hours * 2)
-    
-    def hours_remaining(self, now: Optional[datetime] = None) -> float:
-        now = now or datetime.now(timezone.utc)
-        return (self.expires_at - now).total_seconds() / 3600
-    
-    def compute_state(self, now: Optional[datetime] = None) -> TrustState:
-        """Compute current state based on time. This is the core cascade logic."""
-        now = now or datetime.now(timezone.utc)
-        
-        if self.state == TrustState.PROBATION:
-            return TrustState.PROBATION  # Awaiting re-attestation result
-        
-        if now < self.grace_starts:
-            return TrustState.FULL
-        elif now < self.expires_at:
-            return TrustState.GRACE
-        elif now < self.degradation_deadline:
-            return TrustState.DEGRADED
-        else:
-            return TrustState.EXPIRED
+    def is_vulnerable(self) -> bool:
+        """Agent is vulnerable if degraded but still trusted."""
+        return self.state == TrustState.DEGRADED and self.trust_score > 0.3
 
 
-class SoftCascadeManager:
+@dataclass
+class SimResult:
+    strategy: str
+    ticks: int
+    avg_trust: float
+    exploits: int
+    false_recoveries: int       # Recovered without actual improvement
+    legitimate_blocks: int      # Legitimate agents blocked unnecessarily
+    total_challenges: int
+    recovery_success_rate: float
+
+
+class SoftCascadeSimulator:
     """
-    Manages trust credential lifecycle with soft cascade.
+    Simulate trust degradation and recovery under different strategies.
     
-    Design principles (from TLS cert evolution):
-    1. Short TTL > revocation lists (SC-081v3 killed multi-year certs)
-    2. Active renewal > passive expiry (Google killed OCSP)
-    3. Gradual degradation > binary revoke (grace period = renewal window)
-    4. Re-attestation cost scales with degradation depth
-    5. History of renewals = trust velocity metric
+    Models the OCSP lesson: soft-fail checking is worse than no checking
+    because it provides false confidence. Same applies to trust recovery.
     """
     
-    def __init__(self):
-        self.credentials: dict[str, TrustCredential] = {}
-        self.events: list[dict] = []
+    def __init__(self, num_agents: int = 20, ticks: int = 200, seed: int = 42):
+        self.num_agents = num_agents
+        self.ticks = ticks
+        self.rng = random.Random(seed)
+        
+        # Simulation parameters
+        self.base_ttl = 72           # Base TTL in ticks (maps to 72h)
+        self.degradation_rate = 0.15 # Probability of erosion event per tick
+        self.attack_rate = 0.05      # Probability of attack on degraded agent
+        self.challenge_pass_rate = 0.7  # Probability of passing challenge
+        self.passive_cooloff = 20    # Ticks before passive recovery
+        self.degradation_threshold = 0.5  # Below this = "significant" degradation
     
-    def issue(self, agent_id: str, attester_id: str, scope: str, 
-              ttl_hours: float = 72.0) -> TrustCredential:
-        """Issue a new trust credential."""
-        cred = TrustCredential(
-            agent_id=agent_id,
-            attester_id=attester_id,
-            scope=scope,
-            ttl_hours=ttl_hours,
-        )
-        key = f"{agent_id}:{scope}"
-        self.credentials[key] = cred
-        self._log("ISSUED", cred)
-        return cred
-    
-    def tick(self, now: Optional[datetime] = None) -> list[dict]:
-        """Advance time and compute state transitions. Returns transition events."""
-        now = now or datetime.now(timezone.utc)
-        transitions = []
-        
-        for key, cred in self.credentials.items():
-            old_state = cred.state
-            new_state = cred.compute_state(now)
-            
-            if old_state != new_state:
-                cred.state = new_state
-                cred.degradation_history.append({
-                    "from": old_state.value,
-                    "to": new_state.value,
-                    "at": now.isoformat(),
-                })
-                
-                event = {
-                    "agent_id": cred.agent_id,
-                    "scope": cred.scope,
-                    "transition": f"{old_state.value} → {new_state.value}",
-                    "hours_remaining": round(cred.hours_remaining(now), 1),
-                    "action_required": self._required_action(new_state),
-                }
-                transitions.append(event)
-                self._log("TRANSITION", cred, extra=event)
-        
-        return transitions
-    
-    def renew(self, agent_id: str, scope: str, 
-              challenge_passed: bool = True,
-              now: Optional[datetime] = None) -> dict:
-        """
-        Attempt to renew a trust credential.
-        
-        Renewal difficulty scales with degradation:
-        - GRACE/FULL: simple renewal (like ACME cert renewal)
-        - DEGRADED: capability probe required
-        - EXPIRED: full reinstatement (multi-attester)
-        """
-        now = now or datetime.now(timezone.utc)
-        key = f"{agent_id}:{scope}"
-        cred = self.credentials.get(key)
-        
-        if cred is None:
-            return {"success": False, "reason": "NO_CREDENTIAL"}
-        
-        current_state = cred.compute_state(now)
-        challenge = self._challenge_for_state(current_state)
-        
-        if not challenge_passed:
-            return {
-                "success": False,
-                "reason": "CHALLENGE_FAILED",
-                "challenge_type": challenge.value,
-                "state": current_state.value,
-            }
-        
-        # Successful renewal
-        old_state = cred.state
-        cred.state = TrustState.FULL
-        cred.last_renewal = now
-        cred.renewal_count += 1
-        
-        # Adaptive TTL: frequent renewers earn longer TTL (max 2x base)
-        # This mirrors ACME account reputation
-        trust_velocity = min(cred.renewal_count / 10, 1.0)
-        effective_ttl = cred.ttl_hours * (1 + trust_velocity)
-        
-        result = {
-            "success": True,
-            "previous_state": old_state.value,
-            "new_state": TrustState.FULL.value,
-            "challenge_type": challenge.value,
-            "renewal_count": cred.renewal_count,
-            "trust_velocity": round(trust_velocity, 2),
-            "effective_ttl_hours": round(effective_ttl, 1),
-            "next_grace": (now + timedelta(hours=effective_ttl * 0.8)).isoformat(),
-        }
-        
-        self._log("RENEWED", cred, extra=result)
-        return result
-    
-    def _challenge_for_state(self, state: TrustState) -> ChallengeType:
-        """Challenge difficulty scales with degradation depth."""
-        if state in (TrustState.FULL, TrustState.GRACE):
-            return ChallengeType.RENEWAL
-        elif state == TrustState.DEGRADED:
-            return ChallengeType.CAPABILITY_PROBE
-        else:  # EXPIRED or PROBATION
-            return ChallengeType.FULL_REINSTATEMENT
-    
-    def _required_action(self, state: TrustState) -> str:
-        actions = {
-            TrustState.FULL: "none",
-            TrustState.GRACE: "RENEW_SOON — grace period active",
-            TrustState.DEGRADED: "RENEW_NOW — capability probe required",
-            TrustState.PROBATION: "AWAITING_ATTESTATION — re-attestation in progress",
-            TrustState.EXPIRED: "REINSTATE — full multi-attester reinstatement needed",
-        }
-        return actions.get(state, "unknown")
-    
-    def _log(self, event_type: str, cred: TrustCredential, extra: dict = None):
-        entry = {
-            "type": event_type,
-            "agent_id": cred.agent_id,
-            "scope": cred.scope,
-            "state": cred.state.value,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if extra:
-            entry["details"] = extra
-        self.events.append(entry)
-    
-    def status(self, now: Optional[datetime] = None) -> list[dict]:
-        """Get status of all credentials."""
-        now = now or datetime.now(timezone.utc)
+    def init_agents(self) -> list[TrustRecord]:
         return [
-            {
-                "agent_id": c.agent_id,
-                "scope": c.scope,
-                "state": c.compute_state(now).value,
-                "hours_remaining": round(c.hours_remaining(now), 1),
-                "renewal_count": c.renewal_count,
-                "action": self._required_action(c.compute_state(now)),
-            }
-            for c in self.credentials.values()
+            TrustRecord(
+                agent_id=f"agent_{i}",
+                trust_score=1.0,
+                state=TrustState.FULL,
+                ttl_remaining=self.base_ttl,
+            )
+            for i in range(self.num_agents)
         ]
+    
+    def apply_degradation(self, agent: TrustRecord) -> Optional[EventType]:
+        """Random erosion event."""
+        if self.rng.random() < self.degradation_rate:
+            erosion = self.rng.uniform(0.05, 0.25)
+            agent.trust_score = max(0.0, agent.trust_score - erosion)
+            agent.degradation_count += 1
+            if agent.trust_score < self.degradation_threshold:
+                agent.state = TrustState.DEGRADED
+            return EventType.COMPLAINT
+        return None
+    
+    def apply_attack(self, agent: TrustRecord) -> Optional[EventType]:
+        """Attack attempt on vulnerable agent."""
+        if agent.is_vulnerable and self.rng.random() < self.attack_rate:
+            agent.exploited_count += 1
+            return EventType.ATTACK
+        return None
+    
+    def tick_ttl(self, agent: TrustRecord):
+        """Decrement TTL."""
+        agent.ttl_remaining -= 1
+        if agent.ttl_remaining <= 0:
+            agent.state = TrustState.EXPIRED
+    
+    def recover_soft_fail(self, agent: TrustRecord):
+        """OCSP model: ignore degradation entirely."""
+        # "Soft-fail OCSP checking became the norm... that is, unfortunately, pointless."
+        if agent.state == TrustState.DEGRADED:
+            # Pretend everything is fine
+            agent.state = TrustState.FULL  # False recovery
+    
+    def recover_passive(self, agent: TrustRecord, tick: int):
+        """Auto-restore after cool-off period."""
+        if agent.state == TrustState.DEGRADED:
+            # Wait for cool-off, then auto-restore
+            if agent.degradation_count > 0 and tick % self.passive_cooloff == 0:
+                agent.trust_score = min(1.0, agent.trust_score + 0.3)
+                agent.state = TrustState.FULL
+                agent.recovery_count += 1
+    
+    def recover_active(self, agent: TrustRecord) -> bool:
+        """ACME model: challenge required for recovery."""
+        if agent.state in (TrustState.DEGRADED, TrustState.EXPIRED):
+            agent.state = TrustState.CHALLENGED
+            if self.rng.random() < self.challenge_pass_rate:
+                agent.trust_score = min(1.0, agent.trust_score + 0.4)
+                agent.state = TrustState.FULL
+                agent.recovery_count += 1
+                agent.ttl_remaining = self.base_ttl
+                return True
+            else:
+                agent.trust_score = max(0.0, agent.trust_score - 0.1)
+                agent.state = TrustState.DEGRADED
+                return False
+        return False
+    
+    def recover_hybrid(self, agent: TrustRecord, tick: int) -> bool:
+        """Passive for minor, active for significant degradation."""
+        if agent.state == TrustState.DEGRADED:
+            if agent.trust_score >= self.degradation_threshold:
+                # Minor: passive recovery
+                if tick % self.passive_cooloff == 0:
+                    agent.trust_score = min(1.0, agent.trust_score + 0.2)
+                    agent.state = TrustState.FULL
+                    agent.recovery_count += 1
+                return False
+            else:
+                # Significant: active challenge required
+                return self.recover_active(agent)
+        elif agent.state == TrustState.EXPIRED:
+            return self.recover_active(agent)
+        return False
+    
+    def run(self, strategy: RecoveryStrategy) -> SimResult:
+        agents = self.init_agents()
+        trust_history = []
+        exploits = 0
+        false_recoveries = 0
+        legitimate_blocks = 0
+        total_challenges = 0
+        
+        for tick in range(self.ticks):
+            tick_trust = []
+            
+            for agent in agents:
+                # 1. TTL decay
+                self.tick_ttl(agent)
+                
+                # 2. Random degradation
+                self.apply_degradation(agent)
+                
+                # 3. Attack attempts
+                event = self.apply_attack(agent)
+                if event == EventType.ATTACK:
+                    exploits += 1
+                
+                # 4. Recovery based on strategy
+                if strategy == RecoveryStrategy.SOFT_FAIL:
+                    if agent.state == TrustState.DEGRADED:
+                        old_score = agent.trust_score
+                        self.recover_soft_fail(agent)
+                        if agent.trust_score <= 0.5:
+                            false_recoveries += 1
+                
+                elif strategy == RecoveryStrategy.PASSIVE:
+                    self.recover_passive(agent, tick)
+                
+                elif strategy == RecoveryStrategy.ACTIVE:
+                    if agent.state in (TrustState.DEGRADED, TrustState.EXPIRED):
+                        total_challenges += 1
+                        passed = self.recover_active(agent)
+                        if not passed and agent.trust_score > 0.6:
+                            legitimate_blocks += 1
+                
+                elif strategy == RecoveryStrategy.HYBRID:
+                    if agent.state in (TrustState.DEGRADED, TrustState.EXPIRED):
+                        if agent.trust_score < self.degradation_threshold:
+                            total_challenges += 1
+                        passed = self.recover_hybrid(agent, tick)
+                        if not passed and agent.trust_score > 0.6:
+                            legitimate_blocks += 1
+                
+                # 5. TTL renewal for healthy agents
+                if agent.state == TrustState.FULL and agent.ttl_remaining <= 0:
+                    agent.ttl_remaining = self.base_ttl
+                
+                tick_trust.append(agent.trust_score)
+            
+            trust_history.append(statistics.mean(tick_trust))
+        
+        total_recoveries = sum(a.recovery_count for a in agents)
+        total_degradations = sum(a.degradation_count for a in agents)
+        
+        return SimResult(
+            strategy=strategy.value,
+            ticks=self.ticks,
+            avg_trust=round(statistics.mean(trust_history), 4),
+            exploits=exploits,
+            false_recoveries=false_recoveries,
+            legitimate_blocks=legitimate_blocks,
+            total_challenges=total_challenges,
+            recovery_success_rate=round(total_recoveries / max(total_degradations, 1), 4),
+        )
 
 
-def run_scenarios():
-    """Demonstrate soft cascade lifecycle."""
-    mgr = SoftCascadeManager()
-    
+def run_comparison():
     print("=" * 70)
-    print("SOFT CASCADE TRUST RECOVERY")
-    print("SC-081v3 (47d certs) + Google OCSP kill → short TTL for agent trust")
+    print("SOFT CASCADE RECOVERY — TRUST DEGRADATION STRATEGY COMPARISON")
+    print("Based on OCSP death (LE Dec 2024, Google Apr 2025)")
     print("=" * 70)
     
-    # Issue credentials with 72h TTL
-    t0 = datetime(2026, 3, 26, 12, 0, 0, tzinfo=timezone.utc)
+    sim = SoftCascadeSimulator(num_agents=30, ticks=300, seed=42)
     
-    cred_a = mgr.issue("agent_alpha", "registry_1", "code_review", ttl_hours=72.0)
-    cred_a.issued_at = t0
-    cred_a.last_renewal = t0
-    
-    cred_b = mgr.issue("agent_beta", "registry_1", "security_audit", ttl_hours=72.0)
-    cred_b.issued_at = t0
-    cred_b.last_renewal = t0
-    
-    print(f"\n[T+0h] Issued 2 credentials (72h TTL, 20% grace)")
-    
-    # Simulate time progression
-    checkpoints = [
-        (56, "approaching grace"),    # 72 * 0.8 = 57.6h grace start
-        (60, "in grace period"),
-        (73, "just expired"),
-        (100, "deep degradation"),
-        (220, "past deadline"),
+    strategies = [
+        RecoveryStrategy.SOFT_FAIL,
+        RecoveryStrategy.PASSIVE,
+        RecoveryStrategy.ACTIVE,
+        RecoveryStrategy.HYBRID,
     ]
     
-    for hours, label in checkpoints:
-        t = t0 + timedelta(hours=hours)
-        transitions = mgr.tick(t)
-        
-        print(f"\n[T+{hours}h] {label}")
-        for tr in transitions:
-            print(f"  {tr['agent_id']}: {tr['transition']} — {tr['action_required']}")
-        
-        status = mgr.status(t)
-        for s in status:
-            print(f"  {s['agent_id']}:{s['scope']} = {s['state']} ({s['hours_remaining']}h remaining)")
-        
-        # agent_alpha renews at T+60h (in grace)
-        if hours == 60:
-            print("\n  → agent_alpha RENEWS (grace period)")
-            result = mgr.renew("agent_alpha", "code_review", challenge_passed=True, now=t)
-            print(f"    {json.dumps({k: result[k] for k in ['success', 'challenge_type', 'renewal_count', 'trust_velocity']})}")
-        
-        # agent_beta tries to renew at T+100h (degraded)
-        if hours == 100:
-            print("\n  → agent_beta RENEWS (degraded — capability probe)")
-            result = mgr.renew("agent_beta", "security_audit", challenge_passed=True, now=t)
-            print(f"    {json.dumps({k: result[k] for k in ['success', 'challenge_type', 'previous_state', 'renewal_count']})}")
+    results = []
+    for strategy in strategies:
+        result = sim.run(strategy)
+        results.append(result)
     
-    # Final status
-    t_final = t0 + timedelta(hours=220)
-    mgr.tick(t_final)
-    print(f"\n{'=' * 70}")
-    print("Final status:")
-    for s in mgr.status(t_final):
-        print(f"  {s['agent_id']}:{s['scope']} = {s['state']} — {s['action']}")
+    # Display comparison
+    print(f"\n{'Strategy':<15} {'Avg Trust':>10} {'Exploits':>10} {'False Rec':>10} {'Blocks':>10} {'Challenges':>10} {'Rec Rate':>10}")
+    print("-" * 75)
+    for r in results:
+        print(f"{r.strategy:<15} {r.avg_trust:>10.4f} {r.exploits:>10} {r.false_recoveries:>10} {r.legitimate_blocks:>10} {r.total_challenges:>10} {r.recovery_success_rate:>10.4f}")
     
     print(f"\n{'=' * 70}")
-    print("Design principles:")
-    print("1. Short TTL > revocation lists (SC-081v3: 47d certs by 2029)")
-    print("2. Active renewal > passive expiry (Google killed OCSP H2 2025)")
-    print("3. Challenge cost scales with degradation depth")
-    print("4. Trust velocity: frequent renewers earn longer effective TTL")
-    print("5. Absence of renewal IS the revocation signal")
-    print(f"\nTotal lifecycle events: {len(mgr.events)}")
+    print("ANALYSIS")
+    print(f"{'=' * 70}")
+    
+    sf, pa, ac, hy = results
+    
+    print(f"\n1. SOFT_FAIL: avg trust {sf.avg_trust:.3f}, {sf.exploits} DETECTED exploits, {sf.false_recoveries} false recoveries")
+    print(f"   → 0 detected ≠ 0 actual. Attacks invisible because degraded→FULL instantly.")
+    print(f"   → OCSP lesson: 'soft-fail checking is worse than no checking'")
+    print(f"   → {sf.false_recoveries} false recoveries = trust score decays to {sf.avg_trust:.3f} anyway")
+    
+    print(f"\n2. PASSIVE: avg trust {pa.avg_trust:.3f}, {pa.exploits} exploits")
+    print(f"   → Auto-restore = trust inflation. No proof of actual improvement.")
+    print(f"   → 'Time heals' is a lie when the underlying problem persists.")
+    
+    print(f"\n3. ACTIVE (ACME): avg trust {ac.avg_trust:.3f}, {ac.exploits} exploits, {ac.legitimate_blocks} false blocks")
+    print(f"   → Challenge-based = strongest signal. {ac.total_challenges} challenges issued.")
+    print(f"   → Maps to LE short-lived certs: 'we have a plausible revocation story'")
+    
+    print(f"\n4. HYBRID: avg trust {hy.avg_trust:.3f}, {hy.exploits} exploits, {hy.total_challenges} challenges")
+    print(f"   → Best balance: passive for minor erosion, active for significant.")
+    print(f"   → Analogous to: standard certs (47d) for most + short-lived (6d) for high-security")
+    
+    # Winner determination
+    best = min(results, key=lambda r: r.exploits)
+    print(f"\n→ LOWEST EXPLOIT RATE: {best.strategy} ({best.exploits} exploits)")
+    
+    best_trust = max(results, key=lambda r: r.avg_trust)
+    print(f"→ HIGHEST AVG TRUST: {best_trust.strategy} ({best_trust.avg_trust:.4f})")
+    
+    # The OCSP lesson
+    print(f"\n{'=' * 70}")
+    print("KEY INSIGHT (from PKI history):")
+    print("  OCSP soft-fail was WORSE than not checking at all.")
+    print("  It gave users false confidence while providing zero attack prevention.")
+    print("  Same for trust: passive auto-recovery = false confidence.")
+    print("  Active re-attestation (ACME model) = the only honest recovery.")
+    print("  Short TTL eliminates revocation entirely — absence of renewal IS revocation.")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":
-    run_scenarios()
+    run_comparison()
