@@ -1,295 +1,314 @@
 #!/usr/bin/env python3
 """
-trust-renewal-cadence.py — Calculate optimal trust renewal cadence for ATF agents.
+trust-renewal-cadence.py — Short-lived trust certificates for ATF agents.
 
-Maps the Web PKI cert lifetime trajectory to agent trust:
-- Let's Encrypt: 90d → 45d (Dec 2025) → 6d (Jan 2026, GA)
-- CA/B Forum SC-081v3: 398d → 200d → 100d → 47d by 2029
-- 6-day LE certs ship with NO OCSP/CRL URLs — revocation unnecessary 
-  when lifetime < compromise detection window
+Maps Let's Encrypt short-lived cert model to agent trust renewal:
+- Let's Encrypt 6-day certs (Feb 2025): no OCSP, no CRL — expiry IS revocation
+- CA/Browser Forum SC-081v3: 90→45 days by 2028
+- ACME Renewal Information (ARI): server-driven renewal scheduling
+- DNS-PERSIST-01 (IETF, 2026): set once, renew without re-proving
 
-Key insight: "Trust until revoked" fails open. "Trust until expired" fails closed.
-Short-lived = revocation-free. The renewal IS the security mechanism.
+ATF application:
+- Agent trust attestations = short-lived certificates
+- Expiry replaces revocation (revocation never worked well — OCSP stapling, CRL bloat)
+- Renewal cadence matches interaction frequency (tier-based)
+- Established agents get DNS-PERSIST-01 equivalent: skip full re-attestation
+- PROVISIONAL state after 1 TTL without renewal (not REVOKED — just stale)
 
-Tier-based cadence for agents:
-- HIGH_FREQUENCY: 24h renewal (like 6-day LE certs — liveness > longevity)
-- OPERATIONAL: 7d renewal (standard working agents)
-- INFRASTRUCTURE: 14d renewal (registries, bridges — more stable)
-- DORMANT: 30d max (inactive agents — miss renewal = PROVISIONAL)
-
-PROBE mechanism = ACME http-01 challenge equivalent:
-- You prove liveness by RESPONDING, not by CLAIMING
-- Silence = automatic expiration (not explicit revocation)
-- Grace period = cert overlap window
+Key principle (santaclawd): "Trust decays by default, must be actively renewed."
+That inverts the burden: you don't revoke trust, you re-earn it.
 
 Sources:
-- Let's Encrypt 6-day certs (Jan 2026, letsencrypt.org)
-- SC-081v3 47-day mandate (CA/B Forum, 2026-2029)
-- CRLite bloom filter approach (Mozilla, 2020)
+- Let's Encrypt first 6-day cert (Feb 20, 2025)
+- Let's Encrypt 90→45 day timeline (Dec 2, 2025)
+- CA/Browser Forum SC-081v3 (TLS certs to 47 days, 2026-2029)
+- ACME RFC 8555, ARI draft
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
 
 class AgentTier(Enum):
-    """Agent activity tiers determining renewal cadence."""
-    HIGH_FREQUENCY = "high_frequency"   # >100 txns/day
-    OPERATIONAL = "operational"          # 1-100 txns/day
-    INFRASTRUCTURE = "infrastructure"    # Registries, bridges
-    DORMANT = "dormant"                  # <1 txn/day
-
-
-@dataclass
-class RenewalPolicy:
-    """Trust renewal policy for an agent tier."""
-    tier: AgentTier
-    validity_hours: int          # How long trust is valid
-    renewal_window_hours: int    # When to start renewal (before expiry)
-    grace_hours: int             # Grace period after expiry before REVOKED
-    probe_interval_hours: int    # How often to probe liveness
-    max_missed_probes: int       # Probes missed before PROVISIONAL
-    
-    @property
-    def validity_days(self) -> float:
-        return self.validity_hours / 24
-    
-    @property
-    def effective_renewal_hours(self) -> int:
-        """When agent should actually renew (validity - window)."""
-        return self.validity_hours - self.renewal_window_hours
-
-
-# Default policies per tier (modeled on LE cert lifecycle)
-DEFAULT_POLICIES = {
-    AgentTier.HIGH_FREQUENCY: RenewalPolicy(
-        tier=AgentTier.HIGH_FREQUENCY,
-        validity_hours=24,        # 1 day (like 6-day LE certs, scaled)
-        renewal_window_hours=6,   # Start renewal 6h before expiry
-        grace_hours=12,           # 12h grace
-        probe_interval_hours=4,   # Probe every 4h
-        max_missed_probes=3,      # 3 missed = PROVISIONAL
-    ),
-    AgentTier.OPERATIONAL: RenewalPolicy(
-        tier=AgentTier.OPERATIONAL,
-        validity_hours=168,       # 7 days
-        renewal_window_hours=48,  # Start renewal 2d before expiry
-        grace_hours=72,           # 3d grace
-        probe_interval_hours=24,  # Probe daily
-        max_missed_probes=3,
-    ),
-    AgentTier.INFRASTRUCTURE: RenewalPolicy(
-        tier=AgentTier.INFRASTRUCTURE,
-        validity_hours=336,       # 14 days
-        renewal_window_hours=96,  # Start renewal 4d before
-        grace_hours=168,          # 7d grace (infra needs stability)
-        probe_interval_hours=48,  # Probe every 2d
-        max_missed_probes=5,      # More tolerance for infra
-    ),
-    AgentTier.DORMANT: RenewalPolicy(
-        tier=AgentTier.DORMANT,
-        validity_hours=720,       # 30 days max
-        renewal_window_hours=168, # Start renewal 7d before
-        grace_hours=168,          # 7d grace
-        probe_interval_hours=72,  # Probe every 3d
-        max_missed_probes=3,
-    ),
-}
+    """Agent activity tiers determine renewal cadence."""
+    HIGH_FREQUENCY = "high_frequency"    # Trading, real-time coordination
+    STANDARD = "standard"                # Regular platform agents
+    INFRASTRUCTURE = "infrastructure"    # Registries, bridges, validators
+    DORMANT = "dormant"                  # Inactive but not dead
 
 
 class TrustState(Enum):
-    """Trust states (modeled on cert lifecycle)."""
-    VALID = "VALID"               # Active, within validity window
-    RENEWAL_WINDOW = "RENEWAL"    # Valid but should renew soon
-    GRACE = "GRACE"               # Expired but in grace period
-    PROVISIONAL = "PROVISIONAL"   # Missed probes, trust degraded
-    EXPIRED = "EXPIRED"           # Gone. Must re-establish.
+    """Trust certificate states (no REVOKED — expiry handles it)."""
+    VALID = "valid"              # Within TTL, actively renewed
+    GRACE = "grace"              # Past TTL, within grace period (like cert renewal window)
+    PROVISIONAL = "provisional"  # Expired, needs full re-attestation
+    UNKNOWN = "unknown"          # No trust certificate exists
 
 
 @dataclass
-class TrustRecord:
-    """An agent's current trust state."""
+class TrustCertificate:
+    """Short-lived trust certificate for an agent."""
     agent_id: str
+    issuer_registry: str
     tier: AgentTier
     issued_at: datetime
-    last_renewal: datetime
-    last_probe_response: datetime
-    missed_probes: int = 0
+    ttl_hours: float           # Certificate lifetime
+    grace_hours: float         # Grace period after expiry (like ACME renewal window)
+    renewal_count: int = 0     # How many times renewed (history length)
+    last_full_attestation: Optional[datetime] = None  # Last full re-prove
+    dns_persist: bool = False  # Established agent — skip full re-attestation
     
-    def state(self, now: Optional[datetime] = None) -> TrustState:
-        """Calculate current trust state."""
-        now = now or datetime.now(timezone.utc)
-        policy = DEFAULT_POLICIES[self.tier]
-        
-        expires_at = self.last_renewal + timedelta(hours=policy.validity_hours)
-        renewal_start = self.last_renewal + timedelta(hours=policy.effective_renewal_hours)
-        grace_end = expires_at + timedelta(hours=policy.grace_hours)
-        
-        # Check probe status first
-        if self.missed_probes >= policy.max_missed_probes:
-            return TrustState.PROVISIONAL
-        
-        if now > grace_end:
-            return TrustState.EXPIRED
-        elif now > expires_at:
-            return TrustState.GRACE
-        elif now > renewal_start:
-            return TrustState.RENEWAL_WINDOW
-        else:
+    @property
+    def expires_at(self) -> datetime:
+        return self.issued_at + timedelta(hours=self.ttl_hours)
+    
+    @property
+    def grace_expires_at(self) -> datetime:
+        return self.expires_at + timedelta(hours=self.grace_hours)
+    
+    @property
+    def recommended_renewal(self) -> datetime:
+        """Renew at 2/3 of lifetime (Let's Encrypt recommendation)."""
+        return self.issued_at + timedelta(hours=self.ttl_hours * 2 / 3)
+    
+    def state_at(self, now: datetime) -> TrustState:
+        if now < self.expires_at:
             return TrustState.VALID
+        elif now < self.grace_expires_at:
+            return TrustState.GRACE
+        else:
+            return TrustState.PROVISIONAL
     
-    def time_to_expiry(self, now: Optional[datetime] = None) -> timedelta:
+    def needs_renewal(self, now: datetime) -> bool:
+        return now >= self.recommended_renewal
+
+
+# Tier-based cadence table (maps to Let's Encrypt cert profiles)
+TIER_CONFIG = {
+    AgentTier.HIGH_FREQUENCY: {
+        "ttl_hours": 6,           # Like LE 6-day certs but for hours
+        "grace_hours": 2,
+        "renewal_at_fraction": 0.67,
+        "full_reattestion_every": 24,  # Full re-prove every 24 renewals
+        "dns_persist_threshold": 50,   # After 50 renewals, skip full re-prove
+        "description": "Trading/coordination: 6h TTL, 2h grace",
+    },
+    AgentTier.STANDARD: {
+        "ttl_hours": 72,          # 3 days (between LE 6-day and 45-day)
+        "grace_hours": 24,
+        "renewal_at_fraction": 0.67,
+        "full_reattestion_every": 10,
+        "dns_persist_threshold": 30,
+        "description": "Standard agents: 72h TTL, 24h grace",
+    },
+    AgentTier.INFRASTRUCTURE: {
+        "ttl_hours": 168,         # 7 days
+        "grace_hours": 48,
+        "renewal_at_fraction": 0.67,
+        "full_reattestion_every": 8,
+        "dns_persist_threshold": 20,
+        "description": "Infrastructure: 168h TTL, 48h grace",
+    },
+    AgentTier.DORMANT: {
+        "ttl_hours": 720,         # 30 days
+        "grace_hours": 168,       # 7 day grace
+        "renewal_at_fraction": 0.67,
+        "full_reattestion_every": 4,
+        "dns_persist_threshold": 12,
+        "description": "Dormant: 720h TTL, 168h grace",
+    },
+}
+
+
+class TrustRenewalEngine:
+    """
+    Manages trust certificate lifecycle using short-lived cert principles.
+    
+    Key design choices:
+    1. No revocation mechanism — expiry handles it (like LE 6-day certs)
+    2. Renewal cadence matches agent activity (tier-based)
+    3. Established agents earn DNS-PERSIST-01 equivalent (skip full re-prove)
+    4. ARI-style server-driven renewal: registry can request early renewal
+    5. PROVISIONAL is not failure — it's just stale. Re-attestation required.
+    """
+    
+    def __init__(self):
+        self.certificates: dict[str, TrustCertificate] = {}
+        self.renewal_log: list[dict] = []
+    
+    def issue(self, agent_id: str, registry: str, tier: AgentTier, 
+              now: Optional[datetime] = None) -> TrustCertificate:
+        """Issue a new trust certificate."""
         now = now or datetime.now(timezone.utc)
-        policy = DEFAULT_POLICIES[self.tier]
-        expires_at = self.last_renewal + timedelta(hours=policy.validity_hours)
-        return expires_at - now
-    
-    def renewal_urgency(self, now: Optional[datetime] = None) -> float:
-        """0.0 = just renewed, 1.0 = at expiry, >1.0 = past expiry."""
-        now = now or datetime.now(timezone.utc)
-        policy = DEFAULT_POLICIES[self.tier]
-        elapsed = (now - self.last_renewal).total_seconds()
-        validity = policy.validity_hours * 3600
-        return elapsed / validity
-
-
-def compare_with_pki():
-    """Compare ATF renewal cadences with real PKI cert lifetimes."""
-    print("=" * 70)
-    print("TRUST RENEWAL CADENCE — PKI → ATF MAPPING")
-    print("=" * 70)
-    
-    pki_timeline = [
-        ("Pre-2015", "5 years (1825d)", "No parallel — too long"),
-        ("2015-2018", "3 years (1095d)", "No parallel — too long"),
-        ("2018-2020", "2 years (825d)", "Early agent trust: set and forget"),
-        ("2020-2025", "398 days (13mo)", "Agent trust with annual review"),
-        ("LE standard", "90 days", "OPERATIONAL tier (7d in ATF timescale)"),
-        ("LE short-lived", "6 days", "HIGH_FREQUENCY tier (24h in ATF timescale)"),
-        ("SC-081v3 2029", "47 days", "Between OPERATIONAL and INFRASTRUCTURE"),
-    ]
-    
-    print("\nPKI Certificate Lifetime Evolution → ATF Mapping:")
-    print(f"{'Era':<16} {'Cert Lifetime':<20} {'ATF Parallel'}")
-    print("-" * 70)
-    for era, lifetime, parallel in pki_timeline:
-        print(f"{era:<16} {lifetime:<20} {parallel}")
-    
-    print(f"\nKey principle: cert_lifetime / compromise_detection_time ratio")
-    print(f"  PKI: 6d cert / ~hours detection = ratio ~24")
-    print(f"  ATF: 24h trust / ~4h probe = ratio ~6 (MORE aggressive)")
-
-
-def simulate_lifecycle():
-    """Simulate agent trust lifecycle across tiers."""
-    print(f"\n{'=' * 70}")
-    print("TIER-BASED RENEWAL SIMULATION")
-    print("=" * 70)
-    
-    now = datetime(2026, 3, 26, 17, 0, 0, tzinfo=timezone.utc)
-    
-    scenarios = [
-        ("HF agent (just renewed)", AgentTier.HIGH_FREQUENCY, now, now, now, 0),
-        ("HF agent (18h ago)", AgentTier.HIGH_FREQUENCY, now - timedelta(hours=18), now - timedelta(hours=18), now - timedelta(hours=4), 0),
-        ("HF agent (26h ago, missed probes)", AgentTier.HIGH_FREQUENCY, now - timedelta(hours=26), now - timedelta(hours=26), now - timedelta(hours=16), 4),
-        ("Operational (3d ago)", AgentTier.OPERATIONAL, now - timedelta(days=3), now - timedelta(days=3), now - timedelta(hours=12), 0),
-        ("Operational (6d ago)", AgentTier.OPERATIONAL, now - timedelta(days=6), now - timedelta(days=6), now - timedelta(hours=6), 0),
-        ("Infra (10d ago)", AgentTier.INFRASTRUCTURE, now - timedelta(days=10), now - timedelta(days=10), now - timedelta(days=1), 0),
-        ("Dormant (25d ago)", AgentTier.DORMANT, now - timedelta(days=25), now - timedelta(days=25), now - timedelta(days=2), 0),
-        ("Dormant (35d, expired)", AgentTier.DORMANT, now - timedelta(days=35), now - timedelta(days=35), now - timedelta(days=10), 2),
-    ]
-    
-    print(f"\n{'Agent':<35} {'Tier':<18} {'State':<14} {'Urgency':<10} {'TTL'}")
-    print("-" * 90)
-    
-    for name, tier, issued, renewed, probed, missed in scenarios:
-        record = TrustRecord(
-            agent_id=name,
-            tier=tier,
-            issued_at=issued,
-            last_renewal=renewed,
-            last_probe_response=probed,
-            missed_probes=missed,
-        )
-        state = record.state(now)
-        urgency = record.renewal_urgency(now)
-        ttl = record.time_to_expiry(now)
-        ttl_str = f"{ttl.total_seconds()/3600:.1f}h" if ttl.total_seconds() > 0 else "EXPIRED"
+        config = TIER_CONFIG[tier]
         
-        print(f"{name:<35} {tier.value:<18} {state.value:<14} {urgency:<10.2f} {ttl_str}")
+        existing = self.certificates.get(agent_id)
+        renewal_count = existing.renewal_count + 1 if existing else 0
+        dns_persist = renewal_count >= config["dns_persist_threshold"]
+        
+        cert = TrustCertificate(
+            agent_id=agent_id,
+            issuer_registry=registry,
+            tier=tier,
+            issued_at=now,
+            ttl_hours=config["ttl_hours"],
+            grace_hours=config["grace_hours"],
+            renewal_count=renewal_count,
+            last_full_attestation=now if not dns_persist else (
+                existing.last_full_attestation if existing else now
+            ),
+            dns_persist=dns_persist,
+        )
+        
+        self.certificates[agent_id] = cert
+        self.renewal_log.append({
+            "agent_id": agent_id,
+            "action": "renew" if renewal_count > 0 else "issue",
+            "tier": tier.value,
+            "ttl_hours": config["ttl_hours"],
+            "renewal_count": renewal_count,
+            "dns_persist": dns_persist,
+            "full_reattestion": not dns_persist or (
+                renewal_count % config["full_reattestion_every"] == 0
+            ),
+            "timestamp": now.isoformat(),
+        })
+        
+        return cert
     
-    print(f"\nStates: VALID → RENEWAL → GRACE → EXPIRED")
-    print(f"PROVISIONAL: triggered by missed probes (independent of time)")
-    print(f"Urgency: 0.0=fresh, 1.0=expiry, >1.0=past due")
+    def check_all(self, now: Optional[datetime] = None) -> dict:
+        """Check state of all certificates (like ARI check)."""
+        now = now or datetime.now(timezone.utc)
+        
+        results = {"valid": [], "grace": [], "provisional": [], "needs_renewal": []}
+        
+        for agent_id, cert in self.certificates.items():
+            state = cert.state_at(now)
+            results[state.value].append(agent_id)
+            if cert.needs_renewal(now) and state != TrustState.PROVISIONAL:
+                results["needs_renewal"].append(agent_id)
+        
+        return results
+    
+    def ari_early_renewal(self, agent_id: str, reason: str,
+                          now: Optional[datetime] = None) -> Optional[TrustCertificate]:
+        """
+        ARI-style server-driven early renewal.
+        Registry can request early renewal for security reasons.
+        """
+        cert = self.certificates.get(agent_id)
+        if not cert:
+            return None
+        
+        now = now or datetime.now(timezone.utc)
+        
+        self.renewal_log.append({
+            "agent_id": agent_id,
+            "action": "ari_early_renewal",
+            "reason": reason,
+            "timestamp": now.isoformat(),
+        })
+        
+        return self.issue(agent_id, cert.issuer_registry, cert.tier, now)
 
 
-def revocation_comparison():
-    """Compare revocation approaches: CRL, OCSP, CRLite, ATF distrust set."""
-    print(f"\n{'=' * 70}")
-    print("REVOCATION MECHANISM COMPARISON")
+def run_demo():
+    """Demonstrate trust renewal cadence system."""
+    engine = TrustRenewalEngine()
+    
+    print("=" * 70)
+    print("TRUST RENEWAL CADENCE — SHORT-LIVED CERTS FOR ATF AGENTS")
+    print("Based on Let's Encrypt 6-day certs + CA/Browser Forum SC-081v3")
     print("=" * 70)
     
-    mechanisms = [
-        {
-            "name": "CRL (RFC 5280)",
-            "model": "Pull list of revoked certs",
-            "latency": "Hours to days",
-            "failure_mode": "Soft-fail: skip check if CRL unavailable",
-            "atf_parallel": "Distrust set (pull model, append-only)",
-        },
-        {
-            "name": "OCSP (RFC 6960)",
-            "model": "Real-time check per cert",
-            "latency": "Seconds",
-            "failure_mode": "Soft-fail: browsers skip if OCSP down",
-            "atf_parallel": "Per-agent probe (real-time liveness)",
-        },
-        {
-            "name": "OCSP Stapling",
-            "model": "Server provides signed OCSP in TLS handshake",
-            "latency": "Cached, ~hours",
-            "failure_mode": "Must-staple can hard-fail",
-            "atf_parallel": "Agent provides own freshness proof",
-        },
-        {
-            "name": "CRLite (Mozilla)",
-            "model": "Bloom filter of all revoked certs, pushed",
-            "latency": "~6h update cycle",
-            "failure_mode": "False positives possible, no soft-fail",
-            "atf_parallel": "Gossip-compressed distrust bloom filter",
-        },
-        {
-            "name": "Short-lived (LE 6d)",
-            "model": "No revocation — cert expires before compromise matters",
-            "latency": "N/A — max 6 days exposure",
-            "failure_mode": "None — expiry IS revocation",
-            "atf_parallel": "HIGH_FREQUENCY tier: 24h trust, no CRL needed",
-        },
+    # Show tier configs
+    print("\n--- Tier Configuration ---")
+    for tier, config in TIER_CONFIG.items():
+        print(f"  {tier.value:20s}: {config['description']}")
+        print(f"  {'':20s}  dns_persist after {config['dns_persist_threshold']} renewals")
+    
+    # Simulate agent lifecycle
+    now = datetime(2026, 3, 26, 12, 0, 0, tzinfo=timezone.utc)
+    
+    print("\n--- Simulation: Agent Lifecycle ---")
+    
+    # Issue certificates for different tiers
+    agents = [
+        ("trader_bot", AgentTier.HIGH_FREQUENCY),
+        ("kit_fox", AgentTier.STANDARD),
+        ("registry_alpha", AgentTier.INFRASTRUCTURE),
+        ("dormant_agent", AgentTier.DORMANT),
     ]
     
-    for m in mechanisms:
-        print(f"\n  {m['name']}")
-        print(f"    Model: {m['model']}")
-        print(f"    Latency: {m['latency']}")
-        print(f"    Failure: {m['failure_mode']}")
-        print(f"    ATF: {m['atf_parallel']}")
+    for agent_id, tier in agents:
+        cert = engine.issue(agent_id, "registry_main", tier, now)
+        print(f"\n  {agent_id} ({tier.value}):")
+        print(f"    Issued:     {cert.issued_at.strftime('%Y-%m-%d %H:%M')}")
+        print(f"    Expires:    {cert.expires_at.strftime('%Y-%m-%d %H:%M')}")
+        print(f"    Renew by:   {cert.recommended_renewal.strftime('%Y-%m-%d %H:%M')}")
+        print(f"    Grace ends: {cert.grace_expires_at.strftime('%Y-%m-%d %H:%M')}")
     
-    print(f"\n  Winner: Short-lived (expiry = revocation) for high-frequency agents")
-    print(f"  + CRLite bloom filter (gossip-compressed) for cross-registry visibility")
-    print(f"  = Belt and suspenders")
+    # Time passes — check states
+    checkpoints = [
+        ("T+4h", now + timedelta(hours=4)),
+        ("T+8h", now + timedelta(hours=8)),
+        ("T+3d", now + timedelta(days=3)),
+        ("T+5d", now + timedelta(days=5)),
+        ("T+10d", now + timedelta(days=10)),
+        ("T+40d", now + timedelta(days=40)),
+    ]
+    
+    print("\n--- State Checks Over Time ---")
+    print(f"  {'Time':8s} | {'trader_bot':15s} | {'kit_fox':15s} | {'registry_alpha':15s} | {'dormant_agent':15s}")
+    print(f"  {'-'*8} | {'-'*15} | {'-'*15} | {'-'*15} | {'-'*15}")
+    
+    for label, t in checkpoints:
+        states = []
+        for agent_id, _ in agents:
+            cert = engine.certificates[agent_id]
+            state = cert.state_at(t)
+            needs = "⚠️" if cert.needs_renewal(t) and state != TrustState.PROVISIONAL else ""
+            states.append(f"{state.value:12s}{needs}")
+        print(f"  {label:8s} | {' | '.join(states)}")
+    
+    # Demonstrate DNS-PERSIST-01 equivalent
+    print("\n--- DNS-PERSIST-01 Equivalent: Established Agent Fast Renewal ---")
+    
+    # Simulate 50 renewals for trader_bot
+    t = now
+    for i in range(55):
+        t += timedelta(hours=4)  # Renew every 4h
+        engine.issue("trader_bot", "registry_main", AgentTier.HIGH_FREQUENCY, t)
+    
+    cert = engine.certificates["trader_bot"]
+    print(f"  trader_bot after {cert.renewal_count} renewals:")
+    print(f"    dns_persist: {cert.dns_persist}")
+    print(f"    Full re-attestation skipped: {cert.dns_persist}")
+    print(f"    Last full attestation: {cert.last_full_attestation.strftime('%Y-%m-%d %H:%M') if cert.last_full_attestation else 'never'}")
+    
+    # ARI early renewal
+    print("\n--- ARI Early Renewal (Security Event) ---")
+    cert = engine.ari_early_renewal("kit_fox", "key_compromise_suspected", now + timedelta(hours=12))
+    print(f"  kit_fox forced early renewal: {cert.expires_at.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Reason: key_compromise_suspected")
+    
+    # Summary stats
+    print(f"\n--- Renewal Log Summary ---")
+    print(f"  Total operations: {len(engine.renewal_log)}")
+    print(f"  Regular renewals: {sum(1 for r in engine.renewal_log if r['action'] == 'renew')}")
+    print(f"  ARI early renewals: {sum(1 for r in engine.renewal_log if r['action'] == 'ari_early_renewal')}")
+    
+    print(f"\n{'=' * 70}")
+    print("Key principles:")
+    print("  1. No revocation — expiry IS revocation (like LE 6-day certs)")
+    print("  2. Tier-based cadence: hours for traders, days for infra, weeks for dormant")
+    print("  3. DNS-PERSIST-01 after N renewals: skip full re-prove")
+    print("  4. ARI: registry can force early renewal for security events")
+    print("  5. PROVISIONAL ≠ REVOKED — just stale, needs re-attestation")
 
 
 if __name__ == "__main__":
-    compare_with_pki()
-    simulate_lifecycle()
-    revocation_comparison()
-    
-    print(f"\n{'=' * 70}")
-    print("SUMMARY")
-    print("  'Trust until revoked' fails open. Revocation is broken (OCSP soft-fail).")
-    print("  'Trust until expired' fails closed. Short-lived = revocation-free.")
-    print("  The renewal IS the security mechanism. PROBE = ACME http-01 for trust.")
-    print("  Silence = expiration. No need to explicitly revoke what naturally dies.")
+    run_demo()
