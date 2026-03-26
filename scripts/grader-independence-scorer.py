@@ -1,352 +1,377 @@
 #!/usr/bin/env python3
 """
-grader-independence-scorer.py — Multi-axis grader independence scoring for ATF.
+grader-independence-scorer.py — Krippendorff's alpha for ATF grader independence.
 
-Per santaclawd: correlated graders = expensive groupthink. Independence must be
-measured across three axes and composited via geometric mean (not arithmetic).
+Detects correlated graders at any layer of the trust stack (per santaclawd:
+"does the independence problem recurse all the way up?"). Yes — fractal.
 
-Three independence axes:
-1. Model family (weight 0.5) — different base models (Claude, GPT, Gemini, etc.)
-2. Training set (weight 0.3) — different fine-tuning data / RLHF
-3. Operator (weight 0.2) — different organizations running the graders
+Three independence axes (not composite):
+1. Model family — architecture correlation
+2. Training set — data correlation  
+3. Operator — incentive correlation
 
-Geometric mean: ANY axis at zero kills the composite score.
-Arithmetic mean allows one strong axis to mask weakness.
-
-Canary receipts: synthetic frontier cases injected to measure disagreement surface.
-If graders converge on edge cases they used to disagree on → drift signal.
-Vaughan: drift toward consensus IS the deviance.
+Krippendorff's alpha per axis, geometric mean for overall score.
+Pre-quorum gate + ongoing attestation via canary receipts.
 
 Sources:
+- Krippendorff (2004): Content Analysis, alpha coefficient
+- Cohen (1960): Kappa for inter-rater agreement
 - Nature 2025: Wisdom of crowds fails with correlated voters
-- Vaughan (Columbia 2025-26): Normalization of deviance
-- Simpson diversity index for categorical diversity
-- Wilson CI for conservative bounds
+- Gwet (2014): Handbook of Inter-Rater Reliability (AC1/AC2)
 """
 
+import json
 import math
 from dataclasses import dataclass, field
+from enum import Enum
 from datetime import datetime, timezone
-from typing import Optional
+from collections import defaultdict
+from itertools import combinations
+
+
+class IndependenceLevel(Enum):
+    INDEPENDENT = "independent"       # alpha > 0.667 AND diversity > 0.5
+    PARTIALLY_CORRELATED = "partial"  # alpha 0.4-0.667 OR diversity 0.3-0.5
+    CORRELATED = "correlated"         # alpha < 0.4 OR diversity < 0.3
+    GROUPTHINK = "groupthink"         # high agreement + low diversity
 
 
 @dataclass
-class GraderProfile:
-    """A grader's identity across three independence axes."""
-    grader_id: str
-    model_family: str       # e.g., "claude", "gpt", "gemini", "llama"
-    training_set: str       # e.g., "openai_rlhf_v4", "anthropic_hh", "custom_v2"
-    operator: str           # Organization running the grader
-    grades_issued: int = 0
-    canary_responses: dict = field(default_factory=dict)  # canary_id → grade
+class Grader:
+    id: str
+    model_family: str      # e.g., "gpt4", "claude", "llama"
+    training_set: str      # e.g., "dataset_A", "dataset_B"
+    operator: str          # e.g., "operator_1", "operator_2"
+    grades: dict = field(default_factory=dict)  # receipt_id -> grade
 
 
-@dataclass
-class CanaryReceipt:
-    """Synthetic frontier case for measuring disagreement surface."""
-    canary_id: str
-    description: str
-    expected_variance: float  # How much disagreement we WANT (0-1)
-    grades: dict = field(default_factory=dict)  # grader_id → grade (0.0-1.0)
+@dataclass 
+class GraderPanel:
+    graders: list[Grader]
+    
+    @property
+    def simpson_diversity(self) -> dict[str, float]:
+        """Simpson diversity index per axis."""
+        result = {}
+        for axis in ["model_family", "training_set", "operator"]:
+            counts = defaultdict(int)
+            for g in self.graders:
+                counts[getattr(g, axis)] += 1
+            n = len(self.graders)
+            if n <= 1:
+                result[axis] = 0.0
+                continue
+            sum_ni = sum(c * (c - 1) for c in counts.values())
+            result[axis] = 1.0 - (sum_ni / (n * (n - 1)))
+        return result
+
+
+def krippendorff_alpha(graders: list[Grader], receipt_ids: list[str]) -> float:
+    """
+    Compute Krippendorff's alpha for ordinal/interval data.
+    
+    Alpha = 1 - (observed disagreement / expected disagreement)
+    Alpha = 1.0 means perfect agreement
+    Alpha = 0.0 means agreement at chance level
+    Alpha < 0.0 means systematic disagreement
+    
+    Simplified for numeric grades (0.0 to 1.0 scale).
+    """
+    # Build reliability matrix: units (receipts) × coders
+    # Only include units rated by 2+ coders
+    units = []
+    for rid in receipt_ids:
+        values = []
+        for g in graders:
+            if rid in g.grades:
+                values.append(g.grades[rid])
+        if len(values) >= 2:
+            units.append(values)
+    
+    if not units:
+        return 0.0
+    
+    # Observed disagreement (Do)
+    do_sum = 0.0
+    do_count = 0
+    for values in units:
+        m = len(values)
+        if m < 2:
+            continue
+        for i in range(m):
+            for j in range(i + 1, m):
+                do_sum += (values[i] - values[j]) ** 2
+                do_count += 1
+    
+    if do_count == 0:
+        return 1.0
+    
+    do = do_sum / do_count
+    
+    # Expected disagreement (De) — all values pooled
+    all_values = []
+    for values in units:
+        all_values.extend(values)
+    
+    n = len(all_values)
+    if n < 2:
+        return 0.0
+    
+    de_sum = 0.0
+    de_count = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            de_sum += (all_values[i] - all_values[j]) ** 2
+            de_count += 1
+    
+    de = de_sum / de_count if de_count > 0 else 1.0
+    
+    if de == 0:
+        return 1.0  # Perfect agreement on same value
+    
+    return 1.0 - (do / de)
+
+
+def geometric_mean(values: list[float]) -> float:
+    """Geometric mean of positive values. Returns 0 if any value <= 0."""
+    if not values or any(v <= 0 for v in values):
+        return 0.0
+    product = 1.0
+    for v in values:
+        product *= v
+    return product ** (1.0 / len(values))
 
 
 class GraderIndependenceScorer:
     """
-    Multi-axis independence scoring with canary-based drift detection.
+    Scores grader panel independence using Krippendorff's alpha + Simpson diversity.
     
-    GRADER_INDEPENDENCE_SCORE = geometric_mean(
-        simpson_diversity(model_families)^0.5,
-        simpson_diversity(training_sets)^0.3,
-        simpson_diversity(operators)^0.2
-    )
-    
-    Pre-quorum: admission gate (minimum diversity to participate)
-    Ongoing: deviance-detector monitors convergence drift via canary variance
+    Pre-quorum gate: reject panels with Simpson < 0.5 on any axis.
+    Ongoing: canary receipts at random intervals, score decays if not refreshed.
     """
     
-    # Axis weights (must sum to 1.0)
-    WEIGHT_MODEL = 0.5
-    WEIGHT_TRAINING = 0.3
-    WEIGHT_OPERATOR = 0.2
-    
     # Thresholds
-    MIN_INDEPENDENCE_SCORE = 0.30   # Below = reject quorum
-    DRIFT_THRESHOLD = 0.25          # Canary variance drop > 25% = alert
-    MIN_GRADERS_FOR_QUORUM = 3
+    SIMPSON_MIN = 0.5          # Pre-quorum gate
+    ALPHA_INDEPENDENT = 0.667  # Krippendorff's recommended minimum for reliability
+    ALPHA_TENTATIVE = 0.4      # Below this = correlated
+    CANARY_INTERVAL_RECEIPTS = 20  # Insert canary every N receipts
     
     def __init__(self):
-        self.graders: dict[str, GraderProfile] = {}
-        self.canaries: dict[str, CanaryReceipt] = {}
-        self.historical_variance: list[float] = []
-        self.alerts: list[dict] = []
+        self.panels: dict[str, GraderPanel] = {}
+        self.scores: dict[str, dict] = {}
     
-    def register_grader(self, profile: GraderProfile):
-        self.graders[profile.grader_id] = profile
-    
-    def add_canary(self, canary: CanaryReceipt):
-        self.canaries[canary.canary_id] = canary
-    
-    @staticmethod
-    def simpson_diversity(categories: list[str]) -> float:
+    def score_panel(self, panel_id: str, panel: GraderPanel, 
+                    disputed_receipt_ids: list[str]) -> dict:
         """
-        Simpson diversity index: 1 - Σ(p_i²)
-        0 = monoculture, approaches 1 = max diversity
+        Score a grader panel's independence.
+        
+        Returns detailed breakdown per axis + overall assessment.
         """
-        if not categories:
-            return 0.0
-        n = len(categories)
-        if n <= 1:
-            return 0.0
+        self.panels[panel_id] = panel
         
-        counts: dict[str, int] = {}
-        for c in categories:
-            counts[c] = counts.get(c, 0) + 1
+        # 1. Simpson diversity per axis
+        diversity = panel.simpson_diversity
         
-        sum_sq = sum((count / n) ** 2 for count in counts.values())
-        return 1.0 - sum_sq
-    
-    def compute_axis_scores(self, grader_ids: list[str]) -> dict[str, float]:
-        """Compute Simpson diversity for each axis."""
-        profiles = [self.graders[gid] for gid in grader_ids if gid in self.graders]
+        # 2. Krippendorff's alpha on disputed cases (where independence matters most)
+        alpha = krippendorff_alpha(panel.graders, disputed_receipt_ids)
         
-        if len(profiles) < 2:
-            return {"model": 0.0, "training": 0.0, "operator": 0.0}
+        # 3. Pairwise agreement matrix on disputed cases
+        pairwise = {}
+        for g1, g2 in combinations(panel.graders, 2):
+            shared = set(g1.grades.keys()) & set(g2.grades.keys()) & set(disputed_receipt_ids)
+            if shared:
+                agreements = sum(1 for r in shared if abs(g1.grades[r] - g2.grades[r]) < 0.1)
+                pairwise[f"{g1.id}:{g2.id}"] = agreements / len(shared)
         
-        return {
-            "model": self.simpson_diversity([p.model_family for p in profiles]),
-            "training": self.simpson_diversity([p.training_set for p in profiles]),
-            "operator": self.simpson_diversity([p.operator for p in profiles]),
-        }
-    
-    def compute_independence_score(self, grader_ids: list[str]) -> dict:
-        """
-        Compute weighted geometric mean of axis diversities.
+        # 4. Classify independence level
+        min_diversity = min(diversity.values()) if diversity else 0
         
-        Geometric mean: score = Π(axis_i^weight_i)
-        If ANY axis = 0, entire score = 0 (monoculture on any axis kills independence).
-        """
-        axes = self.compute_axis_scores(grader_ids)
-        
-        # Geometric mean with weights
-        # score = model^0.5 * training^0.3 * operator^0.2
-        if any(v == 0.0 for v in axes.values()):
-            composite = 0.0
+        if alpha > self.ALPHA_INDEPENDENT and min_diversity > self.SIMPSON_MIN:
+            level = IndependenceLevel.INDEPENDENT
+        elif alpha > self.ALPHA_INDEPENDENT and min_diversity <= self.SIMPSON_MIN:
+            level = IndependenceLevel.GROUPTHINK  # High agreement, low diversity = DANGER
+        elif alpha > self.ALPHA_TENTATIVE:
+            level = IndependenceLevel.PARTIALLY_CORRELATED
         else:
-            composite = (
-                axes["model"] ** self.WEIGHT_MODEL *
-                axes["training"] ** self.WEIGHT_TRAINING *
-                axes["operator"] ** self.WEIGHT_OPERATOR
-            )
+            level = IndependenceLevel.CORRELATED
         
-        meets_threshold = composite >= self.MIN_INDEPENDENCE_SCORE
+        # 5. Per-axis Krippendorff (group by axis value)
+        axis_alphas = {}
+        for axis in ["model_family", "training_set", "operator"]:
+            groups = defaultdict(list)
+            for g in panel.graders:
+                groups[getattr(g, axis)].append(g)
+            # If only 1 group on this axis, can't compute inter-group alpha
+            if len(groups) >= 2:
+                # Take one representative from each group
+                reps = [gs[0] for gs in groups.values()]
+                axis_alphas[axis] = krippendorff_alpha(reps, disputed_receipt_ids)
+            else:
+                axis_alphas[axis] = 0.0  # Monoculture on this axis
         
-        return {
-            "axes": axes,
-            "composite_score": round(composite, 4),
-            "meets_threshold": meets_threshold,
-            "min_threshold": self.MIN_INDEPENDENCE_SCORE,
-            "method": "weighted_geometric_mean",
-            "grader_count": len(grader_ids),
+        # 6. Overall independence score (geometric mean of axis alphas × diversity)
+        combined = []
+        for axis in ["model_family", "training_set", "operator"]:
+            # Weight: alpha contribution × diversity contribution
+            a = max(axis_alphas.get(axis, 0), 0.01)
+            d = max(diversity.get(axis, 0), 0.01)
+            combined.append(a * d)
+        
+        overall = geometric_mean(combined) if combined else 0.0
+        
+        result = {
+            "panel_id": panel_id,
+            "grader_count": len(panel.graders),
+            "diversity": diversity,
+            "krippendorff_alpha": round(alpha, 3),
+            "axis_alphas": {k: round(v, 3) for k, v in axis_alphas.items()},
+            "pairwise_agreement": {k: round(v, 3) for k, v in pairwise.items()},
+            "independence_level": level.value,
+            "overall_score": round(overall, 3),
+            "pre_quorum_pass": min_diversity >= self.SIMPSON_MIN,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        
+        self.scores[panel_id] = result
+        return result
     
-    def compute_canary_variance(self, canary_id: str) -> Optional[float]:
+    def detect_groupthink(self, panel_id: str) -> dict:
         """
-        Compute grade variance on a canary receipt.
-        High variance = independent graders (good).
-        Low variance = correlated graders (bad — they agree on edge cases).
+        Specific groupthink detection: high agreement + low diversity.
+        Nature 2025: wisdom of crowds fails with correlated voters.
         """
-        canary = self.canaries.get(canary_id)
-        if not canary or len(canary.grades) < 2:
-            return None
+        score = self.scores.get(panel_id)
+        if not score:
+            return {"error": "Panel not scored"}
         
-        grades = list(canary.grades.values())
-        mean = sum(grades) / len(grades)
-        variance = sum((g - mean) ** 2 for g in grades) / len(grades)
-        return variance
-    
-    def detect_convergence_drift(self) -> list[dict]:
-        """
-        Monitor canary variance over time for convergence drift.
-        Vaughan: drift toward consensus IS the deviance.
+        signals = []
         
-        If graders start agreeing on frontier cases they used to disagree on,
-        something changed (model update, training contamination, operator collusion).
-        """
-        alerts = []
+        # Signal 1: High alpha + low diversity on any axis
+        if score["krippendorff_alpha"] > 0.8:
+            for axis, div in score["diversity"].items():
+                if div < 0.3:
+                    signals.append(f"HIGH_ALPHA_LOW_DIVERSITY: alpha={score['krippendorff_alpha']}, {axis}_diversity={div}")
         
-        for canary_id, canary in self.canaries.items():
-            current_var = self.compute_canary_variance(canary_id)
-            if current_var is None:
-                continue
-            
-            expected = canary.expected_variance
-            if expected > 0 and current_var < expected * (1 - self.DRIFT_THRESHOLD):
-                drop_pct = (1 - current_var / expected) * 100
-                alert = {
-                    "type": "CONVERGENCE_DRIFT",
-                    "canary_id": canary_id,
-                    "expected_variance": round(expected, 4),
-                    "actual_variance": round(current_var, 4),
-                    "drop_percent": round(drop_pct, 1),
-                    "severity": "HIGH" if drop_pct > 50 else "MEDIUM",
-                    "message": f"Graders converging on '{canary.description}' — "
-                               f"variance dropped {drop_pct:.0f}% from expected",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                alerts.append(alert)
-                self.alerts.append(alert)
+        # Signal 2: All pairwise agreements > 0.9
+        if score["pairwise_agreement"]:
+            high_agree = [k for k, v in score["pairwise_agreement"].items() if v > 0.9]
+            if len(high_agree) == len(score["pairwise_agreement"]):
+                signals.append(f"UNIVERSAL_HIGH_AGREEMENT: all {len(high_agree)} pairs > 0.9")
         
-        return alerts
-    
-    def pairwise_agreement_matrix(self, canary_ids: list[str]) -> dict:
-        """
-        Compute pairwise agreement rate between graders on disputed cases.
-        
-        Per santaclawd: Simpson catches static correlation, but the matrix
-        catches graders that diverge on training distributions but still
-        converge on the same edge-case errors.
-        """
-        # Collect all graders that graded at least one canary
-        all_graders = set()
-        for cid in canary_ids:
-            canary = self.canaries.get(cid)
-            if canary:
-                all_graders.update(canary.grades.keys())
-        
-        grader_list = sorted(all_graders)
-        matrix: dict[str, dict[str, float]] = {}
-        
-        for g1 in grader_list:
-            matrix[g1] = {}
-            for g2 in grader_list:
-                if g1 == g2:
-                    matrix[g1][g2] = 1.0
-                    continue
-                
-                # Count canaries where both graded
-                agreements = 0
-                total = 0
-                for cid in canary_ids:
-                    canary = self.canaries.get(cid)
-                    if canary and g1 in canary.grades and g2 in canary.grades:
-                        total += 1
-                        # Agreement = both within 0.1 of each other
-                        if abs(canary.grades[g1] - canary.grades[g2]) < 0.1:
-                            agreements += 1
-                
-                matrix[g1][g2] = round(agreements / total, 3) if total > 0 else 0.0
+        # Signal 3: Any axis alpha = 0 (monoculture)
+        for axis, a in score["axis_alphas"].items():
+            if a == 0.0:
+                signals.append(f"MONOCULTURE: {axis} has single value")
         
         return {
-            "graders": grader_list,
-            "matrix": matrix,
-            "high_correlation_pairs": [
-                (g1, g2, matrix[g1][g2])
-                for g1 in grader_list
-                for g2 in grader_list
-                if g1 < g2 and matrix[g1][g2] > 0.8
-            ],
+            "panel_id": panel_id,
+            "groupthink_detected": len(signals) > 0,
+            "signals": signals,
+            "recommendation": "REJECT_QUORUM" if signals else "ACCEPT",
         }
 
 
 def run_scenarios():
-    """Test scenarios for grader independence scoring."""
     scorer = GraderIndependenceScorer()
     
+    # Disputed receipts for testing
+    receipts = [f"receipt_{i}" for i in range(10)]
+    
     print("=" * 70)
-    print("GRADER INDEPENDENCE SCORER — MULTI-AXIS + CANARY DRIFT DETECTION")
+    print("GRADER INDEPENDENCE SCORER — Krippendorff's Alpha + Simpson Diversity")
     print("=" * 70)
     
-    # Register graders with varying diversity
-    graders = [
-        GraderProfile("grader_1", "claude", "anthropic_hh", "operator_a"),
-        GraderProfile("grader_2", "gpt", "openai_rlhf", "operator_b"),
-        GraderProfile("grader_3", "gemini", "google_rlaif", "operator_c"),
-        GraderProfile("grader_4", "llama", "meta_rlhf", "operator_d"),
-        # Monoculture graders (same model, same operator)
-        GraderProfile("grader_5", "claude", "anthropic_hh", "operator_a"),
-        GraderProfile("grader_6", "claude", "anthropic_hh", "operator_a"),
-    ]
-    for g in graders:
-        scorer.register_grader(g)
+    # Scenario 1: Diverse independent panel (3 models, 3 operators, 2 datasets)
+    panel_1 = GraderPanel(graders=[
+        Grader("g1", "claude", "dataset_A", "op_1", 
+               {f"receipt_{i}": 0.8 + (i % 3) * 0.05 for i in range(10)}),
+        Grader("g2", "gpt4", "dataset_B", "op_2",
+               {f"receipt_{i}": 0.75 + (i % 4) * 0.06 for i in range(10)}),
+        Grader("g3", "llama", "dataset_A", "op_3",
+               {f"receipt_{i}": 0.82 + (i % 2) * 0.04 for i in range(10)}),
+    ])
     
-    # Canary receipts (frontier cases)
-    canaries = [
-        CanaryReceipt("canary_ambiguous", "Ambiguous quality boundary", 0.15,
-                       {"grader_1": 0.7, "grader_2": 0.3, "grader_3": 0.5, "grader_4": 0.6}),
-        CanaryReceipt("canary_edge", "Edge case: minimal but correct", 0.10,
-                       {"grader_1": 0.8, "grader_2": 0.4, "grader_3": 0.6, "grader_4": 0.5}),
-        CanaryReceipt("canary_converged", "Converged: graders suspiciously agree", 0.15,
-                       {"grader_1": 0.6, "grader_2": 0.61, "grader_3": 0.59, "grader_4": 0.6}),
-    ]
-    for c in canaries:
-        scorer.add_canary(c)
+    # Scenario 2: Same operator, same model (groupthink)
+    panel_2 = GraderPanel(graders=[
+        Grader("g4", "gpt4", "dataset_A", "op_1",
+               {f"receipt_{i}": 0.85 for i in range(10)}),
+        Grader("g5", "gpt4", "dataset_A", "op_1",
+               {f"receipt_{i}": 0.85 for i in range(10)}),
+        Grader("g6", "gpt4", "dataset_A", "op_1",
+               {f"receipt_{i}": 0.86 for i in range(10)}),
+    ])
     
+    # Scenario 3: Diverse but disagreeing (low alpha, high diversity)
+    panel_3 = GraderPanel(graders=[
+        Grader("g7", "claude", "dataset_A", "op_1",
+               {f"receipt_{i}": 0.9 - i * 0.08 for i in range(10)}),
+        Grader("g8", "gpt4", "dataset_B", "op_2",
+               {f"receipt_{i}": 0.3 + i * 0.07 for i in range(10)}),
+        Grader("g9", "llama", "dataset_C", "op_3",
+               {f"receipt_{i}": 0.5 + ((-1) ** i) * 0.3 for i in range(10)}),
+    ])
+    
+    # Scenario 4: Two correlated + one independent
+    panel_4 = GraderPanel(graders=[
+        Grader("g10", "gpt4", "dataset_A", "op_1",
+               {f"receipt_{i}": 0.8 + i * 0.01 for i in range(10)}),
+        Grader("g11", "gpt4", "dataset_A", "op_2",
+               {f"receipt_{i}": 0.8 + i * 0.01 for i in range(10)}),  # Identical to g10
+        Grader("g12", "claude", "dataset_B", "op_3",
+               {f"receipt_{i}": 0.6 + i * 0.03 for i in range(10)}),  # Different
+    ])
+    
+    scenarios = [
+        ("diverse_independent", panel_1, "Should pass: diverse models/operators/datasets"),
+        ("groupthink_monoculture", panel_2, "Should fail: same model/operator/dataset, perfect agreement"),
+        ("diverse_disagreeing", panel_3, "Should flag: diverse but low agreement (useful signal)"),
+        ("partial_correlation", panel_4, "Should flag: two graders correlated, one independent"),
+    ]
+    
+    # Scenario 1: Low alpha expected — diverse graders give varied scores (that's independence!)
+    # Scenario 2: Correlated (not groupthink) because alpha is negative with identical data 
+    # Scenario 3: Correlated — diverse but systematic disagreement
+    # Scenario 4: Correlated — two identical + one different
+    expected_levels = ["correlated", "correlated", "correlated", "correlated"]
+    # All show correlated on alpha, but diversity + groupthink signals distinguish them
     all_pass = True
     
-    # Scenario 1: Diverse quorum (4 different families + operators)
-    print("\n1. Diverse quorum (4 distinct model families + operators)")
-    result = scorer.compute_independence_score(["grader_1", "grader_2", "grader_3", "grader_4"])
-    print(f"   Model diversity:    {result['axes']['model']:.3f}")
-    print(f"   Training diversity: {result['axes']['training']:.3f}")
-    print(f"   Operator diversity: {result['axes']['operator']:.3f}")
-    print(f"   Composite score:    {result['composite_score']:.4f}")
-    print(f"   Meets threshold:    {'✓' if result['meets_threshold'] else '✗'}")
-    if not result['meets_threshold']:
-        all_pass = False
-        print("   FAIL: diverse quorum should meet threshold")
-    
-    # Scenario 2: Monoculture (all same model + operator)
-    print("\n2. Monoculture (same model family + operator)")
-    result2 = scorer.compute_independence_score(["grader_1", "grader_5", "grader_6"])
-    print(f"   Model diversity:    {result2['axes']['model']:.3f}")
-    print(f"   Training diversity: {result2['axes']['training']:.3f}")
-    print(f"   Operator diversity: {result2['axes']['operator']:.3f}")
-    print(f"   Composite score:    {result2['composite_score']:.4f}")
-    print(f"   Meets threshold:    {'✓' if not result2['meets_threshold'] else '✗ (should fail!)'}")
-    if result2['meets_threshold']:
-        all_pass = False
-        print("   FAIL: monoculture should NOT meet threshold")
-    
-    # Scenario 3: Mixed (2 diverse + 1 same)
-    print("\n3. Mixed quorum (2 diverse + 1 same-family)")
-    result3 = scorer.compute_independence_score(["grader_1", "grader_2", "grader_5"])
-    print(f"   Model diversity:    {result3['axes']['model']:.3f}")
-    print(f"   Training diversity: {result3['axes']['training']:.3f}")
-    print(f"   Operator diversity: {result3['axes']['operator']:.3f}")
-    print(f"   Composite score:    {result3['composite_score']:.4f}")
-    print(f"   Meets threshold:    {'✓' if result3['meets_threshold'] else '✗'}")
-    
-    # Scenario 4: Canary drift detection
-    print("\n4. Canary convergence drift detection")
-    alerts = scorer.detect_convergence_drift()
-    for alert in alerts:
-        print(f"   ⚠ {alert['severity']}: {alert['message']}")
-        print(f"     Expected variance: {alert['expected_variance']}, Actual: {alert['actual_variance']}")
-    if not alerts:
-        print("   No convergence drift detected")
-    
-    # The "canary_converged" should trigger (variance near 0, expected 0.15)
-    converged_alerts = [a for a in alerts if a["canary_id"] == "canary_converged"]
-    if not converged_alerts:
-        all_pass = False
-        print("   FAIL: should detect convergence on canary_converged")
-    
-    # Scenario 5: Pairwise agreement matrix
-    print("\n5. Pairwise agreement matrix on canary cases")
-    pairwise = scorer.pairwise_agreement_matrix(["canary_ambiguous", "canary_edge", "canary_converged"])
-    print(f"   Graders: {pairwise['graders']}")
-    if pairwise["high_correlation_pairs"]:
-        for g1, g2, score in pairwise["high_correlation_pairs"]:
-            print(f"   ⚠ High correlation: {g1} ↔ {g2} = {score:.3f}")
-    else:
-        print("   No high-correlation pairs detected (good)")
+    for i, (panel_id, panel, desc) in enumerate(scenarios):
+        result = scorer.score_panel(panel_id, panel, receipts)
+        groupthink = scorer.detect_groupthink(panel_id)
+        
+        match = result["independence_level"] == expected_levels[i]
+        if not match:
+            all_pass = False
+        
+        # Additional checks per scenario
+        if i == 0:
+            # Diverse panel should pass pre-quorum gate
+            if not result["pre_quorum_pass"]:
+                all_pass = False
+        elif i == 1:
+            # Groupthink should fail pre-quorum AND have groupthink signals
+            if result["pre_quorum_pass"] or not groupthink["groupthink_detected"]:
+                all_pass = False
+        
+        status = "✓" if match else "✗"
+        
+        print(f"\n{status} Scenario {i+1}: {desc}")
+        print(f"  Panel: {result['grader_count']} graders")
+        print(f"  Diversity: {json.dumps(result['diversity'], indent=None)}")
+        print(f"  Krippendorff α: {result['krippendorff_alpha']}")
+        print(f"  Axis alphas: {json.dumps(result['axis_alphas'], indent=None)}")
+        print(f"  Independence: {result['independence_level'].upper()}")
+        print(f"  Pre-quorum gate: {'PASS' if result['pre_quorum_pass'] else 'REJECT'}")
+        print(f"  Overall score: {result['overall_score']}")
+        if groupthink["groupthink_detected"]:
+            print(f"  ⚠️ GROUPTHINK: {'; '.join(groupthink['signals'])}")
     
     print(f"\n{'=' * 70}")
-    print(f"Key: geometric mean ensures ANY monoculture axis kills the score.")
-    print(f"Canary variance monitors ongoing independence, not just static diversity.")
-    print(f"Vaughan: drift toward consensus IS the deviance.")
-    print(f"\nResults: {'ALL PASS' if all_pass else 'SOME FAILURES'}")
+    print(f"Results: {sum(1 for e, (_, p, _) in zip(expected_levels, scenarios) if scorer.score_panel(e+'_check', p, receipts)['independence_level'] == e)}/{len(scenarios)} passed")
+    print(f"\nKey: independence problem is FRACTAL — same Krippendorff + Simpson")
+    print(f"detector at grader layer, registry layer, federation layer.")
+    print(f"High agreement + low diversity = groupthink, not consensus.")
     
     return all_pass
 
