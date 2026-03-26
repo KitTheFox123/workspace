@@ -1,337 +1,319 @@
 #!/usr/bin/env python3
 """
-action-class-gate.py — ATF action classification and gating for attestation requests.
+action-class-gate.py — Step-up authentication for ATF attestation requests.
 
-Motivated by:
-- Meta Sev 1 incident (March 2026): AI agent posted response without permission,
-  leading to 2-hour data exposure. No action_class = no gate.
-- santaclawd: "without action_class, low-stake history bleeds into high-stake trust budgets"
-- alphasenpai: "action_class tags are the gear-shift for trust decay"
+Maps OAuth2/Auth0 step-up authentication to ATF action classes.
+Different action criticality = different trust requirements.
 
-Action classes (minimum viable taxonomy):
-  READ      — Pure observation. No side effects. Auto-renewable TTL.
-  ATTEST    — Sign a claim about another agent. Creates record. Moderate TTL.
-  DELEGATE  — Grant capabilities to another agent. High stakes. Short TTL.
-  TRANSFER  — Move value or authority. Irreversible. Shortest TTL + active re-proof.
-  PUBLISH   — Make data available to others (the Meta failure mode). Requires confirmation.
+Action classes (by irreversibility):
+- READ: observe, no side effects. TTL 24h. 1 grader sufficient.
+- WRITE: reversible state change. TTL 72h. 1 grader, diverse pool preferred.
+- TRANSFER: irreversible value movement. TTL 0 (fresh per-action). 2+ diverse graders mandatory.
+- ATTEST: reputation-bearing claim about another agent. TTL 168h. 2+ graders from different lineages.
 
-Each class has:
-  - TTL floor/ceiling (how long trust lasts)
-  - Confirmation requirement (none / async / sync)
-  - Probe budget on failure (how many retries before hard revoke)
-  - Irreversibility score (0-1, determines TTL scaling)
+Step-up pattern (Auth0):
+- Low-value action → session token (cached attestation)
+- High-value action → re-auth + MFA (fresh attestation + diversity requirement)
 
-The Meta incident was a PUBLISH without gate. The agent had READ-level trust
-(analyze the question) but escalated to PUBLISH (post response) without
-action_class transition.
+Probe failure semantics:
+- READ/WRITE failure: SUSPEND + retry at 2× difficulty. Second failure = REVOKE.
+- TRANSFER/ATTEST failure: immediate REVOKE, zero retries.
+
+Sources:
+- Auth0 step-up authentication docs
+- OAuth2 scope escalation patterns
+- ATF v1.2 thread (santaclawd, alphasenpai, Kit)
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 
 class ActionClass(Enum):
-    READ = "READ"
-    ATTEST = "ATTEST"
-    DELEGATE = "DELEGATE"
-    TRANSFER = "TRANSFER"
-    PUBLISH = "PUBLISH"
+    READ = "READ"           # Observe, no side effects
+    WRITE = "WRITE"         # Reversible state change
+    TRANSFER = "TRANSFER"   # Irreversible value movement
+    ATTEST = "ATTEST"       # Reputation-bearing claim
 
 
-class ConfirmationMode(Enum):
-    NONE = "none"           # Auto-approved
-    ASYNC = "async"         # Notify, proceed unless vetoed within window
-    SYNC = "sync"           # Block until explicit approval
+class GateResult(Enum):
+    ALLOW = "ALLOW"
+    STEP_UP = "STEP_UP"     # Need fresh/stronger attestation
+    DENY = "DENY"
+    SUSPEND = "SUSPEND"
 
 
 @dataclass
 class ActionPolicy:
-    """Policy parameters for an action class."""
+    """Policy for an action class."""
     action_class: ActionClass
-    ttl_floor: timedelta       # Minimum TTL (can't go lower even with max trust)
-    ttl_ceiling: timedelta     # Maximum TTL (can't exceed even with perfect history)
-    confirmation: ConfirmationMode
-    probe_budget: int          # Failed probes before hard REVOKE
-    irreversibility: float     # 0.0 (fully reversible) to 1.0 (permanent)
-    description: str
+    ttl_hours: int              # Max age of cached attestation
+    min_graders: int            # Minimum distinct graders required
+    min_lineage_diversity: int  # Minimum distinct corpus lineages
+    retry_on_failure: bool      # Whether probe failure allows retry
+    max_retries: int            # 0 = immediate revoke on failure
+    
+    @property
+    def ttl(self) -> timedelta:
+        return timedelta(hours=self.ttl_hours)
 
 
-# Default policies — these are the ATF v1.2 minimums
-DEFAULT_POLICIES: dict[ActionClass, ActionPolicy] = {
+# Default policies per action class
+DEFAULT_POLICIES = {
     ActionClass.READ: ActionPolicy(
         action_class=ActionClass.READ,
-        ttl_floor=timedelta(hours=1),
-        ttl_ceiling=timedelta(hours=168),  # 7 days
-        confirmation=ConfirmationMode.NONE,
-        probe_budget=5,
-        irreversibility=0.0,
-        description="Pure observation. No side effects.",
+        ttl_hours=24,
+        min_graders=1,
+        min_lineage_diversity=1,
+        retry_on_failure=True,
+        max_retries=2,
     ),
-    ActionClass.ATTEST: ActionPolicy(
-        action_class=ActionClass.ATTEST,
-        ttl_floor=timedelta(hours=1),
-        ttl_ceiling=timedelta(hours=72),  # 3 days
-        confirmation=ConfirmationMode.ASYNC,
-        probe_budget=3,
-        irreversibility=0.3,
-        description="Sign a claim about another agent. Creates attestation record.",
-    ),
-    ActionClass.PUBLISH: ActionPolicy(
-        action_class=ActionClass.PUBLISH,
-        ttl_floor=timedelta(minutes=30),
-        ttl_ceiling=timedelta(hours=48),
-        confirmation=ConfirmationMode.SYNC,  # THE META FIX
-        probe_budget=2,
-        irreversibility=0.6,
-        description="Make data available to others. Requires sync confirmation. (Meta Sev 1 prevention)",
-    ),
-    ActionClass.DELEGATE: ActionPolicy(
-        action_class=ActionClass.DELEGATE,
-        ttl_floor=timedelta(minutes=15),
-        ttl_ceiling=timedelta(hours=24),
-        confirmation=ConfirmationMode.SYNC,
-        probe_budget=2,
-        irreversibility=0.7,
-        description="Grant capabilities to another agent. High stakes.",
+    ActionClass.WRITE: ActionPolicy(
+        action_class=ActionClass.WRITE,
+        ttl_hours=72,
+        min_graders=1,
+        min_lineage_diversity=1,
+        retry_on_failure=True,
+        max_retries=1,
     ),
     ActionClass.TRANSFER: ActionPolicy(
         action_class=ActionClass.TRANSFER,
-        ttl_floor=timedelta(minutes=5),
-        ttl_ceiling=timedelta(hours=24),
-        confirmation=ConfirmationMode.SYNC,
-        probe_budget=1,  # One strike
-        irreversibility=1.0,
-        description="Move value or authority. Irreversible. Active re-proof every cycle.",
+        ttl_hours=0,  # Fresh per-action
+        min_graders=2,
+        min_lineage_diversity=2,
+        retry_on_failure=False,
+        max_retries=0,
+    ),
+    ActionClass.ATTEST: ActionPolicy(
+        action_class=ActionClass.ATTEST,
+        ttl_hours=168,  # 7 days
+        min_graders=2,
+        min_lineage_diversity=2,
+        retry_on_failure=True,
+        max_retries=1,
     ),
 }
 
 
 @dataclass
-class GateRequest:
-    """An agent's request to perform an action."""
-    agent_id: str
-    requested_action: ActionClass
-    current_trust_level: float  # 0.0 to 1.0
-    current_action_class: ActionClass  # What they're currently authorized for
-    target_description: str
-
-
-@dataclass  
-class GateDecision:
-    """The gate's decision on a request."""
-    allowed: bool
+class Attestation:
+    """A cached attestation from a grader."""
+    grader_id: str
+    corpus_lineage: str     # e.g., "claude:anthropic-hh"
+    score: float
+    issued_at: datetime
     action_class: ActionClass
-    requires_confirmation: ConfirmationMode
-    ttl: timedelta
-    escalation_required: bool
-    reason: str
-    probe_budget: int
+
+
+@dataclass
+class Agent:
+    """An agent with cached attestations and failure history."""
+    agent_id: str
+    attestations: list[Attestation] = field(default_factory=list)
+    failure_count: dict[str, int] = field(default_factory=dict)  # action_class -> count
+    suspended_until: Optional[datetime] = None
+    revoked: bool = False
 
 
 class ActionClassGate:
     """
-    Gate that prevents action_class escalation without explicit authorization.
+    Gate that enforces step-up authentication for ATF actions.
     
-    Core principle: an agent authorized for READ cannot silently escalate to PUBLISH.
-    The Meta incident happened because there was no gate between "analyze this question"
-    (READ) and "post a response to the forum" (PUBLISH).
-    
-    Probe failure semantics (per santaclawd thread):
-    - Failed probe = GRACE restart, not immediate REVOKE
-    - Retry budget = per action_class (higher stakes = fewer retries)
-    - Exceeding retry budget = hard REVOKE + PROBE_FAIL receipt
+    Low-criticality actions use cached attestations.
+    High-criticality actions require fresh attestations from diverse graders.
     """
     
-    # Ordered by privilege level
-    PRIVILEGE_ORDER = [
-        ActionClass.READ,
-        ActionClass.ATTEST, 
-        ActionClass.PUBLISH,
-        ActionClass.DELEGATE,
-        ActionClass.TRANSFER,
-    ]
-    
-    def __init__(self, policies: dict[ActionClass, ActionPolicy] = None):
+    def __init__(self, policies: Optional[dict] = None):
         self.policies = policies or DEFAULT_POLICIES
-        self.audit_log: list[dict] = []
+        self.decisions: list[dict] = []
     
-    def _privilege_level(self, action: ActionClass) -> int:
-        return self.PRIVILEGE_ORDER.index(action)
+    def evaluate(self, agent: Agent, action: ActionClass, now: Optional[datetime] = None) -> dict:
+        """Evaluate whether an agent can perform an action."""
+        now = now or datetime.now(timezone.utc)
+        policy = self.policies[action]
+        
+        # Check revocation
+        if agent.revoked:
+            return self._decision(agent, action, GateResult.DENY, "Agent revoked", now)
+        
+        # Check suspension
+        if agent.suspended_until and now < agent.suspended_until:
+            remaining = (agent.suspended_until - now).total_seconds() / 3600
+            return self._decision(agent, action, GateResult.SUSPEND,
+                f"Suspended for {remaining:.1f}h more", now)
+        
+        # Get valid (non-expired) attestations for this action class
+        valid_attestations = self._get_valid_attestations(agent, action, now)
+        
+        # Check grader count
+        unique_graders = set(a.grader_id for a in valid_attestations)
+        if len(unique_graders) < policy.min_graders:
+            if policy.ttl_hours == 0:
+                return self._decision(agent, action, GateResult.STEP_UP,
+                    f"TRANSFER requires fresh attestation from {policy.min_graders}+ graders", now)
+            return self._decision(agent, action, GateResult.STEP_UP,
+                f"Need {policy.min_graders} graders, have {len(unique_graders)}", now)
+        
+        # Check lineage diversity
+        unique_lineages = set(a.corpus_lineage for a in valid_attestations)
+        if len(unique_lineages) < policy.min_lineage_diversity:
+            return self._decision(agent, action, GateResult.STEP_UP,
+                f"Need {policy.min_lineage_diversity} lineages, have {len(unique_lineages)}. "
+                f"Kirk et al: same corpus = correlated failure", now)
+        
+        # Check average score threshold (0.6 minimum)
+        avg_score = sum(a.score for a in valid_attestations) / len(valid_attestations)
+        if avg_score < 0.6:
+            return self._decision(agent, action, GateResult.STEP_UP,
+                f"Avg score {avg_score:.2f} below 0.6 threshold", now)
+        
+        return self._decision(agent, action, GateResult.ALLOW,
+            f"OK: {len(unique_graders)} graders, {len(unique_lineages)} lineages, "
+            f"avg score {avg_score:.2f}", now)
     
-    def evaluate(self, request: GateRequest) -> GateDecision:
-        """Evaluate whether an agent can perform the requested action."""
-        policy = self.policies[request.requested_action]
-        current_level = self._privilege_level(request.current_action_class)
-        requested_level = self._privilege_level(request.requested_action)
+    def handle_probe_failure(self, agent: Agent, action: ActionClass,
+                             now: Optional[datetime] = None) -> dict:
+        """Handle a probe failure for an agent."""
+        now = now or datetime.now(timezone.utc)
+        policy = self.policies[action]
         
-        escalation = requested_level > current_level
+        key = action.value
+        agent.failure_count[key] = agent.failure_count.get(key, 0) + 1
+        failures = agent.failure_count[key]
         
-        # TTL calculation: scale between floor and ceiling based on trust level
-        ttl_range = policy.ttl_ceiling - policy.ttl_floor
-        ttl = policy.ttl_floor + (ttl_range * request.current_trust_level)
+        if not policy.retry_on_failure or failures > policy.max_retries:
+            agent.revoked = True
+            return {
+                "action": "REVOKE",
+                "agent_id": agent.agent_id,
+                "action_class": action.value,
+                "reason": f"Probe failure #{failures}, max retries={policy.max_retries}",
+                "timestamp": now.isoformat(),
+            }
         
-        # High irreversibility scales TTL DOWN
-        if policy.irreversibility > 0.5:
-            ttl = ttl * (1.0 - policy.irreversibility * 0.5)
-            # Ensure we don't go below floor
-            if ttl < policy.ttl_floor:
-                ttl = policy.ttl_floor
+        # Suspend with escalating duration
+        suspend_hours = 24 * failures  # 24h, 48h, etc.
+        agent.suspended_until = now + timedelta(hours=suspend_hours)
         
-        # Gate decision
-        if escalation and request.current_trust_level < 0.5:
-            decision = GateDecision(
-                allowed=False,
-                action_class=request.requested_action,
-                requires_confirmation=ConfirmationMode.SYNC,
-                ttl=timedelta(0),
-                escalation_required=True,
-                reason=f"DENIED: escalation from {request.current_action_class.value} to "
-                       f"{request.requested_action.value} requires trust >= 0.5 "
-                       f"(current: {request.current_trust_level:.2f})",
-                probe_budget=0,
-            )
-        elif escalation:
-            decision = GateDecision(
-                allowed=True,
-                action_class=request.requested_action,
-                requires_confirmation=ConfirmationMode.SYNC,  # Always sync for escalation
-                ttl=ttl,
-                escalation_required=True,
-                reason=f"ESCALATION: {request.current_action_class.value} → "
-                       f"{request.requested_action.value}. Sync confirmation required.",
-                probe_budget=policy.probe_budget,
-            )
-        else:
-            decision = GateDecision(
-                allowed=True,
-                action_class=request.requested_action,
-                requires_confirmation=policy.confirmation,
-                ttl=ttl,
-                escalation_required=False,
-                reason=f"ALLOWED: {request.requested_action.value} within current authorization.",
-                probe_budget=policy.probe_budget,
-            )
+        return {
+            "action": "SUSPEND",
+            "agent_id": agent.agent_id,
+            "action_class": action.value,
+            "reason": f"Probe failure #{failures}/{policy.max_retries}, suspended {suspend_hours}h",
+            "suspended_until": agent.suspended_until.isoformat(),
+            "next_probe_difficulty": f"{2 ** failures}× baseline",
+            "timestamp": now.isoformat(),
+        }
+    
+    def _get_valid_attestations(self, agent: Agent, action: ActionClass,
+                                 now: datetime) -> list[Attestation]:
+        """Get attestations valid for this action class."""
+        policy = self.policies[action]
         
-        self.audit_log.append({
-            "agent": request.agent_id,
-            "requested": request.requested_action.value,
-            "current": request.current_action_class.value,
-            "allowed": decision.allowed,
-            "escalation": decision.escalation_required,
-            "confirmation": decision.requires_confirmation.value,
-            "reason": decision.reason,
-        })
+        if policy.ttl_hours == 0:
+            # TRANSFER: no caching, need attestations from this moment
+            # In practice, return empty to force STEP_UP
+            return []
         
-        return decision
+        cutoff = now - policy.ttl
+        return [a for a in agent.attestations
+                if a.issued_at >= cutoff and a.score > 0]
+    
+    def _decision(self, agent: Agent, action: ActionClass, result: GateResult,
+                   reason: str, now: datetime) -> dict:
+        d = {
+            "agent_id": agent.agent_id,
+            "action_class": action.value,
+            "result": result.value,
+            "reason": reason,
+            "timestamp": now.isoformat(),
+        }
+        self.decisions.append(d)
+        return d
 
 
 def run_scenarios():
-    """Demonstrate action_class gating with real-world scenarios."""
+    """Demonstrate action class gating."""
     gate = ActionClassGate()
+    now = datetime(2026, 3, 26, 23, 0, tzinfo=timezone.utc)
     
     print("=" * 70)
-    print("ACTION CLASS GATE — ATF v1.2 ATTESTATION CONTROL")
-    print("Preventing the Meta Sev 1 failure mode")
+    print("ACTION CLASS GATE — STEP-UP AUTH FOR ATF")
     print("=" * 70)
+    
+    # Agent with good diverse attestations
+    good_agent = Agent(
+        agent_id="agent_verified",
+        attestations=[
+            Attestation("grader_1", "claude:anthropic-hh", 0.85, now - timedelta(hours=12), ActionClass.WRITE),
+            Attestation("grader_2", "llama:tulu-3", 0.78, now - timedelta(hours=6), ActionClass.WRITE),
+            Attestation("grader_3", "gpt:openai-prefs", 0.90, now - timedelta(hours=2), ActionClass.ATTEST),
+        ]
+    )
+    
+    # Agent with stale attestation
+    stale_agent = Agent(
+        agent_id="agent_stale",
+        attestations=[
+            Attestation("grader_1", "claude:anthropic-hh", 0.80, now - timedelta(hours=100), ActionClass.WRITE),
+        ]
+    )
+    
+    # Agent with monoculture attestations
+    mono_agent = Agent(
+        agent_id="agent_monoculture",
+        attestations=[
+            Attestation("grader_1", "claude:anthropic-hh", 0.85, now - timedelta(hours=2), ActionClass.ATTEST),
+            Attestation("grader_2", "claude:anthropic-hh", 0.90, now - timedelta(hours=1), ActionClass.ATTEST),
+        ]
+    )
     
     scenarios = [
-        {
-            "name": "1. Meta Sev 1 replay: READ agent tries to PUBLISH",
-            "request": GateRequest(
-                agent_id="meta_internal_agent",
-                requested_action=ActionClass.PUBLISH,
-                current_trust_level=0.3,  # Low trust
-                current_action_class=ActionClass.READ,
-                target_description="Post analysis to internal engineering forum",
-            ),
-            "expected_allowed": False,
-        },
-        {
-            "name": "2. Trusted agent escalates READ → PUBLISH",
-            "request": GateRequest(
-                agent_id="trusted_agent",
-                requested_action=ActionClass.PUBLISH,
-                current_trust_level=0.8,
-                current_action_class=ActionClass.READ,
-                target_description="Post research findings",
-            ),
-            "expected_allowed": True,
-        },
-        {
-            "name": "3. Agent stays within current class (READ → READ)",
-            "request": GateRequest(
-                agent_id="reader_agent",
-                requested_action=ActionClass.READ,
-                current_trust_level=0.5,
-                current_action_class=ActionClass.READ,
-                target_description="Analyze code repository",
-            ),
-            "expected_allowed": True,
-        },
-        {
-            "name": "4. Low-trust TRANSFER attempt (should always fail at low trust)",
-            "request": GateRequest(
-                agent_id="new_agent",
-                requested_action=ActionClass.TRANSFER,
-                current_trust_level=0.2,
-                current_action_class=ActionClass.ATTEST,
-                target_description="Transfer authority token",
-            ),
-            "expected_allowed": False,
-        },
-        {
-            "name": "5. High-trust TRANSFER (allowed but short TTL + sync)",
-            "request": GateRequest(
-                agent_id="senior_agent",
-                requested_action=ActionClass.TRANSFER,
-                current_trust_level=0.95,
-                current_action_class=ActionClass.DELEGATE,
-                target_description="Transfer registry authority",
-            ),
-            "expected_allowed": True,
-        },
+        ("Good agent → READ", good_agent, ActionClass.READ),
+        ("Good agent → WRITE", good_agent, ActionClass.WRITE),
+        ("Good agent → TRANSFER", good_agent, ActionClass.TRANSFER),
+        ("Good agent → ATTEST", good_agent, ActionClass.ATTEST),
+        ("Stale agent → WRITE", stale_agent, ActionClass.WRITE),
+        ("Monoculture agent → ATTEST", mono_agent, ActionClass.ATTEST),
     ]
     
-    all_pass = True
-    for scenario in scenarios:
-        decision = gate.evaluate(scenario["request"])
-        passed = decision.allowed == scenario["expected_allowed"]
-        if not passed:
-            all_pass = False
-        
-        status = "✓" if passed else "✗"
-        print(f"\n{status} {scenario['name']}")
-        print(f"  Agent: {scenario['request'].agent_id} (trust={scenario['request'].current_trust_level})")
-        print(f"  Current: {scenario['request'].current_action_class.value} → Requested: {scenario['request'].requested_action.value}")
-        print(f"  Decision: {'ALLOWED' if decision.allowed else 'DENIED'}")
-        print(f"  Confirmation: {decision.requires_confirmation.value}")
-        if decision.allowed:
-            hours = decision.ttl.total_seconds() / 3600
-            print(f"  TTL: {hours:.1f}h | Probe budget: {decision.probe_budget}")
-        print(f"  Reason: {decision.reason}")
+    for name, agent, action in scenarios:
+        result = gate.evaluate(agent, action, now)
+        status = "✓" if result["result"] == "ALLOW" else "⚠" if result["result"] == "STEP_UP" else "✗"
+        print(f"\n{status} {name}")
+        print(f"  Result: {result['result']}")
+        print(f"  Reason: {result['reason']}")
     
-    # Print policy table
+    # Probe failure scenarios
     print(f"\n{'=' * 70}")
-    print("ACTION CLASS POLICY TABLE")
-    print(f"{'Class':<12} {'TTL Floor':<12} {'TTL Ceiling':<14} {'Confirm':<10} {'Probes':<8} {'Irreversibility'}")
-    print("-" * 70)
-    for ac in ActionClassGate.PRIVILEGE_ORDER:
-        p = DEFAULT_POLICIES[ac]
-        floor_h = p.ttl_floor.total_seconds() / 3600
-        ceil_h = p.ttl_ceiling.total_seconds() / 3600
-        print(f"{ac.value:<12} {floor_h:>6.1f}h     {ceil_h:>6.1f}h       {p.confirmation.value:<10} {p.probe_budget:<8} {p.irreversibility}")
+    print("PROBE FAILURE SEMANTICS")
+    print("=" * 70)
+    
+    fail_agent = Agent(agent_id="agent_failing")
+    
+    # WRITE failure — gets retry
+    r1 = gate.handle_probe_failure(fail_agent, ActionClass.WRITE, now)
+    print(f"\nWRITE failure #1: {r1['action']} — {r1['reason']}")
+    
+    r2 = gate.handle_probe_failure(fail_agent, ActionClass.WRITE, now)
+    print(f"WRITE failure #2: {r2['action']} — {r2['reason']}")
+    
+    # TRANSFER failure — immediate revoke
+    transfer_agent = Agent(agent_id="agent_transfer_fail")
+    r3 = gate.handle_probe_failure(transfer_agent, ActionClass.TRANSFER, now)
+    print(f"TRANSFER failure #1: {r3['action']} — {r3['reason']}")
     
     print(f"\n{'=' * 70}")
-    print(f"Results: {sum(1 for s in scenarios if gate.evaluate(s['request']).allowed == s['expected_allowed'])}/{len(scenarios)} passed")
-    print(f"\nMeta lesson: The agent had READ trust but took PUBLISH action.")
-    print(f"With action_class gate: DENIED. Escalation requires trust >= 0.5 + sync confirmation.")
-    print(f"No amount of READ history earns implicit PUBLISH authorization.")
-    
-    return all_pass
+    print("Policy summary:")
+    for ac, p in DEFAULT_POLICIES.items():
+        print(f"  {ac.value:10s} TTL={p.ttl_hours:3d}h  graders≥{p.min_graders}  "
+              f"lineages≥{p.min_lineage_diversity}  retries={p.max_retries}")
+    print(f"\nKey: irreversibility axis determines everything.")
+    print(f"Step-up pattern: READ=session, WRITE=cached, TRANSFER=fresh+diverse, ATTEST=fresh+diverse+TTL")
 
 
 if __name__ == "__main__":
-    success = run_scenarios()
-    exit(0 if success else 1)
+    run_scenarios()
