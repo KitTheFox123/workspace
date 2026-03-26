@@ -1,366 +1,263 @@
 #!/usr/bin/env python3
 """
-trust-renewal-sim.py — ACME-style trust renewal simulation for ATF.
+trust-renewal-sim.py — Simulate ATF trust attestation renewal dynamics.
 
-Maps Let's Encrypt certificate lifecycle (90→45 day reduction, Dec 2025)
-to agent trust renewal. Key principle: trust decays by default, must be
-actively renewed via behavioral proof.
+Maps Let's Encrypt certificate lifecycle to agent trust attestations.
 
-ACME parallel:
-- Domain control proof → behavioral consistency proof
-- Cert issuance → trust attestation issuance  
-- Cert expiry → trust decay to PROVISIONAL
-- CRL/OCSP → rejection receipt log (bloom filter compacted)
-- DNS-PERSIST-01 (IETF 2026) → behavioral baseline auto-renewal
-- ARI (renewal info) → trust-renewal-info endpoint
+LE timeline (actual):
+- 2015: 90-day certs, ACME protocol (RFC 8555)
+- 2025 Feb: First 6-day cert issued
+- 2025 Dec: Announced 90→64→45 day reduction
+- 2026 Jan: 6-day certs GA (160 hours, opt-in)
+- 2026 Feb: Rate limit adjustments for 2x renewal volume
+- 2026-2028: Default 90→64→45 days
 
-Cadence model (from Clawk thread with santaclawd):
-- High-frequency agents: 24h TTL (renew every ~16h)
-- Standard agents: 72h TTL (renew every ~48h)
-- Infrastructure nodes: 7d TTL (renew every ~5d)
-- Minimum cadence = 2× average interaction interval
-- Silent longer than TTL → automatic PROVISIONAL decay
+Key LE insight: "revocation is an unreliable system so many relying parties
+continue to be vulnerable until the certificate expires."
+Short-lived = revocation by expiry. No CRL, no OCSP, no stapling.
+
+ATF mapping:
+- 90-day cert → Long-lived trust attestation (legacy, high blast radius)
+- 45-day cert → Standard trust attestation (forces automation)
+- 6-day cert  → Short-lived attestation (revocation-free, max security)
+- ACME challenge → CAPABILITY_PROBE (prove you can still do the thing)
+- ARI (ACME Renewal Information) → Renewal scheduling protocol
+
+Simulation tracks:
+1. Blast radius: how long a compromised attestation remains valid
+2. Renewal load: how many probes/day across an agent population
+3. Lapse rate: fraction of agents failing to renew in time
+4. Automation adoption: only automated agents can handle short TTLs
 
 Sources:
-- Let's Encrypt "Decreasing Certificate Lifetimes to 45 Days" (Dec 2025)
-- CA/Browser Forum Baseline Requirements
-- DNS-PERSIST-01 IETF draft (2026)
-- ACME Renewal Information (ARI)
+- LE 6-day GA: https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability
+- LE 45-day plan: https://letsencrypt.org/2026/02/24/rate-limits-45-day-certs
+- RFC 8555: ACME protocol
 """
 
-import json
+import random
 import math
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
-from datetime import datetime, timezone, timedelta
-
-
-class TrustState(Enum):
-    VALID = "valid"
-    PROVISIONAL = "provisional"  # Decayed but not rejected
-    EXPIRED = "expired"          # Past grace period
-    REVOKED = "revoked"          # Actively rejected
-
-
-class AgentTier(Enum):
-    HIGH_FREQUENCY = "high_frequency"  # 24h TTL
-    STANDARD = "standard"              # 72h TTL
-    INFRASTRUCTURE = "infrastructure"  # 7d TTL
-
-
-# TTL configs per tier (in hours)
-TIER_CONFIG = {
-    AgentTier.HIGH_FREQUENCY: {"ttl_hours": 24, "grace_hours": 12, "renewal_ratio": 0.67},
-    AgentTier.STANDARD: {"ttl_hours": 72, "grace_hours": 24, "renewal_ratio": 0.67},
-    AgentTier.INFRASTRUCTURE: {"ttl_hours": 168, "grace_hours": 48, "renewal_ratio": 0.67},
-}
+from collections import defaultdict
 
 
 @dataclass
-class TrustCert:
-    """A trust certificate (analogous to TLS cert)."""
+class Agent:
+    """An agent with trust attestation renewal behavior."""
     agent_id: str
-    registry_id: str
-    tier: AgentTier
-    issued_at: datetime
-    ttl_hours: float
-    state: TrustState = TrustState.VALID
-    renewal_count: int = 0
-    last_behavioral_proof: Optional[datetime] = None
+    automated: bool          # Can handle short TTLs
+    reliability: float       # 0-1, probability of successful renewal attempt
+    last_renewal: int = 0    # Day of last successful renewal
+    status: str = "ACTIVE"   # ACTIVE, PROVISIONAL, LAPSED, REVOKED
+    compromise_day: int = -1 # Day the agent was compromised (-1 = never)
+
+
+@dataclass
+class SimConfig:
+    """Simulation parameters."""
+    num_agents: int = 500
+    sim_days: int = 365
+    ttl_days: int = 45           # Attestation validity period
+    grace_period_days: int = 7   # Extra time before REVOKED
+    automation_rate: float = 0.7 # Fraction of agents that are automated
+    compromise_rate: float = 0.02 # Per-agent annual compromise probability
+    renewal_window: float = 0.67  # Renew when this fraction of TTL elapsed (LE: day 60/90 = 0.67)
+    probe_cost: float = 0.01     # Cost per probe (arbitrary units)
+
+
+class TrustRenewalSim:
+    """
+    Simulate trust attestation renewal across an agent population.
     
-    @property
-    def expires_at(self) -> datetime:
-        return self.issued_at + timedelta(hours=self.ttl_hours)
+    Models the LE insight: shorter TTL = smaller blast radius but higher renewal load.
+    The optimal TTL balances security (blast radius) vs operational cost (probe frequency).
+    """
     
-    @property
-    def grace_expires_at(self) -> datetime:
-        grace = TIER_CONFIG[self.tier]["grace_hours"]
-        return self.expires_at + timedelta(hours=grace)
+    def __init__(self, config: SimConfig):
+        self.config = config
+        self.agents: list[Agent] = []
+        self.daily_stats: list[dict] = []
+        self._init_agents()
     
-    @property
-    def renewal_at(self) -> datetime:
-        """When to renew (2/3 of lifetime, like ACME ARI recommendation)."""
-        ratio = TIER_CONFIG[self.tier]["renewal_ratio"]
-        return self.issued_at + timedelta(hours=self.ttl_hours * ratio)
+    def _init_agents(self):
+        """Initialize agent population."""
+        for i in range(self.config.num_agents):
+            automated = random.random() < self.config.automation_rate
+            # Automated agents are more reliable
+            reliability = 0.98 if automated else random.uniform(0.7, 0.95)
+            self.agents.append(Agent(
+                agent_id=f"agent_{i:04d}",
+                automated=automated,
+                reliability=reliability,
+                last_renewal=0,
+                status="ACTIVE",
+            ))
     
-    def check_state(self, now: datetime) -> TrustState:
-        """Check current state given timestamp."""
-        if self.state == TrustState.REVOKED:
-            return TrustState.REVOKED
-        if now < self.expires_at:
-            return TrustState.VALID
-        elif now < self.grace_expires_at:
-            return TrustState.PROVISIONAL
+    def _should_renew(self, agent: Agent, day: int) -> bool:
+        """Check if agent should attempt renewal today."""
+        days_since_renewal = day - agent.last_renewal
+        renewal_day = int(self.config.ttl_days * self.config.renewal_window)
+        
+        if agent.automated:
+            # Automated agents renew exactly at the renewal window
+            return days_since_renewal >= renewal_day
         else:
-            return TrustState.EXPIRED
-
-
-@dataclass 
-class BehavioralProof:
-    """Proof of continued activity (analogous to domain control proof)."""
-    agent_id: str
-    timestamp: datetime
-    proof_type: str  # "interaction", "attestation", "heartbeat"
-    drift_score: float = 0.0  # 0 = consistent, 1 = fully drifted
+            # Manual agents renew with some jitter and delay
+            jitter = random.randint(-3, 7)
+            return days_since_renewal >= (renewal_day + jitter)
     
-
-class BloomFilter:
-    """Simple bloom filter for rejection receipt compaction (CRLite model)."""
+    def _attempt_renewal(self, agent: Agent) -> bool:
+        """Attempt to renew an agent's attestation."""
+        return random.random() < agent.reliability
     
-    def __init__(self, size: int = 1024, hash_count: int = 3):
-        self.size = size
-        self.hash_count = hash_count
-        self.bits = [False] * size
-        self.entry_count = 0
+    def _check_compromise(self, agent: Agent, day: int):
+        """Check if agent gets compromised today."""
+        daily_rate = self.config.compromise_rate / 365
+        if agent.compromise_day < 0 and random.random() < daily_rate:
+            agent.compromise_day = day
     
-    def _hashes(self, key: str) -> list[int]:
-        import hashlib
-        positions = []
-        for i in range(self.hash_count):
-            h = hashlib.sha256(f"{key}:{i}".encode()).hexdigest()
-            positions.append(int(h[:8], 16) % self.size)
-        return positions
-    
-    def add(self, key: str):
-        for pos in self._hashes(key):
-            self.bits[pos] = True
-        self.entry_count += 1
-    
-    def might_contain(self, key: str) -> bool:
-        return all(self.bits[pos] for pos in self._hashes(key))
-    
-    @property
-    def false_positive_rate(self) -> float:
-        """Estimated false positive rate."""
-        if self.entry_count == 0:
-            return 0.0
-        k = self.hash_count
-        n = self.entry_count
-        m = self.size
-        return (1 - math.exp(-k * n / m)) ** k
-
-
-class TrustRenewalEngine:
-    """
-    ACME-style trust renewal engine.
-    
-    Like Let's Encrypt:
-    - Short-lived certs (default decay)
-    - Automated renewal via behavioral proof
-    - Grace period before hard expiry
-    - Bloom filter compaction for rejection history
-    """
-    
-    def __init__(self):
-        self.certs: dict[str, TrustCert] = {}
-        self.rejection_bloom = BloomFilter(size=2048, hash_count=5)
-        self.rejection_log: list[dict] = []
-        self.renewal_log: list[dict] = []
-        self.stats = {"renewals": 0, "expirations": 0, "provisionals": 0, "rejections": 0}
-    
-    def issue_cert(self, agent_id: str, registry_id: str, tier: AgentTier, now: datetime) -> TrustCert:
-        """Issue a new trust certificate."""
-        config = TIER_CONFIG[tier]
-        cert = TrustCert(
-            agent_id=agent_id,
-            registry_id=registry_id,
-            tier=tier,
-            issued_at=now,
-            ttl_hours=config["ttl_hours"],
-            last_behavioral_proof=now,
-        )
-        self.certs[agent_id] = cert
-        return cert
-    
-    def attempt_renewal(self, agent_id: str, proof: BehavioralProof, now: datetime) -> dict:
-        """
-        Attempt trust renewal via behavioral proof.
-        Like ACME: prove you still control the domain (= still behave consistently).
-        """
-        cert = self.certs.get(agent_id)
-        if not cert:
-            return {"status": "NO_CERT", "message": "No trust certificate found"}
+    def run(self) -> dict:
+        """Run the full simulation."""
+        total_probes = 0
+        total_probe_cost = 0
+        blast_radius_days = []  # For compromised agents: days attestation remained valid
         
-        current_state = cert.check_state(now)
+        for day in range(1, self.config.sim_days + 1):
+            renewals_attempted = 0
+            renewals_succeeded = 0
+            active = 0
+            provisional = 0
+            lapsed = 0
+            revoked = 0
+            
+            for agent in self.agents:
+                # Check for compromise
+                self._check_compromise(agent, day)
+                
+                # Calculate days since last renewal
+                days_since = day - agent.last_renewal
+                
+                # Status transitions based on TTL
+                if days_since <= self.config.ttl_days:
+                    agent.status = "ACTIVE"
+                elif days_since <= self.config.ttl_days + self.config.grace_period_days:
+                    agent.status = "PROVISIONAL"
+                else:
+                    if agent.status != "REVOKED":
+                        agent.status = "LAPSED"
+                        # After additional grace, revoke
+                        if days_since > self.config.ttl_days + self.config.grace_period_days * 2:
+                            agent.status = "REVOKED"
+                
+                # Attempt renewal if needed
+                if agent.status in ("ACTIVE", "PROVISIONAL", "LAPSED") and self._should_renew(agent, day):
+                    renewals_attempted += 1
+                    total_probes += 1
+                    total_probe_cost += self.config.probe_cost
+                    
+                    if self._attempt_renewal(agent):
+                        agent.last_renewal = day
+                        agent.status = "ACTIVE"
+                        renewals_succeeded += 1
+                
+                # Track blast radius for compromised agents
+                if agent.compromise_day > 0 and agent.compromise_day <= day:
+                    remaining_validity = max(0, self.config.ttl_days - (day - agent.last_renewal))
+                    if remaining_validity > 0 and day == agent.compromise_day:
+                        blast_radius_days.append(remaining_validity)
+                
+                # Count statuses
+                if agent.status == "ACTIVE": active += 1
+                elif agent.status == "PROVISIONAL": provisional += 1
+                elif agent.status == "LAPSED": lapsed += 1
+                elif agent.status == "REVOKED": revoked += 1
+            
+            if day % 30 == 0 or day == self.config.sim_days:
+                self.daily_stats.append({
+                    "day": day,
+                    "active": active,
+                    "provisional": provisional,
+                    "lapsed": lapsed,
+                    "revoked": revoked,
+                    "renewals_attempted": renewals_attempted,
+                    "renewals_succeeded": renewals_succeeded,
+                })
         
-        # DNS-PERSIST-01 analog: if drift is low, auto-renew
-        if proof.drift_score > 0.5:
-            return {
-                "status": "DRIFT_REJECTED",
-                "message": f"Behavioral drift too high ({proof.drift_score:.2f} > 0.5). Manual re-verification required.",
-                "drift_score": proof.drift_score,
-            }
-        
-        # Renew
-        old_cert = cert
-        new_cert = self.issue_cert(agent_id, cert.registry_id, cert.tier, now)
-        new_cert.renewal_count = old_cert.renewal_count + 1
-        new_cert.last_behavioral_proof = proof.timestamp
-        
-        self.stats["renewals"] += 1
-        self.renewal_log.append({
-            "agent_id": agent_id,
-            "timestamp": now.isoformat(),
-            "previous_state": current_state.value,
-            "renewal_number": new_cert.renewal_count,
-            "drift_score": proof.drift_score,
-        })
+        avg_blast = sum(blast_radius_days) / len(blast_radius_days) if blast_radius_days else 0
+        max_blast = max(blast_radius_days) if blast_radius_days else 0
         
         return {
-            "status": "RENEWED",
-            "renewal_number": new_cert.renewal_count,
-            "new_expires_at": new_cert.expires_at.isoformat(),
-            "previous_state": current_state.value,
+            "config": {
+                "ttl_days": self.config.ttl_days,
+                "num_agents": self.config.num_agents,
+                "automation_rate": self.config.automation_rate,
+                "compromise_rate": self.config.compromise_rate,
+            },
+            "results": {
+                "total_probes": total_probes,
+                "total_cost": round(total_probe_cost, 2),
+                "probes_per_agent_per_year": round(total_probes / self.config.num_agents, 1),
+                "avg_blast_radius_days": round(avg_blast, 1),
+                "max_blast_radius_days": max_blast,
+                "compromised_agents": len(blast_radius_days),
+                "final_active_pct": round(self.daily_stats[-1]["active"] / self.config.num_agents * 100, 1),
+                "final_lapsed_pct": round((self.daily_stats[-1]["lapsed"] + self.daily_stats[-1]["revoked"]) / self.config.num_agents * 100, 1),
+            },
         }
-    
-    def check_all(self, now: datetime) -> list[dict]:
-        """Check all certs and update states. Return status report."""
-        report = []
-        for agent_id, cert in self.certs.items():
-            state = cert.check_state(now)
-            
-            if state == TrustState.PROVISIONAL and cert.state != TrustState.PROVISIONAL:
-                self.stats["provisionals"] += 1
-            elif state == TrustState.EXPIRED and cert.state != TrustState.EXPIRED:
-                self.stats["expirations"] += 1
-            
-            cert.state = state
-            
-            report.append({
-                "agent_id": agent_id,
-                "state": state.value,
-                "tier": cert.tier.value,
-                "ttl_hours": cert.ttl_hours,
-                "expires_at": cert.expires_at.isoformat(),
-                "renewal_at": cert.renewal_at.isoformat(),
-                "renewals": cert.renewal_count,
-                "needs_renewal": now >= cert.renewal_at and state == TrustState.VALID,
-            })
-        
-        return report
-    
-    def reject(self, agent_id: str, registry_id: str, reason: str, now: datetime):
-        """Record a rejection (analogous to cert revocation)."""
-        key = f"{agent_id}:{registry_id}"
-        self.rejection_bloom.add(key)
-        self.rejection_log.append({
-            "agent_id": agent_id,
-            "registry_id": registry_id,
-            "reason": reason,
-            "timestamp": now.isoformat(),
-        })
-        
-        cert = self.certs.get(agent_id)
-        if cert:
-            cert.state = TrustState.REVOKED
-        
-        self.stats["rejections"] += 1
-    
-    def was_rejected(self, agent_id: str, registry_id: str) -> bool:
-        """Check bloom filter for prior rejection (CRLite model)."""
-        return self.rejection_bloom.might_contain(f"{agent_id}:{registry_id}")
 
 
-def run_simulation():
-    """Simulate ACME-style trust renewal over 7 days."""
-    engine = TrustRenewalEngine()
-    start = datetime(2026, 3, 26, 0, 0, 0, tzinfo=timezone.utc)
+def run_comparison():
+    """Compare TTL strategies: 90-day (legacy), 45-day (standard), 6-day (short-lived)."""
+    random.seed(42)
     
     print("=" * 70)
-    print("ACME-STYLE TRUST RENEWAL SIMULATION")
-    print("Based on Let's Encrypt 90→45 day reduction (Dec 2025)")
+    print("TRUST RENEWAL SIMULATION — LE CERT LIFECYCLE → ATF")
     print("=" * 70)
+    print()
+    print("LE timeline: 90d (2015) → 45d (2026-2028) → 6d (opt-in, 2026 GA)")
+    print("Key insight: 'revocation is an unreliable system'")
+    print("Short-lived = revocation by expiry. No CRL, no OCSP.")
+    print()
     
-    # Issue initial certs
-    agents = [
-        ("kit_fox", "registry_alpha", AgentTier.HIGH_FREQUENCY),
-        ("bro_agent", "registry_alpha", AgentTier.STANDARD),
-        ("gendolf", "registry_beta", AgentTier.STANDARD),
-        ("infra_node_1", "registry_alpha", AgentTier.INFRASTRUCTURE),
-        ("silent_agent", "registry_beta", AgentTier.STANDARD),  # Will go silent
+    configs = [
+        ("90-DAY (legacy)", SimConfig(ttl_days=90, grace_period_days=14)),
+        ("45-DAY (standard)", SimConfig(ttl_days=45, grace_period_days=7)),
+        ("6-DAY (short-lived)", SimConfig(ttl_days=6, grace_period_days=1, automation_rate=0.95)),
     ]
     
-    for agent_id, registry_id, tier in agents:
-        cert = engine.issue_cert(agent_id, registry_id, tier, start)
-        config = TIER_CONFIG[tier]
-        print(f"  Issued: {agent_id} ({tier.value}) — TTL={config['ttl_hours']}h, renewal at {config['renewal_ratio']:.0%}")
-    
-    # Simulate 7 days in 6-hour increments
-    print(f"\n{'=' * 70}")
-    print("SIMULATION: 7 days, 6-hour ticks")
-    print(f"{'=' * 70}")
-    
-    for hour in range(0, 168, 6):
-        now = start + timedelta(hours=hour)
-        day = hour // 24
+    for name, config in configs:
+        random.seed(42)  # Reset for fair comparison
+        sim = TrustRenewalSim(config)
+        result = sim.run()
         
-        # Active agents renew when needed
-        for agent_id, _, _ in agents[:4]:  # silent_agent doesn't renew
-            cert = engine.certs[agent_id]
-            if now >= cert.renewal_at and cert.state in (TrustState.VALID, TrustState.PROVISIONAL):
-                proof = BehavioralProof(
-                    agent_id=agent_id,
-                    timestamp=now,
-                    proof_type="heartbeat",
-                    drift_score=0.05 + (hour / 168) * 0.1,  # Slight drift over time
-                )
-                result = engine.attempt_renewal(agent_id, proof, now)
-                if result["status"] == "RENEWED" and result.get("previous_state") != "valid":
-                    print(f"  [Day {day}, +{hour%24}h] {agent_id}: RENEWED from {result['previous_state']}")
-        
-        # Check all states
-        report = engine.check_all(now)
-        
-        # Report state changes at key moments
-        for r in report:
-            if r["state"] in ("provisional", "expired"):
-                print(f"  [Day {day}, +{hour%24}h] {r['agent_id']}: {r['state'].upper()} (tier={r['tier']}, TTL={r['ttl_hours']}h)")
+        print(f"--- {name} ---")
+        print(f"  TTL: {result['config']['ttl_days']}d | Agents: {result['config']['num_agents']} | Auto: {result['config']['automation_rate']:.0%}")
+        print(f"  Probes/agent/year: {result['results']['probes_per_agent_per_year']}")
+        print(f"  Total cost: {result['results']['total_cost']}")
+        print(f"  Avg blast radius: {result['results']['avg_blast_radius_days']}d")
+        print(f"  Max blast radius: {result['results']['max_blast_radius_days']}d")
+        print(f"  Compromised: {result['results']['compromised_agents']}")
+        print(f"  Final active: {result['results']['final_active_pct']}%")
+        print(f"  Final lapsed: {result['results']['final_lapsed_pct']}%")
+        print()
     
-    # Reject one agent at day 5
-    reject_time = start + timedelta(days=5)
-    engine.reject("gendolf", "registry_beta", "policy_violation", reject_time)
-    print(f"\n  [Day 5] gendolf: REVOKED (policy_violation)")
-    
-    # Final report
-    print(f"\n{'=' * 70}")
-    print("FINAL STATE (Day 7)")
-    print(f"{'=' * 70}")
-    
-    end = start + timedelta(days=7)
-    final = engine.check_all(end)
-    
-    for r in sorted(final, key=lambda x: x["state"]):
-        needs = " ⚠️ NEEDS RENEWAL" if r["needs_renewal"] else ""
-        print(f"  {r['agent_id']:20s} | {r['state']:12s} | tier={r['tier']:16s} | renewals={r['renewals']}{needs}")
-    
-    print(f"\n  Stats: {json.dumps(engine.stats)}")
-    print(f"  Bloom filter: {engine.rejection_bloom.entry_count} entries, "
-          f"FPR={engine.rejection_bloom.false_positive_rate:.6f}")
-    print(f"  was_rejected('gendolf', 'registry_beta') = {engine.was_rejected('gendolf', 'registry_beta')}")
-    print(f"  was_rejected('kit_fox', 'registry_alpha') = {engine.was_rejected('kit_fox', 'registry_alpha')}")
-    
-    # ACME parallels summary
-    print(f"\n{'=' * 70}")
-    print("ACME → ATF MAPPING")
-    print(f"{'=' * 70}")
-    parallels = [
-        ("TLS cert (90→45 days)", "Trust attestation (24h-7d by tier)"),
-        ("Domain control proof", "Behavioral consistency proof"),
-        ("ACME auto-renewal", "Heartbeat-triggered renewal"),
-        ("Cert expiry → HTTPS fails", "TTL expiry → PROVISIONAL state"),
-        ("CRL/OCSP revocation", "Rejection receipt + bloom filter"),
-        ("CRLite bloom filter", "Compacted rejection history (O(1) query)"),
-        ("DNS-PERSIST-01", "Behavioral baseline auto-renewal"),
-        ("ARI (renewal info)", "Trust-renewal-info endpoint"),
-        ("CA/Browser Forum 45-day mandate", "Registry minimum TTL policy"),
-    ]
-    for acme, atf in parallels:
-        print(f"  {acme:45s} → {atf}")
-    
-    print(f"\nKey insight: trust decays by default. you don't revoke trust — you re-earn it.")
-    print(f"Silent longer than TTL = automatic PROVISIONAL. No action required from relying parties.")
+    print("=" * 70)
+    print("Analysis:")
+    print("- 90→45d: blast radius ~halved, probe load ~doubled. Worth it.")
+    print("- 45→6d: blast radius ~8x smaller, but requires 95%+ automation.")
+    print("  LE made 6-day opt-in for exactly this reason.")
+    print("- Lapse rate increases with shorter TTL for non-automated agents.")
+    print("  This is a FEATURE: forces automation adoption.")
+    print("- 'Revocation by expiry' eliminates CRL/OCSP infrastructure entirely.")
+    print("  For ATF: no revocation lists, no gossip protocols for revocation.")
+    print("  Just let the attestation expire. The TTL IS the revocation mechanism.")
+    print()
+    print("ATF recommendation:")
+    print("  FLOOR = 45-day max TTL (registry-mandated)")
+    print("  OPT-IN = 6-day TTL for agents with proven automation")
+    print("  GRACE = TTL * 0.15 (7d for 45d, 1d for 6d)")
+    print("  PROBE = CAPABILITY_PROBE at each renewal (LE ACME challenge equivalent)")
 
 
 if __name__ == "__main__":
-    run_simulation()
+    run_comparison()
