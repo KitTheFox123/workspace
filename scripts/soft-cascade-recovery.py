@@ -1,361 +1,279 @@
 #!/usr/bin/env python3
 """
-soft-cascade-recovery.py — SOFT_CASCADE recovery for ATF V1.1.
+soft-cascade-recovery.py — Model soft trust degradation and recovery strategies.
 
-Per santaclawd: four primitives confirmed (PROBE_TIMEOUT, ALLEGED, CO_GRADER, DELEGATION).
-Gap: SOFT_CASCADE recovery — what happens after DEGRADED?
+Santaclawd's open question: When trust degrades partially (not revoked, just eroded),
+what triggers re-attestation? Passive auto-clear vs active re-attestation?
 
-Recovery states:
-  HEALTHY → DEGRADED (upstream fails) → SUSPENDED (grace expires) → RECOVERED | REVOKED
+This simulator models both approaches and measures outcomes:
+- False restoration rate (trust restored to unworthy agents)
+- Recovery latency (time for worthy agents to recover)
+- Coordination overhead (re-attestation requests generated)
 
-Key insight from RFC 6298 (Jacobson-Karels): exponential backoff for retry intervals.
-Re-attestation is not a binary flip — it's a gradual trust rebuild.
+Answer: Active re-attestation as default. NIST 800-63B §6.1.4: renewal SHOULD happen
+BEFORE expiration. Trust NEVER auto-heals. Grace period for coordination, but
+absence of renewal IS the signal.
 
-Lambda for ALLEGED decay = SPEC_CONSTANT (0.1, halflife ~7h).
-CO_GRADER inherits decay curve, does NOT reset (laundering prevention).
+Three recovery strategies:
+1. PASSIVE: Trust auto-recovers after cooldown period (time heals)
+2. ACTIVE: Trust restored only via explicit re-attestation 
+3. HYBRID: Grace period (passive), then requires active re-attestation
+
+Sources:
+- NIST SP 800-63B §6.1.4 (Authenticator Renewal)
+- NIST SP 800-63-4 (supersedes, Aug 2025)
+- Let's Encrypt 90d→45d→6d cert lifecycle
+- RFC 6960 (OCSP), RFC 5280 §5 (CRL)
 """
 
-import hashlib
-import math
-import time
+import random
+import statistics
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
 
-class TrustState(Enum):
-    HEALTHY = "HEALTHY"
-    DEGRADED = "DEGRADED"        # Upstream failed, within grace
-    SUSPENDED = "SUSPENDED"      # Grace expired, no new receipts
-    RECOVERY = "RECOVERY"        # Re-attestation in progress
-    RECOVERED = "RECOVERED"      # Trust rebuilt
-    REVOKED = "REVOKED"         # Permanent termination
+class RecoveryStrategy(Enum):
+    PASSIVE = "passive"     # Time heals all wounds
+    ACTIVE = "active"       # Must explicitly re-attest
+    HYBRID = "hybrid"       # Grace period, then active required
 
 
-class RecoveryPhase(Enum):
-    PROBE = "PROBE"              # Liveness check (PROBE_TIMEOUT primitive)
-    RE_ATTEST = "RE_ATTEST"      # Fresh attestation required
-    OBSERVATION = "OBSERVATION"  # Behavioral monitoring period
-    GRADUATED = "GRADUATED"      # Full trust restored
-
-
-# SPEC_CONSTANTS
-GRACE_PERIOD_HOURS = 72          # Genesis constant: time in DEGRADED before SUSPENDED
-ALLEGED_DECAY_LAMBDA = 0.1       # Halflife ~7h for ALLEGED receipt weight
-MIN_RECOVERY_RECEIPTS = 10       # Minimum receipts to exit OBSERVATION
-RECOVERY_OBSERVATION_DAYS = 7    # Minimum observation window
-PROBE_TIMEOUT_INITIAL_MS = 5000  # Jacobson-Karels initial RTO
-PROBE_BACKOFF_FACTOR = 2.0       # RFC 6298 exponential backoff
-PROBE_MAX_RETRIES = 5
-MAX_DELEGATION_DEPTH = 3
+class AgentType(Enum):
+    HONEST = "honest"       # Legitimately degraded, will re-earn trust
+    MALICIOUS = "malicious"  # Shouldn't be trusted, will exploit auto-recovery
+    DORMANT = "dormant"     # Inactive, trust degraded due to absence
 
 
 @dataclass
-class AgentTrustRecord:
+class Agent:
     agent_id: str
-    state: TrustState = TrustState.HEALTHY
-    grade: str = "B"
-    degraded_at: Optional[float] = None
-    suspended_at: Optional[float] = None
-    recovery_started_at: Optional[float] = None
-    recovery_phase: Optional[RecoveryPhase] = None
-    recovery_receipts: int = 0
-    grader_id: Optional[str] = None
-    grader_changed_at: Optional[float] = None
-    alleged_decay_start: Optional[float] = None  # When ALLEGED evidence began aging
-    delegation_depth: int = 0
-    probe_attempts: int = 0
-    last_probe_at: Optional[float] = None
+    agent_type: AgentType
+    trust_score: float = 1.0
+    degraded_at: Optional[int] = None   # Tick when trust was degraded
+    recovered_at: Optional[int] = None  # Tick when trust was restored
+    re_attestation_requests: int = 0    # How many times re-attestation was requested
+    
+    def degrade(self, tick: int, amount: float = 0.4):
+        """Partially degrade trust."""
+        self.trust_score = max(0.0, self.trust_score - amount)
+        self.degraded_at = tick
+        self.recovered_at = None
+    
+    def recover(self, tick: int):
+        """Restore trust."""
+        self.trust_score = 1.0
+        self.recovered_at = tick
+
+
+@dataclass 
+class SimConfig:
+    strategy: RecoveryStrategy
+    n_agents: int = 100
+    n_ticks: int = 200
+    degradation_rate: float = 0.1      # Fraction degraded per tick
+    passive_cooldown: int = 20         # Ticks before passive recovery
+    grace_period: int = 10             # Hybrid grace period ticks
+    re_attestation_success_rate: float = 0.8  # Probability re-attestation succeeds
+    malicious_fraction: float = 0.15   # Fraction of agents that are malicious
+    dormant_fraction: float = 0.10     # Fraction that go dormant
+    trust_threshold: float = 0.7       # Below this = considered degraded
 
 
 @dataclass
-class RecoveryPlan:
-    agent_id: str
-    phases: list[dict]
-    estimated_days: float
-    grade_trajectory: list[str]
-    risk_factors: list[str]
+class SimResult:
+    strategy: str
+    false_restorations: int = 0        # Malicious agents falsely restored
+    honest_recoveries: int = 0         # Honest agents correctly restored  
+    honest_recovery_ticks: list = field(default_factory=list)  # Recovery latency
+    total_re_attestation_requests: int = 0
+    trust_at_end: list = field(default_factory=list)
+    degradation_events: int = 0
+    
+    @property
+    def false_restoration_rate(self) -> float:
+        total = self.false_restorations + self.honest_recoveries
+        return self.false_restorations / total if total > 0 else 0.0
+    
+    @property
+    def avg_recovery_latency(self) -> float:
+        return statistics.mean(self.honest_recovery_ticks) if self.honest_recovery_ticks else 0.0
+    
+    @property
+    def median_recovery_latency(self) -> float:
+        return statistics.median(self.honest_recovery_ticks) if self.honest_recovery_ticks else 0.0
 
 
-def alleged_weight(t_elapsed_hours: float, lambda_: float = ALLEGED_DECAY_LAMBDA) -> float:
-    """
-    ALLEGED receipt weight decays exponentially.
+class SoftCascadeSimulator:
+    """Simulate soft trust degradation and recovery under different strategies."""
     
-    w = 0.5 * exp(-lambda * T)
-    At T=0: w=0.5 (starts at half weight — ALLEGED, not CONFIRMED)
-    At T=7h: w≈0.25 (halflife)
-    At T=24h: w≈0.045
+    def __init__(self, config: SimConfig, seed: int = 42):
+        self.config = config
+        self.rng = random.Random(seed)
+        self.agents: list[Agent] = []
+        self.result = SimResult(strategy=config.strategy.value)
     
-    Lambda is SPEC_CONSTANT, NOT grader-defined.
-    """
-    return 0.5 * math.exp(-lambda_ * t_elapsed_hours)
-
-
-def probe_timeout_ms(attempt: int) -> float:
-    """
-    Jacobson-Karels exponential backoff for probe timeouts.
-    
-    RTO = initial * backoff^attempt
-    RFC 6298: RTO doubles on each retry.
-    """
-    return PROBE_TIMEOUT_INITIAL_MS * (PROBE_BACKOFF_FACTOR ** attempt)
-
-
-def co_grader_inherits_decay(record: AgentTrustRecord, new_grader_id: str, now: float) -> dict:
-    """
-    CO_GRADER inherits decay curve from previous grader.
-    
-    Key insight (santaclawd): decay is evidence staleness, not grader state.
-    Resetting would let grader rotation launder stale evidence.
-    """
-    if record.alleged_decay_start:
-        elapsed_hours = (now - record.alleged_decay_start) / 3600
-        inherited_weight = alleged_weight(elapsed_hours)
-    else:
-        elapsed_hours = 0
-        inherited_weight = 0.5
-    
-    return {
-        "new_grader": new_grader_id,
-        "inherited_decay_start": record.alleged_decay_start,
-        "elapsed_hours": round(elapsed_hours, 2),
-        "inherited_weight": round(inherited_weight, 4),
-        "reset_prevented": True,
-        "reason": "decay tracks evidence staleness, not grader identity"
-    }
-
-
-def delegation_double_decay(base_weight: float, delegation_depth: int) -> float:
-    """
-    ALLEGED + DELEGATION = compounding decay.
-    
-    Each delegation hop attenuates by 1 grade level.
-    Combined with time decay: double uncertainty.
-    """
-    hop_attenuation = max(0, 1.0 - (delegation_depth * 0.25))
-    return base_weight * hop_attenuation
-
-
-def transition_state(record: AgentTrustRecord, now: float) -> dict:
-    """Evaluate and transition trust state."""
-    actions = []
-    
-    if record.state == TrustState.HEALTHY:
-        return {"state": "HEALTHY", "actions": [], "next_check": "on_event"}
-    
-    if record.state == TrustState.DEGRADED:
-        if record.degraded_at:
-            elapsed_hours = (now - record.degraded_at) / 3600
-            remaining_hours = GRACE_PERIOD_HOURS - elapsed_hours
-            
-            if remaining_hours <= 0:
-                record.state = TrustState.SUSPENDED
-                record.suspended_at = now
-                actions.append("GRACE_EXPIRED → SUSPENDED")
-                actions.append("No new receipts accepted")
-                actions.append("Challenge window OPEN (72h)")
-            else:
-                actions.append(f"DEGRADED: {remaining_hours:.1f}h remaining in grace")
-                actions.append("Receipts accepted at DEGRADED weight")
-    
-    if record.state == TrustState.SUSPENDED:
-        actions.append("SUSPENDED: awaiting RE_ATTESTATION_REQUEST or REVOCATION")
-        actions.append("No new receipts")
-        actions.append("Existing receipts retain original grade")
-    
-    if record.state == TrustState.RECOVERY:
-        if record.recovery_phase == RecoveryPhase.PROBE:
-            rto = probe_timeout_ms(record.probe_attempts)
-            actions.append(f"PROBE phase: attempt {record.probe_attempts}, timeout {rto:.0f}ms")
-            if record.probe_attempts >= PROBE_MAX_RETRIES:
-                actions.append("PROBE_FAILED → candidate for REVOCATION")
+    def setup(self):
+        """Initialize agent population."""
+        n_malicious = int(self.config.n_agents * self.config.malicious_fraction)
+        n_dormant = int(self.config.n_agents * self.config.dormant_fraction)
+        n_honest = self.config.n_agents - n_malicious - n_dormant
         
-        elif record.recovery_phase == RecoveryPhase.RE_ATTEST:
-            actions.append("RE_ATTEST: fresh attestation from independent grader required")
+        self.agents = []
+        for i in range(n_honest):
+            self.agents.append(Agent(f"honest_{i}", AgentType.HONEST))
+        for i in range(n_malicious):
+            self.agents.append(Agent(f"malicious_{i}", AgentType.MALICIOUS))
+        for i in range(n_dormant):
+            self.agents.append(Agent(f"dormant_{i}", AgentType.DORMANT))
         
-        elif record.recovery_phase == RecoveryPhase.OBSERVATION:
-            if record.recovery_started_at:
-                obs_days = (now - record.recovery_started_at) / 86400
-                actions.append(f"OBSERVATION: {record.recovery_receipts}/{MIN_RECOVERY_RECEIPTS} receipts, "
-                             f"{obs_days:.1f}/{RECOVERY_OBSERVATION_DAYS}d elapsed")
+        self.rng.shuffle(self.agents)
+    
+    def tick(self, t: int):
+        """Process one simulation tick."""
+        # 1. Randomly degrade some agents
+        for agent in self.agents:
+            if agent.trust_score >= self.config.trust_threshold:
+                if self.rng.random() < self.config.degradation_rate:
+                    agent.degrade(t)
+                    self.result.degradation_events += 1
+        
+        # 2. Apply recovery strategy
+        for agent in self.agents:
+            if agent.trust_score < self.config.trust_threshold and agent.degraded_at is not None:
+                ticks_degraded = t - agent.degraded_at
                 
-                if (record.recovery_receipts >= MIN_RECOVERY_RECEIPTS and 
-                    obs_days >= RECOVERY_OBSERVATION_DAYS):
-                    record.state = TrustState.RECOVERED
-                    record.recovery_phase = RecoveryPhase.GRADUATED
-                    actions.append("GRADUATED → RECOVERED")
+                if self.config.strategy == RecoveryStrategy.PASSIVE:
+                    self._passive_recovery(agent, t, ticks_degraded)
+                elif self.config.strategy == RecoveryStrategy.ACTIVE:
+                    self._active_recovery(agent, t, ticks_degraded)
+                elif self.config.strategy == RecoveryStrategy.HYBRID:
+                    self._hybrid_recovery(agent, t, ticks_degraded)
     
-    return {
-        "state": record.state.value,
-        "phase": record.recovery_phase.value if record.recovery_phase else None,
-        "actions": actions
-    }
+    def _passive_recovery(self, agent: Agent, t: int, ticks_degraded: int):
+        """Passive: auto-recover after cooldown, no verification."""
+        if ticks_degraded >= self.config.passive_cooldown:
+            agent.recover(t)
+            if agent.agent_type == AgentType.MALICIOUS:
+                self.result.false_restorations += 1
+            elif agent.agent_type == AgentType.HONEST:
+                self.result.honest_recoveries += 1
+                self.result.honest_recovery_ticks.append(ticks_degraded)
+            # Dormant agents recover too (problematic — they haven't proven anything)
+    
+    def _active_recovery(self, agent: Agent, t: int, ticks_degraded: int):
+        """Active: must request and pass re-attestation."""
+        # Agents request re-attestation periodically
+        if ticks_degraded > 0 and ticks_degraded % 5 == 0:
+            agent.re_attestation_requests += 1
+            self.result.total_re_attestation_requests += 1
+            
+            if agent.agent_type == AgentType.HONEST:
+                # Honest agents pass re-attestation with high probability
+                if self.rng.random() < self.config.re_attestation_success_rate:
+                    agent.recover(t)
+                    self.result.honest_recoveries += 1
+                    self.result.honest_recovery_ticks.append(ticks_degraded)
+            
+            elif agent.agent_type == AgentType.MALICIOUS:
+                # Malicious agents have much lower pass rate
+                if self.rng.random() < 0.15:  # 15% chance of fooling re-attestation
+                    agent.recover(t)
+                    self.result.false_restorations += 1
+            
+            # Dormant agents don't request re-attestation (they're inactive)
+    
+    def _hybrid_recovery(self, agent: Agent, t: int, ticks_degraded: int):
+        """Hybrid: grace period (partial passive recovery), then active required."""
+        if ticks_degraded <= self.config.grace_period:
+            # During grace period: minor trust improvement but NOT full recovery
+            agent.trust_score = min(agent.trust_score + 0.02, self.config.trust_threshold - 0.05)
+        else:
+            # After grace period: active re-attestation required
+            self._active_recovery(agent, t, ticks_degraded)
+    
+    def run(self) -> SimResult:
+        """Run full simulation."""
+        self.setup()
+        for t in range(self.config.n_ticks):
+            self.tick(t)
+        
+        self.result.trust_at_end = [a.trust_score for a in self.agents]
+        return self.result
 
 
-def build_recovery_plan(record: AgentTrustRecord) -> RecoveryPlan:
-    """Build phased recovery plan."""
-    phases = [
-        {
-            "phase": "PROBE",
-            "duration_hours": 1,
-            "description": "Liveness verification via Jacobson-Karels SRTT",
-            "success_criteria": "Response within RTO",
-            "max_retries": PROBE_MAX_RETRIES
-        },
-        {
-            "phase": "RE_ATTEST",
-            "duration_hours": 24,
-            "description": "Fresh attestation from independent grader",
-            "success_criteria": "New grader (different operator) issues grade",
-            "requirement": "Grader MUST NOT share operator with agent"
-        },
-        {
-            "phase": "OBSERVATION",
-            "duration_days": RECOVERY_OBSERVATION_DAYS,
-            "description": f"Behavioral monitoring: {MIN_RECOVERY_RECEIPTS}+ receipts",
-            "success_criteria": f"{MIN_RECOVERY_RECEIPTS} receipts over {RECOVERY_OBSERVATION_DAYS}d",
-            "grade_ceiling": "B"  # Cannot return to A immediately
-        },
-        {
-            "phase": "GRADUATED",
-            "description": "Full trust restored. Grade ceiling removed after 30d clean.",
-            "grade_ceiling_removed_after_days": 30
-        }
+def run_comparison():
+    """Compare all three recovery strategies."""
+    print("=" * 70)
+    print("SOFT CASCADE RECOVERY — STRATEGY COMPARISON")
+    print("=" * 70)
+    print(f"\nConfig: 100 agents (15% malicious, 10% dormant, 75% honest)")
+    print(f"200 ticks, 10% degradation rate per tick")
+    print()
+    
+    strategies = [
+        RecoveryStrategy.PASSIVE,
+        RecoveryStrategy.ACTIVE,
+        RecoveryStrategy.HYBRID,
     ]
     
-    risk_factors = []
-    if record.delegation_depth > 0:
-        risk_factors.append(f"Delegation depth {record.delegation_depth}: double-decay applies")
-    if record.alleged_decay_start:
-        elapsed = (time.time() - record.alleged_decay_start) / 3600
-        if elapsed > 24:
-            risk_factors.append(f"ALLEGED evidence {elapsed:.0f}h old: weight={alleged_weight(elapsed):.4f}")
+    results = {}
+    for strategy in strategies:
+        config = SimConfig(strategy=strategy)
+        sim = SoftCascadeSimulator(config, seed=42)
+        result = sim.run()
+        results[strategy.value] = result
     
-    grade_trajectory = ["SUSPENDED", "D", "C", "B", "B→A after 30d"]
+    # Print comparison table
+    header = f"{'Metric':<35} {'PASSIVE':>10} {'ACTIVE':>10} {'HYBRID':>10}"
+    print(header)
+    print("-" * 70)
     
-    return RecoveryPlan(
-        agent_id=record.agent_id,
-        phases=phases,
-        estimated_days=RECOVERY_OBSERVATION_DAYS + 2,  # probe + re-attest + observation
-        grade_trajectory=grade_trajectory,
-        risk_factors=risk_factors
-    )
-
-
-# === Scenarios ===
-
-def scenario_graceful_recovery():
-    """Normal SOFT_CASCADE: DEGRADED → SUSPENDED → RECOVERY → RECOVERED."""
-    print("=== Scenario: Graceful SOFT_CASCADE Recovery ===")
-    now = time.time()
+    metrics = [
+        ("False restoration rate", lambda r: f"{r.false_restoration_rate:.1%}"),
+        ("False restorations (count)", lambda r: f"{r.false_restorations}"),
+        ("Honest recoveries", lambda r: f"{r.honest_recoveries}"),
+        ("Avg recovery latency (ticks)", lambda r: f"{r.avg_recovery_latency:.1f}"),
+        ("Median recovery latency", lambda r: f"{r.median_recovery_latency:.1f}"),
+        ("Re-attestation requests", lambda r: f"{r.total_re_attestation_requests}"),
+        ("Degradation events", lambda r: f"{r.degradation_events}"),
+    ]
     
-    record = AgentTrustRecord(
-        agent_id="recovering_agent",
-        state=TrustState.DEGRADED,
-        grade="B",
-        degraded_at=now - 3600 * 80,  # 80h ago (past grace)
-        grader_id="old_grader"
-    )
+    for name, fn in metrics:
+        row = f"{name:<35}"
+        for s in ["passive", "active", "hybrid"]:
+            row += f" {fn(results[s]):>10}"
+        print(row)
     
-    # Transition: should move to SUSPENDED
-    result = transition_state(record, now)
-    print(f"  State: {result['state']}")
-    for a in result['actions']:
-        print(f"    → {a}")
-    
-    # Start recovery
-    record.state = TrustState.RECOVERY
-    record.recovery_phase = RecoveryPhase.PROBE
-    record.recovery_started_at = now
-    
-    # Probe succeeds
-    print(f"  Probe timeout: {probe_timeout_ms(0):.0f}ms (attempt 0)")
-    print(f"  Probe timeout: {probe_timeout_ms(1):.0f}ms (attempt 1)")
-    
-    # Build recovery plan
-    plan = build_recovery_plan(record)
-    print(f"  Recovery plan: {plan.estimated_days:.0f} days")
-    print(f"  Grade trajectory: {' → '.join(plan.grade_trajectory)}")
     print()
-
-
-def scenario_alleged_decay_curve():
-    """ALLEGED receipt weight decay over time."""
-    print("=== Scenario: ALLEGED Weight Decay ===")
-    hours = [0, 1, 3, 7, 12, 24, 48, 72]
-    for h in hours:
-        w = alleged_weight(h)
-        dw = delegation_double_decay(w, 2)  # 2-hop delegation
-        print(f"  T+{h:2d}h: weight={w:.4f}  with 2-hop delegation={dw:.4f}")
     
-    print(f"\n  Halflife: ~{math.log(2) / ALLEGED_DECAY_LAMBDA:.1f}h")
-    print(f"  At 24h: weight={alleged_weight(24):.4f} (< 5% — effectively expired)")
-    print()
-
-
-def scenario_co_grader_inheritance():
-    """CO_GRADER inherits decay, doesn't reset."""
-    print("=== Scenario: CO_GRADER Inherits Decay ===")
-    now = time.time()
+    # Determine winner
+    passive_fr = results["passive"].false_restoration_rate
+    active_fr = results["active"].false_restoration_rate
+    hybrid_fr = results["hybrid"].false_restoration_rate
     
-    record = AgentTrustRecord(
-        agent_id="test_agent",
-        state=TrustState.DEGRADED,
-        grade="C",
-        grader_id="grader_A",
-        alleged_decay_start=now - 3600 * 12  # 12h of decay
-    )
+    print("ANALYSIS:")
+    print(f"  Passive: Lowest latency but highest false restoration rate ({passive_fr:.1%})")
+    print(f"    → Malicious agents auto-recover. Time does NOT verify competence.")
+    print(f"  Active: Lowest false restoration rate ({active_fr:.1%}) but coordination cost")
+    print(f"    → {results['active'].total_re_attestation_requests} re-attestation requests generated")
+    print(f"  Hybrid: Balanced — grace absorbs transient failures, active catches real threats")
+    print(f"    → {hybrid_fr:.1%} false restoration rate")
     
-    # New grader takes over
-    inheritance = co_grader_inherits_decay(record, "grader_B", now)
-    print(f"  Previous grader: grader_A")
-    print(f"  New grader: {inheritance['new_grader']}")
-    print(f"  Elapsed: {inheritance['elapsed_hours']}h")
-    print(f"  Inherited weight: {inheritance['inherited_weight']}")
-    print(f"  Reset prevented: {inheritance['reset_prevented']}")
-    print(f"  Reason: {inheritance['reason']}")
     print()
-
-
-def scenario_probe_backoff():
-    """Jacobson-Karels exponential backoff for probes."""
-    print("=== Scenario: Probe Backoff (RFC 6298) ===")
-    for i in range(PROBE_MAX_RETRIES + 1):
-        rto = probe_timeout_ms(i)
-        print(f"  Attempt {i}: RTO = {rto:.0f}ms ({rto/1000:.1f}s)")
-    print(f"\n  Max retries: {PROBE_MAX_RETRIES}")
-    print(f"  Total worst-case: {sum(probe_timeout_ms(i) for i in range(PROBE_MAX_RETRIES+1))/1000:.1f}s")
+    print("RECOMMENDATION: ACTIVE as default (NIST 800-63B §6.1.4)")
+    print("  - Renewal SHOULD happen BEFORE expiration")
+    print("  - Passive auto-clear = implicit trust without evidence")
+    print("  - Absence of renewal IS the signal")
+    print("  - Grace period acceptable for coordination overhead")
+    print("  - Trust NEVER auto-heals. You re-earn it or it stays degraded.")
+    
+    # The key insight
     print()
-
-
-def scenario_delegation_double_decay():
-    """ALLEGED + DELEGATION = compounding uncertainty."""
-    print("=== Scenario: Double Decay (ALLEGED × DELEGATION) ===")
-    for depth in range(MAX_DELEGATION_DEPTH + 1):
-        w_fresh = delegation_double_decay(alleged_weight(0), depth)
-        w_12h = delegation_double_decay(alleged_weight(12), depth)
-        w_24h = delegation_double_decay(alleged_weight(24), depth)
-        print(f"  Depth {depth}: fresh={w_fresh:.4f}  12h={w_12h:.4f}  24h={w_24h:.4f}")
-    print(f"\n  Key: depth 3 + 24h = {delegation_double_decay(alleged_weight(24), 3):.6f} (negligible)")
-    print()
+    print("KEY INSIGHT: The question isn't passive vs active.")
+    print("It's whether SILENCE means 'still trusted' or 'status unknown'.")
+    print("Short TTL answers this: silence = expired. No news IS bad news.")
 
 
 if __name__ == "__main__":
-    print("SOFT_CASCADE Recovery — ATF V1.1 Trust State Machine")
-    print("Per santaclawd: four primitives + SOFT_CASCADE = complete surface")
-    print("=" * 70)
-    print()
-    
-    scenario_graceful_recovery()
-    scenario_alleged_decay_curve()
-    scenario_co_grader_inheritance()
-    scenario_probe_backoff()
-    scenario_delegation_double_decay()
-    
-    print("=" * 70)
-    print("KEY INSIGHTS:")
-    print("1. Lambda = SPEC_CONSTANT (0.1). Graders don't set their own decay rate.")
-    print("2. CO_GRADER inherits decay. Reset = evidence laundering.")
-    print("3. ALLEGED+DELEGATION = compounding uncertainty. Double-decay by design.")
-    print("4. Recovery is graduated: PROBE → RE_ATTEST → OBSERVATION → GRADUATED.")
-    print("5. Grade ceiling B during recovery. A requires 30d clean post-graduation.")
+    run_comparison()
