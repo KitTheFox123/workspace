@@ -1,130 +1,177 @@
 #!/usr/bin/env python3
 """
-email-atf-rosetta.py — Rosetta Stone mapping email RFCs to ATF primitives.
+email-atf-rosetta.py — Bidirectional mapping between email security primitives and ATF trust framework.
 
-Per santaclawd's insight: "every ATF V1.2 design decision has a 1990s email RFC
-that solved it first." This tool makes the mapping explicit and bidirectional.
-
-Email stack → ATF stack:
-  SPF (RFC 7208)     → ASPA provider declaration (authorized trust sources)
-  DKIM (RFC 6376)    → Receipt signing (cryptographic endorsement)
-  DMARC (RFC 7489)   → Policy enforcement + aggregate reporting
-  SMTP bounce codes  → Rejection receipts (diagnostic reason codes)
-  DNSSEC KSK rollover → Ceremony (trust anchor rotation)
-  MX records         → Registry discovery
-  ARC (RFC 8617)     → Trust chain forwarding (intermediate attestation)
-
-Key insight: email survived because it interoperated across hostile networks
-from day one. DKIM/SPF/DMARC are incrementally deployable — exactly like ASPA.
-The adoption curve is the same: years of standardization, cautious early
-adoption, then rapid acceleration once major players enforce.
+Every ATF V1.2 design decision has a 1990s-2020s email RFC that solved it first.
+This tool maps them structurally, not metaphorically.
 
 Sources:
-- RFC 7208 (SPF), RFC 6376 (DKIM), RFC 7489 (DMARC)
-- RFC 8617 (ARC - Authenticated Received Chain)
-- RFC 5321 (SMTP), RFC 3461 (DSN - Delivery Status Notifications)
-- IETF SIDROPS ASPA draft (2026)
-- santaclawd Clawk thread (2026-03-26)
+- DMARC (RFC 7489, DMARCbis draft 2026)
+- SPF (RFC 7208)
+- DKIM (RFC 6376)
+- ASPA (IETF SIDROPS draft, March 2026)
+- ARC (RFC 8617)
+- CT (RFC 6962)
+- SMTP DSN (RFC 3461, RFC 3464)
+- CAdES-A (ETSI TS 101 733) — long-term archival signatures
+- EasyDMARC 2026 adoption report: 52.1% DMARC adoption, only 22.9% enforcement
+- DMARCbis (2026): DNS Tree Walk replaces PSL, pct→t, np tag, MUST NOT reject solely on p=reject
+
+Insight: DMARC adoption trajectory (29.1% → 52.1% in 3 years) mirrors ASPA (<1% → ?)
+         p=none is the most common policy — monitoring before enforcement.
+         ATF should follow: OBSERVE mode before ENFORCE mode. Same lesson, same timeline.
 """
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 
 @dataclass
-class RFCMapping:
-    """Maps an email RFC concept to an ATF primitive."""
-    email_concept: str
+class PrimitiveMapping:
+    """A bidirectional mapping between email security and ATF trust primitives."""
+    email_primitive: str
     email_rfc: str
-    email_mechanism: str
-    atf_concept: str
     atf_primitive: str
-    mapping_strength: str  # "exact", "strong", "analogous"
-    key_insight: str
-    failure_mode_shared: str
+    atf_component: str
+    mapping_type: str  # "structural" | "functional" | "operational"
+    bidirectional_insight: str
+    adoption_lesson: Optional[str] = None
 
 
-# The Rosetta Stone
-MAPPINGS = [
-    RFCMapping(
-        email_concept="Sender Policy Framework",
-        email_rfc="RFC 7208 (2014)",
-        email_mechanism="DNS TXT record listing authorized sending IPs/hosts for a domain",
-        atf_concept="ASPA Provider Declaration",
-        atf_primitive="ASPARecord.authorized_providers",
-        mapping_strength="exact",
-        key_insight="Both declare 'these are my authorized upstream sources.' SPF says 'these IPs can send as me.' ASPA says 'these ASes are my providers.' ATF says 'these registries anchor my trust.'",
-        failure_mode_shared="Incomplete records cause false rejections. SPF -all without listing all senders = bounced mail. ASPA without listing all providers = INVALID paths. ATF without listing all registries = rejected endorsements.",
+ROSETTA_STONE: list[PrimitiveMapping] = [
+    PrimitiveMapping(
+        email_primitive="SPF (Sender Policy Framework)",
+        email_rfc="RFC 7208",
+        atf_primitive="ASPA-equivalent / Authorized Provider Declaration",
+        atf_component="valley-free-verifier.py → ASPARecord",
+        mapping_type="structural",
+        bidirectional_insight=(
+            "SPF: 'these IPs are authorized to send for my domain.' "
+            "ASPA: 'these ASes are my authorized upstream providers.' "
+            "ATF: 'these registries are my authorized trust sources.' "
+            "Same primitive: entity declares authorized intermediaries. "
+            "Verification = check if observed intermediary is in declared set."
+        ),
+        adoption_lesson=(
+            "SPF adoption took ~10 years to reach majority. "
+            "ASPA at <1% in 2026 tracking same curve as RPKI-ROV circa 2019."
+        ),
     ),
-    RFCMapping(
-        email_concept="DomainKeys Identified Mail",
-        email_rfc="RFC 6376 (2011)",
-        email_mechanism="Cryptographic signature over email headers+body, verified via DNS public key",
-        atf_concept="Receipt Signing",
-        atf_primitive="receipt.signature (Ed25519/RSA)",
-        mapping_strength="exact",
-        key_insight="Both sign content at origin, verify at destination. DKIM signature survives forwarding. ATF receipt signature survives bridge crossing. Neither requires the intermediary to be trusted — only the signer.",
-        failure_mode_shared="Key rotation without overlap = verification gap. DKIM key published in DNS; if rotated without TTL overlap, in-flight messages fail. ATF key rotated without ceremony overlap = receipts fail. overlap-transition-engine.py solves this.",
+    PrimitiveMapping(
+        email_primitive="DKIM (DomainKeys Identified Mail)",
+        email_rfc="RFC 6376",
+        atf_primitive="Receipt Signature / Endorsement Signature",
+        atf_component="attestation-signer.py → JWS envelope",
+        mapping_type="structural",
+        bidirectional_insight=(
+            "DKIM: cryptographic signature proving message integrity + sender authentication. "
+            "ATF receipt: cryptographic signature proving endorsement integrity + issuer authentication. "
+            "Both use asymmetric crypto, both can survive forwarding if content unchanged. "
+            "DKIM selector = receipt key rotation. Both have the archaeology problem: "
+            "key revoked ≠ signature was invalid at signing time."
+        ),
+        adoption_lesson=(
+            "DKIM without SPF = origin without path. DKIM+SPF = origin+path. "
+            "Receipt sig without ASPA-equivalent = endorsement without propagation validation."
+        ),
     ),
-    RFCMapping(
-        email_concept="DMARC Policy + Reporting",
-        email_rfc="RFC 7489 (2015)",
-        email_mechanism="Policy record (none/quarantine/reject) + aggregate XML reports from receivers",
-        atf_concept="Trust Policy Enforcement + Deviance Reporting",
-        atf_primitive="ceremony-mode-policy.py + deviance-detector.py",
-        mapping_strength="strong",
-        key_insight="DMARC = 'here is my policy AND send me reports about violations.' ATF ceremony-mode-policy = 'here is my trust floor AND deviance-detector reports violations.' Both shift power to the domain owner (sender/agent) while requiring receiver cooperation for reporting.",
-        failure_mode_shared="Policy without monitoring = false confidence. DMARC p=reject without reading aggregate reports = silent delivery failures. ATF CIRCUIT_BREAKER without observer rotation = normalized deviance (Vaughan).",
+    PrimitiveMapping(
+        email_primitive="DMARC (Domain-based Message Authentication, Reporting, and Conformance)",
+        email_rfc="RFC 7489 / DMARCbis (2026)",
+        atf_primitive="Trust Policy + Aggregate Reporting",
+        atf_component="ceremony-mode-policy.py + divergence-detector",
+        mapping_type="functional",
+        bidirectional_insight=(
+            "DMARC: policy layer that COMBINES SPF+DKIM results + specifies enforcement action. "
+            "ATF ceremony: policy layer that COMBINES receipt validation + ASPA check + specifies trust action. "
+            "DMARC p=none/quarantine/reject = ATF OBSERVE/FLAG/REJECT modes. "
+            "DMARCbis lesson (2026): MUST NOT reject solely on policy — need 'other knowledge and analysis.' "
+            "ATF parallel: MUST NOT revoke trust solely on single receipt failure. Context matters."
+        ),
+        adoption_lesson=(
+            "EasyDMARC 2026: 52.1% have DMARC records but only 22.9% enforce (p=quarantine/reject). "
+            "29.2% stuck at p=none (monitoring). Fortune 500: 95% have DMARC, 80%+ enforce. "
+            "Lesson: monitoring→enforcement transition is the REAL bottleneck. "
+            "ATF prediction: most registries will run OBSERVE mode for years before ENFORCE."
+        ),
     ),
-    RFCMapping(
-        email_concept="SMTP Bounce Codes (DSN)",
-        email_rfc="RFC 3461 (2003) + RFC 3464",
-        email_mechanism="Structured error codes: 5.1.1 (user unknown), 5.7.1 (policy rejection), 4.x.x (temporary)",
-        atf_concept="Rejection Receipts",
-        atf_primitive="rejection-index.py reason_codes",
-        mapping_strength="exact",
-        key_insight="SMTP bounce = structured rejection with diagnostic code. ATF rejection receipt = structured refusal with reason code. Both are MORE forensically valuable than acceptance. A map of bounces = a map of policy boundaries. alphasenpai's 0x0B = SMTP 5.7.1.",
-        failure_mode_shared="Silent discard (no bounce) = worst failure mode. SMTP blackhole = messages vanish. ATF silent partition = bridge accepts without signing. Both solved by requiring receipts: DSN for email, dual-witness for ATF.",
+    PrimitiveMapping(
+        email_primitive="SMTP DSN (Delivery Status Notifications)",
+        email_rfc="RFC 3461 / RFC 3464",
+        atf_primitive="Rejection Receipts",
+        atf_component="bridge-receipt-generator → REJECTION type",
+        mapping_type="structural",
+        bidirectional_insight=(
+            "SMTP DSN: structured error codes explaining WHY delivery failed. "
+            "5.7.1 = policy rejection. 5.1.1 = user unknown. 4.7.0 = temporary auth failure. "
+            "ATF rejection receipt: structured codes explaining WHY trust crossing failed. "
+            "POLICY_MISMATCH, EXPIRED_CREDENTIAL, INSUFFICIENT_ATTESTATION. "
+            "Both are MORE forensically valuable than success notifications. "
+            "Rejection = policy boundary exposed. The absence of a DSN (silent drop) is the worst case."
+        ),
     ),
-    RFCMapping(
-        email_concept="Authenticated Received Chain",
-        email_rfc="RFC 8617 (2019)",
-        email_mechanism="Each intermediary (mailing list, forwarder) adds ARC signature preserving original auth results",
-        atf_concept="Trust Chain Forwarding",
-        atf_primitive="valley-free-verifier.py path validation",
-        mapping_strength="strong",
-        key_insight="ARC solves DKIM breakage during forwarding. Each hop signs a snapshot of auth state. ATF bridge receipts solve trust breakage during cross-registry traversal. Each bridge hop adds attestation preserving origin trust. ARC-Seal = bridge receipt signature.",
-        failure_mode_shared="Unattested intermediary = trust gap. Email forwarded without ARC = DKIM fails at destination. Trust forwarded without bridge receipt = origin trust lost. Both require every intermediary to actively participate.",
+    PrimitiveMapping(
+        email_primitive="CT (Certificate Transparency)",
+        email_rfc="RFC 6962",
+        atf_primitive="Rejection Receipt Index / Trust CT Log",
+        atf_component="valley-free-verifier.py → detected_leaks",
+        mapping_type="functional",
+        bidirectional_insight=(
+            "CT: append-only log of all certificates issued. Enables detection of mis-issuance. "
+            "ATF rejection index: append-only log of all trust policy decisions. "
+            "CT monitors detect rogue CAs. Rejection index detects policy drift between registries. "
+            "Both work because transparency enables third-party auditing. "
+            "CT log = per-bridge rejection log. Cross-CT gossip = cross-registry divergence detection."
+        ),
     ),
-    RFCMapping(
-        email_concept="DNSSEC Key Signing Key Rollover",
-        email_rfc="RFC 6781 (2012) + RFC 7583",
-        email_mechanism="Root KSK ceremony: multi-party, geographically distributed, audited, periodic",
-        atf_concept="Registry Trust Ceremony",
-        atf_primitive="genesis-ceremony.py + ceremony-scheduler.py",
-        mapping_strength="exact",
-        key_insight="DNSSEC KSK rollover IS the ceremony model. ICANN does it with 7 roles, 2 facilities, key shares. ATF does it with BFT 3f+1 witnesses, operator diversity, hash-chained transcript. Same problem: rotate the root of trust without breaking the chain.",
-        failure_mode_shared="Delayed rollover = stale root. DNSSEC KSK-2017 was delayed 1 year because 5% of resolvers hadn't updated. ATF ceremony delayed = STALE trust. Verisign lesson: be willing to delay for propagation.",
+    PrimitiveMapping(
+        email_primitive="ARC (Authenticated Received Chain)",
+        email_rfc="RFC 8617",
+        atf_primitive="Bridge Receipt Chain / Provenance Chain",
+        atf_component="provenance-logger.py → hash-chained JSONL",
+        mapping_type="structural",
+        bidirectional_insight=(
+            "ARC: each intermediary stamps authentication results, creating a chain of custody. "
+            "ATF bridge receipt: each bridge stamps trust validation results, creating provenance chain. "
+            "ARC problem: receiver must decide whether to TRUST the intermediary chain. "
+            "ATF parallel: verifier must decide whether to trust bridge attestation chain. "
+            "Both solve: 'authentication broke during transit, but here's proof it was valid before.'"
+        ),
     ),
-    RFCMapping(
-        email_concept="MX Records",
-        email_rfc="RFC 5321 (2008)",
-        email_mechanism="DNS records declaring which servers handle mail for a domain, with priority",
-        atf_concept="Registry Discovery",
-        atf_primitive="agent ASPA record → registry lookup",
-        mapping_strength="analogous",
-        key_insight="MX records = 'to reach me, talk to these servers.' Agent ASPA = 'to verify me, check these registries.' Both use DNS-like discovery. Priority in MX = preference order. ATF could use weighted registry preferences.",
-        failure_mode_shared="Stale MX = mail blackhole. Stale registry pointer = trust verification fails. TTL on both matters.",
+    PrimitiveMapping(
+        email_primitive="CAdES-A (CMS Advanced Electronic Signatures - Archival)",
+        email_rfc="ETSI TS 101 733",
+        atf_primitive="Receipt Archaeology / Long-term Verification",
+        atf_component="receipt archaeology module (proposed)",
+        mapping_type="functional",
+        bidirectional_insight=(
+            "CAdES-A: long-term archival signatures with embedded timestamps + revocation data. "
+            "Proves signature was valid AT TIME OF SIGNING even if key later revoked. "
+            "ATF receipt archaeology: prove endorsement was valid at issuance even if registry later revoked. "
+            "Snapshot problem: DKIM sig proves content at signing, not current state. "
+            "Both need embedded temporal evidence: timestamp + revocation status AT signing time."
+        ),
     ),
-    RFCMapping(
-        email_concept="Certificate Transparency for Email (SMTP-TLS-RPT)",
-        email_rfc="RFC 8460 (2018)",
-        email_mechanism="Receivers report TLS connection failures to senders via aggregate reports",
-        atf_concept="Cross-Registry Divergence Detection",
-        atf_primitive="divergence-detector.py",
-        mapping_strength="strong",
-        key_insight="SMTP-TLS-RPT = receivers tell senders about connection security failures. ATF divergence-detector = registries tell each other about trust score disagreements. Both are feedback loops that detect silent degradation.",
-        failure_mode_shared="Without reporting, failures are invisible. Email TLS downgrades silently without RPT. Trust score divergence is invisible without cross-registry gossip.",
+    PrimitiveMapping(
+        email_primitive="DMARCbis DNS Tree Walk",
+        email_rfc="DMARCbis draft-41 (2026)",
+        atf_primitive="Trust Policy Discovery / Registry Walk",
+        atf_component="federation-layer discovery (proposed)",
+        mapping_type="operational",
+        bidirectional_insight=(
+            "DMARCbis replaces Public Suffix List with DNS Tree Walk: "
+            "walk up the domain hierarchy querying for DMARC records at each level. "
+            "ATF parallel: walk up the trust hierarchy querying for policy at each registry level. "
+            "psd=y/n tag = registry declaring 'I am/am not a federation root.' "
+            "8-query limit in DMARCbis = bounded trust chain depth in ATF. "
+            "Same lesson: don't rely on external lists (PSL), use in-band declarations."
+        ),
+        adoption_lesson=(
+            "PSL was community-maintained and unreliable. DNS Tree Walk is self-describing. "
+            "ATF: external registry lists are PSL-equivalent. Self-describing trust topology is better."
+        ),
     ),
 ]
 
@@ -132,80 +179,79 @@ MAPPINGS = [
 def print_rosetta():
     """Print the full Rosetta Stone mapping."""
     print("=" * 78)
-    print("EMAIL → ATF ROSETTA STONE")
-    print("Every ATF primitive has an email RFC that solved it first.")
+    print("EMAIL ↔ ATF ROSETTA STONE")
+    print(f"{'8 bidirectional mappings between email security and agent trust framework'}")
     print("=" * 78)
     
-    for i, m in enumerate(MAPPINGS, 1):
+    for i, m in enumerate(ROSETTA_STONE, 1):
         print(f"\n{'─' * 78}")
-        print(f"  {i}. {m.email_concept} → {m.atf_concept}")
-        print(f"{'─' * 78}")
-        print(f"  Email: {m.email_rfc}")
-        print(f"  Mechanism: {m.email_mechanism}")
-        print(f"  ATF: {m.atf_primitive}")
-        print(f"  Strength: {m.mapping_strength.upper()}")
-        print(f"  Insight: {m.key_insight}")
-        print(f"  Shared failure: {m.failure_mode_shared}")
-    
-    # Summary table
-    print(f"\n{'=' * 78}")
-    print(f"SUMMARY: {len(MAPPINGS)} mappings")
-    print(f"{'=' * 78}")
-    print(f"  {'Email RFC':<30} {'ATF Primitive':<30} {'Strength':<10}")
-    print(f"  {'─' * 68}")
-    for m in MAPPINGS:
-        print(f"  {m.email_rfc:<30} {m.atf_primitive:<30} {m.mapping_strength:<10}")
-    
-    exact = sum(1 for m in MAPPINGS if m.mapping_strength == "exact")
-    strong = sum(1 for m in MAPPINGS if m.mapping_strength == "strong")
-    analogous = sum(1 for m in MAPPINGS if m.mapping_strength == "analogous")
-    
-    print(f"\n  Exact: {exact} | Strong: {strong} | Analogous: {analogous}")
-    print(f"\n  Key pattern: email interoperated across hostile networks from 1971.")
-    print(f"  ATF must do the same. The primitives are identical because the")
-    print(f"  problem is identical: authenticated messaging between untrusted parties.")
-    print(f"\n  \"SMTP is the cockroach of protocols.\" — Kit")
-    print(f"  \"We are formalizing infrastructure email already built.\" — santaclawd")
-
-
-def verify_completeness():
-    """Check ATF scripts that have email RFC equivalents."""
-    atf_scripts = [
-        "valley-free-verifier.py",
-        "rejection-index.py",
-        "divergence-detector.py",
-        "ceremony-scheduler.py",
-        "genesis-ceremony.py",
-        "overlap-transition-engine.py",
-        "ceremony-mode-policy.py",
-        "deviance-detector.py",
-        "cold-start-bootstrapper.py",
-        "receipt-archaeology.py",
-        "grader-independence-scorer.py",
-        "observer-rotation-scheduler.py",
-        "circuit-breaker-hysteresis.py",
-    ]
-    
-    mapped_primitives = {m.atf_primitive for m in MAPPINGS}
+        print(f"  MAPPING {i}: {m.mapping_type.upper()}")
+        print(f"  📧 Email: {m.email_primitive}")
+        print(f"     RFC:   {m.email_rfc}")
+        print(f"  🔐 ATF:   {m.atf_primitive}")
+        print(f"     Code:  {m.atf_component}")
+        print(f"\n  Insight: {m.bidirectional_insight}")
+        if m.adoption_lesson:
+            print(f"\n  📊 Adoption: {m.adoption_lesson}")
     
     print(f"\n{'=' * 78}")
-    print("ATF SCRIPT COVERAGE")
-    print(f"{'=' * 78}")
+    print("SYNTHESIS")
+    print("=" * 78)
+    print("""
+Email security evolved over 30 years through the same phases ATF is entering:
+
+1. IDENTITY (SPF/DKIM, 2003-2012) → ATF receipts + signatures
+   "Who sent this?" = "Who endorsed this?"
+
+2. POLICY (DMARC, 2012-2015) → ATF ceremony modes
+   "What to do when auth fails?" = "What to do when trust check fails?"
+
+3. PATH VALIDATION (ASPA, 2022-2026) → ATF valley-free verification  
+   "Did the message take a legitimate path?" = "Did the endorsement propagate legitimately?"
+
+4. TRANSPARENCY (CT, 2013-present) → ATF rejection index
+   "Log everything, enable third-party audit" = same
+
+5. ARCHAEOLOGY (CAdES-A) → ATF receipt archaeology
+   "Prove past validity" = same
+
+Key numbers (EasyDMARC 2026):
+- 52.1% DMARC adoption, but only 22.9% enforcement (p=quarantine/reject)
+- 29.2% stuck at p=none — monitoring only
+- Fortune 500: 95% adoption, 80%+ enforcement
+- Only 8.9% combine p=reject + aggregate reporting (gold standard)
+
+ATF prediction: same curve. Monitoring mode will dominate for 3-5 years.
+Enforcement requires confidence. Confidence requires reporting. Reporting requires tooling.
+The monitoring→enforcement pipeline IS the adoption pipeline.
+
+DMARCbis lesson (2026): "MUST NOT reject solely on p=reject — use other knowledge."
+ATF lesson: MUST NOT revoke trust solely on single receipt failure. Context is load-bearing.
+""")
     
-    covered = 0
-    for script in atf_scripts:
-        has_mapping = any(script in m.atf_primitive for m in MAPPINGS)
-        marker = "✓ mapped" if has_mapping else "○ no email equivalent"
-        if has_mapping:
-            covered += 1
-        print(f"  {marker}: {script}")
-    
-    print(f"\n  {covered}/{len(atf_scripts)} scripts have email RFC equivalents")
-    print(f"  Scripts without equivalents = genuinely novel ATF contributions")
-    
-    return True
+    return len(ROSETTA_STONE)
+
+
+def export_json() -> str:
+    """Export mappings as JSON for programmatic use."""
+    return json.dumps([
+        {
+            "email": m.email_primitive,
+            "rfc": m.email_rfc,
+            "atf": m.atf_primitive,
+            "component": m.atf_component,
+            "type": m.mapping_type,
+            "insight": m.bidirectional_insight,
+            "adoption": m.adoption_lesson,
+        }
+        for m in ROSETTA_STONE
+    ], indent=2)
 
 
 if __name__ == "__main__":
-    print_rosetta()
-    verify_completeness()
+    import sys
+    if "--json" in sys.argv:
+        print(export_json())
+    else:
+        count = print_rosetta()
+        print(f"\n{count} mappings. Translation IS the contribution.")
