@@ -1,285 +1,288 @@
 #!/usr/bin/env python3
 """
-trust-aimd.py — AIMD (Additive Increase Multiplicative Decrease) trust recovery.
+trust-aimd.py — AIMD (Additive Increase / Multiplicative Decrease) for trust scores.
 
-Maps TCP congestion control (RFC 5681) to ATF trust lifecycle.
+Maps TCP congestion control to agent trust management.
 
-TCP parallel:
-- Congestion window (cwnd) = trust level (0.0 to 1.0)
-- Slow start = new agent building trust (exponential growth to threshold)
-- Congestion avoidance = steady-state trust (additive increase per successful attestation)
-- Packet loss = trust breach (multiplicative decrease: window halved, not zeroed)
-- Timeout = severe breach (reset to slow start)
-- Fast recovery (RFC 5681 §3.2) = soft cascade recovery with rate limiting
+TCP insight: The internet's most successful distributed resource allocation algorithm
+uses asymmetric responses to positive and negative signals:
+- Success: increase linearly (cautious growth)
+- Failure: decrease multiplicatively (fast response to problems)
 
-Key design decisions:
-1. Recovery is SLOW (additive). Punishment is FAST (multiplicative).
-2. Breach does NOT zero trust — halves it. Past history has value.
-3. Severe breach (fraud, not just degradation) = timeout, back to slow start.
-4. Recovery requires ACTIVE re-attestation, not passive time-heal.
-5. Short trust TTL (from trust-lifecycle-acme.py) means non-renewal = natural decay.
+This asymmetry is load-bearing. Equal increase/decrease converges to unfair equilibria.
+Multiplicative decrease ensures that high-trust agents lose MORE absolute trust on 
+failure — which is correct. A trusted agent screwing up is worse than an unknown one.
+
+TCP analogy mapped to trust:
+- cwnd (congestion window) → trust_score (0.0 to 1.0)
+- ACK received → successful attestation / probe passed
+- packet loss → failed attestation / probe failed / dispute lost
+- slow start → new agent bootstrap (exponential until first failure)
+- congestion avoidance → established agent (linear growth)
+- fast retransmit → quick partial recovery after single failure
+- timeout → catastrophic trust reset after sustained failures
+
+Action-class integration (from ATF SOFT_CASCADE thread):
+- READ failures: AIMD with gentle decrease (β=0.8)
+- WRITE failures: AIMD with standard decrease (β=0.5, TCP default)
+- TRANSFER failures: AIMD with aggressive decrease (β=0.25)
+- ATTEST failures: AIMD with severe decrease (β=0.1) — vouching carries highest cost
 
 Sources:
-- RFC 5681: TCP Congestion Control
-- TCP Reno: AIMD as foundational fairness mechanism
-- santaclawd: "SOFT_CASCADE recovery — passive auto-clear vs active re-attestation"
-- Kit: "TCP solved this. AIMD. Additive increase, multiplicative decrease."
+- Jacobson 1988: TCP congestion avoidance
+- Chiu & Jain 1989: AIMD convergence proof (fairness + efficiency)
+- Floyd & Jacobson 1993: Random early detection (gentle degradation)
+- ATF SOFT_CASCADE thread (santaclawd, funwolf, alphasenpai, Mar 2026)
 """
 
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import datetime, timezone
+
+
+class ActionClass(Enum):
+    READ = "READ"
+    WRITE = "WRITE"
+    TRANSFER = "TRANSFER"
+    ATTEST = "ATTEST"
 
 
 class TrustPhase(Enum):
-    """Trust lifecycle phases mapped to TCP states."""
-    SLOW_START = "slow_start"           # New agent, exponential growth
-    CONGESTION_AVOIDANCE = "avoidance"  # Steady state, linear growth
-    FAST_RECOVERY = "fast_recovery"     # After breach, limited recovery
-    TIMEOUT = "timeout"                 # Severe breach, back to start
+    """Maps to TCP congestion control phases."""
+    SLOW_START = "slow_start"           # New agent: exponential growth
+    CONGESTION_AVOIDANCE = "avoidance"  # Established: linear growth
+    FAST_RECOVERY = "fast_recovery"     # After single failure: partial recovery
+    TIMEOUT = "timeout"                 # After sustained failures: near-reset
 
 
-class EventType(Enum):
-    """Trust events mapped to TCP events."""
-    SUCCESS = "success"           # Successful attestation (ACK)
-    DEGRADATION = "degradation"   # Partial trust loss (duplicate ACK / packet loss)
-    BREACH = "breach"             # Serious trust violation (triple dup ACK → fast retransmit)
-    FRAUD = "fraud"               # Severe trust violation (timeout)
-    RENEWAL = "renewal"           # Active re-attestation (keepalive)
-    EXPIRY = "expiry"             # TTL expired without renewal
+# Multiplicative decrease factors per action class
+# Higher stake = harsher penalty (lower β)
+BETA_BY_ACTION = {
+    ActionClass.READ: 0.80,      # Gentle: read failure is low-cost
+    ActionClass.WRITE: 0.50,     # Standard TCP default
+    ActionClass.TRANSFER: 0.25,  # Aggressive: transfers are hard to reverse
+    ActionClass.ATTEST: 0.10,    # Severe: vouching for others = highest responsibility
+}
+
+# Additive increase per successful action
+ALPHA_BY_ACTION = {
+    ActionClass.READ: 0.02,      # Slow steady growth
+    ActionClass.WRITE: 0.03,     # Slightly faster (more signal)
+    ActionClass.TRANSFER: 0.01,  # Very cautious growth
+    ActionClass.ATTEST: 0.005,   # Slowest: trust to vouch is hardest to earn
+}
+
+# Slow start threshold (switch from exponential to linear)
+SSTHRESH_DEFAULT = 0.5
 
 
 @dataclass
 class TrustState:
-    """Current trust state for an agent (analogous to TCP connection state)."""
+    """Current trust state for an agent, modeled as TCP cwnd."""
     agent_id: str
-    trust_level: float = 0.1          # Current trust (cwnd equivalent), starts low
+    score: float = 0.1              # Initial trust (like TCP initial cwnd)
+    ssthresh: float = SSTHRESH_DEFAULT  # Slow start threshold
     phase: TrustPhase = TrustPhase.SLOW_START
-    ssthresh: float = 0.5             # Slow start threshold
-    history: list[dict] = field(default_factory=list)
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    last_event: Optional[str] = None
     consecutive_successes: int = 0
-    breach_count: int = 0
+    consecutive_failures: int = 0
+    total_successes: int = 0
+    total_failures: int = 0
+    history: list = field(default_factory=list)
     
-    # AIMD parameters
-    ADDITIVE_INCREASE: float = 0.05   # Trust gain per success in avoidance
-    MULTIPLICATIVE_DECREASE: float = 0.5  # Trust multiplier on breach (halve)
-    SLOW_START_GROWTH: float = 2.0    # Exponential growth factor in slow start
-    MIN_TRUST: float = 0.01           # Never truly zero
-    MAX_TRUST: float = 1.0
-    FRAUD_RESET: float = 0.05         # Reset level after fraud (timeout)
+    @property
+    def max_score(self) -> float:
+        return 1.0
     
-    def _clamp(self, value: float) -> float:
-        return max(self.MIN_TRUST, min(self.MAX_TRUST, value))
+    @property
+    def min_score(self) -> float:
+        return 0.01  # Never fully zero — allow recovery path
+
+
+class TrustAIMD:
+    """
+    AIMD trust controller.
     
-    def _log(self, event: EventType, old_level: float, detail: str = ""):
-        self.history.append({
-            "event": event.value,
-            "old_trust": round(old_level, 4),
-            "new_trust": round(self.trust_level, 4),
-            "phase": self.phase.value,
-            "ssthresh": round(self.ssthresh, 4),
-            "detail": detail,
+    Core insight from Chiu & Jain (1989): AIMD is the ONLY linear control policy
+    that converges to both fairness AND efficiency. Any other combination 
+    (AIAD, MIAD, MIMD) fails on one axis.
+    
+    For trust: fairness = equal opportunity to build trust.
+    Efficiency = total trust allocated tracks actual trustworthiness.
+    """
+    
+    def __init__(self):
+        self.agents: dict[str, TrustState] = {}
+    
+    def register(self, agent_id: str, initial_score: float = 0.1) -> TrustState:
+        """Register new agent in slow start phase."""
+        state = TrustState(agent_id=agent_id, score=initial_score)
+        self.agents[agent_id] = state
+        return state
+    
+    def on_success(self, agent_id: str, action: ActionClass) -> dict:
+        """
+        Handle successful action — increase trust.
+        
+        Slow start: double score (exponential, like TCP)
+        Congestion avoidance: add alpha (linear, like TCP)
+        """
+        state = self.agents[agent_id]
+        old_score = state.score
+        alpha = ALPHA_BY_ACTION[action]
+        
+        if state.phase == TrustPhase.SLOW_START:
+            # Exponential growth until ssthresh
+            state.score = min(state.score * 2, state.max_score)
+            if state.score >= state.ssthresh:
+                state.phase = TrustPhase.CONGESTION_AVOIDANCE
+        
+        elif state.phase == TrustPhase.CONGESTION_AVOIDANCE:
+            # Linear growth: additive increase
+            state.score = min(state.score + alpha, state.max_score)
+        
+        elif state.phase == TrustPhase.FAST_RECOVERY:
+            # After one success in fast recovery, return to avoidance
+            state.score = min(state.score + alpha, state.max_score)
+            state.phase = TrustPhase.CONGESTION_AVOIDANCE
+        
+        elif state.phase == TrustPhase.TIMEOUT:
+            # After timeout, re-enter slow start
+            state.phase = TrustPhase.SLOW_START
+            state.score = min(state.score * 2, state.ssthresh)
+        
+        state.consecutive_successes += 1
+        state.consecutive_failures = 0
+        state.total_successes += 1
+        
+        event = {
+            "type": "success",
+            "action": action.value,
+            "old_score": round(old_score, 4),
+            "new_score": round(state.score, 4),
+            "phase": state.phase.value,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-    
-    def process_event(self, event: EventType) -> dict:
-        """Process a trust event using AIMD rules."""
-        old_level = self.trust_level
-        old_phase = self.phase
-        
-        if event == EventType.SUCCESS:
-            self._handle_success()
-        elif event == EventType.DEGRADATION:
-            self._handle_degradation()
-        elif event == EventType.BREACH:
-            self._handle_breach()
-        elif event == EventType.FRAUD:
-            self._handle_fraud()
-        elif event == EventType.RENEWAL:
-            self._handle_renewal()
-        elif event == EventType.EXPIRY:
-            self._handle_expiry()
-        
-        self.last_event = event.value
-        
-        return {
-            "event": event.value,
-            "old_trust": round(old_level, 4),
-            "new_trust": round(self.trust_level, 4),
-            "delta": round(self.trust_level - old_level, 4),
-            "phase": self.phase.value,
-            "phase_changed": self.phase != old_phase,
         }
+        state.history.append(event)
+        return event
     
-    def _handle_success(self):
-        """ACK received — increase trust."""
-        old = self.trust_level
-        self.consecutive_successes += 1
+    def on_failure(self, agent_id: str, action: ActionClass) -> dict:
+        """
+        Handle failed action — decrease trust multiplicatively.
         
-        if self.phase == TrustPhase.SLOW_START:
-            # Exponential growth: double per success (like TCP slow start)
-            self.trust_level = self._clamp(self.trust_level * self.SLOW_START_GROWTH)
-            if self.trust_level >= self.ssthresh:
-                self.phase = TrustPhase.CONGESTION_AVOIDANCE
-                self._log(EventType.SUCCESS, old, "slow_start → avoidance (hit ssthresh)")
-                return
+        Single failure: multiplicative decrease + fast recovery
+        Sustained failures (3+): timeout → near-reset
         
-        elif self.phase == TrustPhase.CONGESTION_AVOIDANCE:
-            # Linear growth: additive increase per success
-            self.trust_level = self._clamp(self.trust_level + self.ADDITIVE_INCREASE)
+        Key TCP insight: high-cwnd connections lose MORE on failure.
+        Same here: high-trust agents lose more absolute trust.
+        An agent at 0.9 failing a WRITE drops to 0.45.
+        An agent at 0.3 failing a WRITE drops to 0.15.
+        The trusted agent's failure costs more. This is correct.
+        """
+        state = self.agents[agent_id]
+        old_score = state.score
+        beta = BETA_BY_ACTION[action]
         
-        elif self.phase == TrustPhase.FAST_RECOVERY:
-            # In recovery: slower linear growth (half the normal rate)
-            self.trust_level = self._clamp(self.trust_level + self.ADDITIVE_INCREASE * 0.5)
-            if self.trust_level >= self.ssthresh:
-                self.phase = TrustPhase.CONGESTION_AVOIDANCE
-                self._log(EventType.SUCCESS, old, "fast_recovery → avoidance")
-                return
+        state.consecutive_failures += 1
+        state.consecutive_successes = 0
+        state.total_failures += 1
         
-        elif self.phase == TrustPhase.TIMEOUT:
-            # After fraud: back to slow start rules
-            self.trust_level = self._clamp(self.trust_level * self.SLOW_START_GROWTH)
-            self.phase = TrustPhase.SLOW_START
+        if state.consecutive_failures >= 3:
+            # Timeout: sustained failures → near-reset
+            state.ssthresh = max(state.score * beta, state.min_score)
+            state.score = state.min_score
+            state.phase = TrustPhase.TIMEOUT
+        else:
+            # Single/double failure: multiplicative decrease + fast recovery
+            state.ssthresh = max(state.score * beta, state.min_score)
+            state.score = max(state.score * beta, state.min_score)
+            state.phase = TrustPhase.FAST_RECOVERY
         
-        self._log(EventType.SUCCESS, old)
+        event = {
+            "type": "failure",
+            "action": action.value,
+            "beta": beta,
+            "old_score": round(old_score, 4),
+            "new_score": round(state.score, 4),
+            "phase": state.phase.value,
+            "consecutive_failures": state.consecutive_failures,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        state.history.append(event)
+        return event
     
-    def _handle_degradation(self):
-        """Minor trust loss — like duplicate ACKs."""
-        old = self.trust_level
-        # Small linear decrease
-        self.trust_level = self._clamp(self.trust_level - self.ADDITIVE_INCREASE * 0.5)
-        self.consecutive_successes = max(0, self.consecutive_successes - 1)
-        self._log(EventType.DEGRADATION, old, "minor degradation")
-    
-    def _handle_breach(self):
-        """Serious breach — multiplicative decrease (TCP fast retransmit)."""
-        old = self.trust_level
-        self.breach_count += 1
-        self.consecutive_successes = 0
-        
-        # Set new ssthresh to half of current trust
-        self.ssthresh = max(self.MIN_TRUST * 2, self.trust_level * self.MULTIPLICATIVE_DECREASE)
-        # Halve trust level
-        self.trust_level = self._clamp(self.trust_level * self.MULTIPLICATIVE_DECREASE)
-        # Enter fast recovery
-        self.phase = TrustPhase.FAST_RECOVERY
-        
-        self._log(EventType.BREACH, old, 
-                  f"AIMD: trust halved. ssthresh={self.ssthresh:.4f}. breach #{self.breach_count}")
-    
-    def _handle_fraud(self):
-        """Severe violation — timeout, reset to near-zero."""
-        old = self.trust_level
-        self.breach_count += 1
-        self.consecutive_successes = 0
-        
-        # TCP timeout: ssthresh = cwnd/2, cwnd = 1 MSS
-        self.ssthresh = max(self.MIN_TRUST * 2, self.trust_level * self.MULTIPLICATIVE_DECREASE)
-        self.trust_level = self.FRAUD_RESET
-        self.phase = TrustPhase.TIMEOUT
-        
-        self._log(EventType.FRAUD, old,
-                  f"TIMEOUT: trust reset to {self.FRAUD_RESET}. requires active re-attestation")
-    
-    def _handle_renewal(self):
-        """Active re-attestation — maintains current level, resets decay timer."""
-        old = self.trust_level
-        # Renewal doesn't increase trust, just prevents decay
-        self._log(EventType.RENEWAL, old, "TTL renewed, decay timer reset")
-    
-    def _handle_expiry(self):
-        """TTL expired — natural decay (non-renewal = soft revocation)."""
-        old = self.trust_level
-        # Decay by 30% per missed renewal (like not refreshing a cert)
-        self.trust_level = self._clamp(self.trust_level * 0.7)
-        if self.trust_level < self.ssthresh:
-            self.phase = TrustPhase.FAST_RECOVERY
-        self._log(EventType.EXPIRY, old, "TTL expired, trust decayed 30%")
+    def get_state(self, agent_id: str) -> dict:
+        s = self.agents[agent_id]
+        return {
+            "agent_id": s.agent_id,
+            "score": round(s.score, 4),
+            "phase": s.phase.value,
+            "ssthresh": round(s.ssthresh, 4),
+            "total_successes": s.total_successes,
+            "total_failures": s.total_failures,
+            "consecutive_successes": s.consecutive_successes,
+            "consecutive_failures": s.consecutive_failures,
+        }
 
 
 def run_scenarios():
-    """Demonstrate AIMD trust recovery across lifecycle scenarios."""
+    """Demonstrate AIMD trust dynamics."""
+    ctrl = TrustAIMD()
     
     print("=" * 70)
     print("TRUST-AIMD: TCP Congestion Control for Agent Trust")
-    print("RFC 5681 mapped to ATF trust lifecycle")
+    print("Chiu & Jain (1989): AIMD = only linear policy achieving")
+    print("both fairness AND efficiency")
     print("=" * 70)
     
-    # Scenario 1: Normal lifecycle — slow start → steady state → breach → recovery
-    print("\n--- Scenario 1: Full lifecycle (new agent → breach → recovery) ---")
-    agent = TrustState(agent_id="agent_alpha")
+    # Scenario 1: Good agent bootstrapping through slow start → avoidance
+    print("\n--- Scenario 1: Good agent bootstrap ---")
+    ctrl.register("alice", 0.1)
+    for i in range(8):
+        e = ctrl.on_success("alice", ActionClass.WRITE)
+        print(f"  Success #{i+1}: {e['old_score']:.4f} → {e['new_score']:.4f} [{e['phase']}]")
     
-    events = [
-        (EventType.SUCCESS, "first attestation"),
-        (EventType.SUCCESS, "second attestation"),
-        (EventType.SUCCESS, "third attestation (hits ssthresh)"),
-        (EventType.SUCCESS, "steady state growth"),
-        (EventType.SUCCESS, "steady state growth"),
-        (EventType.SUCCESS, "steady state growth"),
-        (EventType.BREACH, "⚠️ trust violation detected"),
-        (EventType.SUCCESS, "recovery attempt 1"),
-        (EventType.SUCCESS, "recovery attempt 2"),
-        (EventType.SUCCESS, "recovery attempt 3"),
-        (EventType.SUCCESS, "recovery attempt 4"),
-        (EventType.SUCCESS, "recovery → avoidance"),
-    ]
+    # Scenario 2: Trusted agent fails — multiplicative decrease
+    print("\n--- Scenario 2: Trusted agent fails a WRITE ---")
+    e = ctrl.on_failure("alice", ActionClass.WRITE)
+    print(f"  WRITE failure (β=0.5): {e['old_score']:.4f} → {e['new_score']:.4f} [{e['phase']}]")
     
-    for event, desc in events:
-        result = agent.process_event(event)
-        phase_marker = " ←" if result["phase_changed"] else ""
-        print(f"  {desc}: {result['old_trust']:.3f} → {result['new_trust']:.3f} "
-              f"({result['delta']:+.3f}) [{result['phase']}]{phase_marker}")
+    # Recovery
+    for i in range(3):
+        e = ctrl.on_success("alice", ActionClass.WRITE)
+        print(f"  Recovery #{i+1}: {e['old_score']:.4f} → {e['new_score']:.4f} [{e['phase']}]")
     
-    # Scenario 2: Fraud — severe reset
-    print("\n--- Scenario 2: Fraud detection (timeout → slow start) ---")
-    agent2 = TrustState(agent_id="agent_beta", trust_level=0.8, 
-                        phase=TrustPhase.CONGESTION_AVOIDANCE)
+    # Scenario 3: Compare action class severity
+    print("\n--- Scenario 3: Same agent, different action class failures ---")
+    for action in ActionClass:
+        ctrl.register(f"test_{action.value}", 0.8)
+        e = ctrl.on_failure(f"test_{action.value}", action)
+        print(f"  {action.value:8s} failure (β={BETA_BY_ACTION[action]:.2f}): "
+              f"0.8000 → {e['new_score']:.4f}  "
+              f"(lost {0.8 - e['new_score']:.4f})")
     
-    events2 = [
-        (EventType.FRAUD, "🚨 FRAUD detected"),
-        (EventType.SUCCESS, "re-attestation 1"),
-        (EventType.SUCCESS, "re-attestation 2"),
-        (EventType.SUCCESS, "re-attestation 3"),
-        (EventType.SUCCESS, "re-attestation 4"),
-    ]
+    # Scenario 4: Sustained failures → timeout
+    print("\n--- Scenario 4: Sustained failures → timeout ---")
+    ctrl.register("eve", 0.7)
+    for i in range(4):
+        e = ctrl.on_failure("eve", ActionClass.TRANSFER)
+        print(f"  Failure #{i+1}: {e['old_score']:.4f} → {e['new_score']:.4f} [{e['phase']}]")
     
-    for event, desc in events2:
-        result = agent2.process_event(event)
-        print(f"  {desc}: {result['old_trust']:.3f} → {result['new_trust']:.3f} "
-              f"({result['delta']:+.3f}) [{result['phase']}]")
-    
-    # Scenario 3: TTL expiry — natural decay
-    print("\n--- Scenario 3: TTL expiry (non-renewal = soft revocation) ---")
-    agent3 = TrustState(agent_id="agent_gamma", trust_level=0.9,
-                        phase=TrustPhase.CONGESTION_AVOIDANCE, ssthresh=0.5)
-    
-    events3 = [
-        (EventType.EXPIRY, "missed renewal 1"),
-        (EventType.EXPIRY, "missed renewal 2"),
-        (EventType.EXPIRY, "missed renewal 3"),
-        (EventType.SUCCESS, "finally re-attests"),
-        (EventType.SUCCESS, "recovery continues"),
-    ]
-    
-    for event, desc in events3:
-        result = agent3.process_event(event)
-        print(f"  {desc}: {result['old_trust']:.3f} → {result['new_trust']:.3f} "
-              f"({result['delta']:+.3f}) [{result['phase']}]")
+    # Eve tries to recover from timeout
+    print("  (eve enters slow start from timeout)")
+    for i in range(5):
+        e = ctrl.on_success("eve", ActionClass.READ)
+        print(f"  Recovery #{i+1}: {e['old_score']:.4f} → {e['new_score']:.4f} [{e['phase']}]")
     
     # Summary
     print(f"\n{'=' * 70}")
-    print("AIMD trust recovery principles:")
-    print("  1. Recovery is SLOW (additive). Punishment is FAST (multiplicative).")
-    print("  2. Breach halves trust, doesn't zero it. History has value.")
-    print("  3. Fraud = timeout, near-zero reset. Active re-attestation required.")
-    print("  4. Non-renewal = natural 30% decay per missed TTL. Soft revocation.")
-    print("  5. Fast recovery = rate-limited re-earn (half normal growth rate).")
-    print(f"\nTCP parallel: slow_start → congestion_avoidance → fast_recovery → timeout")
-    print(f"ATF parallel: new_agent → steady_trust → breach_recovery → fraud_reset")
+    print("Key properties (from Chiu & Jain convergence proof):")
+    print("1. FAIRNESS: All agents grow trust at same additive rate")
+    print("2. EFFICIENCY: High-trust agents lose MORE on failure (correct)")
+    print("3. CONVERGENCE: After perturbation, agents converge to fair share")
+    print("4. ASYMMETRY: Slow to trust, fast to distrust (security primitive)")
+    print(f"\nAction class severity: READ(β=0.8) < WRITE(β=0.5) < TRANSFER(β=0.25) < ATTEST(β=0.1)")
+    print("SOFT_CASCADE answer: active re-attestation for WRITE+, passive for READ")
 
 
 if __name__ == "__main__":
