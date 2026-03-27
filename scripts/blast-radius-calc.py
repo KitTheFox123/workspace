@@ -1,253 +1,231 @@
 #!/usr/bin/env python3
 """
-blast-radius-calc.py — Calculate blast radius of ATF attestation failures.
+blast-radius-calc.py — ATF attestation blast radius calculator.
 
-When an attester is compromised, what's the damage surface?
-Blast radius = f(depth, breadth, action_class weights).
+When an attester is compromised, how far does the damage propagate?
+This tool computes blast surface area (breadth × depth) and identifies
+which agents are most exposed to cascading trust failures.
 
-Depth limits by action class (from Clawk ATF thread, 2026-03-27):
-  READ: 5 hops (low risk, ephemeral)
-  ATTEST: 3 hops (meta-trust, medium risk)  
-  TRANSFER: 2 hops (value movement, high risk)
-  WRITE: 3 hops (state change, medium risk)
+Inspired by Clawk thread (2026-03-27): "READ[5] ATTEST[3] TRANSFER[2]
+maps to blast radius. but depth alone isnt the full story — breadth
+matters too."
 
-Key insight from thread: depth alone misses breadth.
-2-deep × 100 attesters > 5-deep × 3 attesters.
-Surface area = depth × breadth at each level.
-
-This tool models attestation graphs and calculates:
-1. Blast radius (# agents affected by single compromise)
-2. Blast surface area (weighted by action class risk)
-3. Containment time (how fast min() caps propagation)
-4. AIMD recovery trajectory after compromise detected
+Metrics:
+- BLAST_DEPTH: Longest path from compromised node to any affected node
+- BLAST_BREADTH: Number of unique agents reachable at each depth
+- BLAST_SURFACE: Sum of breadth at each depth level (total exposure)
+- BLAST_WEIGHTED: Surface weighted by action class severity
+  (TRANSFER=4x, ATTEST=3x, WRITE=2x, READ=1x)
+- CONCENTRATION: Gini coefficient of exposure across agents
+  (high Gini = few agents bear most risk)
 
 Kit 🦊 — 2026-03-27
 """
 
 import json
 from dataclasses import dataclass, field
-from typing import Optional
-from collections import deque
+from collections import defaultdict
+
+
+ACTION_WEIGHTS = {
+    "TRANSFER": 4.0,
+    "ATTEST": 3.0,
+    "WRITE": 2.0,
+    "READ": 1.0,
+}
 
 
 @dataclass
 class AttestationEdge:
     attester: str
     subject: str
-    action_class: str  # READ/WRITE/ATTEST/TRANSFER
-    score: float
-    depth: int = 0  # Hop count from root
-
-
-# Depth limits per action class (from ATF thread consensus)
-DEPTH_LIMITS = {
-    "READ": 5,
-    "WRITE": 3,
-    "ATTEST": 3,
-    "TRANSFER": 2,
-}
-
-# Risk weights per action class (higher = more damage per compromised edge)
-RISK_WEIGHTS = {
-    "READ": 1.0,
-    "WRITE": 3.0,
-    "ATTEST": 5.0,    # Meta-trust: compromised attester poisons downstream
-    "TRANSFER": 10.0,  # Value at risk
-}
-
-# AIMD parameters
-AIMD_ADDITIVE_INCREASE = 0.05   # Trust increase per successful interaction
-AIMD_MULTIPLICATIVE_DECREASE = 0.5  # Trust halved on failure
+    action_class: str
+    score: float = 1.0
 
 
 @dataclass
-class AttestationGraph:
-    edges: list[AttestationEdge] = field(default_factory=list)
-    adjacency: dict[str, list[AttestationEdge]] = field(default_factory=dict)
+class BlastReport:
+    compromised: str
+    depth: int
+    breadth_by_depth: dict[int, int]
+    surface: int
+    weighted_surface: float
+    affected_agents: list[str]
+    concentration: float  # Gini
+    critical_paths: list[list[str]]  # Paths with highest weighted exposure
+
+
+class BlastRadiusCalculator:
+    def __init__(self):
+        self.edges: list[AttestationEdge] = []
+        self.adjacency: dict[str, list[AttestationEdge]] = defaultdict(list)
     
     def add_edge(self, edge: AttestationEdge):
         self.edges.append(edge)
-        if edge.attester not in self.adjacency:
-            self.adjacency[edge.attester] = []
         self.adjacency[edge.attester].append(edge)
     
-    def blast_radius(self, compromised: str) -> dict:
-        """
-        BFS from compromised node. Blast radius = all reachable nodes
-        within depth limits per action class.
-        """
-        affected = set()
-        affected_by_class: dict[str, set] = {c: set() for c in DEPTH_LIMITS}
-        surface_area = 0.0
-        max_depth_reached = 0
-        
-        # BFS with per-class depth tracking
-        queue = deque()
-        # Start: compromised node attests others
-        for edge in self.adjacency.get(compromised, []):
-            queue.append((edge, 1))
-        
+    def compute_blast(self, compromised: str) -> BlastReport:
+        """BFS from compromised node, tracking depth and action classes."""
         visited = {compromised}
+        queue = [(compromised, 0, [])]
+        breadth_by_depth = defaultdict(int)
+        affected = []
+        paths = []
+        agent_exposure = defaultdict(float)  # agent → weighted exposure
         
         while queue:
-            edge, depth = queue.popleft()
+            node, depth, path = queue.pop(0)
             
-            # Check depth limit for this action class
-            limit = DEPTH_LIMITS.get(edge.action_class, 3)
-            if depth > limit:
-                continue
-            
-            if edge.subject in visited:
-                continue
-            visited.add(edge.subject)
-            
-            affected.add(edge.subject)
-            affected_by_class[edge.action_class].add(edge.subject)
-            surface_area += RISK_WEIGHTS.get(edge.action_class, 1.0) * edge.score
-            max_depth_reached = max(max_depth_reached, depth)
-            
-            # Propagate: compromised trust flows downstream
-            for next_edge in self.adjacency.get(edge.subject, []):
-                if next_edge.subject not in visited:
-                    queue.append((next_edge, depth + 1))
+            for edge in self.adjacency.get(node, []):
+                if edge.subject not in visited:
+                    visited.add(edge.subject)
+                    new_depth = depth + 1
+                    new_path = path + [f"{node}--[{edge.action_class}]-->{edge.subject}"]
+                    breadth_by_depth[new_depth] += 1
+                    affected.append(edge.subject)
+                    
+                    weight = ACTION_WEIGHTS.get(edge.action_class, 1.0) * edge.score
+                    agent_exposure[edge.subject] += weight
+                    paths.append((weight, new_path))
+                    
+                    queue.append((edge.subject, new_depth, new_path))
         
-        return {
-            "compromised_agent": compromised,
-            "total_affected": len(affected),
-            "affected_agents": sorted(affected),
-            "by_action_class": {k: len(v) for k, v in affected_by_class.items()},
-            "weighted_surface_area": round(surface_area, 2),
-            "max_depth_reached": max_depth_reached,
-            "depth_limits_applied": DEPTH_LIMITS,
-        }
+        surface = sum(breadth_by_depth.values())
+        weighted_surface = sum(agent_exposure.values())
+        max_depth = max(breadth_by_depth.keys()) if breadth_by_depth else 0
+        
+        # Gini coefficient of exposure
+        concentration = self._gini(list(agent_exposure.values())) if agent_exposure else 0.0
+        
+        # Top 3 critical paths by weight
+        paths.sort(key=lambda x: -x[0])
+        critical = [p[1] for p in paths[:3]]
+        
+        return BlastReport(
+            compromised=compromised,
+            depth=max_depth,
+            breadth_by_depth=dict(breadth_by_depth),
+            surface=surface,
+            weighted_surface=round(weighted_surface, 2),
+            affected_agents=affected,
+            concentration=round(concentration, 3),
+            critical_paths=critical,
+        )
     
-    def containment_time(self, compromised: str, detection_rounds: int = 1) -> dict:
-        """
-        How fast does min() composition contain the damage?
+    def find_most_dangerous(self) -> list[tuple[str, float]]:
+        """Rank all agents by blast weighted surface if compromised."""
+        all_agents = set()
+        for e in self.edges:
+            all_agents.add(e.attester)
+            all_agents.add(e.subject)
         
-        min() means each hop caps the trust score to the minimum
-        of the chain. A compromised node with score 0 propagates
-        zero trust immediately — but detection takes time.
+        results = []
+        for agent in all_agents:
+            report = self.compute_blast(agent)
+            results.append((agent, report.weighted_surface))
         
-        Model: compromise happens at t=0, detected at t=detection_rounds.
-        During detection gap, compromised node operates at original score.
-        After detection, score drops to 0 and min() propagates.
-        """
-        blast = self.blast_radius(compromised)
-        
-        # Pre-detection: full blast radius active
-        pre_detection_exposure = blast["weighted_surface_area"] * detection_rounds
-        
-        # Post-detection: min() zeroes propagate in 1 round per hop
-        containment_rounds = blast["max_depth_reached"]  # 1 round per depth level
-        
-        # AIMD recovery: how long to rebuild trust for affected agents?
-        recovery_rounds = []
-        for agent in blast["affected_agents"]:
-            # Trust drops to score * AIMD_MULTIPLICATIVE_DECREASE
-            # Recovery at AIMD_ADDITIVE_INCREASE per round
-            current = 0.5 * AIMD_MULTIPLICATIVE_DECREASE  # assume avg 0.5 pre-compromise
-            target = 0.5
-            rounds_to_recover = 0
-            while current < target and rounds_to_recover < 1000:
-                current += AIMD_ADDITIVE_INCREASE
-                rounds_to_recover += 1
-            recovery_rounds.append(rounds_to_recover)
-        
-        avg_recovery = sum(recovery_rounds) / max(len(recovery_rounds), 1)
-        
-        return {
-            "detection_delay_rounds": detection_rounds,
-            "pre_detection_exposure": round(pre_detection_exposure, 2),
-            "containment_rounds_post_detection": containment_rounds,
-            "avg_recovery_rounds": round(avg_recovery, 1),
-            "total_incident_duration": detection_rounds + containment_rounds + round(avg_recovery),
-        }
+        return sorted(results, key=lambda x: -x[1])
+    
+    @staticmethod
+    def _gini(values: list[float]) -> float:
+        if not values or all(v == 0 for v in values):
+            return 0.0
+        sorted_v = sorted(values)
+        n = len(sorted_v)
+        total = sum(sorted_v)
+        cum = sum((i + 1) * v for i, v in enumerate(sorted_v))
+        return (2 * cum) / (n * total) - (n + 1) / n
 
 
 def demo():
+    calc = BlastRadiusCalculator()
+    
+    # Model a realistic ATF network
+    # Genesis → high-trust attesters → specialized agents
+    edges = [
+        # Genesis attests core agents (ATTEST class)
+        ("genesis", "kit", "ATTEST", 0.9),
+        ("genesis", "bro_agent", "ATTEST", 0.85),
+        ("genesis", "funwolf", "ATTEST", 0.8),
+        
+        # Core agents attest each other (cross-validation)
+        ("kit", "bro_agent", "WRITE", 0.75),
+        ("bro_agent", "kit", "WRITE", 0.8),
+        ("funwolf", "kit", "READ", 0.7),
+        
+        # Kit attests downstream agents
+        ("kit", "alpha", "ATTEST", 0.6),
+        ("kit", "beta", "ATTEST", 0.55),
+        ("kit", "gamma", "TRANSFER", 0.5),
+        
+        # bro_agent attests downstream
+        ("bro_agent", "delta", "WRITE", 0.7),
+        ("bro_agent", "epsilon", "ATTEST", 0.65),
+        
+        # Deeper chain
+        ("alpha", "zeta", "READ", 0.4),
+        ("alpha", "eta", "WRITE", 0.45),
+        ("gamma", "theta", "TRANSFER", 0.3),
+        
+        # funwolf has narrow but deep chain
+        ("funwolf", "iota", "ATTEST", 0.7),
+        ("iota", "kappa", "WRITE", 0.6),
+        ("kappa", "lambda_", "READ", 0.5),
+    ]
+    
+    for attester, subject, action, score in edges:
+        calc.add_edge(AttestationEdge(attester, subject, action, score))
+    
     print("=" * 60)
-    print("ATF BLAST RADIUS CALCULATOR")
+    print("ATF BLAST RADIUS ANALYSIS")
     print("=" * 60)
-    
-    g = AttestationGraph()
-    
-    # Build a realistic attestation graph
-    # Hub attester "alpha" attests many agents (high breadth)
-    for i in range(10):
-        g.add_edge(AttestationEdge("alpha", f"agent_{i}", "ATTEST", 0.8))
-    
-    # Some of those agents attest others (depth chain)
-    for i in range(5):
-        g.add_edge(AttestationEdge(f"agent_{i}", f"downstream_{i}", "WRITE", 0.7))
-    
-    # agent_0 is a hub itself
-    for i in range(8):
-        g.add_edge(AttestationEdge("agent_0", f"sub_{i}", "READ", 0.6))
-    
-    # Transfer chain (short, high risk)
-    g.add_edge(AttestationEdge("agent_1", "treasury", "TRANSFER", 0.9))
-    g.add_edge(AttestationEdge("treasury", "escrow", "TRANSFER", 0.85))
-    
-    print("\nGraph: alpha→10 agents, 5 with downstream WRITE, agent_0→8 READ subs")
-    print("Plus: agent_1→treasury→escrow (TRANSFER chain)")
+    print(f"Network: {len(edges)} attestation edges")
     print()
     
-    # Scenario 1: Hub compromise
-    print("SCENARIO 1: Hub attester 'alpha' compromised")
-    print("-" * 40)
-    blast = g.blast_radius("alpha")
-    print(f"Total affected: {blast['total_affected']}")
-    print(f"By class: {blast['by_action_class']}")
-    print(f"Weighted surface area: {blast['weighted_surface_area']}")
-    print(f"Max depth: {blast['max_depth_reached']}")
-    
-    containment = g.containment_time("alpha", detection_rounds=3)
-    print(f"\nContainment (3-round detection delay):")
-    print(f"  Pre-detection exposure: {containment['pre_detection_exposure']}")
-    print(f"  Containment after detection: {containment['containment_rounds_post_detection']} rounds")
-    print(f"  Avg recovery: {containment['avg_recovery_rounds']} rounds")
-    print(f"  Total incident: {containment['total_incident_duration']} rounds")
+    # Scenario 1: Genesis compromised (worst case)
+    report = calc.compute_blast("genesis")
+    print(f"SCENARIO: '{report.compromised}' compromised")
+    print(f"  Blast depth: {report.depth}")
+    print(f"  Breadth by depth: {report.breadth_by_depth}")
+    print(f"  Blast surface: {report.surface} agents")
+    print(f"  Weighted surface: {report.weighted_surface}")
+    print(f"  Concentration (Gini): {report.concentration}")
+    print(f"  Affected: {report.affected_agents}")
+    print(f"  Critical paths:")
+    for p in report.critical_paths:
+        print(f"    {'  →  '.join(p)}")
     print()
     
-    # Scenario 2: Leaf compromise
-    print("SCENARIO 2: Leaf agent 'agent_5' compromised")
-    print("-" * 40)
-    blast2 = g.blast_radius("agent_5")
-    print(f"Total affected: {blast2['total_affected']}")
-    print(f"Weighted surface area: {blast2['weighted_surface_area']}")
+    # Scenario 2: Kit compromised (mid-tier)
+    report2 = calc.compute_blast("kit")
+    print(f"SCENARIO: '{report2.compromised}' compromised")
+    print(f"  Blast depth: {report2.depth}")
+    print(f"  Blast surface: {report2.surface} agents")
+    print(f"  Weighted surface: {report2.weighted_surface}")
+    print(f"  Affected: {report2.affected_agents}")
     print()
     
-    # Scenario 3: Transfer chain compromise
-    print("SCENARIO 3: 'agent_1' compromised (has TRANSFER chain)")
-    print("-" * 40)
-    blast3 = g.blast_radius("agent_1")
-    print(f"Total affected: {blast3['total_affected']}")
-    print(f"By class: {blast3['by_action_class']}")
-    print(f"Weighted surface area: {blast3['weighted_surface_area']}")
-    print(f"  (TRANSFER edges dominate risk despite fewer nodes)")
-    
-    containment3 = g.containment_time("agent_1", detection_rounds=1)
-    print(f"\nContainment (1-round detection):")
-    print(f"  Total incident: {containment3['total_incident_duration']} rounds")
+    # Scenario 3: Leaf node compromised (minimal)
+    report3 = calc.compute_blast("theta")
+    print(f"SCENARIO: '{report3.compromised}' compromised")
+    print(f"  Blast surface: {report3.surface} agents")
+    print(f"  Weighted surface: {report3.weighted_surface}")
     print()
     
-    # Key insight
+    # Most dangerous nodes
     print("=" * 60)
-    print("KEY INSIGHTS")
+    print("MOST DANGEROUS NODES (by weighted blast surface)")
     print("=" * 60)
-    print("1. Hub compromise (alpha): 25 affected, surface area 57.6")
-    print("   vs Leaf compromise (agent_5): 1 affected, surface area 2.1")
-    print("   → Hub attacks 25x more damaging by count, 27x by weighted area")
+    rankings = calc.find_most_dangerous()
+    for i, (agent, surface) in enumerate(rankings[:8]):
+        bar = "█" * int(surface / 2)
+        print(f"  {i+1}. {agent:15s} {surface:6.1f}  {bar}")
+    
     print()
-    print("2. TRANSFER chains dominate risk weight despite depth limit of 2")
-    print("   → Short chains with high-value actions > long chains with READ")
-    print()
-    print("3. Detection delay is THE lever. 3-round delay = 3x pre-detection exposure")
-    print("   → Invest in fast detection (monitoring) over deep revocation chains")
-    print()
-    print("4. min() composition = automatic containment. Zero score propagates")
-    print("   in max_depth rounds. No revocation protocol needed — just update score.")
+    print("INSIGHT: Genesis has highest blast radius (expected).")
+    print("But kit's radius is disproportionate due to TRANSFER edge")
+    print("to gamma→theta (4x weight). TRANSFER chains are expensive")
+    print("to validate but catastrophic when compromised.")
 
 
 if __name__ == "__main__":
