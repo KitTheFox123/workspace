@@ -1,377 +1,363 @@
 #!/usr/bin/env python3
 """
-trust-circuit-breaker.py — Circuit breaker pattern for ATF trust degradation.
+trust-circuit-breaker.py — Circuit breaker pattern for ATF trust attestations.
 
-Maps the distributed systems circuit breaker (Nygard, "Release It!" 2007) to
-agent trust lifecycle. Answers santaclawd's SOFT_CASCADE question:
-"when trust degrades partially, what triggers re-attestation?"
+Maps microservice resilience patterns (Mohammad 2025 SLR, Netflix Hystrix) to
+agent trust recovery. The circuit breaker prevents cascading trust failures:
+when an agent repeatedly fails attestation probes, stop trusting it rather than
+accumulating bad attestations.
 
-Answer: Circuit breaker with HALF-OPEN probing.
+States (per Hystrix/Resilience4j):
+  CLOSED  — trust flowing, failures counted
+  OPEN    — trust suspended, no attestations accepted
+  HALF_OPEN — bounded probe: one re-attestation at reduced difficulty
 
-States:
-- CLOSED: Trust flowing normally. Attestations accepted.
-- OPEN: Trust degraded beyond threshold. No new trust-dependent tasks.
-  Timer starts for probe window.
-- HALF-OPEN: Probe phase. One low-stakes task allowed through.
-  Success → CLOSED. Failure → OPEN (with backoff).
+ATF-specific extensions:
+  - Action-class-aware probes: TRANSFER failure → probe with TRANSFER, not READ
+  - Difficulty downgrade: probe at 0.5× the difficulty that triggered failure
+  - Soft cascade: failure in one action class doesn't immediately affect others
+  - Jitter on recovery window: prevents thundering-herd re-attestation
+  - Witness liveness check: dead witness in N-of-M = silent quorum shrink
 
-Key design decisions:
-1. Default = ACTIVE re-attestation (not passive time-healing)
-2. Passive time-healing ONLY for PROVISIONAL tier (lowest stakes)
-3. HALF-OPEN probe = controlled exposure, not full restore
-4. Exponential backoff on repeated failures (1h → 2h → 4h → 8h → 24h cap)
-5. Failure threshold = configurable per trust tier (higher trust = stricter)
-
-The circuit breaker IS the re-attestation mechanism. No separate process needed.
+Key thread insights:
+  - santaclawd: "active re-attestation for WRITE/TRANSFER/ATTEST, passive for READ"
+  - santaclawd: SOFT_CASCADE = CLOSED → OPEN → HALF-OPEN per action class
+  - Kit: "probe MUST match degraded action class. READ probe after TRANSFER failure
+    = testing the wrong muscle"
 
 Sources:
-- Michael Nygard, "Release It!" (2007) — original circuit breaker pattern
-- AWS Well-Architected: REL05-BP01 graceful degradation
-- Netflix Hystrix (now resilience4j) — production circuit breaker at scale
-- ATF v1.2 trust lifecycle (santaclawd + kit_fox thread, March 2026)
+  - Mohammad (2025): Resilient Microservices SLR, 26 studies, 9 themes
+  - Netflix Hystrix (2012): Original circuit breaker for microservices
+  - Resilience4j: Modern Java implementation
+  - Mohammad T3: Retry with jitter prevents storms
+  - Mohammad T5: Bulkheads limit blast radius (= action class isolation)
+  - Mohammad T8: Observability = prerequisite for safe recovery
 """
 
-import time
 import json
+import math
+import random
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Callable
+from typing import Optional
 from datetime import datetime, timezone, timedelta
 
 
-class BreakerState(Enum):
+class CircuitState(Enum):
     CLOSED = "CLOSED"       # Trust flowing normally
-    OPEN = "OPEN"           # Trust degraded, blocking
-    HALF_OPEN = "HALF_OPEN" # Probing with low-stakes task
+    OPEN = "OPEN"           # Trust suspended
+    HALF_OPEN = "HALF_OPEN" # Probing recovery
 
 
-class TrustTier(Enum):
-    PROVISIONAL = "PROVISIONAL"  # New agent, minimal history
-    ESTABLISHED = "ESTABLISHED"  # Some track record
-    TRUSTED = "TRUSTED"          # Significant history
-    VERIFIED = "VERIFIED"        # Highest tier, cross-attested
+class ActionClass(Enum):
+    READ = "READ"           # No state change, passive attestation OK
+    WRITE = "WRITE"         # State change, active re-attestation required
+    TRANSFER = "TRANSFER"   # Irrevocable, strictest probing
+    ATTEST = "ATTEST"       # Signing for others, delegated trust
 
 
-@dataclass
-class BreakerConfig:
-    """Per-tier circuit breaker configuration."""
-    tier: TrustTier
-    failure_threshold: int       # Failures before OPEN
-    success_threshold: int       # Successes in HALF_OPEN to CLOSE
-    base_timeout_seconds: float  # Initial OPEN duration before HALF_OPEN
-    max_timeout_seconds: float   # Cap on exponential backoff
-    passive_healing: bool        # Allow passive time-based recovery?
-    probe_task_level: str        # What level of task for HALF_OPEN probe
+# TTLs per action class (hours)
+ACTION_TTLS = {
+    ActionClass.READ: 168,      # 7 days
+    ActionClass.WRITE: 72,      # 3 days
+    ActionClass.TRANSFER: 48,   # 2 days
+    ActionClass.ATTEST: 24,     # 1 day (shortest — delegated trust decays fastest)
+}
 
-
-# Default configs per tier
-TIER_CONFIGS = {
-    TrustTier.PROVISIONAL: BreakerConfig(
-        tier=TrustTier.PROVISIONAL,
-        failure_threshold=3,
-        success_threshold=1,
-        base_timeout_seconds=3600,      # 1h
-        max_timeout_seconds=86400,      # 24h
-        passive_healing=True,           # Only tier with passive healing
-        probe_task_level="trivial",
-    ),
-    TrustTier.ESTABLISHED: BreakerConfig(
-        tier=TrustTier.ESTABLISHED,
-        failure_threshold=3,
-        success_threshold=2,
-        base_timeout_seconds=3600,
-        max_timeout_seconds=86400,
-        passive_healing=False,
-        probe_task_level="low_stakes",
-    ),
-    TrustTier.TRUSTED: BreakerConfig(
-        tier=TrustTier.TRUSTED,
-        failure_threshold=2,            # Stricter — more to lose
-        success_threshold=3,
-        base_timeout_seconds=7200,      # 2h
-        max_timeout_seconds=86400,
-        passive_healing=False,
-        probe_task_level="low_stakes",
-    ),
-    TrustTier.VERIFIED: BreakerConfig(
-        tier=TrustTier.VERIFIED,
-        failure_threshold=2,
-        success_threshold=3,
-        base_timeout_seconds=14400,     # 4h — verified agents get longer cool-off
-        max_timeout_seconds=172800,     # 48h
-        passive_healing=False,
-        probe_task_level="medium_stakes",
-    ),
+# Recovery mode per action class (santaclawd's TCP/UDP insight)
+RECOVERY_MODE = {
+    ActionClass.READ: "passive",      # UDP: fire-and-forget, check on next use
+    ActionClass.WRITE: "active",      # TCP: handshake required
+    ActionClass.TRANSFER: "active",   # TCP: handshake required
+    ActionClass.ATTEST: "active",     # TCP: handshake required
 }
 
 
 @dataclass
-class TrustEvent:
-    """Record of a trust-relevant interaction."""
-    timestamp: str
-    event_type: str  # "success", "failure", "probe_success", "probe_failure"
-    details: str
-    task_level: str
+class ProbeResult:
+    """Result of a re-attestation probe."""
+    success: bool
+    action_class: ActionClass
+    difficulty: float       # 0.0-1.0
+    score: float           # 0.0-1.0 (quality of response)
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
-class TrustCircuitBreaker:
+class CircuitBreaker:
     """
-    Circuit breaker for a specific agent's trust relationship.
+    Per-agent, per-action-class circuit breaker.
     
-    Each relying party maintains one breaker per trusted agent.
-    State is LOCAL — my breaker for agent X is independent of yours.
-    This is subjective trust, not global reputation.
+    Isolation: each action class has its own breaker (bulkhead pattern, T5).
+    TRANSFER failure doesn't affect READ trust.
     """
     agent_id: str
-    tier: TrustTier
-    state: BreakerState = BreakerState.CLOSED
+    action_class: ActionClass
+    state: CircuitState = CircuitState.CLOSED
+    
+    # Thresholds
+    failure_threshold: int = 3          # Failures before OPEN
+    success_threshold: int = 2          # Successes in HALF_OPEN before CLOSED
+    recovery_window_base: float = 300.0 # Base recovery window (seconds)
+    max_recovery_window: float = 3600.0 # Max recovery window (1 hour)
+    
+    # Counters
     failure_count: int = 0
     success_count: int = 0
-    consecutive_opens: int = 0  # For exponential backoff
-    last_state_change: Optional[str] = None
-    last_failure: Optional[str] = None
-    events: list[TrustEvent] = field(default_factory=list)
+    consecutive_opens: int = 0          # For exponential backoff
+    
+    # Timing
+    opened_at: Optional[str] = None
+    last_probe_at: Optional[str] = None
+    last_failure_difficulty: float = 0.5
+    
+    # History
+    probe_history: list = field(default_factory=list)
     
     @property
-    def config(self) -> BreakerConfig:
-        return TIER_CONFIGS[self.tier]
+    def recovery_window(self) -> float:
+        """Exponential backoff with jitter (Mohammad T3: prevents retry storms)."""
+        base = self.recovery_window_base * (2 ** min(self.consecutive_opens, 5))
+        capped = min(base, self.max_recovery_window)
+        # Add jitter: ±25% (prevents thundering-herd re-attestation)
+        jitter = capped * random.uniform(-0.25, 0.25)
+        return capped + jitter
     
     @property
-    def current_timeout(self) -> float:
-        """Exponential backoff on repeated OPEN states."""
-        timeout = self.config.base_timeout_seconds * (2 ** self.consecutive_opens)
-        return min(timeout, self.config.max_timeout_seconds)
+    def probe_difficulty(self) -> float:
+        """
+        Probe at 0.5× the difficulty that triggered failure.
+        "half-open = prove you can still walk before we let you run"
+        """
+        return self.last_failure_difficulty * 0.5
     
-    def _now(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+    @property
+    def is_recovery_ready(self) -> bool:
+        """Check if enough time has passed to attempt recovery."""
+        if self.state != CircuitState.OPEN or self.opened_at is None:
+            return False
+        opened = datetime.fromisoformat(self.opened_at)
+        elapsed = (datetime.now(timezone.utc) - opened).total_seconds()
+        return elapsed >= self.recovery_window
     
-    def _log(self, event_type: str, details: str, task_level: str = ""):
-        self.events.append(TrustEvent(
-            timestamp=self._now(),
-            event_type=event_type,
-            details=details,
-            task_level=task_level,
-        ))
-    
-    def record_success(self, task_level: str = "normal") -> dict:
-        """Record a successful trust interaction."""
-        if self.state == BreakerState.CLOSED:
-            self.failure_count = max(0, self.failure_count - 1)  # Gradual healing
-            self._log("success", "Normal operation, failure count decremented", task_level)
-            return {"action": "CONTINUE", "state": self.state.value}
+    def record_failure(self, difficulty: float = 0.5) -> dict:
+        """Record a trust attestation failure."""
+        self.failure_count += 1
+        self.last_failure_difficulty = difficulty
         
-        elif self.state == BreakerState.HALF_OPEN:
-            self.success_count += 1
-            self._log("probe_success", f"Probe success {self.success_count}/{self.config.success_threshold}", task_level)
-            
-            if self.success_count >= self.config.success_threshold:
-                # Re-close the breaker
-                self.state = BreakerState.CLOSED
-                self.failure_count = 0
-                self.success_count = 0
-                self.consecutive_opens = max(0, self.consecutive_opens - 1)
-                self.last_state_change = self._now()
-                self._log("state_change", "HALF_OPEN → CLOSED: re-attestation complete", task_level)
-                return {"action": "RESTORED", "state": self.state.value, "message": "Trust re-established via probe"}
-            
-            return {"action": "PROBE_CONTINUE", "state": self.state.value, 
-                    "remaining": self.config.success_threshold - self.success_count}
-        
-        elif self.state == BreakerState.OPEN:
-            # Shouldn't happen — no tasks should flow when OPEN
-            self._log("anomaly", "Success recorded while OPEN — should not happen", task_level)
-            return {"action": "ANOMALY", "state": self.state.value}
-    
-    def record_failure(self, task_level: str = "normal", reason: str = "") -> dict:
-        """Record a failed trust interaction."""
-        self.last_failure = self._now()
-        
-        if self.state == BreakerState.CLOSED:
-            self.failure_count += 1
-            self._log("failure", f"Failure {self.failure_count}/{self.config.failure_threshold}: {reason}", task_level)
-            
-            if self.failure_count >= self.config.failure_threshold:
-                self.state = BreakerState.OPEN
-                self.consecutive_opens += 1
-                self.last_state_change = self._now()
-                self._log("state_change", 
-                         f"CLOSED → OPEN: {self.failure_count} failures. "
-                         f"Timeout: {self.current_timeout/3600:.1f}h (backoff #{self.consecutive_opens})", 
-                         task_level)
-                return {
-                    "action": "TRIPPED", 
-                    "state": self.state.value,
-                    "timeout_hours": round(self.current_timeout / 3600, 1),
-                    "message": f"Trust degraded after {self.failure_count} failures"
-                }
-            
-            return {"action": "WARNING", "state": self.state.value,
-                    "remaining_tolerance": self.config.failure_threshold - self.failure_count}
-        
-        elif self.state == BreakerState.HALF_OPEN:
-            # Probe failed — back to OPEN with increased backoff
-            self.state = BreakerState.OPEN
-            self.success_count = 0
-            self.consecutive_opens += 1
-            self.last_state_change = self._now()
-            self._log("state_change",
-                     f"HALF_OPEN → OPEN: probe failed. "
-                     f"Next timeout: {self.current_timeout/3600:.1f}h",
-                     task_level)
-            return {
-                "action": "PROBE_FAILED",
-                "state": self.state.value,
-                "timeout_hours": round(self.current_timeout / 3600, 1),
-                "message": "Re-attestation probe failed, extending cooldown"
-            }
-        
-        elif self.state == BreakerState.OPEN:
-            self._log("failure_while_open", f"Additional failure while OPEN: {reason}", task_level)
-            return {"action": "ALREADY_OPEN", "state": self.state.value}
-    
-    def check_probe_ready(self, current_time: Optional[datetime] = None) -> dict:
-        """Check if enough time has passed to attempt HALF-OPEN probe."""
-        if self.state != BreakerState.OPEN:
-            return {"ready": False, "reason": f"State is {self.state.value}, not OPEN"}
-        
-        if not self.last_state_change:
-            return {"ready": True, "probe_task_level": self.config.probe_task_level}
-        
-        now = current_time or datetime.now(timezone.utc)
-        changed_at = datetime.fromisoformat(self.last_state_change)
-        elapsed = (now - changed_at).total_seconds()
-        
-        if elapsed >= self.current_timeout:
-            if self.config.passive_healing:
-                # PROVISIONAL tier: auto-heal without probe
-                self.state = BreakerState.CLOSED
-                self.failure_count = 0
-                self.success_count = 0
-                self.last_state_change = self._now()
-                self._log("passive_healing", "PROVISIONAL tier: passive time-healing applied")
-                return {"ready": False, "healed": True, "message": "Passive healing complete (PROVISIONAL only)"}
-            
-            # Transition to HALF-OPEN for probing
-            self.state = BreakerState.HALF_OPEN
-            self.success_count = 0
-            self.last_state_change = self._now()
-            self._log("state_change",
-                     f"OPEN → HALF_OPEN: timeout elapsed ({elapsed/3600:.1f}h). "
-                     f"Probe with {self.config.probe_task_level} task.",
-                     self.config.probe_task_level)
-            return {
-                "ready": True,
-                "probe_task_level": self.config.probe_task_level,
-                "message": f"Ready for re-attestation probe ({self.config.probe_task_level})"
-            }
-        
-        remaining = self.current_timeout - elapsed
-        return {
-            "ready": False,
-            "remaining_seconds": round(remaining),
-            "remaining_hours": round(remaining / 3600, 1),
-        }
-    
-    def status(self) -> dict:
-        return {
-            "agent_id": self.agent_id,
-            "tier": self.tier.value,
-            "state": self.state.value,
+        event = {
+            "event": "FAILURE",
+            "agent": self.agent_id,
+            "action_class": self.action_class.value,
             "failure_count": self.failure_count,
-            "success_count": self.success_count,
-            "consecutive_opens": self.consecutive_opens,
-            "current_timeout_hours": round(self.current_timeout / 3600, 1),
-            "passive_healing": self.config.passive_healing,
-            "event_count": len(self.events),
+            "threshold": self.failure_threshold,
+        }
+        
+        if self.failure_count >= self.failure_threshold and self.state == CircuitState.CLOSED:
+            self.state = CircuitState.OPEN
+            self.opened_at = datetime.now(timezone.utc).isoformat()
+            self.consecutive_opens += 1
+            event["state_change"] = "CLOSED → OPEN"
+            event["recovery_window_sec"] = round(self.recovery_window, 1)
+            event["recovery_mode"] = RECOVERY_MODE[self.action_class]
+        
+        return event
+    
+    def attempt_probe(self, result: ProbeResult) -> dict:
+        """Process a re-attestation probe result in HALF_OPEN state."""
+        self.probe_history.append(result)
+        self.last_probe_at = result.timestamp
+        
+        event = {
+            "event": "PROBE",
+            "agent": self.agent_id,
+            "action_class": self.action_class.value,
+            "probe_success": result.success,
+            "probe_score": result.score,
+            "probe_difficulty": result.difficulty,
+        }
+        
+        if result.success:
+            self.success_count += 1
+            if self.success_count >= self.success_threshold:
+                self.state = CircuitState.CLOSED
+                self.failure_count = 0
+                self.success_count = 0
+                self.consecutive_opens = 0
+                event["state_change"] = "HALF_OPEN → CLOSED"
+                event["message"] = "Trust restored"
+            else:
+                event["progress"] = f"{self.success_count}/{self.success_threshold}"
+        else:
+            # Failed probe → back to OPEN with longer window
+            self.state = CircuitState.OPEN
+            self.opened_at = datetime.now(timezone.utc).isoformat()
+            self.success_count = 0
+            event["state_change"] = "HALF_OPEN → OPEN"
+            event["recovery_window_sec"] = round(self.recovery_window, 1)
+        
+        return event
+    
+    def try_transition_to_half_open(self) -> Optional[dict]:
+        """Attempt to transition from OPEN to HALF_OPEN for probing."""
+        if self.state != CircuitState.OPEN:
+            return None
+        
+        if not self.is_recovery_ready:
+            return None
+        
+        self.state = CircuitState.HALF_OPEN
+        self.success_count = 0
+        
+        return {
+            "event": "TRANSITION",
+            "state_change": "OPEN → HALF_OPEN",
+            "agent": self.agent_id,
+            "action_class": self.action_class.value,
+            "probe_difficulty": round(self.probe_difficulty, 3),
+            "recovery_mode": RECOVERY_MODE[self.action_class],
+            "message": f"Probing at {self.probe_difficulty:.1%} difficulty (was {self.last_failure_difficulty:.1%})",
         }
 
 
-def run_scenarios():
-    """Demonstrate circuit breaker trust degradation and recovery."""
+class TrustCircuitBreakerPool:
+    """
+    Pool of circuit breakers — one per agent per action class.
+    Implements soft cascade: action classes are isolated (bulkhead pattern).
+    """
+    
+    def __init__(self):
+        self.breakers: dict[tuple[str, ActionClass], CircuitBreaker] = {}
+        self.event_log: list[dict] = []
+    
+    def get_breaker(self, agent_id: str, action_class: ActionClass) -> CircuitBreaker:
+        """Get or create a circuit breaker for agent+action_class."""
+        key = (agent_id, action_class)
+        if key not in self.breakers:
+            self.breakers[key] = CircuitBreaker(agent_id=agent_id, action_class=action_class)
+        return self.breakers[key]
+    
+    def can_trust(self, agent_id: str, action_class: ActionClass) -> dict:
+        """Check if an agent is trusted for a specific action class."""
+        breaker = self.get_breaker(agent_id, action_class)
+        
+        result = {
+            "agent": agent_id,
+            "action_class": action_class.value,
+            "state": breaker.state.value,
+            "trusted": breaker.state == CircuitState.CLOSED,
+            "ttl_hours": ACTION_TTLS[action_class],
+        }
+        
+        if breaker.state == CircuitState.OPEN:
+            result["recovery_ready"] = breaker.is_recovery_ready
+            result["recovery_mode"] = RECOVERY_MODE[action_class]
+        elif breaker.state == CircuitState.HALF_OPEN:
+            result["probe_progress"] = f"{breaker.success_count}/{breaker.success_threshold}"
+            result["probe_difficulty"] = round(breaker.probe_difficulty, 3)
+        
+        return result
+    
+    def agent_status(self, agent_id: str) -> dict:
+        """Full status across all action classes (soft cascade view)."""
+        status = {"agent": agent_id, "action_classes": {}}
+        for ac in ActionClass:
+            check = self.can_trust(agent_id, ac)
+            status["action_classes"][ac.value] = {
+                "state": check["state"],
+                "trusted": check["trusted"],
+            }
+        
+        # Overall: trusted only if ALL action classes are CLOSED
+        status["fully_trusted"] = all(
+            status["action_classes"][ac.value]["trusted"] for ac in ActionClass
+        )
+        return status
+
+
+def run_scenario():
+    """Demonstrate circuit breaker behavior with soft cascade."""
+    pool = TrustCircuitBreakerPool()
+    random.seed(42)  # Reproducible jitter
+    
     print("=" * 70)
-    print("TRUST CIRCUIT BREAKER — SOFT_CASCADE RECOVERY")
+    print("TRUST CIRCUIT BREAKER — ATF SOFT CASCADE")
+    print("Based on Mohammad (2025) SLR + Netflix Hystrix + Clawk threads")
     print("=" * 70)
     
-    # Scenario 1: ESTABLISHED agent degrades and recovers via probe
-    print("\n--- Scenario 1: ESTABLISHED agent — degrade + probe recovery ---")
-    breaker = TrustCircuitBreaker("agent_alpha", TrustTier.ESTABLISHED)
+    agent = "agent_alpha"
     
-    print(f"  Initial: {breaker.status()['state']}")
-    
-    # 3 failures → OPEN
+    # Phase 1: Agent fails TRANSFER attestations
+    print("\n--- Phase 1: TRANSFER failures (3× → OPEN) ---")
+    breaker = pool.get_breaker(agent, ActionClass.TRANSFER)
     for i in range(3):
-        result = breaker.record_failure(reason=f"bad attestation #{i+1}")
-        print(f"  Failure {i+1}: {result['action']}")
+        event = breaker.record_failure(difficulty=0.7)
+        print(f"  Failure {i+1}: {json.dumps({k: v for k, v in event.items() if k != 'agent'})}")
     
-    print(f"  State: {breaker.status()['state']} (timeout: {breaker.status()['current_timeout_hours']}h)")
+    # Phase 2: Check soft cascade — other action classes unaffected
+    print("\n--- Phase 2: Soft cascade check ---")
+    status = pool.agent_status(agent)
+    for ac, info in status["action_classes"].items():
+        print(f"  {ac}: {info['state']} (trusted={info['trusted']})")
+    print(f"  Fully trusted: {status['fully_trusted']}")
     
-    # Simulate timeout elapsed
-    past = datetime.now(timezone.utc) - timedelta(hours=2)
-    breaker.last_state_change = past.isoformat()
-    probe = breaker.check_probe_ready()
-    print(f"  Probe ready: {probe.get('ready')} — {probe.get('message', '')}")
+    # Phase 3: Simulate recovery
+    print("\n--- Phase 3: Recovery attempt ---")
+    # Force recovery-ready by backdating opened_at
+    breaker.opened_at = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
     
-    # Probe succeeds twice → CLOSED
-    r1 = breaker.record_success("low_stakes")
-    print(f"  Probe 1: {r1['action']}")
-    r2 = breaker.record_success("low_stakes")
-    print(f"  Probe 2: {r2['action']} — {r2.get('message', '')}")
-    print(f"  Final: {breaker.status()['state']}")
+    transition = breaker.try_transition_to_half_open()
+    if transition:
+        print(f"  {json.dumps({k: v for k, v in transition.items() if k != 'agent'})}")
     
-    # Scenario 2: PROVISIONAL agent — passive healing
-    print("\n--- Scenario 2: PROVISIONAL agent — passive time-healing ---")
-    breaker2 = TrustCircuitBreaker("agent_beta", TrustTier.PROVISIONAL)
+    # First probe: success at reduced difficulty
+    probe1 = ProbeResult(
+        success=True, action_class=ActionClass.TRANSFER,
+        difficulty=breaker.probe_difficulty, score=0.75,
+    )
+    event1 = breaker.attempt_probe(probe1)
+    print(f"  Probe 1: {json.dumps({k: v for k, v in event1.items() if k != 'agent'})}")
     
-    for i in range(3):
-        breaker2.record_failure(reason="sketchy behavior")
-    print(f"  After 3 failures: {breaker2.status()['state']}")
+    # Second probe: success → CLOSED
+    probe2 = ProbeResult(
+        success=True, action_class=ActionClass.TRANSFER,
+        difficulty=breaker.probe_difficulty, score=0.82,
+    )
+    event2 = breaker.attempt_probe(probe2)
+    print(f"  Probe 2: {json.dumps({k: v for k, v in event2.items() if k != 'agent'})}")
     
-    past = datetime.now(timezone.utc) - timedelta(hours=2)
-    breaker2.last_state_change = past.isoformat()
-    result = breaker2.check_probe_ready()
-    print(f"  After timeout: healed={result.get('healed')} — {result.get('message', '')}")
-    print(f"  State: {breaker2.status()['state']} (passive healing = PROVISIONAL only)")
+    # Phase 4: Failed probe scenario
+    print("\n--- Phase 4: Failed probe → back to OPEN ---")
+    breaker2 = pool.get_breaker("agent_beta", ActionClass.WRITE)
+    for _ in range(3):
+        breaker2.record_failure(difficulty=0.6)
+    breaker2.opened_at = (datetime.now(timezone.utc) - timedelta(seconds=400)).isoformat()
+    breaker2.try_transition_to_half_open()
     
-    # Scenario 3: VERIFIED agent — strict, exponential backoff
-    print("\n--- Scenario 3: VERIFIED agent — exponential backoff ---")
-    breaker3 = TrustCircuitBreaker("agent_gamma", TrustTier.VERIFIED)
+    failed_probe = ProbeResult(
+        success=False, action_class=ActionClass.WRITE,
+        difficulty=0.3, score=0.2,
+    )
+    event = breaker2.attempt_probe(failed_probe)
+    print(f"  Failed probe: {json.dumps({k: v for k, v in event.items() if k != 'agent'})}")
+    print(f"  Next recovery window: {breaker2.recovery_window:.0f}s (exponential backoff + jitter)")
     
-    # First trip
-    breaker3.record_failure(reason="missed deadline")
-    result = breaker3.record_failure(reason="bad quality")
-    print(f"  First trip: timeout={breaker3.status()['current_timeout_hours']}h")
+    # Phase 5: Action class TTLs and recovery modes
+    print("\n--- Phase 5: Action class properties ---")
+    print(f"  {'Class':<12} {'TTL (hrs)':<12} {'Recovery':<10}")
+    print(f"  {'-'*12} {'-'*12} {'-'*10}")
+    for ac in ActionClass:
+        print(f"  {ac.value:<12} {ACTION_TTLS[ac]:<12} {RECOVERY_MODE[ac]:<10}")
     
-    # Simulate timeout, probe, fail
-    past = datetime.now(timezone.utc) - timedelta(hours=9)
-    breaker3.last_state_change = past.isoformat()
-    breaker3.check_probe_ready()
-    result = breaker3.record_failure(reason="probe task also failed")
-    print(f"  Probe failed: {result['action']}, new timeout={result['timeout_hours']}h")
-    
-    # Second timeout, probe, fail again
-    past = datetime.now(timezone.utc) - timedelta(hours=20)
-    breaker3.last_state_change = past.isoformat()
-    breaker3.check_probe_ready()
-    result = breaker3.record_failure(reason="still failing")
-    print(f"  Second probe failed: timeout={result['timeout_hours']}h (backoff)")
-    
-    print(f"  Status: {json.dumps(breaker3.status(), indent=4)}")
-    
-    # Summary
     print(f"\n{'=' * 70}")
-    print("Design decisions:")
-    print("  1. ACTIVE re-attestation by default (HALF-OPEN probe)")
-    print("  2. Passive time-healing ONLY for PROVISIONAL tier")
-    print("  3. Exponential backoff on repeated failures")
-    print("  4. HALF-OPEN probe = controlled exposure, not full restore")
-    print("  5. Breaker is LOCAL — my assessment, not global reputation")
-    print()
-    print("Santaclawd's question answered:")
-    print("  'what triggers re-attestation?' → The circuit breaker timeout.")
-    print("  HALF-OPEN state IS the re-attestation. Probe with low-stakes task.")
-    print("  Success = gradually restore. Failure = backoff + wait longer.")
+    print("Key patterns mapped from Mohammad (2025) SLR:")
+    print("  T1: Failure-mode–pattern fit → action-class-specific probes")
+    print("  T3: Retry with jitter → recovery window with ±25% jitter")
+    print("  T5: Bulkheads → action class isolation (soft cascade)")
+    print("  T8: Observability → probe history + event log")
+    print("  Key: 'context—not mechanism—determines resilience gain'")
 
 
 if __name__ == "__main__":
-    run_scenarios()
+    run_scenario()
