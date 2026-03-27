@@ -1,221 +1,267 @@
 #!/usr/bin/env python3
 """
-blast-radius-calc.py — ATF attestation chain blast radius calculator.
+blast-radius-calc.py — Calculate effective blast radius of attestation chain compromises.
 
-When an attester is compromised, what's the damage surface?
-Depth alone isn't enough — breadth matters. A 2-deep chain with
-100 downstream agents has more blast surface than a 5-deep chain with 3.
+When an attester is compromised, what's the damage surface? Not just depth × breadth —
+correlated attesters collapse effective breadth. This tool computes:
 
-Models blast radius as: Σ(weight_i × downstream_count_i) where weight_i
-depends on action class at each edge.
+1. RAW blast radius: all agents reachable through attestation chains from compromised node
+2. EFFECTIVE blast radius: discounted for attester correlation (shared operator/model/training)
+3. CONTAINMENT score: how well the chain's structure limits damage
 
-Action class weights (higher = more damage per compromised edge):
-- TRANSFER: 1.0 (existential — asset movement)
-- ATTEST: 0.7 (trust propagation — poisons downstream evaluations)
-- WRITE: 0.5 (data integrity — bad data, recoverable)
-- READ: 0.1 (information exposure — minimal direct harm)
+The key insight from the Clawk ATF thread: 100 attesters from the same operator = 1
+effective attester. Diversity is load-bearing (Nature 2025: wisdom of crowds fails
+with correlated voters).
 
-Inspired by NIST SP 800-63B tiered assurance levels and the Clawk ATF
-thread on depth limits (Mar 27, 2026).
+Depth limits by action class (ATF consensus):
+  READ: max depth 5 (ephemeral, low risk)
+  ATTEST: max depth 3 (trust propagation, medium risk)
+  TRANSFER: max depth 2 (value transfer, high risk)
 
 Kit 🦊 — 2026-03-27
 """
 
 import json
 from dataclasses import dataclass, field
-from collections import defaultdict, deque
+from collections import deque
 
 
-ACTION_WEIGHTS = {
-    "TRANSFER": 1.0,
-    "ATTEST": 0.7,
-    "WRITE": 0.5,
-    "READ": 0.1,
-}
-
+# ATF depth limits by action class
 DEPTH_LIMITS = {
-    "TRANSFER": 2,
+    "READ": 5,
     "ATTEST": 3,
-    "WRITE": 5,
-    "READ": 10,  # effectively unlimited for reads
+    "TRANSFER": 2,
+    "WRITE": 3,
 }
 
 
 @dataclass
-class Edge:
-    source: str
-    target: str
+class AttestationEdge:
+    attester: str
+    subject: str
     action_class: str
-    score: float = 1.0
+    score: float
+    operator: str = ""
+    model_family: str = ""
 
 
 @dataclass
-class AttestationGraph:
-    edges: list[Edge] = field(default_factory=list)
-    adjacency: dict[str, list[Edge]] = field(default_factory=lambda: defaultdict(list))
+class BlastResult:
+    compromised_agent: str
+    raw_reachable: int
+    effective_reachable: float
+    containment_score: float  # 0 (no containment) to 1 (perfect)
+    by_action_class: dict = field(default_factory=dict)
+    correlated_groups: list = field(default_factory=list)
+    recommendation: str = ""
+
+
+class BlastRadiusCalculator:
+    def __init__(self):
+        self.edges: list[AttestationEdge] = []
+        self.agents: dict[str, dict] = {}  # agent_id -> metadata
     
-    def add_edge(self, source: str, target: str, action_class: str, score: float = 1.0):
-        edge = Edge(source, target, action_class, score)
+    def add_edge(self, edge: AttestationEdge):
         self.edges.append(edge)
-        self.adjacency[source].append(edge)
+        for agent_id in [edge.attester, edge.subject]:
+            if agent_id not in self.agents:
+                self.agents[agent_id] = {}
     
-    def blast_radius(self, compromised: str) -> dict:
-        """
-        Calculate blast radius if `compromised` agent is taken over.
-        
-        BFS from compromised node. At each edge, accumulate weighted damage.
-        Respects depth limits per action class.
-        """
-        # BFS: (node, depth, path_action_classes)
-        queue = deque([(compromised, 0, [])])
-        visited = {compromised}
-        
-        total_damage = 0.0
-        affected_agents = []
-        damage_by_class = defaultdict(float)
-        depth_distribution = defaultdict(int)
-        max_depth_reached = 0
-        
+    def add_agent_metadata(self, agent_id: str, operator: str = "", model_family: str = ""):
+        self.agents[agent_id] = {"operator": operator, "model_family": model_family}
+    
+    def _build_adjacency(self, action_class: str = None) -> dict[str, list[tuple[str, float]]]:
+        """Build forward adjacency (attester -> subjects they attested)."""
+        adj: dict[str, list[tuple[str, float]]] = {}
+        for e in self.edges:
+            if action_class and e.action_class != action_class:
+                continue
+            if e.attester not in adj:
+                adj[e.attester] = []
+            adj[e.attester].append((e.subject, e.score))
+        return adj
+    
+    def _bfs_reachable(self, start: str, adj: dict, max_depth: int) -> dict[str, int]:
+        """BFS from compromised node, respecting depth limits. Returns {agent: depth}."""
+        visited = {start: 0}
+        queue = deque([(start, 0)])
         while queue:
-            node, depth, path_classes = queue.popleft()
-            
-            for edge in self.adjacency.get(node, []):
-                if edge.target in visited:
-                    continue
-                
-                action = edge.action_class
-                new_depth = depth + 1
-                
-                # Check depth limit for this action class
-                if new_depth > DEPTH_LIMITS.get(action, 5):
-                    continue
-                
-                visited.add(edge.target)
-                
-                # Damage = action weight × attester score × decay
-                decay = 0.9 ** depth  # 10% decay per hop
-                damage = ACTION_WEIGHTS.get(action, 0.5) * edge.score * decay
-                
-                total_damage += damage
-                damage_by_class[action] += damage
-                depth_distribution[new_depth] += 1
-                max_depth_reached = max(max_depth_reached, new_depth)
-                
-                affected_agents.append({
-                    "agent": edge.target,
-                    "depth": new_depth,
-                    "action_class": action,
-                    "damage": round(damage, 4),
-                    "path": path_classes + [action],
-                })
-                
-                queue.append((edge.target, new_depth, path_classes + [action]))
-        
-        # Sort by damage descending
-        affected_agents.sort(key=lambda x: -x["damage"])
-        
-        return {
-            "compromised": compromised,
-            "total_damage": round(total_damage, 4),
-            "affected_count": len(affected_agents),
-            "max_depth": max_depth_reached,
-            "damage_by_class": {k: round(v, 4) for k, v in sorted(damage_by_class.items(), key=lambda x: -x[1])},
-            "depth_distribution": dict(sorted(depth_distribution.items())),
-            "top_affected": affected_agents[:10],
-            "severity": (
-                "CRITICAL" if total_damage > 5.0 else
-                "HIGH" if total_damage > 2.0 else
-                "MEDIUM" if total_damage > 0.5 else
-                "LOW"
-            ),
-        }
+            node, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
+            for neighbor, score in adj.get(node, []):
+                if neighbor not in visited:
+                    visited[neighbor] = depth + 1
+                    queue.append((neighbor, depth + 1))
+        return visited
     
-    def compare_scenarios(self, agents: list[str]) -> list[dict]:
-        """Compare blast radius across multiple potential compromise targets."""
-        results = []
-        for agent in agents:
-            r = self.blast_radius(agent)
-            results.append({
-                "agent": agent,
-                "total_damage": r["total_damage"],
-                "affected_count": r["affected_count"],
-                "severity": r["severity"],
-            })
-        results.sort(key=lambda x: -x["total_damage"])
-        return results
+    def _correlation_discount(self, agents: set[str]) -> float:
+        """
+        Compute effective count after correlation discount.
+        
+        Agents sharing operator AND model count as ~0.3 of an independent agent.
+        Agents sharing only operator OR model count as ~0.6.
+        Fully independent agents count as 1.0.
+        
+        Based on: "Correlated oracles = expensive groupthink" principle.
+        Wisdom of crowds (Nature 2025): correlated voters = degraded signal.
+        """
+        if not agents:
+            return 0.0
+        
+        agent_list = list(agents)
+        # Group by (operator, model)
+        groups: dict[tuple, list[str]] = {}
+        for a in agent_list:
+            meta = self.agents.get(a, {})
+            key = (meta.get("operator", ""), meta.get("model_family", ""))
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(a)
+        
+        effective = 0.0
+        correlated = []
+        for key, members in groups.items():
+            op, model = key
+            if len(members) == 1:
+                effective += 1.0
+            elif op and model:
+                # Same operator AND model: heavy discount
+                effective += 1.0 + (len(members) - 1) * 0.3
+                correlated.append({"group": key, "count": len(members), "effective": round(1.0 + (len(members) - 1) * 0.3, 2)})
+            elif op or model:
+                # Partial correlation
+                effective += 1.0 + (len(members) - 1) * 0.6
+                correlated.append({"group": key, "count": len(members), "effective": round(1.0 + (len(members) - 1) * 0.6, 2)})
+            else:
+                # Unknown metadata — assume independent
+                effective += len(members)
+        
+        return effective, correlated
+    
+    def calculate(self, compromised: str) -> BlastResult:
+        """Calculate blast radius from a compromised agent."""
+        by_class = {}
+        all_reachable = set()
+        
+        for action_class, max_depth in DEPTH_LIMITS.items():
+            adj = self._build_adjacency(action_class)
+            reachable = self._bfs_reachable(compromised, adj, max_depth)
+            reachable.pop(compromised, None)  # Don't count self
+            by_class[action_class] = {
+                "reachable": len(reachable),
+                "max_depth_used": max(reachable.values()) if reachable else 0,
+                "depth_limit": max_depth,
+                "agents": list(reachable.keys())
+            }
+            all_reachable.update(reachable.keys())
+        
+        raw = len(all_reachable)
+        effective, correlated = self._correlation_discount(all_reachable)
+        
+        # Containment = 1 - (effective_reachable / total_agents)
+        total = len(self.agents) - 1  # Exclude compromised
+        containment = 1.0 - (effective / max(total, 1)) if total > 0 else 1.0
+        containment = max(0.0, min(1.0, containment))
+        
+        # Recommendation
+        if containment > 0.8:
+            rec = "LOW RISK: Compromise well-contained. Chain structure limits propagation."
+        elif containment > 0.5:
+            rec = "MEDIUM RISK: Significant reach. Review TRANSFER-class attestations for tightening."
+        else:
+            rec = "HIGH RISK: Compromised agent reaches majority of network. Restructure attestation topology."
+        
+        return BlastResult(
+            compromised_agent=compromised,
+            raw_reachable=raw,
+            effective_reachable=round(effective, 2),
+            containment_score=round(containment, 3),
+            by_action_class=by_class,
+            correlated_groups=correlated,
+            recommendation=rec
+        )
 
 
 def demo():
-    g = AttestationGraph()
+    calc = BlastRadiusCalculator()
     
-    # Build a realistic ATF attestation graph
-    # Hub agent (high-trust attester) → many downstream
-    for i in range(20):
-        g.add_edge("hub_attester", f"agent_{i}", "ATTEST", score=0.9)
+    # Set up a network with some correlation
+    agents = {
+        "genesis": ("foundation", "claude"),
+        "alice": ("acme", "claude"),
+        "bob": ("acme", "claude"),      # Same as alice — correlated!
+        "carol": ("indie", "gpt"),
+        "dave": ("indie", "llama"),
+        "eve": ("evil_co", "gpt"),
+        "frank": ("solo", "mistral"),
+        "grace": ("acme", "claude"),     # Third acme/claude — correlated!
+    }
     
-    # Some agents do TRANSFER through hub
-    for i in range(5):
-        g.add_edge("hub_attester", f"treasury_{i}", "TRANSFER", score=0.85)
+    for name, (op, model) in agents.items():
+        calc.add_agent_metadata(name, operator=op, model_family=model)
     
-    # Chain: hub → mid_tier → leaf agents
-    for i in range(5):
-        g.add_edge(f"agent_{i}", f"leaf_{i}_a", "WRITE", score=0.7)
-        g.add_edge(f"agent_{i}", f"leaf_{i}_b", "READ", score=0.6)
-        g.add_edge(f"agent_{i}", f"leaf_{i}_c", "ATTEST", score=0.75)
+    # Attestation chain
+    edges = [
+        ("genesis", "alice", "ATTEST", 0.9),
+        ("genesis", "bob", "ATTEST", 0.85),
+        ("alice", "carol", "WRITE", 0.8),
+        ("alice", "dave", "READ", 0.7),
+        ("bob", "eve", "TRANSFER", 0.75),
+        ("bob", "frank", "ATTEST", 0.6),
+        ("carol", "grace", "READ", 0.65),
+        ("frank", "grace", "WRITE", 0.7),
+        ("dave", "eve", "READ", 0.5),
+    ]
     
-    # Peripheral agent with few connections
-    g.add_edge("peripheral", "leaf_p1", "READ", score=0.5)
-    g.add_edge("peripheral", "leaf_p2", "WRITE", score=0.6)
+    for attester, subject, action, score in edges:
+        calc.add_edge(AttestationEdge(
+            attester=attester, subject=subject,
+            action_class=action, score=score,
+            operator=agents[attester][0], model_family=agents[attester][1]
+        ))
     
     print("=" * 60)
-    print("ATF BLAST RADIUS CALCULATOR")
+    print("BLAST RADIUS: Compromising 'genesis'")
     print("=" * 60)
+    result = calc.calculate("genesis")
+    print(f"Raw reachable: {result.raw_reachable}")
+    print(f"Effective reachable (correlation-adjusted): {result.effective_reachable}")
+    print(f"Containment score: {result.containment_score}")
+    print(f"Recommendation: {result.recommendation}")
     print()
-    
-    # Scenario 1: Hub compromise (worst case)
-    r1 = g.blast_radius("hub_attester")
-    print(f"SCENARIO 1: Hub attester compromised")
-    print(f"  Severity: {r1['severity']}")
-    print(f"  Total damage: {r1['total_damage']}")
-    print(f"  Affected agents: {r1['affected_count']}")
-    print(f"  Max depth: {r1['max_depth']}")
-    print(f"  Damage by class: {json.dumps(r1['damage_by_class'])}")
-    print(f"  Depth distribution: {r1['depth_distribution']}")
-    print(f"  Top 3 affected:")
-    for a in r1["top_affected"][:3]:
-        print(f"    {a['agent']}: damage={a['damage']} via {' → '.join(a['path'])}")
+    for ac, data in result.by_action_class.items():
+        if data["reachable"] > 0:
+            print(f"  {ac}: {data['reachable']} agents (max depth {data['max_depth_used']}/{data['depth_limit']})")
     print()
+    if result.correlated_groups:
+        print("Correlated groups (discount applied):")
+        for g in result.correlated_groups:
+            print(f"  {g['group']}: {g['count']} agents → {g['effective']} effective")
     
-    # Scenario 2: Peripheral compromise (minimal)
-    r2 = g.blast_radius("peripheral")
-    print(f"SCENARIO 2: Peripheral agent compromised")
-    print(f"  Severity: {r2['severity']}")
-    print(f"  Total damage: {r2['total_damage']}")
-    print(f"  Affected agents: {r2['affected_count']}")
     print()
-    
-    # Scenario 3: Mid-tier compromise
-    r3 = g.blast_radius("agent_0")
-    print(f"SCENARIO 3: Mid-tier agent_0 compromised")
-    print(f"  Severity: {r3['severity']}")
-    print(f"  Total damage: {r3['total_damage']}")
-    print(f"  Affected agents: {r3['affected_count']}")
-    print(f"  Damage by class: {json.dumps(r3['damage_by_class'])}")
-    print()
-    
-    # Compare all key agents
     print("=" * 60)
-    print("COMPARATIVE ANALYSIS")
+    print("BLAST RADIUS: Compromising 'alice'")
     print("=" * 60)
-    comparison = g.compare_scenarios(["hub_attester", "peripheral", "agent_0", "agent_5", "treasury_0"])
-    for c in comparison:
-        print(f"  {c['agent']:20s}  damage={c['total_damage']:.4f}  affected={c['affected_count']}  [{c['severity']}]")
+    result2 = calc.calculate("alice")
+    print(f"Raw reachable: {result2.raw_reachable}")
+    print(f"Effective reachable: {result2.effective_reachable}")
+    print(f"Containment score: {result2.containment_score}")
+    print(f"Recommendation: {result2.recommendation}")
+    print()
+    for ac, data in result2.by_action_class.items():
+        if data["reachable"] > 0:
+            print(f"  {ac}: {data['reachable']} agents (max depth {data['max_depth_used']}/{data['depth_limit']})")
     
     print()
-    print("KEY INSIGHT: Hub attesters are single points of failure.")
-    print("Blast radius = depth × breadth × action_weight.")
-    print("TRANSFER edges at depth 1 = existential risk.")
-    print("Depth limits per action class ARE the safety mechanism.")
+    print("=" * 60)
+    print("BLAST RADIUS: Compromising 'frank' (leaf-ish node)")
+    print("=" * 60)
+    result3 = calc.calculate("frank")
+    print(f"Raw reachable: {result3.raw_reachable}")
+    print(f"Effective reachable: {result3.effective_reachable}")
+    print(f"Containment score: {result3.containment_score}")
+    print(f"Recommendation: {result3.recommendation}")
 
 
 if __name__ == "__main__":
