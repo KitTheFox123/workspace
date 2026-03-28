@@ -1,251 +1,268 @@
 #!/usr/bin/env python3
 """
-blast-radius-calculator.py — ATF attestation blast radius analysis.
+blast-radius-calculator.py — Calculate exposure surface of attestation chains.
 
-When a trust relationship degrades (SOFT_CASCADE), what's the blast radius?
-Depth × Breadth = exposure surface, but the relationship is non-linear.
+From Clawk thread (2026-03-28, 27 replies): "depth alone isn't the full story —
+breadth matters too. a 2-deep chain with 100 attesters has more blast surface
+than a 5-deep chain with 2."
 
-Models:
-1. THIN-DEEP: Few attesters per level, many levels (auditable, low blast)
-2. WIDE-SHALLOW: Many attesters per level, few levels (fragile, high blast)
-3. BALANCED: Moderate depth and breadth
+Exposure = f(depth, breadth, action_class)
 
-Each node at depth d with action_class A has a cascade probability that
-depends on how many of its trust sources are affected.
+Action class TTL weights (from ATF consensus):
+- READ: TTL=5 (ephemeral, low blast)  
+- ATTEST: TTL=3 (medium blast)
+- WRITE: TTL=2 (persistent, higher blast)
+- TRANSFER: TTL=1 (value movement, highest blast per hop)
 
-Draws from:
-- NIST SP 800-63B tiered assurance levels
-- ATF SOFT_CASCADE circuit breaker pattern
-- Epidemiological R0 (basic reproduction number) analogy
+Blast radius model:
+- depth_factor = sum(action_weight[i] for each hop)
+- breadth_factor = unique_attesters at each depth level
+- exposure = depth_factor × log2(breadth_factor + 1)
+- Using log2 for breadth because marginal exposure decreases
+  (100th attester adds less blast than the 2nd)
 
-Kit 🦊 — 2026-03-27
+Caps:
+- min() caps depth (TTL monotonic decrease)
+- AIMD caps breadth (attestation-rate-limiter.py)
+
+Kit 🦊 — 2026-03-28
 """
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Optional
-from enum import Enum
 
 
-class ActionClass(Enum):
-    READ = "READ"
-    ATTEST = "ATTEST"
-    WRITE = "WRITE"
-    TRANSFER = "TRANSFER"
-
-
-# Depth limits per action class (from ATF thread consensus)
-DEPTH_LIMITS = {
-    ActionClass.READ: 5,
-    ActionClass.ATTEST: 3,
-    ActionClass.WRITE: 2,
-    ActionClass.TRANSFER: 2,
+# Action class weights: higher = more blast per hop
+ACTION_WEIGHTS = {
+    "READ": 1.0,
+    "ATTEST": 2.0, 
+    "WRITE": 3.0,
+    "TRANSFER": 5.0,
 }
 
-# Cascade probability: if a trust source degrades, how likely
-# does it cascade to dependents? Higher for sensitive actions.
-CASCADE_PROB = {
-    ActionClass.READ: 0.1,      # Low — passive, ephemeral
-    ActionClass.ATTEST: 0.4,    # Medium — attestation validity affected
-    ActionClass.WRITE: 0.6,     # High — data integrity at stake
-    ActionClass.TRANSFER: 0.8,  # Critical — value transfer
+# Max TTL per action class (hops before expiry)
+ACTION_TTL = {
+    "READ": 5,
+    "ATTEST": 3,
+    "WRITE": 2,
+    "TRANSFER": 1,
 }
 
 
 @dataclass
-class TrustNode:
-    id: str
+class AttestationHop:
+    attester: str
+    subject: str
+    action_class: str
+    score: float
     depth: int
-    action_class: ActionClass
-    attesters: list[str] = field(default_factory=list)  # IDs of trust sources
-    dependents: list[str] = field(default_factory=list)  # IDs that depend on this node
-    degraded: bool = False
 
 
 @dataclass
 class BlastRadius:
-    topology: str
-    total_nodes: int
+    total_exposure: float
+    depth_factor: float
+    breadth_factor: float
     max_depth: int
-    max_breadth: int
-    affected_nodes: int
-    affected_by_class: dict
-    exposure_surface: float  # depth × avg_breadth
-    r0: float  # Reproduction number: avg secondary cascades per failure
-    containment_depth: int  # Depth at which cascade naturally stops
-    circuit_breaker_saves: int  # Nodes saved by SOFT_CASCADE
+    total_attesters: int
+    action_breakdown: dict
+    risk_level: str  # LOW, MEDIUM, HIGH, CRITICAL
+    depth_by_level: dict  # depth → count of attesters
+    capped_by: list  # What limits apply
 
 
-def build_topology(name: str, depth: int, breadth: int, 
-                   action_class: ActionClass) -> dict[str, TrustNode]:
-    """Build a trust graph with given depth and breadth."""
-    nodes = {}
+class BlastRadiusCalculator:
     
-    # Root node (the degraded trust source)
-    root = TrustNode(id="root", depth=0, action_class=action_class)
-    nodes["root"] = root
+    # Risk thresholds
+    LOW_THRESHOLD = 5.0
+    MEDIUM_THRESHOLD = 15.0
+    HIGH_THRESHOLD = 30.0
     
-    # Build tree
-    current_level = ["root"]
-    for d in range(1, depth + 1):
-        next_level = []
-        for parent_id in current_level:
-            for b in range(breadth):
-                nid = f"d{d}_b{b}_p{parent_id[-4:]}"
-                node = TrustNode(
-                    id=nid, depth=d, action_class=action_class,
-                    attesters=[parent_id]
-                )
-                nodes[nid] = node
-                nodes[parent_id].dependents.append(nid)
-                next_level.append(nid)
-        current_level = next_level
+    # AIMD breadth cap
+    MAX_BREADTH = 32
     
-    return nodes
-
-
-def simulate_cascade(nodes: dict[str, TrustNode], 
-                     circuit_breaker_depth: Optional[int] = None) -> BlastRadius:
-    """
-    Simulate cascade from root degradation.
+    def __init__(self):
+        self.hops: list[AttestationHop] = []
     
-    Circuit breaker: at circuit_breaker_depth, SOFT_CASCADE triggers
-    HALF-OPEN state — bounded probe instead of full cascade.
-    """
-    # Root always degrades
-    nodes["root"].degraded = True
-    affected = {"root"}
+    def add_hop(self, hop: AttestationHop):
+        self.hops.append(hop)
     
-    # BFS cascade
-    queue = ["root"]
-    max_depth = 0
-    max_breadth = 0
-    secondary_cascades = []
-    circuit_breaker_saves = 0
-    
-    while queue:
-        current_id = queue.pop(0)
-        current = nodes[current_id]
+    def calculate(self) -> BlastRadius:
+        if not self.hops:
+            return BlastRadius(
+                total_exposure=0, depth_factor=0, breadth_factor=0,
+                max_depth=0, total_attesters=0, action_breakdown={},
+                risk_level="LOW", depth_by_level={}, capped_by=[]
+            )
         
-        breadth_at_depth = len(current.dependents)
-        max_breadth = max(max_breadth, breadth_at_depth)
+        # Depth factor: sum of action weights along the chain
+        depth_factor = 0.0
+        action_counts = {}
+        for hop in self.hops:
+            weight = ACTION_WEIGHTS.get(hop.action_class, 1.0)
+            # Weight decreases with depth (trust decays)
+            decay = 1.0 / (1.0 + 0.2 * hop.depth)
+            depth_factor += weight * decay * hop.score
+            
+            action_counts[hop.action_class] = action_counts.get(hop.action_class, 0) + 1
         
-        for dep_id in current.dependents:
-            dep = nodes[dep_id]
-            
-            # Circuit breaker check
-            if circuit_breaker_depth and dep.depth >= circuit_breaker_depth:
-                circuit_breaker_saves += 1
-                continue
-            
-            # Depth limit check (ATF action class limits)
-            if dep.depth > DEPTH_LIMITS.get(dep.action_class, 5):
-                continue
-            
-            # Cascade probability
-            prob = CASCADE_PROB[dep.action_class]
-            
-            # Deterministic for analysis: cascade if prob > 0.5 or depth < 2
-            if prob > 0.3 or dep.depth <= 1:
-                dep.degraded = True
-                affected.add(dep_id)
-                queue.append(dep_id)
-                max_depth = max(max_depth, dep.depth)
-                secondary_cascades.append(len(dep.dependents))
-    
-    # Count by action class
-    affected_by_class = {}
-    for nid in affected:
-        ac = nodes[nid].action_class.value
-        affected_by_class[ac] = affected_by_class.get(ac, 0) + 1
-    
-    # R0: average secondary cascades per affected node
-    r0 = sum(secondary_cascades) / max(len(secondary_cascades), 1)
-    
-    # Exposure surface
-    total_nodes = len(nodes)
-    avg_breadth = total_nodes / max(max_depth, 1)
-    
-    return BlastRadius(
-        topology="custom",
-        total_nodes=total_nodes,
-        max_depth=max_depth,
-        max_breadth=max_breadth,
-        affected_nodes=len(affected),
-        affected_by_class=affected_by_class,
-        exposure_surface=max_depth * avg_breadth,
-        r0=round(r0, 2),
-        containment_depth=max_depth,
-        circuit_breaker_saves=circuit_breaker_saves
-    )
+        # Breadth factor: unique attesters per depth level
+        depth_levels: dict[int, set] = {}
+        for hop in self.hops:
+            if hop.depth not in depth_levels:
+                depth_levels[hop.depth] = set()
+            depth_levels[hop.depth].add(hop.attester)
+        
+        # Breadth = max attesters at any single level
+        max_breadth_at_level = max(len(attesters) for attesters in depth_levels.values())
+        
+        # Log scale: 100th attester adds less blast than 2nd
+        breadth_factor = math.log2(max_breadth_at_level + 1)
+        
+        # Total exposure
+        total_exposure = depth_factor * breadth_factor
+        
+        # Caps
+        capped_by = []
+        
+        # Check TTL caps (min() on depth)
+        for action, count in action_counts.items():
+            ttl = ACTION_TTL.get(action, 5)
+            max_depth_for_action = max(
+                h.depth for h in self.hops if h.action_class == action
+            )
+            if max_depth_for_action >= ttl:
+                capped_by.append(f"TTL cap: {action} max depth {ttl}, chain reaches {max_depth_for_action}")
+        
+        # Check AIMD breadth cap
+        if max_breadth_at_level > self.MAX_BREADTH:
+            capped_by.append(f"AIMD breadth cap: {max_breadth_at_level} > {self.MAX_BREADTH}")
+            breadth_factor = math.log2(self.MAX_BREADTH + 1)
+            total_exposure = depth_factor * breadth_factor
+        
+        # Risk level
+        if total_exposure < self.LOW_THRESHOLD:
+            risk_level = "LOW"
+        elif total_exposure < self.MEDIUM_THRESHOLD:
+            risk_level = "MEDIUM"
+        elif total_exposure < self.HIGH_THRESHOLD:
+            risk_level = "HIGH"
+        else:
+            risk_level = "CRITICAL"
+        
+        unique_attesters = len(set(h.attester for h in self.hops))
+        
+        return BlastRadius(
+            total_exposure=round(total_exposure, 3),
+            depth_factor=round(depth_factor, 3),
+            breadth_factor=round(breadth_factor, 3),
+            max_depth=max(h.depth for h in self.hops),
+            total_attesters=unique_attesters,
+            action_breakdown=action_counts,
+            risk_level=risk_level,
+            depth_by_level={d: len(a) for d, a in sorted(depth_levels.items())},
+            capped_by=capped_by
+        )
 
 
-def compare_topologies():
-    """Compare THIN-DEEP vs WIDE-SHALLOW vs BALANCED for each action class."""
+def demo():
+    print("=" * 60)
+    print("SCENARIO 1: Deep chain, narrow (5-deep, 2 attesters)")
+    print("=" * 60)
     
-    topologies = {
-        "THIN-DEEP": (5, 2),     # depth=5, breadth=2 → 63 nodes
-        "WIDE-SHALLOW": (2, 10), # depth=2, breadth=10 → 111 nodes
-        "BALANCED": (3, 4),      # depth=3, breadth=4 → 85 nodes
-    }
+    calc1 = BlastRadiusCalculator()
+    for i in range(5):
+        calc1.add_hop(AttestationHop(
+            attester=f"agent_{i}", subject=f"agent_{i+1}",
+            action_class="ATTEST", score=0.8, depth=i
+        ))
     
-    print("=" * 70)
-    print("ATF BLAST RADIUS ANALYSIS")
-    print("=" * 70)
+    r1 = calc1.calculate()
+    print(f"  Exposure: {r1.total_exposure} ({r1.risk_level})")
+    print(f"  Depth factor: {r1.depth_factor}, Breadth factor: {r1.breadth_factor}")
+    print(f"  Depth levels: {r1.depth_by_level}")
+    print(f"  Caps: {r1.capped_by}")
     print()
     
-    for action_class in [ActionClass.READ, ActionClass.WRITE, ActionClass.TRANSFER]:
-        print(f"--- {action_class.value} (depth limit: {DEPTH_LIMITS[action_class]}, "
-              f"cascade prob: {CASCADE_PROB[action_class]:.0%}) ---")
-        print(f"{'Topology':<16} {'Nodes':>6} {'Affected':>9} {'Rate':>6} "
-              f"{'R0':>5} {'CB Saves':>9} {'Exposure':>9}")
-        
-        for topo_name, (depth, breadth) in topologies.items():
-            # Without circuit breaker
-            nodes = build_topology(topo_name, depth, breadth, action_class)
-            result = simulate_cascade(nodes)
-            
-            # With circuit breaker at depth 2
-            nodes_cb = build_topology(topo_name, depth, breadth, action_class)
-            result_cb = simulate_cascade(nodes_cb, circuit_breaker_depth=2)
-            
-            rate = result.affected_nodes / max(result.total_nodes, 1)
-            rate_cb = result_cb.affected_nodes / max(result_cb.total_nodes, 1)
-            
-            print(f"{topo_name:<16} {result.total_nodes:>6} "
-                  f"{result.affected_nodes:>5}/{result_cb.affected_nodes:<3} "
-                  f"{rate:>5.0%} "
-                  f"{result.r0:>5.1f} "
-                  f"{result_cb.circuit_breaker_saves:>9} "
-                  f"{result.exposure_surface:>9.0f}")
-        
-        print()
+    print("=" * 60)
+    print("SCENARIO 2: Shallow chain, wide (2-deep, 50 attesters)")
+    print("=" * 60)
     
-    print("=" * 70)
-    print("ANALYSIS")
-    print("=" * 70)
-    print("""
-WIDE-SHALLOW is dangerous: high blast radius, hard to audit.
-  - 10 attesters at depth 1 = 10 immediate cascade candidates
-  - But only 2 levels deep = fast containment IF circuit breaker fires
-
-THIN-DEEP is auditable: low blast radius, clear chain of responsibility.
-  - 2 attesters per level = manageable dependency graph
-  - 5 levels deep = long tail but narrow exposure
-
-BALANCED is the practical sweet spot for most ATF deployments.
-
-Circuit breaker (SOFT_CASCADE at depth 2) dramatically reduces blast:
-  - Converts OPEN cascade to bounded HALF-OPEN probe
-  - Saves proportional to nodes beyond depth 2
-  - Most effective on WIDE-SHALLOW (many nodes to save)
-
-R0 analogy (epidemiology):
-  - R0 > 1: cascade grows (epidemic)
-  - R0 < 1: cascade dies out naturally
-  - Circuit breaker = vaccination: reduces effective R to < 1
-""")
+    calc2 = BlastRadiusCalculator()
+    # 50 attesters at depth 0, all attesting same subject
+    for i in range(50):
+        calc2.add_hop(AttestationHop(
+            attester=f"grader_{i}", subject="target",
+            action_class="ATTEST", score=0.85, depth=0
+        ))
+    # 5 at depth 1
+    for i in range(5):
+        calc2.add_hop(AttestationHop(
+            attester=f"verifier_{i}", subject="grader_0",
+            action_class="ATTEST", score=0.9, depth=1
+        ))
+    
+    r2 = calc2.calculate()
+    print(f"  Exposure: {r2.total_exposure} ({r2.risk_level})")
+    print(f"  Depth factor: {r2.depth_factor}, Breadth factor: {r2.breadth_factor}")
+    print(f"  Depth levels: {r2.depth_by_level}")
+    print(f"  Caps: {r2.capped_by}")
+    print()
+    
+    print("=" * 60)
+    print("SCENARIO 3: TRANSFER chain (highest blast per hop)")
+    print("=" * 60)
+    
+    calc3 = BlastRadiusCalculator()
+    calc3.add_hop(AttestationHop(
+        attester="escrow", subject="recipient",
+        action_class="TRANSFER", score=0.95, depth=0
+    ))
+    calc3.add_hop(AttestationHop(
+        attester="validator", subject="escrow",
+        action_class="ATTEST", score=0.9, depth=1
+    ))
+    
+    r3 = calc3.calculate()
+    print(f"  Exposure: {r3.total_exposure} ({r3.risk_level})")
+    print(f"  Depth factor: {r3.depth_factor}, Breadth factor: {r3.breadth_factor}")
+    print(f"  Actions: {r3.action_breakdown}")
+    print(f"  Caps: {r3.capped_by}")
+    print()
+    
+    print("=" * 60)
+    print("SCENARIO 4: Sybil ring (100 mutual attesters, depth 0)")
+    print("=" * 60)
+    
+    calc4 = BlastRadiusCalculator()
+    for i in range(100):
+        calc4.add_hop(AttestationHop(
+            attester=f"sybil_{i}", subject="target",
+            action_class="ATTEST", score=0.99, depth=0
+        ))
+    
+    r4 = calc4.calculate()
+    print(f"  Exposure: {r4.total_exposure} ({r4.risk_level})")
+    print(f"  Breadth (raw): 100, Breadth (capped to {calc4.MAX_BREADTH})")
+    print(f"  Depth factor: {r4.depth_factor}, Breadth factor: {r4.breadth_factor}")
+    print(f"  Caps: {r4.capped_by}")
+    print()
+    
+    # Comparison
+    print("=" * 60)
+    print("COMPARISON")
+    print("=" * 60)
+    print(f"  Deep-narrow:    {r1.total_exposure:>8} ({r1.risk_level})")
+    print(f"  Shallow-wide:   {r2.total_exposure:>8} ({r2.risk_level})")
+    print(f"  TRANSFER chain: {r3.total_exposure:>8} ({r3.risk_level})")
+    print(f"  Sybil ring:     {r4.total_exposure:>8} ({r4.risk_level})")
+    print()
+    print("KEY: Shallow-wide > deep-narrow in blast radius.")
+    print("AIMD breadth cap is load-bearing — without it, sybil rings explode.")
+    print("TRANSFER has 5x weight per hop: value movement = highest blast.")
 
 
 if __name__ == "__main__":
-    compare_topologies()
+    demo()
