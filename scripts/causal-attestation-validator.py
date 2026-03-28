@@ -38,6 +38,8 @@ class ValidationResult(Enum):
     VALID = "VALID"
     CONFOUNDED = "CONFOUNDED"
     TEMPORAL_VIOLATION = "TEMPORAL_VIOLATION"
+    TEMPORAL_INVERSION = "TEMPORAL_INVERSION"  # Anchor precedes action (CRITICAL)
+    TEMPORAL_GAP = "TEMPORAL_GAP"              # Large gap, correct ordering (WARNING)
     CYCLIC = "CYCLIC"
     UNFAITHFUL = "UNFAITHFUL"
 
@@ -198,39 +200,69 @@ class CausalAttestationValidator:
             by_subject[att.subject].append(att)
         
         # Check: attestation chains must be temporally ordered
+        # Split severity per santaclawd feedback (2026-03-28):
+        # - INVERSION: anchor precedes action = CRITICAL (predetermined or fraudulent)
+        # - GAP: large delay = WARNING (late attestation, not necessarily fraud)
+        # - VALID: small gap, correct ordering
+        inversions = []
+        gaps = []
+        GAP_THRESHOLD_HOURS = 72  # >3 days = suspicious gap
+        
         for att in self.attestations:
-            # If attester also has attestations FROM others, those must precede
             attester_received = by_subject.get(att.attester, [])
             for prior in attester_received:
                 try:
                     t_received = datetime.fromisoformat(prior.timestamp.replace('Z', '+00:00'))
                     t_given = datetime.fromisoformat(att.timestamp.replace('Z', '+00:00'))
-                    # Attester should have been attested BEFORE they attest others
-                    # (you need trust to give trust — temporal causal ordering)
+                    
                     if t_received > t_given:
-                        violations.append({
+                        # INVERSION: attested others BEFORE receiving own trust
+                        inversions.append({
                             "attester": att.attester,
                             "attested_at": att.timestamp,
                             "received_trust_at": prior.timestamp,
                             "from": prior.attester,
-                            "issue": "Attested others BEFORE receiving own trust — "
-                                    "temporal ordering violation (faithfulness)"
+                            "severity": "CRITICAL",
+                            "issue": "TEMPORAL_INVERSION: Attested others BEFORE receiving own trust. "
+                                    "Either predetermined (scripted performance) or timestamp fraud."
                         })
+                    else:
+                        gap_hours = (t_given - t_received).total_seconds() / 3600
+                        if gap_hours > GAP_THRESHOLD_HOURS:
+                            gaps.append({
+                                "attester": att.attester,
+                                "attested_at": att.timestamp,
+                                "received_trust_at": prior.timestamp,
+                                "from": prior.attester,
+                                "gap_hours": round(gap_hours, 1),
+                                "severity": "WARNING",
+                                "issue": f"TEMPORAL_GAP: {gap_hours:.0f}h between receiving trust and attesting. "
+                                        "Late attestation — possible stale evidence."
+                            })
                 except (ValueError, TypeError):
                     pass
         
-        if violations:
+        violations = inversions + gaps
+        
+        if inversions:
             return CausalValidation(
-                result=ValidationResult.TEMPORAL_VIOLATION,
-                details=f"{len(violations)} temporal ordering violations. "
-                        "Faithfulness assumption violated: causal ordering "
-                        "must match temporal ordering in attestation chains.",
+                result=ValidationResult.TEMPORAL_INVERSION,
+                details=f"{len(inversions)} temporal INVERSIONS (CRITICAL) + {len(gaps)} gaps (WARNING). "
+                        "Inversions = anchor precedes action. Either predetermined performance "
+                        "or timestamp fraud. Worse than gaps.",
+                temporal_violations=violations
+            )
+        elif gaps:
+            return CausalValidation(
+                result=ValidationResult.TEMPORAL_GAP,
+                details=f"{len(gaps)} temporal gaps exceeding {GAP_THRESHOLD_HOURS}h threshold. "
+                        "Late attestation — not necessarily fraudulent but stale evidence.",
                 temporal_violations=violations
             )
         
         return CausalValidation(
             result=ValidationResult.VALID,
-            details="Temporal ordering consistent with causal structure."
+            details="Temporal ordering consistent with causal structure. No inversions or suspicious gaps."
         )
     
     def full_validation(self) -> dict:
@@ -354,7 +386,7 @@ def demo():
     
     result3 = v3.full_validation()
     print(json.dumps(result3, indent=2))
-    assert result3["overall"] == "TEMPORAL_VIOLATION"
+    assert result3["overall"] == "TEMPORAL_INVERSION"
     assert len(result3["temporal"]["violations"]) == 1
     print("✓ PASSED\n")
     
