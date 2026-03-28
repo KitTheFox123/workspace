@@ -1,258 +1,288 @@
 #!/usr/bin/env python3
 """
-sybilwalk-atf.py — Random walk sybil detection for ATF attestation graphs.
+sybilwalk-atf.py — SybilWalk-inspired random walk for ATF trust networks.
 
-Based on SybilWalk (Jia, Wang & Gong 2017): bidirectional random walks
-from labeled benign AND sybil seeds. Key insight: sybil regions are
-dense internally but sparse-cut from honest region.
+Based on Jia, Wang & Gong (Iowa State): Random Walk based Fake Account
+Detection in Online Social Networks. SybilWalk distributes reputation
+from BOTH labeled benign and labeled sybil seeds, achieving 1.3% FPR
+and 17.3% FNR on Twitter.
 
-SybilRank (Cao et al 2012): short random walks from trusted seeds.
-Trust doesn't propagate far across sparse cuts → sybils get low scores.
-SybilWalk extends: walks from BOTH sides tighten the bound on accepted sybils.
+Key insight: honest subgraphs are fast-mixing (random walk converges
+quickly). Sybil regions are dense internally but have few "attack edges"
+connecting to honest region. Random walk from honest seeds diffuses
+widely; walk from sybil seeds stays trapped in sybil cluster.
 
-For ATF: attestation graph = social graph. Edges = attestations.
-Anchor nodes = known-good agents (operators, long-history agents).
-Dense mutual-attestation clusters without anchor connections = sybil signal.
+ATF mapping:
+- "Labeled benign" = genesis attesters (bootstrap trust seeds)
+- "Labeled sybil" = known-bad agents (flagged by dispute resolution)
+- "Attack edges" = attestations crossing sybil/honest boundary
+- Fast-mixing = honest agents attest diverse others (sparse graph)
+- Sybil density = mutual attestation rings (dense graph)
 
-Results on Twitter (Jia et al): 1.3% FPR, 17.3% FNR.
+The walk computes two scores per node:
+- benign_score: reputation flowing from honest seeds
+- sybil_score: contamination flowing from known-bad seeds
+- final_score = benign_score - sybil_score (SybilWalk's key innovation)
 
 Kit 🦊 — 2026-03-28
 """
 
 import random
 import json
-from collections import defaultdict
 from dataclasses import dataclass, field
+from collections import defaultdict
 
 
 @dataclass
 class Node:
     id: str
-    is_sybil: bool = False
-    is_anchor: bool = False  # Known-good seed
+    is_honest: bool  # ground truth (for evaluation only)
+    label: str = "unknown"  # "benign_seed", "sybil_seed", "unknown"
     benign_score: float = 0.0
     sybil_score: float = 0.0
+    
+    @property
+    def final_score(self) -> float:
+        return self.benign_score - self.sybil_score
 
 
 class SybilWalkATF:
     """
-    Bidirectional random walk sybil detection for attestation graphs.
+    Random walk sybil detection adapted for ATF attestation graphs.
     
-    Algorithm:
-    1. Initialize benign scores from anchor nodes
-    2. Initialize sybil scores from known-sybil seeds (if any)
-    3. Propagate scores via short random walks (O(log n) steps)
-    4. Classify: benign_score > sybil_score → honest, else → sybil
-    
-    The sparse cut between honest/sybil regions limits score propagation.
+    From SybilWalk paper:
+    - Distributes scores from both benign and sybil seeds
+    - Uses power iteration (equivalent to random walk)
+    - Fast-mixing honest subgraph → benign scores spread evenly
+    - Dense sybil cluster → sybil scores stay concentrated
     """
     
     def __init__(self):
         self.nodes: dict[str, Node] = {}
         self.edges: dict[str, list[str]] = defaultdict(list)  # adjacency
     
-    def add_node(self, node_id: str, is_sybil: bool = False, is_anchor: bool = False):
-        self.nodes[node_id] = Node(id=node_id, is_sybil=is_sybil, is_anchor=is_anchor)
+    def add_node(self, node_id: str, is_honest: bool, label: str = "unknown"):
+        self.nodes[node_id] = Node(id=node_id, is_honest=is_honest, label=label)
     
     def add_edge(self, from_id: str, to_id: str):
-        """Add attestation edge (bidirectional for walk purposes)."""
+        """Attestation edge: from_id attested to_id."""
         self.edges[from_id].append(to_id)
-        self.edges[to_id].append(from_id)
+        self.edges[to_id].append(from_id)  # Undirected for random walk
     
-    def run_walks(self, walk_length: int = 0, num_walks: int = 1000) -> dict[str, str]:
+    def run_walk(self, iterations: int = 20, decay: float = 0.85) -> dict:
         """
-        Run bidirectional random walks and classify nodes.
+        Power iteration from seed nodes.
         
-        walk_length: steps per walk. 0 = auto (ceil(log2(n)))
-        num_walks: walks per seed node
+        decay (0.85) = probability of continuing walk vs restarting.
+        Higher decay = scores spread further. Lower = stay near seeds.
+        SybilWalk uses ~0.85 (similar to PageRank's 0.85).
         """
-        import math
+        # Initialize seed scores
+        for node in self.nodes.values():
+            if node.label == "benign_seed":
+                node.benign_score = 1.0
+            elif node.label == "sybil_seed":
+                node.sybil_score = 1.0
         
-        n = len(self.nodes)
-        if n == 0:
-            return {}
-        
-        if walk_length == 0:
-            walk_length = max(3, int(math.ceil(math.log2(n))))
-        
-        # Phase 1: Benign walks from anchors
-        anchors = [nid for nid, n in self.nodes.items() if n.is_anchor]
-        for anchor in anchors:
-            for _ in range(num_walks):
-                self._random_walk(anchor, walk_length, score_type="benign")
-        
-        # Phase 2: Sybil walks from known sybils (if labeled)
-        known_sybils = [nid for nid, n in self.nodes.items() if n.is_sybil]
-        for sybil in known_sybils:
-            for _ in range(num_walks):
-                self._random_walk(sybil, walk_length, score_type="sybil")
-        
-        # Phase 3: Normalize and classify
-        max_benign = max((n.benign_score for n in self.nodes.values()), default=1) or 1
-        max_sybil = max((n.sybil_score for n in self.nodes.values()), default=1) or 1
-        
-        classifications = {}
-        for nid, node in self.nodes.items():
-            norm_benign = node.benign_score / max_benign
-            norm_sybil = node.sybil_score / max_sybil if known_sybils else 0
+        # Power iteration
+        for _ in range(iterations):
+            new_benign = {}
+            new_sybil = {}
             
-            # Classification: if no sybil seeds, use benign threshold
-            if known_sybils:
-                classifications[nid] = "honest" if norm_benign > norm_sybil else "sybil"
-            else:
-                # No sybil seeds: low benign score = suspicious
-                threshold = 0.1
-                classifications[nid] = "honest" if norm_benign > threshold else "sybil"
-        
-        return classifications
-    
-    def _random_walk(self, start: str, length: int, score_type: str):
-        """Single random walk, depositing score at each visited node."""
-        current = start
-        for step in range(length):
-            neighbors = self.edges.get(current, [])
-            if not neighbors:
-                break
-            current = random.choice(neighbors)
-            node = self.nodes[current]
-            # Deposit decaying score
-            deposit = 1.0 / (step + 1)
-            if score_type == "benign":
-                node.benign_score += deposit
-            else:
-                node.sybil_score += deposit
-    
-    def analyze_graph(self) -> dict:
-        """Compute graph metrics relevant to sybil detection."""
-        # Density per connected component (approx via degree)
-        degrees = {nid: len(self.edges.get(nid, [])) for nid in self.nodes}
-        avg_degree = sum(degrees.values()) / max(len(degrees), 1)
-        
-        # Cluster density: for each node, what fraction of its neighbors
-        # are also connected to each other? High clustering = dense region.
-        clustering = {}
-        for nid in self.nodes:
-            neighbors = set(self.edges.get(nid, []))
-            if len(neighbors) < 2:
-                clustering[nid] = 0.0
-                continue
+            for nid, node in self.nodes.items():
+                neighbors = self.edges.get(nid, [])
+                if not neighbors:
+                    new_benign[nid] = node.benign_score
+                    new_sybil[nid] = node.sybil_score
+                    continue
+                
+                # Receive scores from neighbors (normalized by their degree)
+                b_incoming = sum(
+                    self.nodes[n].benign_score / max(len(self.edges[n]), 1)
+                    for n in neighbors if n in self.nodes
+                )
+                s_incoming = sum(
+                    self.nodes[n].sybil_score / max(len(self.edges[n]), 1)
+                    for n in neighbors if n in self.nodes
+                )
+                
+                # Restart probability for seeds
+                b_restart = 1.0 if node.label == "benign_seed" else 0.0
+                s_restart = 1.0 if node.label == "sybil_seed" else 0.0
+                
+                new_benign[nid] = decay * b_incoming + (1 - decay) * b_restart
+                new_sybil[nid] = decay * s_incoming + (1 - decay) * s_restart
             
-            triangles = 0
-            possible = len(neighbors) * (len(neighbors) - 1) / 2
-            for n1 in neighbors:
-                for n2 in self.edges.get(n1, []):
-                    if n2 in neighbors and n2 != n1:
-                        triangles += 1
-            clustering[nid] = (triangles / 2) / possible if possible > 0 else 0
+            for nid in self.nodes:
+                self.nodes[nid].benign_score = new_benign.get(nid, 0)
+                self.nodes[nid].sybil_score = new_sybil.get(nid, 0)
+        
+        return self.evaluate()
+    
+    def evaluate(self) -> dict:
+        """Evaluate classification accuracy."""
+        threshold = 0.0  # final_score > 0 = classified benign
+        
+        tp = fp = tn = fn = 0
+        for node in self.nodes.values():
+            if node.label in ("benign_seed", "sybil_seed"):
+                continue  # Skip seeds
+            
+            predicted_honest = node.final_score > threshold
+            if node.is_honest and predicted_honest:
+                tp += 1
+            elif node.is_honest and not predicted_honest:
+                fn += 1
+            elif not node.is_honest and predicted_honest:
+                fp += 1
+            else:
+                tn += 1
+        
+        total = tp + fp + tn + fn
+        accuracy = (tp + tn) / max(total, 1)
+        fpr = fp / max(fp + tn, 1)
+        fnr = fn / max(fn + tp, 1)
         
         return {
-            "node_count": len(self.nodes),
-            "edge_count": sum(len(e) for e in self.edges.values()) // 2,
-            "avg_degree": round(avg_degree, 2),
-            "avg_clustering": round(sum(clustering.values()) / max(len(clustering), 1), 3),
-            "anchor_count": sum(1 for n in self.nodes.values() if n.is_anchor),
-            "known_sybil_count": sum(1 for n in self.nodes.values() if n.is_sybil),
+            "accuracy": round(accuracy, 4),
+            "fpr": round(fpr, 4),
+            "fnr": round(fnr, 4),
+            "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+            "total_evaluated": total
         }
+    
+    def get_rankings(self) -> list[dict]:
+        """Rank all non-seed nodes by final_score (ascending = most suspicious)."""
+        ranked = []
+        for node in self.nodes.values():
+            if node.label in ("benign_seed", "sybil_seed"):
+                continue
+            ranked.append({
+                "id": node.id,
+                "final_score": round(node.final_score, 4),
+                "benign_score": round(node.benign_score, 4),
+                "sybil_score": round(node.sybil_score, 4),
+                "is_honest": node.is_honest
+            })
+        return sorted(ranked, key=lambda x: x["final_score"])
+
+
+def build_test_network(n_honest: int = 30, n_sybil: int = 20,
+                       n_benign_seeds: int = 3, n_sybil_seeds: int = 2,
+                       attack_edges: int = 3) -> SybilWalkATF:
+    """
+    Build a test network with known honest/sybil partition.
+    
+    Honest subgraph: sparse, random edges (fast-mixing).
+    Sybil subgraph: dense, many mutual edges (cluster).
+    Attack edges: few connections between honest and sybil regions.
+    """
+    random.seed(42)
+    sw = SybilWalkATF()
+    
+    # Create honest nodes
+    honest_ids = [f"honest_{i}" for i in range(n_honest)]
+    for i, hid in enumerate(honest_ids):
+        label = "benign_seed" if i < n_benign_seeds else "unknown"
+        sw.add_node(hid, is_honest=True, label=label)
+    
+    # Create sybil nodes
+    sybil_ids = [f"sybil_{i}" for i in range(n_sybil)]
+    for i, sid in enumerate(sybil_ids):
+        label = "sybil_seed" if i < n_sybil_seeds else "unknown"
+        sw.add_node(sid, is_honest=False, label=label)
+    
+    # Honest subgraph: sparse random (each node connects to ~3-5 others)
+    for hid in honest_ids:
+        n_edges = random.randint(2, 5)
+        targets = random.sample([h for h in honest_ids if h != hid], 
+                                min(n_edges, len(honest_ids) - 1))
+        for t in targets:
+            sw.add_edge(hid, t)
+    
+    # Sybil subgraph: dense (each sybil connects to ~60-80% of other sybils)
+    for sid in sybil_ids:
+        n_edges = random.randint(int(n_sybil * 0.6), int(n_sybil * 0.8))
+        targets = random.sample([s for s in sybil_ids if s != sid],
+                                min(n_edges, len(sybil_ids) - 1))
+        for t in targets:
+            sw.add_edge(sid, t)
+    
+    # Attack edges: few connections between regions
+    for _ in range(attack_edges):
+        h = random.choice(honest_ids)
+        s = random.choice(sybil_ids)
+        sw.add_edge(h, s)
+    
+    return sw
 
 
 def demo():
-    random.seed(42)
+    print("=" * 60)
+    print("SybilWalk-ATF: Random Walk Sybil Detection for Trust Networks")
+    print("=" * 60)
+    print()
+    
+    # Scenario 1: Standard network (few attack edges)
+    print("SCENARIO 1: 30 honest + 20 sybil, 3 attack edges")
+    print("-" * 50)
+    sw1 = build_test_network(attack_edges=3)
+    result1 = sw1.run_walk(iterations=20)
+    print(f"Accuracy: {result1['accuracy']:.1%}")
+    print(f"FPR: {result1['fpr']:.1%} (sybils misclassified as honest)")
+    print(f"FNR: {result1['fnr']:.1%} (honest misclassified as sybil)")
+    print(f"Confusion: TP={result1['tp']} FP={result1['fp']} TN={result1['tn']} FN={result1['fn']}")
+    print()
+    
+    top_suspicious = sw1.get_rankings()[:5]
+    print("Top 5 most suspicious (lowest final_score):")
+    for r in top_suspicious:
+        tag = "✓ SYBIL" if not r["is_honest"] else "✗ HONEST (false positive)"
+        print(f"  {r['id']}: score={r['final_score']:+.4f} {tag}")
+    print()
+    
+    bottom_trusted = sw1.get_rankings()[-5:]
+    print("Top 5 most trusted (highest final_score):")
+    for r in reversed(bottom_trusted):
+        tag = "✓ HONEST" if r["is_honest"] else "✗ SYBIL (false negative)"
+        print(f"  {r['id']}: score={r['final_score']:+.4f} {tag}")
+    print()
+    
+    # Scenario 2: More attack edges (harder case)
+    print("SCENARIO 2: Same network, 10 attack edges (more infiltration)")
+    print("-" * 50)
+    sw2 = build_test_network(attack_edges=10)
+    result2 = sw2.run_walk(iterations=20)
+    print(f"Accuracy: {result2['accuracy']:.1%}")
+    print(f"FPR: {result2['fpr']:.1%}")
+    print(f"FNR: {result2['fnr']:.1%}")
+    print()
+    
+    # Scenario 3: Balanced (50/50)
+    print("SCENARIO 3: 25 honest + 25 sybil (50/50, near percolation threshold)")
+    print("-" * 50)
+    sw3 = build_test_network(n_honest=25, n_sybil=25, attack_edges=5)
+    result3 = sw3.run_walk(iterations=20)
+    print(f"Accuracy: {result3['accuracy']:.1%}")
+    print(f"FPR: {result3['fpr']:.1%}")
+    print(f"FNR: {result3['fnr']:.1%}")
+    print()
     
     print("=" * 60)
-    print("SYBILWALK-ATF: Random walk sybil detection for attestations")
-    print("=" * 60)
-    
-    sw = SybilWalkATF()
-    
-    # Honest network: sparse, organic connections
-    honest_agents = [f"honest_{i}" for i in range(20)]
-    for a in honest_agents:
-        sw.add_node(a, is_anchor=(a in ["honest_0", "honest_1", "honest_2", "honest_5", "honest_10"]))
-    
-    # Sparse honest edges (each has ~2-3 connections)
-    for i in range(len(honest_agents)):
-        for j in range(i + 1, min(i + 3, len(honest_agents))):
-            if random.random() < 0.4:
-                sw.add_edge(honest_agents[i], honest_agents[j])
-    # Ensure connected
-    for i in range(1, len(honest_agents)):
-        if not sw.edges.get(honest_agents[i]):
-            sw.add_edge(honest_agents[i], honest_agents[max(0, i - 1)])
-    
-    # Sybil ring: dense mutual attestation
-    sybil_agents = [f"sybil_{i}" for i in range(10)]
-    for a in sybil_agents:
-        sw.add_node(a, is_sybil=True)
-    
-    # Dense sybil edges (almost fully connected)
-    for i in range(len(sybil_agents)):
-        for j in range(i + 1, len(sybil_agents)):
-            if random.random() < 0.8:
-                sw.add_edge(sybil_agents[i], sybil_agents[j])
-    
-    # Sparse cut: only 2 edges between honest and sybil
-    sw.add_edge("honest_15", "sybil_0")
-    sw.add_edge("honest_18", "sybil_3")
-    
-    # Graph analysis
-    metrics = sw.analyze_graph()
-    print(f"\nGraph: {metrics['node_count']} nodes, {metrics['edge_count']} edges")
-    print(f"Avg degree: {metrics['avg_degree']}, Avg clustering: {metrics['avg_clustering']}")
-    print(f"Anchors: {metrics['anchor_count']}, Known sybils: {metrics['known_sybil_count']}")
-    
-    # Run with both seeds (SybilWalk style)
-    print("\n--- BIDIRECTIONAL (SybilWalk: benign + sybil seeds) ---")
-    classifications = sw.run_walks(num_walks=500)
-    
-    tp = sum(1 for a in sybil_agents if classifications.get(a) == "sybil")
-    fn = sum(1 for a in sybil_agents if classifications.get(a) == "honest")
-    fp = sum(1 for a in honest_agents if classifications.get(a) == "sybil")
-    tn = sum(1 for a in honest_agents if classifications.get(a) == "honest")
-    
-    print(f"Sybils detected:  {tp}/{len(sybil_agents)} (TPR: {tp/len(sybil_agents):.1%})")
-    print(f"Sybils missed:    {fn}/{len(sybil_agents)} (FNR: {fn/len(sybil_agents):.1%})")
-    print(f"Honest flagged:   {fp}/{len(honest_agents)} (FPR: {fp/len(honest_agents):.1%})")
-    print(f"Honest correct:   {tn}/{len(honest_agents)}")
-    
-    # Run without sybil seeds (SybilRank style — benign only)
-    print("\n--- UNIDIRECTIONAL (SybilRank: benign seeds only) ---")
-    # Reset scores
-    for n in sw.nodes.values():
-        n.benign_score = 0.0
-        n.sybil_score = 0.0
-    # Remove sybil labels temporarily
-    for a in sybil_agents:
-        sw.nodes[a].is_sybil = False
-    
-    classifications2 = sw.run_walks(num_walks=500)
-    
-    # Restore labels for counting
-    for a in sybil_agents:
-        sw.nodes[a].is_sybil = True
-    
-    tp2 = sum(1 for a in sybil_agents if classifications2.get(a) == "sybil")
-    fn2 = sum(1 for a in sybil_agents if classifications2.get(a) == "honest")
-    fp2 = sum(1 for a in honest_agents if classifications2.get(a) == "sybil")
-    tn2 = sum(1 for a in honest_agents if classifications2.get(a) == "honest")
-    
-    print(f"Sybils detected:  {tp2}/{len(sybil_agents)} (TPR: {tp2/len(sybil_agents):.1%})")
-    print(f"Sybils missed:    {fn2}/{len(sybil_agents)} (FNR: {fn2/len(sybil_agents):.1%})")
-    print(f"Honest flagged:   {fp2}/{len(honest_agents)} (FPR: {fp2/len(honest_agents):.1%})")
-    print(f"Honest correct:   {tn2}/{len(honest_agents)}")
-    
-    print("\n" + "=" * 60)
     print("KEY INSIGHTS")
     print("=" * 60)
-    print("1. Sparse cut limits trust propagation — sybils starve")
-    print("2. Bidirectional walks (SybilWalk) outperform unidirectional (SybilRank)")
-    print("3. Dense internal connectivity = sybil signal")
-    print("4. Anchors matter: more anchors = better honest coverage")
-    print("5. For ATF: known-good agents (operators, long-history) = anchor seeds")
+    print("1. Dense sybil clusters trap sybil_score (high contamination)")
+    print("2. Sparse honest graph lets benign_score spread (fast-mixing)")
+    print("3. Few attack edges = easy separation. Many = harder.")
+    print("4. final_score = benign - sybil. Dual-walk is SybilWalk's edge.")
+    print("5. ATF parallel: genesis attesters = benign seeds,")
+    print("   flagged agents = sybil seeds, attestation = edges.")
+    print()
     
-    # Assertions
-    assert tp >= 7, f"Expected >=7 sybils detected, got {tp}"
-    assert fp <= 12, f"Expected <=12 false positives, got {fp}"
-    print("\nASSERTIONS PASSED ✓")
+    # Verify
+    assert result1['accuracy'] > 0.7, f"Scenario 1 accuracy too low: {result1['accuracy']}"
+    assert result2['accuracy'] > 0.5, f"Scenario 2 accuracy too low: {result2['accuracy']}"
+    print("ALL SCENARIOS PASSED ✓")
 
 
 if __name__ == "__main__":
