@@ -1,305 +1,299 @@
 #!/usr/bin/env python3
 """
-sybil-resistance-scorer.py — Agent resistance to sybil attack requests.
+sybil-resistance-scorer.py — Scores agent resistance to sybil attacks.
 
-Based on Dehkordi & Zehmakan (AAMAS 2025): "More Efficient Sybil Detection
-Mechanisms Leveraging Resistance of Users to Attack Requests."
+Based on Dehkordi & Zehmakan (AAMAS 2025): user RESISTANCE to attack
+requests is the missing variable in sybil detection. Graph structure
+is function of attack_strategy × resistance. Resistance maps to
+identity layer strength in ATF.
 
-Key insight: sybil detection improves when you know which nodes RESIST
-accepting friendship requests from sybils. Revealing resistance of a subset
-of users maximizes benign discovery + attack edge identification.
+Resistance factors:
+1. TEMPORAL — How long has the agent existed? (Can't parallelize calendar time)
+2. BEHAVIORAL — How consistent is behavior? (Stylometric fingerprint)  
+3. SOCIAL — How selective in trust? (Accept rate for attestation requests)
+4. STRUCTURAL — Graph position (clustering coefficient, betweenness)
 
-ATF mapping:
-- "Friendship request" = attestation request (vouch for me)
-- "Resistance" = identity layer strength (how much evidence before trusting)
-- "Attack edge" = sybil→honest attestation (the breach point)
+Resistant agents reject sybil friendship requests → sparse honest graph.
+Non-resistant agents accept freely → dense attack surface.
 
-This scorer evaluates an agent's resistance profile based on:
-1. Acceptance rate (lower = more resistant)
-2. Evidence requirements (higher = more resistant)  
-3. Temporal caution (waiting period before accepting)
-4. Source diversity requirements (not just accepting from one cluster)
-
-Also implements the AAMAS 2025 preprocessing optimization:
-reveal resistance of strategic subset to maximize sybil detection.
+The SPARSITY of the honest graph is the defense mechanism.
 
 Kit 🦊 — 2026-03-28
 """
 
 import json
-import random
+import math
 from dataclasses import dataclass, field
-from enum import Enum
-
-
-class ResistanceLevel(Enum):
-    LOW = "LOW"        # Accepts most requests (sybil-friendly)
-    MEDIUM = "MEDIUM"  # Some caution
-    HIGH = "HIGH"      # Strict requirements
-    PARANOID = "PARANOID"  # Almost never accepts
+from datetime import datetime, timezone
 
 
 @dataclass
-class AttestationRequest:
-    """An incoming request to vouch/attest."""
-    requester_id: str
-    requester_age_days: int       # How old is the requester's identity
-    requester_attestation_count: int
-    requester_identity_score: float  # 0-1
-    mutual_connections: int
-    evidence_provided: bool
-    timestamp_offset_hours: float  # How quickly after first contact
-
-
-@dataclass
-class ResistanceProfile:
-    """An agent's resistance to sybil-style attestation requests."""
+class AgentProfile:
     agent_id: str
-    total_requests: int = 0
-    accepted: int = 0
-    rejected: int = 0
-    avg_wait_hours: float = 0.0  # Average time before accepting
-    min_requester_age: int = 0   # Minimum age they've accepted
-    requires_evidence: bool = True
-    min_mutual_connections: int = 0
-    accepted_identity_scores: list = field(default_factory=list)
-    
-    @property
-    def acceptance_rate(self) -> float:
-        if self.total_requests == 0:
-            return 0.0
-        return self.accepted / self.total_requests
-    
-    @property
-    def resistance_score(self) -> float:
-        """0 = accepts everything, 1 = rejects everything."""
-        score = 0.0
-        
-        # Low acceptance rate = high resistance
-        if self.total_requests > 0:
-            score += 0.3 * (1.0 - self.acceptance_rate)
-        
-        # Requires evidence = resistant
-        if self.requires_evidence:
-            score += 0.2
-        
-        # Long wait time = cautious
-        wait_factor = min(1.0, self.avg_wait_hours / 72)  # 72h = max caution
-        score += 0.2 * wait_factor
-        
-        # High minimum requester age = resistant
-        age_factor = min(1.0, self.min_requester_age / 90)  # 90d = very cautious
-        score += 0.15 * age_factor
-        
-        # Requires mutual connections = resistant to cold approaches
-        conn_factor = min(1.0, self.min_mutual_connections / 3)
-        score += 0.15 * conn_factor
-        
-        return min(1.0, score)
-    
-    @property
-    def level(self) -> ResistanceLevel:
-        s = self.resistance_score
-        if s < 0.25:
-            return ResistanceLevel.LOW
-        elif s < 0.5:
-            return ResistanceLevel.MEDIUM
-        elif s < 0.75:
-            return ResistanceLevel.HIGH
-        return ResistanceLevel.PARANOID
+    created_at: str  # ISO 8601
+    total_interactions: int = 0
+    unique_interactors: int = 0
+    attestation_requests_received: int = 0
+    attestation_requests_accepted: int = 0
+    behavioral_consistency: float = 0.0  # 0-1, stylometric
+    avg_response_time_hours: float = 0.0
+    dkim_chain_days: int = 0
+    clustering_coefficient: float = 0.0  # Local graph clustering
+    degree: int = 0  # Number of trust connections
 
 
-def evaluate_request(profile: ResistanceProfile, req: AttestationRequest) -> tuple[bool, str]:
-    """
-    Evaluate whether an agent with given resistance profile would
-    accept an attestation request. Returns (accepted, reason).
-    """
-    # Check evidence requirement
-    if profile.requires_evidence and not req.evidence_provided:
-        return False, "No evidence provided"
-    
-    # Check requester age
-    if req.requester_age_days < profile.min_requester_age:
-        return False, f"Requester too new ({req.requester_age_days}d < {profile.min_requester_age}d)"
-    
-    # Check mutual connections
-    if req.mutual_connections < profile.min_mutual_connections:
-        return False, f"Insufficient mutual connections ({req.mutual_connections} < {profile.min_mutual_connections})"
-    
-    # Check identity score
-    if profile.accepted_identity_scores:
-        min_accepted = min(profile.accepted_identity_scores)
-        if req.requester_identity_score < min_accepted * 0.8:
-            return False, f"Identity score too low ({req.requester_identity_score:.2f})"
-    
-    # Check timing (too fast = suspicious)
-    if req.timestamp_offset_hours < 1.0 and profile.avg_wait_hours > 24:
-        return False, "Request too soon after first contact"
-    
-    return True, "Passed all checks"
+@dataclass
+class ResistanceScore:
+    agent_id: str
+    overall: float  # 0-1, higher = more resistant to sybil attacks
+    temporal: float
+    behavioral: float
+    social: float
+    structural: float
+    risk_level: str  # LOW, MEDIUM, HIGH, CRITICAL
+    details: dict = field(default_factory=dict)
 
 
-def strategic_reveal(agents: list[ResistanceProfile], budget: int) -> list[str]:
+class SybilResistanceScorer:
     """
-    AAMAS 2025 optimization: select which agents' resistance to reveal
-    to maximize sybil detection. Budget = number of agents we can probe.
-    
-    Heuristic: reveal agents at the boundary (medium resistance) — they
-    are most informative. Low-resistance agents are obvious targets.
-    High-resistance agents are obviously safe.
+    Scores agent resistance to sybil attacks using Dehkordi & Zehmakan's
+    framework. Resistant agents form sparse honest subgraphs that are
+    structurally distinct from dense sybil cliques.
     """
-    # Sort by resistance score
-    sorted_agents = sorted(agents, key=lambda a: a.resistance_score)
     
-    # Find boundary agents (medium resistance, most informative)
-    n = len(sorted_agents)
-    if n == 0:
-        return []
+    def score(self, profile: AgentProfile) -> ResistanceScore:
+        temporal = self._temporal_resistance(profile)
+        behavioral = self._behavioral_resistance(profile)
+        social = self._social_resistance(profile)
+        structural = self._structural_resistance(profile)
+        
+        # Weighted combination (temporal most important — can't be faked)
+        overall = (
+            0.35 * temporal +
+            0.25 * behavioral +
+            0.25 * social +
+            0.15 * structural
+        )
+        
+        if overall >= 0.7:
+            risk = "LOW"
+        elif overall >= 0.5:
+            risk = "MEDIUM"
+        elif overall >= 0.3:
+            risk = "HIGH"
+        else:
+            risk = "CRITICAL"
+        
+        return ResistanceScore(
+            agent_id=profile.agent_id,
+            overall=round(overall, 3),
+            temporal=round(temporal, 3),
+            behavioral=round(behavioral, 3),
+            social=round(social, 3),
+            structural=round(structural, 3),
+            risk_level=risk,
+            details={
+                "age_days": self._agent_age_days(profile),
+                "accept_rate": round(
+                    profile.attestation_requests_accepted / 
+                    max(profile.attestation_requests_received, 1), 3
+                ),
+                "interaction_density": round(
+                    profile.total_interactions / max(self._agent_age_days(profile), 1), 2
+                ),
+                "sybil_indicators": self._sybil_indicators(profile)
+            }
+        )
     
-    # Target the middle band
-    start = max(0, n // 4)
-    end = min(n, 3 * n // 4)
-    boundary = sorted_agents[start:end]
+    def _agent_age_days(self, profile: AgentProfile) -> int:
+        try:
+            created = datetime.fromisoformat(profile.created_at.replace('Z', '+00:00'))
+            return (datetime.now(timezone.utc) - created).days
+        except (ValueError, TypeError):
+            return 0
     
-    # Select up to budget from boundary, prioritizing those with
-    # highest total_requests (more data = more informative)
-    boundary.sort(key=lambda a: -a.total_requests)
-    selected = boundary[:budget]
+    def _temporal_resistance(self, profile: AgentProfile) -> float:
+        """
+        Slow bootstrap = proof of work without energy waste.
+        Can't parallelize 90 days of calendar time.
+        Logarithmic scaling: diminishing returns after 180 days.
+        """
+        age = self._agent_age_days(profile)
+        dkim = profile.dkim_chain_days
+        
+        # Age score (log scale, asymptotes at ~1.0 around 365 days)
+        age_score = min(1.0, math.log1p(age) / math.log1p(365))
+        
+        # DKIM continuity bonus (chain should be close to age)
+        if age > 0:
+            dkim_ratio = min(1.0, dkim / age)
+        else:
+            dkim_ratio = 0.0
+        
+        # Combined: age matters, but DKIM continuity proves you were ACTIVE
+        return 0.6 * age_score + 0.4 * dkim_ratio
     
-    return [a.agent_id for a in selected]
+    def _behavioral_resistance(self, profile: AgentProfile) -> float:
+        """
+        Consistent behavior over time. Stylometric fingerprint.
+        Sybils can mimic content but struggle with behavioral consistency
+        across long time periods.
+        """
+        consistency = profile.behavioral_consistency
+        
+        # Interaction depth (more unique interactors = harder to fake)
+        if profile.total_interactions > 0:
+            diversity = min(1.0, profile.unique_interactors / 
+                          max(profile.total_interactions * 0.3, 1))
+        else:
+            diversity = 0.0
+        
+        # Response time consistency (bots respond too fast or too uniformly)
+        # Sweet spot: 0.5-48 hours (human-like latency)
+        rt = profile.avg_response_time_hours
+        if 0.5 <= rt <= 48:
+            rt_score = 1.0
+        elif rt < 0.5:
+            rt_score = rt / 0.5  # Too fast = suspicious
+        else:
+            rt_score = max(0, 1.0 - (rt - 48) / 168)  # Diminishes after 48h
+        
+        return 0.5 * consistency + 0.3 * diversity + 0.2 * rt_score
+    
+    def _social_resistance(self, profile: AgentProfile) -> float:
+        """
+        Selective trust = resistance. Dehkordi & Zehmakan's key insight:
+        resistant nodes REJECT sybil friendship requests.
+        Low accept rate = high resistance.
+        """
+        received = profile.attestation_requests_received
+        accepted = profile.attestation_requests_accepted
+        
+        if received == 0:
+            # No requests yet — neutral (cold start)
+            return 0.5
+        
+        accept_rate = accepted / received
+        
+        # Sweet spot: 10-40% accept rate (selective but not paranoid)
+        if 0.1 <= accept_rate <= 0.4:
+            selectivity = 1.0
+        elif accept_rate < 0.1:
+            selectivity = accept_rate / 0.1  # Too paranoid = isolated
+        else:
+            # High accept rate = low resistance (accepts sybils)
+            selectivity = max(0, 1.0 - (accept_rate - 0.4) / 0.6)
+        
+        return selectivity
+    
+    def _structural_resistance(self, profile: AgentProfile) -> float:
+        """
+        Graph position. Honest agents in well-structured subgraphs.
+        High clustering = tight community (good).
+        Moderate degree = selective connections (good).
+        SybilGuard: random walks escape sybil regions via sparse attack edges.
+        """
+        # Clustering coefficient (higher = embedded in real community)
+        cc = profile.clustering_coefficient
+        
+        # Degree: moderate is good (5-30), very high is suspicious
+        d = profile.degree
+        if 5 <= d <= 30:
+            degree_score = 1.0
+        elif d < 5:
+            degree_score = d / 5  # Too few connections
+        else:
+            degree_score = max(0.2, 1.0 - (d - 30) / 100)  # Diminishing
+        
+        return 0.6 * cc + 0.4 * degree_score
+    
+    def _sybil_indicators(self, profile: AgentProfile) -> list[str]:
+        """Flag specific sybil-like patterns."""
+        indicators = []
+        age = self._agent_age_days(profile)
+        
+        if age < 7 and profile.degree > 20:
+            indicators.append("RAPID_NETWORKING: Many connections in first week")
+        
+        if profile.attestation_requests_received > 0:
+            rate = profile.attestation_requests_accepted / profile.attestation_requests_received
+            if rate > 0.9:
+                indicators.append("LOW_SELECTIVITY: Accepts >90% of attestation requests")
+        
+        if profile.avg_response_time_hours < 0.05:  # < 3 minutes avg
+            indicators.append("INSTANT_RESPONSE: Suspiciously fast response times")
+        
+        if age > 30 and profile.dkim_chain_days < age * 0.3:
+            indicators.append("DKIM_GAP: DKIM chain covers <30% of account age")
+        
+        if profile.total_interactions > 0 and profile.unique_interactors < 3:
+            indicators.append("LOW_DIVERSITY: Interacts with very few unique agents")
+        
+        return indicators
 
 
 def demo():
-    random.seed(42)
+    scorer = SybilResistanceScorer()
     
-    print("=" * 60)
-    print("SYBIL RESISTANCE SCORER")
-    print("Based on Dehkordi & Zehmakan (AAMAS 2025)")
-    print("=" * 60)
-    print()
-    
-    # Create agent profiles with different resistance levels
     profiles = [
-        ResistanceProfile(
-            agent_id="kit_fox", total_requests=50, accepted=12, rejected=38,
-            avg_wait_hours=48.0, min_requester_age=30, requires_evidence=True,
-            min_mutual_connections=2, accepted_identity_scores=[0.6, 0.7, 0.8, 0.85, 0.9]
-        ),
-        ResistanceProfile(
-            agent_id="naive_bot", total_requests=50, accepted=45, rejected=5,
-            avg_wait_hours=0.5, min_requester_age=0, requires_evidence=False,
-            min_mutual_connections=0, accepted_identity_scores=[0.1, 0.2, 0.3]
-        ),
-        ResistanceProfile(
-            agent_id="paranoid_agent", total_requests=50, accepted=3, rejected=47,
-            avg_wait_hours=168.0, min_requester_age=90, requires_evidence=True,
-            min_mutual_connections=3, accepted_identity_scores=[0.9, 0.95]
-        ),
-        ResistanceProfile(
-            agent_id="medium_agent", total_requests=50, accepted=25, rejected=25,
-            avg_wait_hours=24.0, min_requester_age=14, requires_evidence=True,
-            min_mutual_connections=1, accepted_identity_scores=[0.5, 0.6, 0.7]
-        ),
+        ("Kit (established, selective)", AgentProfile(
+            agent_id="kit_fox",
+            created_at="2026-02-01T00:00:00Z",
+            total_interactions=500, unique_interactors=45,
+            attestation_requests_received=30, attestation_requests_accepted=8,
+            behavioral_consistency=0.85, avg_response_time_hours=2.5,
+            dkim_chain_days=55, clustering_coefficient=0.4, degree=12
+        )),
+        ("Sybil (new, accepts everything)", AgentProfile(
+            agent_id="sybil_bot",
+            created_at="2026-03-27T00:00:00Z",
+            total_interactions=200, unique_interactors=3,
+            attestation_requests_received=50, attestation_requests_accepted=48,
+            behavioral_consistency=0.3, avg_response_time_hours=0.02,
+            dkim_chain_days=1, clustering_coefficient=0.05, degree=45
+        )),
+        ("Cold-start (just registered)", AgentProfile(
+            agent_id="newbie",
+            created_at="2026-03-28T00:00:00Z",
+            total_interactions=2, unique_interactors=2,
+            attestation_requests_received=0, attestation_requests_accepted=0,
+            behavioral_consistency=0.5, avg_response_time_hours=4.0,
+            dkim_chain_days=0, clustering_coefficient=0.0, degree=1
+        )),
+        ("Veteran (old, low activity)", AgentProfile(
+            agent_id="veteran",
+            created_at="2025-06-01T00:00:00Z",
+            total_interactions=100, unique_interactors=30,
+            attestation_requests_received=20, attestation_requests_accepted=5,
+            behavioral_consistency=0.9, avg_response_time_hours=12.0,
+            dkim_chain_days=600, clustering_coefficient=0.5, degree=8
+        )),
     ]
     
-    for p in profiles:
-        print(f"{p.agent_id}:")
-        print(f"  Acceptance rate: {p.acceptance_rate:.0%}")
-        print(f"  Resistance score: {p.resistance_score:.3f}")
-        print(f"  Level: {p.level.value}")
+    for name, profile in profiles:
+        print("=" * 60)
+        print(f"AGENT: {name}")
+        print("=" * 60)
+        result = scorer.score(profile)
+        print(f"  Overall resistance: {result.overall} ({result.risk_level})")
+        print(f"  Temporal:    {result.temporal}")
+        print(f"  Behavioral:  {result.behavioral}")
+        print(f"  Social:      {result.social}")
+        print(f"  Structural:  {result.structural}")
+        print(f"  Age: {result.details['age_days']}d, Accept rate: {result.details['accept_rate']}")
+        if result.details['sybil_indicators']:
+            print(f"  ⚠ Sybil indicators:")
+            for ind in result.details['sybil_indicators']:
+                print(f"    - {ind}")
         print()
     
-    # Simulate sybil attack requests
-    print("=" * 60)
-    print("SYBIL ATTACK SIMULATION")
-    print("=" * 60)
-    print()
-    
-    sybil_request = AttestationRequest(
-        requester_id="sybil_001",
-        requester_age_days=2,
-        requester_attestation_count=5,  # Inflated by sybil ring
-        requester_identity_score=0.15,
-        mutual_connections=0,
-        evidence_provided=False,
-        timestamp_offset_hours=0.1
-    )
-    
-    honest_request = AttestationRequest(
-        requester_id="honest_agent",
-        requester_age_days=60,
-        requester_attestation_count=8,
-        requester_identity_score=0.75,
-        mutual_connections=3,
-        evidence_provided=True,
-        timestamp_offset_hours=72.0
-    )
-    
-    for p in profiles:
-        sybil_accepted, sybil_reason = evaluate_request(p, sybil_request)
-        honest_accepted, honest_reason = evaluate_request(p, honest_request)
-        print(f"{p.agent_id} ({p.level.value}):")
-        print(f"  Sybil request:  {'✗ REJECTED' if not sybil_accepted else '✓ ACCEPTED'} — {sybil_reason}")
-        print(f"  Honest request: {'✓ ACCEPTED' if honest_accepted else '✗ REJECTED'} — {honest_reason}")
-        
-        # False positive/negative analysis
-        if sybil_accepted:
-            print(f"  ⚠ FALSE NEGATIVE: sybil got through!")
-        if not honest_accepted:
-            print(f"  ⚠ FALSE POSITIVE: honest agent rejected!")
-        print()
-    
-    # Strategic reveal optimization
-    print("=" * 60)
-    print("STRATEGIC REVEAL (AAMAS 2025 OPTIMIZATION)")
-    print("=" * 60)
-    print()
-    
-    # Generate 20 agents with varied resistance
-    all_agents = []
-    for i in range(20):
-        resistance_bias = random.random()
-        total = random.randint(10, 100)
-        accepted = int(total * (1 - resistance_bias) * random.uniform(0.5, 1.0))
-        all_agents.append(ResistanceProfile(
-            agent_id=f"agent_{i:03d}",
-            total_requests=total,
-            accepted=accepted,
-            rejected=total - accepted,
-            avg_wait_hours=resistance_bias * 96,
-            min_requester_age=int(resistance_bias * 60),
-            requires_evidence=resistance_bias > 0.3,
-            min_mutual_connections=int(resistance_bias * 3),
-        ))
-    
-    # Reveal budget = 5
-    selected = strategic_reveal(all_agents, budget=5)
-    print(f"Budget: 5 of 20 agents")
-    print(f"Selected for probing: {selected}")
-    print()
-    
-    for aid in selected:
-        agent = next(a for a in all_agents if a.agent_id == aid)
-        print(f"  {aid}: resistance={agent.resistance_score:.3f} ({agent.level.value}), "
-              f"requests={agent.total_requests}")
-    
-    print()
-    print("INSIGHT: Boundary agents (medium resistance) are most informative.")
-    print("Low-resistance = obvious targets. High-resistance = obviously safe.")
-    print("The BOUNDARY is where sybil detection decisions are hardest —")
-    print("and where additional information has highest marginal value.")
-    print()
-    
-    # Verify
-    assert profiles[0].level == ResistanceLevel.HIGH  # kit
-    assert profiles[1].level == ResistanceLevel.LOW    # naive
-    assert profiles[2].level == ResistanceLevel.PARANOID  # paranoid
-    sybil_kit, _ = evaluate_request(profiles[0], sybil_request)
-    honest_kit, _ = evaluate_request(profiles[0], honest_request)
-    assert sybil_kit == False  # kit rejects sybil
-    assert honest_kit == True   # kit accepts honest
-    sybil_naive, _ = evaluate_request(profiles[1], sybil_request)
-    assert sybil_naive == True  # naive accepts sybil
+    # Assertions
+    results = {name: scorer.score(profile) for name, profile in profiles}
+    assert results["Kit (established, selective)"].risk_level == "LOW"
+    assert results["Sybil (new, accepts everything)"].risk_level == "CRITICAL"
+    assert results["Cold-start (just registered)"].risk_level in ["HIGH", "MEDIUM"]
+    assert results["Veteran (old, low activity)"].risk_level == "LOW"
+    assert len(results["Sybil (new, accepts everything)"].details["sybil_indicators"]) >= 2
     
     print("ALL ASSERTIONS PASSED ✓")
 
