@@ -1,183 +1,163 @@
 #!/usr/bin/env python3
 """
-sybilscar-atf.py — SybilSCAR-inspired local rule propagation for ATF trust graphs.
+sybilscar-atf.py — SybilSCAR-inspired sybil detection for ATF attestation graphs.
 
-Adapts Wang et al (IEEE TNSE 2019) to agent trust networks. Key insight:
-sybil regions are dense internally (free mutual inflation) but sparse in
-attack edges to honest region. Local rule propagation detects this by
-iteratively updating each node's trust score based on neighbors + prior.
+Based on Wang et al (IEEE TNSE 2019): Structure-based Sybil Detection via
+Local Rule-based Propagation. Unifies Random Walk and Loopy Belief Propagation
+approaches under a single framework: iteratively apply a local rule to every
+node, propagating label information through the graph.
 
-SybilSCAR unifies Random Walk (SybilRank, Yu 2006; Cao 2012) and
-Loopy Belief Propagation approaches. The local rule:
-  p_i^(t+1) = 0.5 + 0.5 * (w * p_i^prior + (1-w) * avg(p_neighbors^t) - 0.5)
-
-Where:
-- p_i = probability node i is honest [0, 1]  (0.5 = unknown)
-- w = weight of prior vs neighbor influence
-- Convergence guaranteed (unlike LBP)
-- Scalable to millions (unlike LBP)
+Key insight from the paper: sybil regions are internally dense but have few
+"attack edges" to the honest region. The local rule exploits homophily —
+linked nodes likely share the same label (honest or sybil).
 
 ATF mapping:
 - Nodes = agents
 - Edges = attestation relationships (weighted by score)
-- Prior = identity layer evidence (DKIM chain, behavioral consistency)
-- Labeled honest = genesis seeds, manually verified agents
-- Labeled sybil = known bad actors, flagged by trust-layer-validator
+- Homophily weight = probability two connected agents share same label
+- Seeds = known-honest agents (genesis nodes, verified agents)
+- Detection = iterative propagation until convergence
 
-Sources:
-- Wang et al (2019): SybilSCAR, arxiv 1803.04321
-- Yu et al (2006): SybilGuard, random walks on social graphs
-- Cao et al (2012): SybilRank, deployed at Tuenti (largest Spanish OSN)
+The local rule for node u at iteration t+1:
+  p(u) = θ_u * prior(u) + (1 - θ_u) * Σ_v [w(u,v) * p(v)] / degree(u)
+
+Where:
+- θ_u = residual weight (how much prior matters vs neighbors)
+- w(u,v) = homophily weight on edge (attestation score)
+- prior(u) = known label if seed, 0.5 otherwise
 
 Kit 🦊 — 2026-03-28
 """
 
 import json
-import random
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
-class AgentNode:
-    agent_id: str
-    prior: float = 0.5       # Prior probability of being honest [0, 1]
-    score: float = 0.5       # Current estimated probability
-    label: Optional[str] = None  # "honest", "sybil", or None (unknown)
-    identity_strength: float = 0.0  # From trust-layer-validator
-    
-    def __post_init__(self):
-        if self.label == "honest":
-            self.prior = 0.9
-            self.score = 0.9
-        elif self.label == "sybil":
-            self.prior = 0.1
-            self.score = 0.1
+class Agent:
+    id: str
+    is_seed_honest: bool = False
+    is_seed_sybil: bool = False
+    score: float = 0.5  # Probability of being honest [0, 1]
+    prior: float = 0.5
 
 
 @dataclass
-class AttestationEdge:
-    source: str
-    target: str
-    weight: float = 1.0  # Attestation score [0, 1]
+class Attestation:
+    from_agent: str
+    to_agent: str
+    weight: float  # Attestation score [0, 1], maps to homophily weight
 
 
 class SybilSCARDetector:
     """
-    Local rule propagation for sybil detection in ATF trust graphs.
+    SybilSCAR-inspired detector for ATF graphs.
     
-    Convergence: guaranteed because local rule is a contraction mapping
-    with |derivative| < 1 everywhere (Wang et al 2019, Theorem 1).
+    Convergence guarantee: the local rule is a contraction mapping
+    when θ * max_degree < 1 (Wang et al, Theorem 1).
     """
     
-    def __init__(self, prior_weight: float = 0.5, threshold: float = 0.5):
-        self.prior_weight = prior_weight  # w: balance prior vs neighbors
-        self.threshold = threshold         # Classification threshold
-        self.nodes: dict[str, AgentNode] = {}
-        self.edges: list[AttestationEdge] = []
-        self.adjacency: dict[str, list[tuple[str, float]]] = {}
+    def __init__(self, theta: float = 0.5, max_iterations: int = 50,
+                 convergence_threshold: float = 0.001):
+        self.theta = theta  # Residual weight (prior vs neighbors)
+        self.max_iterations = max_iterations
+        self.convergence_threshold = convergence_threshold
+        self.agents: dict[str, Agent] = {}
+        self.adjacency: dict[str, list[tuple[str, float]]] = {}  # id -> [(neighbor, weight)]
     
-    def add_node(self, node: AgentNode):
-        self.nodes[node.agent_id] = node
-        if node.agent_id not in self.adjacency:
-            self.adjacency[node.agent_id] = []
+    def add_agent(self, agent_id: str, seed_honest: bool = False, 
+                  seed_sybil: bool = False):
+        prior = 0.9 if seed_honest else (0.1 if seed_sybil else 0.5)
+        self.agents[agent_id] = Agent(
+            id=agent_id, is_seed_honest=seed_honest,
+            is_seed_sybil=seed_sybil, score=prior, prior=prior
+        )
+        if agent_id not in self.adjacency:
+            self.adjacency[agent_id] = []
     
-    def add_edge(self, edge: AttestationEdge):
-        self.edges.append(edge)
-        # Bidirectional for trust propagation
-        if edge.source not in self.adjacency:
-            self.adjacency[edge.source] = []
-        if edge.target not in self.adjacency:
-            self.adjacency[edge.target] = []
-        self.adjacency[edge.source].append((edge.target, edge.weight))
-        self.adjacency[edge.target].append((edge.source, edge.weight))
+    def add_attestation(self, from_id: str, to_id: str, weight: float):
+        # Ensure agents exist
+        for aid in [from_id, to_id]:
+            if aid not in self.agents:
+                self.add_agent(aid)
+        
+        # Bidirectional (attestation implies mutual relationship)
+        self.adjacency[from_id].append((to_id, weight))
+        self.adjacency[to_id].append((from_id, weight))
     
-    def propagate(self, max_iterations: int = 50, tolerance: float = 1e-4) -> dict:
+    def propagate(self) -> dict:
         """
         Run local rule propagation until convergence.
         
-        Local rule (SybilSCAR):
-        p_i^(t+1) = 0.5 + 0.5 * (w * (2*prior_i - 1) + (1-w) * weighted_avg_neighbors)
-        
-        The (2p-1) mapping centers scores around 0 for propagation,
-        then shifts back to [0,1].
+        Returns iteration log with convergence info.
         """
-        history = []
+        log = []
         
-        for iteration in range(max_iterations):
+        for iteration in range(self.max_iterations):
             max_delta = 0.0
             new_scores = {}
             
-            for agent_id, node in self.nodes.items():
-                # Labeled nodes are fixed
-                if node.label is not None:
-                    new_scores[agent_id] = node.score
-                    continue
-                
+            for agent_id, agent in self.agents.items():
                 neighbors = self.adjacency.get(agent_id, [])
+                
                 if not neighbors:
-                    new_scores[agent_id] = node.prior
+                    new_scores[agent_id] = agent.prior
                     continue
                 
-                # Weighted average of neighbor scores
-                total_weight = sum(w for _, w in neighbors)
-                if total_weight == 0:
-                    neighbor_avg = 0.0
+                # Neighbor influence: weighted average of neighbor scores
+                neighbor_sum = 0.0
+                weight_sum = 0.0
+                for neighbor_id, weight in neighbors:
+                    neighbor_sum += weight * self.agents[neighbor_id].score
+                    weight_sum += weight
+                
+                if weight_sum > 0:
+                    neighbor_influence = neighbor_sum / weight_sum
                 else:
-                    neighbor_avg = sum(
-                        (2 * self.nodes[nid].score - 1) * w 
-                        for nid, w in neighbors 
-                        if nid in self.nodes
-                    ) / total_weight
+                    neighbor_influence = 0.5
                 
-                # Local rule: combine prior and neighbor influence
-                prior_signal = 2 * node.prior - 1  # Map to [-1, 1]
-                combined = self.prior_weight * prior_signal + (1 - self.prior_weight) * neighbor_avg
-                
-                # Clamp and map back to [0, 1]
-                combined = max(-1.0, min(1.0, combined))
-                new_score = 0.5 + 0.5 * combined
-                
-                delta = abs(new_score - node.score)
-                max_delta = max(max_delta, delta)
+                # Local rule: blend prior and neighbor influence
+                new_score = self.theta * agent.prior + (1 - self.theta) * neighbor_influence
                 new_scores[agent_id] = new_score
+                
+                delta = abs(new_score - agent.score)
+                max_delta = max(max_delta, delta)
             
-            # Update scores
+            # Update all scores simultaneously
             for agent_id, score in new_scores.items():
-                self.nodes[agent_id].score = score
+                self.agents[agent_id].score = score
             
-            history.append({
+            log.append({
                 "iteration": iteration + 1,
                 "max_delta": round(max_delta, 6),
-                "avg_score": round(sum(n.score for n in self.nodes.values()) / len(self.nodes), 4)
+                "avg_score": round(sum(a.score for a in self.agents.values()) / len(self.agents), 4)
             })
             
-            if max_delta < tolerance:
+            if max_delta < self.convergence_threshold:
                 break
         
         return {
-            "converged": max_delta < tolerance if history else False,
-            "iterations": len(history),
-            "final_delta": history[-1]["max_delta"] if history else 0,
-            "history": history
+            "iterations": len(log),
+            "converged": log[-1]["max_delta"] < self.convergence_threshold,
+            "log": log[-3:],  # Last 3 iterations
         }
     
-    def classify(self) -> dict:
-        """Classify all nodes as honest/sybil based on threshold."""
+    def classify(self, threshold: float = 0.5) -> dict:
+        """Classify agents as honest or sybil based on current scores."""
         honest = []
         sybil = []
         uncertain = []
         
-        for agent_id, node in self.nodes.items():
+        for agent_id, agent in self.agents.items():
             entry = {
-                "agent_id": agent_id,
-                "score": round(node.score, 4),
-                "prior": round(node.prior, 4),
-                "label": node.label
+                "id": agent_id,
+                "score": round(agent.score, 4),
+                "is_seed": agent.is_seed_honest or agent.is_seed_sybil,
+                "degree": len(self.adjacency.get(agent_id, []))
             }
-            if node.score >= self.threshold + 0.1:
+            if agent.score >= threshold + 0.1:
                 honest.append(entry)
-            elif node.score <= self.threshold - 0.1:
+            elif agent.score <= threshold - 0.1:
                 sybil.append(entry)
             else:
                 uncertain.append(entry)
@@ -186,161 +166,142 @@ class SybilSCARDetector:
             "honest": sorted(honest, key=lambda x: -x["score"]),
             "sybil": sorted(sybil, key=lambda x: x["score"]),
             "uncertain": sorted(uncertain, key=lambda x: x["score"]),
-            "density_analysis": self._analyze_density()
+            "stats": {
+                "total": len(self.agents),
+                "honest": len(honest),
+                "sybil": len(sybil),
+                "uncertain": len(uncertain),
+                "detection_rate": round(len(sybil) / max(1, len(self.agents)), 3)
+            }
         }
     
-    def _analyze_density(self) -> dict:
+    def detect_dense_regions(self) -> list[dict]:
         """
-        Analyze graph density — sybil regions are dense internally,
-        sparse in connections to honest region.
+        Detect internally dense regions (sybil signature).
+        Honest graphs: sparse, power-law degree. Sybil rings: dense, uniform degree.
         """
-        honest_nodes = {aid for aid, n in self.nodes.items() if n.score >= self.threshold}
-        sybil_nodes = {aid for aid, n in self.nodes.items() if n.score < self.threshold}
+        # Calculate local clustering coefficient per node
+        clusters = []
+        for agent_id in self.agents:
+            neighbors = [n for n, _ in self.adjacency.get(agent_id, [])]
+            if len(neighbors) < 2:
+                continue
+            
+            # Count edges between neighbors
+            neighbor_set = set(neighbors)
+            triangles = 0
+            possible = len(neighbors) * (len(neighbors) - 1) / 2
+            
+            for n in neighbors:
+                for n2, _ in self.adjacency.get(n, []):
+                    if n2 in neighbor_set and n2 != n:
+                        triangles += 0.5  # Each triangle counted twice
+            
+            clustering = triangles / possible if possible > 0 else 0
+            clusters.append({
+                "agent": agent_id, 
+                "clustering": round(clustering, 3),
+                "degree": len(neighbors),
+                "score": round(self.agents[agent_id].score, 4)
+            })
         
-        # Count internal vs cross edges
-        honest_internal = 0
-        sybil_internal = 0
-        cross_edges = 0
-        
-        for edge in self.edges:
-            s_honest = edge.source in honest_nodes
-            t_honest = edge.target in honest_nodes
-            if s_honest and t_honest:
-                honest_internal += 1
-            elif not s_honest and not t_honest:
-                sybil_internal += 1
-            else:
-                cross_edges += 1
-        
-        def density(node_count, edge_count):
-            if node_count < 2:
-                return 0.0
-            max_edges = node_count * (node_count - 1) / 2
-            return edge_count / max_edges if max_edges > 0 else 0.0
-        
-        return {
-            "honest_nodes": len(honest_nodes),
-            "sybil_nodes": len(sybil_nodes),
-            "honest_density": round(density(len(honest_nodes), honest_internal), 4),
-            "sybil_density": round(density(len(sybil_nodes), sybil_internal), 4),
-            "cross_edges": cross_edges,
-            "attack_surface": round(cross_edges / max(len(self.edges), 1), 4)
-        }
+        # Flag agents with high clustering + low honest score
+        suspicious = [c for c in clusters if c["clustering"] > 0.7 and c["score"] < 0.5]
+        return suspicious
 
 
 def demo():
-    random.seed(42)
-    
     print("=" * 60)
-    print("SybilSCAR-ATF: Local Rule Propagation for Agent Trust")
+    print("SCENARIO: ATF network with honest core + sybil ring")
     print("=" * 60)
     
-    detector = SybilSCARDetector(prior_weight=0.4, threshold=0.5)
+    detector = SybilSCARDetector(theta=0.5, max_iterations=30)
     
-    # Honest agents (some labeled, some unlabeled)
-    honest_agents = [
-        AgentNode("genesis", label="honest"),
-        AgentNode("kit_fox", prior=0.7, identity_strength=0.82),
-        AgentNode("bro_agent", prior=0.7, identity_strength=0.75),
-        AgentNode("funwolf", prior=0.65, identity_strength=0.7),
-        AgentNode("santaclawd", label="honest"),
-        AgentNode("gerundium", prior=0.6, identity_strength=0.6),
-        AgentNode("gendolf", prior=0.6, identity_strength=0.55),
-    ]
+    # Honest core: sparse connections (realistic trust network)
+    honest = ["genesis", "kit", "bro_agent", "funwolf", "santaclawd", "gendolf"]
+    for a in honest:
+        detector.add_agent(a, seed_honest=(a == "genesis"))
     
-    # Sybil ring (dense internal connections, few to honest)
-    sybil_agents = [
-        AgentNode("sybil_1", prior=0.5),  # Unknown prior
-        AgentNode("sybil_2", prior=0.5),
-        AgentNode("sybil_3", prior=0.5),
-        AgentNode("sybil_4", prior=0.5),
-        AgentNode("sybil_5", prior=0.5),
-    ]
-    # One labeled sybil (detected by other means)
-    sybil_agents[0].label = "sybil"
-    sybil_agents[0].prior = 0.1
-    sybil_agents[0].score = 0.1
-    
-    for a in honest_agents + sybil_agents:
-        detector.add_node(a)
-    
-    # Honest network: sparse but connected (avg degree ~3)
+    # Sparse honest connections (not everyone trusts everyone)
     honest_edges = [
-        ("genesis", "kit_fox", 0.85), ("genesis", "santaclawd", 0.9),
-        ("kit_fox", "bro_agent", 0.8), ("kit_fox", "funwolf", 0.75),
-        ("bro_agent", "santaclawd", 0.7), ("funwolf", "gerundium", 0.65),
-        ("santaclawd", "gendolf", 0.7), ("gerundium", "gendolf", 0.6),
-        ("kit_fox", "gendolf", 0.65),
+        ("genesis", "kit", 0.85), ("genesis", "bro_agent", 0.80),
+        ("kit", "funwolf", 0.75), ("kit", "santaclawd", 0.70),
+        ("bro_agent", "gendolf", 0.65), ("funwolf", "santaclawd", 0.60),
     ]
+    for f, t, w in honest_edges:
+        detector.add_attestation(f, t, w)
     
-    # Sybil ring: dense (mutual inflation, all connected to all)
-    sybil_edges = [
-        ("sybil_1", "sybil_2", 0.95), ("sybil_1", "sybil_3", 0.9),
-        ("sybil_1", "sybil_4", 0.92), ("sybil_1", "sybil_5", 0.88),
-        ("sybil_2", "sybil_3", 0.93), ("sybil_2", "sybil_4", 0.91),
-        ("sybil_2", "sybil_5", 0.89), ("sybil_3", "sybil_4", 0.94),
-        ("sybil_3", "sybil_5", 0.9), ("sybil_4", "sybil_5", 0.87),
-    ]
+    # Sybil ring: dense mutual attestations (signature pattern)
+    sybils = ["sybil_1", "sybil_2", "sybil_3", "sybil_4", "sybil_5"]
+    for s in sybils:
+        detector.add_agent(s)
     
-    # Attack edges: few connections from sybil to honest (sparse cut)
-    attack_edges = [
-        ("sybil_2", "gerundium", 0.5),  # Only 1 attack edge
-    ]
+    # Dense internal connections (everyone attests everyone)
+    for i, s1 in enumerate(sybils):
+        for s2 in sybils[i+1:]:
+            detector.add_attestation(s1, s2, 0.95)  # Suspiciously high mutual scores
     
-    for s, t, w in honest_edges + sybil_edges + attack_edges:
-        detector.add_edge(AttestationEdge(s, t, w))
+    # Few attack edges to honest region
+    detector.add_attestation("sybil_1", "gendolf", 0.4)  # Single attack edge
     
-    print(f"\nNodes: {len(detector.nodes)} ({len(honest_agents)} honest-side, {len(sybil_agents)} sybil-side)")
-    print(f"Edges: {len(detector.edges)} ({len(honest_edges)} honest, {len(sybil_edges)} sybil, {len(attack_edges)} attack)")
-    print(f"Prior weight: {detector.prior_weight}")
-    print()
+    # Also add one known sybil seed for comparison
+    detector.add_agent("known_bad", seed_sybil=True)
+    detector.add_attestation("known_bad", "sybil_3", 0.9)
     
-    # Propagate
-    result = detector.propagate()
-    print(f"Converged: {result['converged']} in {result['iterations']} iterations")
-    print(f"Final max delta: {result['final_delta']}")
-    print()
+    # Run propagation
+    print("\nRunning SybilSCAR propagation...")
+    prop_result = detector.propagate()
+    print(f"Converged: {prop_result['converged']} in {prop_result['iterations']} iterations")
+    print(f"Last iterations: {json.dumps(prop_result['log'], indent=2)}")
     
     # Classify
+    print("\n" + "=" * 60)
+    print("CLASSIFICATION RESULTS")
+    print("=" * 60)
     classification = detector.classify()
     
-    print("HONEST (score > 0.6):")
+    print(f"\nHonest ({classification['stats']['honest']}):")
     for a in classification["honest"]:
-        label_tag = f" [{a['label']}]" if a['label'] else ""
-        print(f"  {a['agent_id']}: {a['score']}{label_tag}")
+        seed = " (SEED)" if a["is_seed"] else ""
+        print(f"  {a['id']}: {a['score']}{seed} [degree={a['degree']}]")
     
-    print(f"\nSYBIL (score < 0.4):")
+    print(f"\nSybil ({classification['stats']['sybil']}):")
     for a in classification["sybil"]:
-        label_tag = f" [{a['label']}]" if a['label'] else ""
-        print(f"  {a['agent_id']}: {a['score']}{label_tag}")
+        seed = " (SEED)" if a["is_seed"] else ""
+        print(f"  {a['id']}: {a['score']}{seed} [degree={a['degree']}]")
     
-    print(f"\nUNCERTAIN (0.4-0.6):")
+    print(f"\nUncertain ({classification['stats']['uncertain']}):")
     for a in classification["uncertain"]:
-        print(f"  {a['agent_id']}: {a['score']}")
+        print(f"  {a['id']}: {a['score']} [degree={a['degree']}]")
     
-    density = classification["density_analysis"]
-    print(f"\nDENSITY ANALYSIS:")
-    print(f"  Honest density: {density['honest_density']}")
-    print(f"  Sybil density: {density['sybil_density']}")
-    print(f"  Cross edges: {density['cross_edges']}")
-    print(f"  Attack surface: {density['attack_surface']:.1%}")
+    # Dense region detection
+    print("\n" + "=" * 60)
+    print("DENSE REGION DETECTION (sybil signature)")
+    print("=" * 60)
+    dense = detector.detect_dense_regions()
+    if dense:
+        for d in dense:
+            print(f"  ⚠ {d['agent']}: clustering={d['clustering']}, "
+                  f"degree={d['degree']}, honest_score={d['score']}")
+    else:
+        print("  No suspicious dense regions detected")
     
-    # Verify: sybils should have lower scores than honest agents
-    honest_scores = [n.score for n in honest_agents]
-    sybil_scores = [n.score for n in sybil_agents]
-    print(f"\n  Honest avg: {sum(honest_scores)/len(honest_scores):.4f}")
-    print(f"  Sybil avg: {sum(sybil_scores)/len(sybil_scores):.4f}")
+    print(f"\nStats: {json.dumps(classification['stats'], indent=2)}")
     
-    assert sum(honest_scores)/len(honest_scores) > sum(sybil_scores)/len(sybil_scores), \
-        "Honest agents should score higher than sybils"
-    assert density["sybil_density"] > density["honest_density"], \
-        "Sybil region should be denser than honest region"
+    # Assertions
+    # Honest agents should score > 0.5
+    for a in honest:
+        assert detector.agents[a].score > 0.5, f"{a} should be honest"
+    # Known bad should score low
+    assert detector.agents["known_bad"].score < 0.3
+    # Sybils connected to known_bad should trend low
+    assert detector.agents["sybil_3"].score < 0.5
     
-    print("\nALL ASSERTIONS PASSED ✓")
-    print()
-    print("KEY: Sybil ring density (mutual inflation) is the detection signal.")
-    print("SybilSCAR local rule propagates labeled seeds through the graph.")
-    print("Sparse attack edges = limited contamination of honest scores.")
+    print("\n✓ Core assertions passed")
+    print("\nMETHODOLOGY NOTE: SybilSCAR local rule = θ*prior + (1-θ)*neighbor_avg.")
+    print("Honest seeds propagate high scores through sparse trust graph.")
+    print("Sybil seeds propagate low scores through dense ring.")
+    print("Attack edges are bottleneck: fewer = better isolation.")
 
 
 if __name__ == "__main__":
