@@ -1,264 +1,279 @@
 #!/usr/bin/env python3
 """
-local-trust-whitelist.py — Personalized PageRank trust white-listing.
+local-trust-whitelist.py — Local trust whitelisting over community structure.
 
-Implements the key insight from Alvisi et al (IEEE S&P 2013, SoK: The Evolution
-of Sybil Defense via Social Networks): universal sybil defense is unattainable
-because the honest region isn't homogeneous — it's a collection of tightly-knit
-local communities loosely coupled. Instead: local white-listing. Rank nodes by
-trustworthiness FROM YOUR PERSPECTIVE using personalized PageRank (PPR).
+Alvisi et al (IEEE S&P 2013, "SoK: The Evolution of Sybil Defense via Social
+Networks") key insight: universal sybil defense FAILS because the honest graph
+isn't homogeneous — it's tightly-knit communities loosely coupled. Random walks
+get trapped in communities, not sybil regions.
 
-PPR from a seed node s: random walk that restarts at s with probability α.
-Nodes that score high are "close" to s in the trust graph. Sybil regions are
-dense internally but sparse-cut from honest region — PPR naturally discounts
-them because few random walks cross the sparse cut.
+Fix: abandon global classification. Instead, each node maintains a LOCAL
+whitelist of trusted peers within its community neighborhood. Trust is always
+relative to the verifier's position in the graph.
 
-Also implements sweep cut (Andersen, Chung & Lang, 2006): sort nodes by
-PPR score, find the prefix with minimum conductance. Everything inside the
-cut = your trust community. Everything outside = untrusted or sybil.
+This tool implements:
+1. Community detection via label propagation (lightweight, no imports needed)
+2. Local whitelist generation from ego-network + community overlap
+3. Sybil boundary detection via attack-edge counting between communities
+4. Trust score = community overlap × behavioral history × path diversity
 
 Kit 🦊 — 2026-03-28
 """
 
-import json
 import random
-from collections import defaultdict
+import json
+from collections import defaultdict, Counter
 from dataclasses import dataclass, field
 
 
 @dataclass
-class TrustGraph:
-    """Directed weighted trust graph."""
-    edges: dict[str, dict[str, float]] = field(default_factory=lambda: defaultdict(dict))
-    
-    def add_edge(self, src: str, dst: str, weight: float = 1.0):
-        self.edges[src][dst] = weight
-    
-    def nodes(self) -> set[str]:
-        nodes = set(self.edges.keys())
-        for targets in self.edges.values():
-            nodes.update(targets.keys())
-        return nodes
-    
-    def out_neighbors(self, node: str) -> dict[str, float]:
-        return self.edges.get(node, {})
-    
-    def out_degree(self, node: str) -> float:
-        return sum(self.edges.get(node, {}).values())
+class Node:
+    id: str
+    is_sybil: bool = False
+    community: int = -1
+    dkim_days: int = 0  # Identity layer strength
+    edges: set = field(default_factory=set)
 
 
-def personalized_pagerank(graph: TrustGraph, seed: str, 
-                          alpha: float = 0.15, iterations: int = 50) -> dict[str, float]:
-    """
-    Personalized PageRank from seed node.
+class LocalTrustWhitelist:
+    def __init__(self):
+        self.nodes: dict[str, Node] = {}
     
-    α = restart probability (higher = more local).
-    Standard PPR: at each step, with prob α restart at seed,
-    with prob (1-α) follow a random outgoing edge.
+    def add_node(self, node_id: str, is_sybil: bool = False, dkim_days: int = 0):
+        self.nodes[node_id] = Node(id=node_id, is_sybil=is_sybil, dkim_days=dkim_days)
     
-    Power iteration implementation (not Monte Carlo).
-    """
-    nodes = graph.nodes()
-    n = len(nodes)
+    def add_edge(self, a: str, b: str):
+        if a in self.nodes and b in self.nodes:
+            self.nodes[a].edges.add(b)
+            self.nodes[b].edges.add(a)
     
-    # Initialize: all mass at seed
-    ppr = {node: 0.0 for node in nodes}
-    ppr[seed] = 1.0
-    
-    for _ in range(iterations):
-        new_ppr = {node: 0.0 for node in nodes}
+    def detect_communities(self, iterations: int = 20):
+        """Label propagation community detection. O(edges × iterations)."""
+        # Initialize each node with unique label
+        for i, node in enumerate(self.nodes.values()):
+            node.community = i
         
-        for node in nodes:
-            if ppr[node] == 0:
+        node_list = list(self.nodes.keys())
+        
+        for _ in range(iterations):
+            random.shuffle(node_list)
+            changed = False
+            for nid in node_list:
+                node = self.nodes[nid]
+                if not node.edges:
+                    continue
+                # Adopt most common label among neighbors
+                neighbor_labels = Counter(
+                    self.nodes[n].community for n in node.edges
+                )
+                most_common = neighbor_labels.most_common(1)[0][0]
+                if node.community != most_common:
+                    node.community = most_common
+                    changed = True
+            if not changed:
+                break
+    
+    def get_ego_network(self, node_id: str, hops: int = 2) -> set:
+        """Get all nodes within `hops` of node_id."""
+        visited = {node_id}
+        frontier = {node_id}
+        for _ in range(hops):
+            next_frontier = set()
+            for nid in frontier:
+                for neighbor in self.nodes[nid].edges:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        next_frontier.add(neighbor)
+            frontier = next_frontier
+        return visited
+    
+    def generate_whitelist(self, verifier_id: str, max_size: int = 50) -> list[dict]:
+        """
+        Generate local whitelist for a verifier.
+        
+        Score = community_overlap × identity_strength × path_diversity
+        
+        Community overlap: fraction of shared community membership in ego network
+        Identity strength: normalized DKIM days (0-1)
+        Path diversity: number of independent paths from verifier (approximated)
+        """
+        if verifier_id not in self.nodes:
+            return []
+        
+        verifier = self.nodes[verifier_id]
+        ego = self.get_ego_network(verifier_id, hops=2)
+        
+        candidates = []
+        for nid in ego:
+            if nid == verifier_id:
                 continue
+            node = self.nodes[nid]
             
-            neighbors = graph.out_neighbors(node)
-            total_weight = sum(neighbors.values())
-            
-            if total_weight == 0:
-                # Dangling node: all mass goes to seed
-                new_ppr[seed] += ppr[node]
-                continue
-            
-            # Restart probability
-            new_ppr[seed] += alpha * ppr[node]
-            
-            # Walk probability
-            for neighbor, weight in neighbors.items():
-                new_ppr[neighbor] += (1 - alpha) * ppr[node] * (weight / total_weight)
-        
-        ppr = new_ppr
-    
-    return ppr
-
-
-def sweep_cut(graph: TrustGraph, ppr_scores: dict[str, float]) -> dict:
-    """
-    Andersen-Chung-Lang (2006) sweep cut.
-    
-    Sort nodes by PPR score descending. For each prefix S, compute
-    conductance φ(S) = cut(S, S̄) / min(vol(S), vol(S̄)).
-    Find the prefix with minimum conductance = trust community boundary.
-    """
-    # Sort by PPR score descending
-    sorted_nodes = sorted(ppr_scores.items(), key=lambda x: -x[1])
-    
-    all_nodes = graph.nodes()
-    total_vol = sum(graph.out_degree(n) for n in all_nodes)
-    
-    if total_vol == 0:
-        return {"cut_index": 0, "conductance": 1.0, "community": [], "excluded": list(all_nodes)}
-    
-    best_conductance = float('inf')
-    best_index = 0
-    
-    community = set()
-    vol_s = 0.0
-    cut_edges = 0.0
-    
-    for i, (node, score) in enumerate(sorted_nodes):
-        community.add(node)
-        
-        # Update volume of S
-        vol_s += graph.out_degree(node)
-        
-        # Update cut: edges from node to outside, minus edges from outside to node
-        for neighbor, weight in graph.out_neighbors(node).items():
-            if neighbor in community:
-                cut_edges -= weight  # Was crossing, now internal
+            # Community overlap: same community = 1.0, adjacent = 0.5, else 0.2
+            if node.community == verifier.community:
+                community_score = 1.0
+            elif any(self.nodes[n].community == verifier.community for n in node.edges):
+                community_score = 0.5
             else:
-                cut_edges += weight  # New crossing edge
+                community_score = 0.2
+            
+            # Identity strength (DKIM days, normalized to 90-day target)
+            identity_score = min(1.0, node.dkim_days / 90)
+            
+            # Path diversity (approx: count shared neighbors with verifier)
+            shared_neighbors = len(node.edges & verifier.edges)
+            path_score = min(1.0, shared_neighbors / 3)  # 3+ shared = max
+            
+            # Combined score
+            trust_score = community_score * 0.4 + identity_score * 0.35 + path_score * 0.25
+            
+            candidates.append({
+                "node_id": nid,
+                "trust_score": round(trust_score, 3),
+                "community_score": round(community_score, 3),
+                "identity_score": round(identity_score, 3),
+                "path_score": round(path_score, 3),
+                "is_sybil": node.is_sybil,
+                "community": node.community
+            })
         
-        # Also count edges from previously-added nodes TO this node
-        for prev_node in community:
-            if prev_node == node:
-                continue
-            if node in graph.out_neighbors(prev_node):
-                pass  # Already counted above
-        
-        # Conductance
-        vol_s_bar = total_vol - vol_s
-        min_vol = min(vol_s, vol_s_bar)
-        
-        if min_vol > 0 and i < len(sorted_nodes) - 1:
-            conductance = max(0, cut_edges) / min_vol
-            if conductance < best_conductance:
-                best_conductance = conductance
-                best_index = i + 1
+        # Sort by trust score, take top N
+        candidates.sort(key=lambda x: -x["trust_score"])
+        return candidates[:max_size]
     
-    community_nodes = [n for n, _ in sorted_nodes[:best_index]]
-    excluded_nodes = [n for n, _ in sorted_nodes[best_index:]]
-    
-    return {
-        "cut_index": best_index,
-        "conductance": round(best_conductance, 4),
-        "community": community_nodes,
-        "excluded": excluded_nodes,
-        "community_size": len(community_nodes),
-        "excluded_size": len(excluded_nodes)
-    }
+    def detect_attack_edges(self) -> list[dict]:
+        """Find edges between communities with high sybil density difference."""
+        community_sybil_rate = defaultdict(lambda: {"total": 0, "sybil": 0})
+        
+        for node in self.nodes.values():
+            community_sybil_rate[node.community]["total"] += 1
+            if node.is_sybil:
+                community_sybil_rate[node.community]["sybil"] += 1
+        
+        attack_edges = []
+        seen = set()
+        for nid, node in self.nodes.items():
+            for neighbor_id in node.edges:
+                edge = tuple(sorted([nid, neighbor_id]))
+                if edge in seen:
+                    continue
+                seen.add(edge)
+                
+                neighbor = self.nodes[neighbor_id]
+                if node.community != neighbor.community:
+                    c1 = community_sybil_rate[node.community]
+                    c2 = community_sybil_rate[neighbor.community]
+                    r1 = c1["sybil"] / max(c1["total"], 1)
+                    r2 = c2["sybil"] / max(c2["total"], 1)
+                    
+                    if abs(r1 - r2) > 0.5:  # High differential = attack edge
+                        attack_edges.append({
+                            "edge": edge,
+                            "communities": (node.community, neighbor.community),
+                            "sybil_rates": (round(r1, 2), round(r2, 2)),
+                            "differential": round(abs(r1 - r2), 2)
+                        })
+        
+        return attack_edges
 
 
 def demo():
     random.seed(42)
+    ltw = LocalTrustWhitelist()
+    
+    # Build honest community A (5 nodes, well-connected, high DKIM)
+    for i in range(5):
+        ltw.add_node(f"honest_a{i}", is_sybil=False, dkim_days=random.randint(60, 120))
+    for i in range(5):
+        for j in range(i+1, 5):
+            if random.random() < 0.7:
+                ltw.add_edge(f"honest_a{i}", f"honest_a{j}")
+    
+    # Build honest community B (5 nodes, loosely coupled to A)
+    for i in range(5):
+        ltw.add_node(f"honest_b{i}", is_sybil=False, dkim_days=random.randint(40, 90))
+    for i in range(5):
+        for j in range(i+1, 5):
+            if random.random() < 0.6:
+                ltw.add_edge(f"honest_b{i}", f"honest_b{j}")
+    
+    # Sparse bridge between communities (1-2 edges)
+    ltw.add_edge("honest_a2", "honest_b0")
+    
+    # Build sybil ring (5 nodes, dense, no DKIM)
+    for i in range(5):
+        ltw.add_node(f"sybil_{i}", is_sybil=True, dkim_days=random.randint(0, 5))
+    for i in range(5):
+        for j in range(i+1, 5):
+            ltw.add_edge(f"sybil_{i}", f"sybil_{j}")  # Fully connected
+    
+    # Attack edges: sybils connect to honest community A
+    ltw.add_edge("sybil_0", "honest_a3")
+    ltw.add_edge("sybil_1", "honest_a4")
+    
+    # Detect communities
+    ltw.detect_communities()
     
     print("=" * 60)
-    print("LOCAL TRUST WHITE-LISTING via Personalized PageRank")
-    print("Alvisi et al (IEEE S&P 2013) + Andersen-Chung-Lang (2006)")
+    print("LOCAL TRUST WHITELIST DEMO")
     print("=" * 60)
     
-    g = TrustGraph()
+    # Show communities
+    communities = defaultdict(list)
+    for nid, node in ltw.nodes.items():
+        communities[node.community].append((nid, node.is_sybil))
     
-    # Honest community: sparse but connected
-    honest = ["kit", "bro_agent", "funwolf", "santaclawd", "gerundium", 
-              "gendolf", "braindiff", "hexdrifter", "kampderp", "aletheaveyra"]
+    print(f"\nCommunities detected: {len(communities)}")
+    for cid, members in sorted(communities.items()):
+        sybil_count = sum(1 for _, s in members if s)
+        print(f"  Community {cid}: {len(members)} members ({sybil_count} sybil)")
     
-    # Sparse honest connections (each node has 2-4 connections)
-    honest_edges = [
-        ("kit", "bro_agent", 0.9), ("kit", "funwolf", 0.85),
-        ("kit", "santaclawd", 0.8), ("kit", "gerundium", 0.7),
-        ("bro_agent", "kit", 0.88), ("bro_agent", "braindiff", 0.75),
-        ("bro_agent", "santaclawd", 0.7),
-        ("funwolf", "kit", 0.82), ("funwolf", "santaclawd", 0.6),
-        ("funwolf", "aletheaveyra", 0.65),
-        ("santaclawd", "kit", 0.85), ("santaclawd", "bro_agent", 0.7),
-        ("santaclawd", "funwolf", 0.6),
-        ("gerundium", "kit", 0.75), ("gerundium", "gendolf", 0.8),
-        ("gendolf", "gerundium", 0.78), ("gendolf", "kit", 0.65),
-        ("braindiff", "bro_agent", 0.72), ("braindiff", "kampderp", 0.6),
-        ("hexdrifter", "kampderp", 0.7), ("hexdrifter", "kit", 0.5),
-        ("kampderp", "hexdrifter", 0.68), ("kampderp", "braindiff", 0.55),
-        ("aletheaveyra", "funwolf", 0.6), ("aletheaveyra", "gerundium", 0.5),
-    ]
-    
-    for src, dst, w in honest_edges:
-        g.add_edge(src, dst, w)
-    
-    # Sybil ring: dense internal connections
-    sybils = [f"sybil_{i}" for i in range(6)]
-    for i, s1 in enumerate(sybils):
-        for j, s2 in enumerate(sybils):
-            if i != j:
-                g.add_edge(s1, s2, 0.95)  # Dense mutual attestation
-    
-    # Sparse attack edges (sybil → honest)
-    g.add_edge("sybil_0", "hexdrifter", 0.3)  # Single attack edge
-    g.add_edge("hexdrifter", "sybil_0", 0.15)  # Weak reciprocal
-    
-    print(f"\nGraph: {len(g.nodes())} nodes, {len(honest)} honest, {len(sybils)} sybil")
-    print(f"Honest density: sparse (2-4 edges each)")
-    print(f"Sybil density: fully connected (all-to-all)")
-    print(f"Attack edges: 1 (sybil_0 ↔ hexdrifter)")
-    
-    # PPR from Kit's perspective
-    print("\n" + "=" * 60)
-    print("PERSONALIZED PAGERANK from kit (α=0.15)")
+    # Generate whitelist for honest_a0
+    print(f"\n{'='*60}")
+    print("WHITELIST for honest_a0:")
     print("=" * 60)
+    whitelist = ltw.generate_whitelist("honest_a0")
     
-    ppr = personalized_pagerank(g, "kit", alpha=0.15)
-    sorted_ppr = sorted(ppr.items(), key=lambda x: -x[1])
+    sybils_in_list = 0
+    for entry in whitelist[:10]:
+        marker = "⚠ SYBIL" if entry["is_sybil"] else "✓"
+        if entry["is_sybil"]:
+            sybils_in_list += 1
+        print(f"  {entry['node_id']:15s} score={entry['trust_score']:.3f} "
+              f"(comm={entry['community_score']:.1f} id={entry['identity_score']:.2f} "
+              f"path={entry['path_score']:.2f}) {marker}")
     
-    for node, score in sorted_ppr:
-        label = "HONEST" if node in honest else "SYBIL"
-        bar = "█" * int(score * 200)
-        print(f"  {node:20s} {score:.4f} {bar} [{label}]")
+    print(f"\nSybils in top-10: {sybils_in_list}")
     
-    # Sweep cut
-    print("\n" + "=" * 60)
-    print("SWEEP CUT (minimum conductance)")
+    # Attack edge detection
+    print(f"\n{'='*60}")
+    print("ATTACK EDGES:")
     print("=" * 60)
+    attack_edges = ltw.detect_attack_edges()
+    for ae in attack_edges:
+        print(f"  {ae['edge'][0]} ↔ {ae['edge'][1]}")
+        print(f"    Communities: {ae['communities']}, sybil rates: {ae['sybil_rates']}")
+        print(f"    Differential: {ae['differential']}")
     
-    cut = sweep_cut(g, ppr)
-    print(f"  Community size: {cut['community_size']}")
-    print(f"  Excluded size: {cut['excluded_size']}")
-    print(f"  Conductance: {cut['conductance']}")
-    print(f"\n  White-listed (trust community):")
-    for node in cut["community"]:
-        label = "✓ HONEST" if node in honest else "✗ SYBIL"
-        print(f"    {node:20s} [{label}]")
-    print(f"\n  Excluded (untrusted):")
-    for node in cut["excluded"]:
-        label = "✓ HONEST" if node in honest else "✗ SYBIL"
-        print(f"    {node:20s} [{label}]")
+    # Verify: sybils should score LOW in honest node's whitelist
+    whitelist_scores = {e["node_id"]: e["trust_score"] for e in whitelist}
+    honest_scores = [s for nid, s in whitelist_scores.items() if not ltw.nodes[nid].is_sybil]
+    sybil_scores = [s for nid, s in whitelist_scores.items() if ltw.nodes[nid].is_sybil]
     
-    # Verify sybils are mostly excluded
-    sybils_in_community = [n for n in cut["community"] if n in sybils]
-    honest_excluded = [n for n in cut["excluded"] if n in honest]
+    if honest_scores and sybil_scores:
+        avg_honest = sum(honest_scores) / len(honest_scores)
+        avg_sybil = sum(sybil_scores) / len(sybil_scores)
+        gap = avg_honest - avg_sybil
+        print(f"\nAvg honest score: {avg_honest:.3f}")
+        print(f"Avg sybil score: {avg_sybil:.3f}")
+        print(f"Gap: {gap:.3f}")
+        assert gap > 0, "Honest nodes should score higher than sybils!"
+        print("✓ Honest nodes score higher than sybils in local whitelist")
     
-    print(f"\n  Sybils in community: {len(sybils_in_community)} / {len(sybils)}")
-    print(f"  Honest excluded: {len(honest_excluded)} / {len(honest)}")
-    
-    # Key insight
-    print("\n" + "=" * 60)
-    print("KEY INSIGHT")
-    print("=" * 60)
-    print("PPR naturally discounts sybil regions because few random walks")
-    print("cross the sparse cut. Dense internal sybil connections don't help —")
-    print("they just recirculate mass within the ring.")
-    print()
-    print("This is LOCAL trust: Kit's perspective ≠ hexdrifter's perspective.")
-    print("No universal classifier. Each agent builds its own whitelist.")
-    print("Alvisi: 'settle for local white-listing, not universal defense.'")
+    print(f"\nKEY: Trust is LOCAL. No global oracle. Community structure")
+    print("protects against sybils because sybils form dense cliques")
+    print("that are easily distinguishable from sparse honest communities.")
+    print("(Alvisi et al, IEEE S&P 2013)")
 
 
 if __name__ == "__main__":
