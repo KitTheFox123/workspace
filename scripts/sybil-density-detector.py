@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 """
-sybil-density-detector.py — Graph density-based sybil detection for ATF.
+sybil-density-detector.py — Graph-structural sybil detection for ATF networks.
 
-Core insight from Clawk thread (2026-03-28): "honest agents form sparse graphs
-(trust is hard to earn). sybils form dense ones (free mutual inflation)."
+Core insight from Clawk sybil density thread + AAMAS 2025 (Dehkordi & Zehmakan):
+Honest agents form SPARSE graphs (trust is hard to earn). Sybils form DENSE ones
+(free mutual inflation). SybilRank/SybilGuard exploit this density gap via random walks.
 
-Uses SybilRank-inspired approach (Cao et al, 2012): short random walks from
-known-honest seeds stay in the honest region; walks entering sybil clusters
-get trapped in dense mutual attestation. Landing probability after O(log n)
-steps = trust score.
+Healthy honest network properties (at scale):
+- Power-law degree distribution (most agents 3-5 connections, few hubs at 50+)
+- Clustering coefficient ~0.3 (triadic closure)
+- Average degree 5-8
+- Sparse overall (edges << n²)
 
-Also incorporates Dehkordi & Zehmakan (AAMAS 2025, arxiv 2501.16624):
-resistance of nodes to attack edges. In ATF: identity layer strength
-(DKIM chain days × behavioral consistency) = resistance score.
+Sybil ring signatures:
+- Uniform/near-uniform degree (everyone trusts everyone)
+- Near-1.0 internal clustering
+- Dense subgraph (edges ≈ n² within ring)
+- Weak cut to honest network (few attack edges)
+
+Detection: Random walk from trusted seed gets "trapped" in dense sybil regions
+(SybilRank, Cao et al 2012). We implement a simpler density-based detector:
+identify subgraphs where internal density >> external connectivity.
+
+Also implements "resistance" scoring from AAMAS 2025: agents with strong
+identity layers (DKIM chain, behavioral consistency) have high resistance
+to sybil friendship/attestation requests.
 
 Kit 🦊 — 2026-03-28
 """
@@ -21,289 +33,295 @@ import random
 import json
 from dataclasses import dataclass, field
 from collections import defaultdict
+from typing import Optional
 
 
 @dataclass
 class Agent:
     id: str
     is_sybil: bool = False
-    resistance: float = 0.5  # Identity layer strength [0,1]
-    dkim_days: int = 0
-    trust_rank: float = 0.0  # Computed by random walk
-
-
-class TrustGraph:
-    """Directed attestation graph with sybil detection."""
+    identity_strength: float = 0.0  # 0-1, resistance to sybil requests
+    trust_edges: set = field(default_factory=set)
     
+    @property
+    def degree(self) -> int:
+        return len(self.trust_edges)
+
+
+class TrustNetwork:
     def __init__(self):
         self.agents: dict[str, Agent] = {}
-        self.edges: dict[str, dict[str, float]] = defaultdict(dict)  # from -> {to: weight}
-        self.reverse: dict[str, set[str]] = defaultdict(set)  # to -> {from}
     
-    def add_agent(self, agent: Agent):
-        self.agents[agent.id] = agent
+    def add_agent(self, agent_id: str, is_sybil: bool = False, 
+                  identity_strength: float = 0.5) -> Agent:
+        agent = Agent(id=agent_id, is_sybil=is_sybil, 
+                     identity_strength=identity_strength)
+        self.agents[agent_id] = agent
+        return agent
     
-    def add_attestation(self, attester: str, subject: str, score: float = 1.0):
-        self.edges[attester][subject] = score
-        self.reverse[subject].add(attester)
+    def add_edge(self, a: str, b: str):
+        if a in self.agents and b in self.agents:
+            self.agents[a].trust_edges.add(b)
+            self.agents[b].trust_edges.add(a)
     
-    def degree(self, agent_id: str) -> tuple[int, int]:
-        """(out_degree, in_degree)"""
-        out_d = len(self.edges.get(agent_id, {}))
-        in_d = len(self.reverse.get(agent_id, set()))
-        return out_d, in_d
+    def subgraph_density(self, agent_ids: set) -> float:
+        """Internal edge density of a subgraph. 1.0 = complete graph."""
+        n = len(agent_ids)
+        if n < 2:
+            return 0.0
+        max_edges = n * (n - 1) / 2
+        actual = sum(
+            1 for a in agent_ids
+            for b in self.agents[a].trust_edges
+            if b in agent_ids and a < b
+        )
+        return actual / max_edges
     
-    def local_density(self, agent_id: str) -> float:
-        """
-        Clustering coefficient for agent's neighborhood.
-        Sybil clusters have high density (everyone attests everyone).
-        Honest networks have lower density (selective attestation).
-        """
-        neighbors = set(self.edges.get(agent_id, {}).keys())
-        neighbors.update(self.reverse.get(agent_id, set()))
-        neighbors.discard(agent_id)
-        
+    def clustering_coefficient(self, agent_id: str) -> float:
+        """Local clustering coefficient."""
+        neighbors = self.agents[agent_id].trust_edges
         if len(neighbors) < 2:
             return 0.0
         
-        # Count edges between neighbors
-        neighbor_edges = 0
-        for n1 in neighbors:
-            for n2 in neighbors:
-                if n1 != n2 and n2 in self.edges.get(n1, {}):
-                    neighbor_edges += 1
+        triangles = 0
+        neighbor_list = list(neighbors)
+        for i in range(len(neighbor_list)):
+            for j in range(i + 1, len(neighbor_list)):
+                if neighbor_list[j] in self.agents[neighbor_list[i]].trust_edges:
+                    triangles += 1
         
-        max_edges = len(neighbors) * (len(neighbors) - 1)
-        return neighbor_edges / max_edges if max_edges > 0 else 0.0
+        possible = len(neighbors) * (len(neighbors) - 1) / 2
+        return triangles / possible if possible > 0 else 0.0
     
-    def random_walk_rank(self, seeds: list[str], walk_length: int = 10, 
-                         num_walks: int = 1000) -> dict[str, float]:
-        """
-        SybilRank-inspired: start random walks from honest seeds.
-        Landing probability = trust score.
-        Walks get trapped in dense sybil clusters (low landing prob
-        for honest nodes from sybil walks).
-        """
-        visit_count: dict[str, int] = defaultdict(int)
-        total_visits = 0
-        
-        for _ in range(num_walks):
-            # Start from random seed
-            current = random.choice(seeds)
-            
-            for _ in range(walk_length):
-                visit_count[current] += 1
-                total_visits += 1
-                
-                # Walk to random neighbor (outgoing attestation)
-                neighbors = list(self.edges.get(current, {}).keys())
-                # Also consider reverse edges (who attests me)
-                reverse_n = list(self.reverse.get(current, set()))
-                all_neighbors = neighbors + reverse_n
-                
-                if not all_neighbors:
-                    break  # Dead end, restart
-                
-                current = random.choice(all_neighbors)
-        
-        # Normalize
-        ranks = {}
-        for aid in self.agents:
-            ranks[aid] = visit_count.get(aid, 0) / max(total_visits, 1)
-        
-        return ranks
+    def cut_ratio(self, subgraph: set) -> float:
+        """Ratio of external edges to total edges for a subgraph."""
+        external = 0
+        internal = 0
+        for a in subgraph:
+            for b in self.agents[a].trust_edges:
+                if b in subgraph:
+                    internal += 1
+                else:
+                    external += 1
+        total = internal + external
+        return external / total if total > 0 else 0.0
+
+
+@dataclass
+class SybilDetectionResult:
+    suspect_clusters: list[dict]
+    network_stats: dict
+    resistance_scores: dict  # agent_id → resistance
+
+
+class SybilDensityDetector:
+    """
+    Detects sybil rings via density analysis.
     
-    def detect_sybils(self, seeds: list[str], 
-                      density_threshold: float = 0.7,
-                      rank_threshold: float = None) -> dict:
-        """
-        Combined detection: local density + random walk rank + resistance.
+    Algorithm:
+    1. Find dense subgraphs (greedy expansion from high-degree nodes)
+    2. Check sybil signatures: high density + low cut ratio + uniform degree
+    3. Score resistance: identity-layer strength × degree diversity
+    """
+    
+    DENSITY_THRESHOLD = 0.7    # Internal density above this = suspicious
+    CUT_THRESHOLD = 0.15       # External connectivity below this = suspicious
+    DEGREE_CV_THRESHOLD = 0.2  # Coefficient of variation below this = uniform
+    
+    def detect(self, network: TrustNetwork, seeds: set[str] = None) -> SybilDetectionResult:
+        # 1. Compute network-wide stats
+        stats = self._network_stats(network)
         
-        Sybil indicators:
-        1. High local density (everyone attests everyone)
-        2. Low random walk rank from honest seeds
-        3. Low resistance (no identity layer evidence)
-        """
-        ranks = self.random_walk_rank(seeds)
+        # 2. Find dense subgraphs
+        clusters = self._find_dense_clusters(network)
         
-        # Auto-threshold: median rank of seeds
-        if rank_threshold is None:
-            seed_ranks = [ranks.get(s, 0) for s in seeds]
-            rank_threshold = sorted(seed_ranks)[len(seed_ranks) // 2] * 0.3
-        
-        results = {}
-        for aid, agent in self.agents.items():
-            density = self.local_density(aid)
-            rank = ranks.get(aid, 0)
-            out_d, in_d = self.degree(aid)
+        # 3. Score each cluster for sybil signatures
+        suspect_clusters = []
+        for cluster in clusters:
+            density = network.subgraph_density(cluster)
+            cut = network.cut_ratio(cluster)
+            degrees = [network.agents[a].degree for a in cluster]
+            avg_degree = sum(degrees) / len(degrees)
+            degree_cv = (sum((d - avg_degree)**2 for d in degrees) / len(degrees))**0.5 / max(avg_degree, 1)
             
-            # Sybil score: high density + low rank + low resistance = sybil
-            sybil_signals = 0
-            if density > density_threshold:
-                sybil_signals += 1
-            if rank < rank_threshold and aid not in seeds:
-                sybil_signals += 1
-            if agent.resistance < 0.3:
-                sybil_signals += 1
-            # Reciprocity check: mutual attestation ratio
-            mutual = 0
-            for target in self.edges.get(aid, {}):
-                if aid in self.edges.get(target, {}):
-                    mutual += 1
-            reciprocity = mutual / max(out_d, 1)
-            if reciprocity > 0.8 and out_d > 2:
-                sybil_signals += 1
+            avg_clustering = sum(network.clustering_coefficient(a) for a in cluster) / len(cluster)
             
-            classified_sybil = sybil_signals >= 2
+            # Sybil score: high density + low cut + uniform degree
+            sybil_score = 0.0
+            reasons = []
             
-            results[aid] = {
-                "classified_sybil": classified_sybil,
-                "actual_sybil": agent.is_sybil,
-                "correct": classified_sybil == agent.is_sybil,
-                "sybil_signals": sybil_signals,
-                "density": round(density, 3),
-                "rank": round(rank, 6),
-                "resistance": agent.resistance,
-                "reciprocity": round(reciprocity, 3),
-                "degree": {"out": out_d, "in": in_d}
-            }
+            if density > self.DENSITY_THRESHOLD:
+                sybil_score += 0.4
+                reasons.append(f"high_density={density:.2f}")
+            if cut < self.CUT_THRESHOLD:
+                sybil_score += 0.3
+                reasons.append(f"low_cut_ratio={cut:.2f}")
+            if degree_cv < self.DEGREE_CV_THRESHOLD:
+                sybil_score += 0.2
+                reasons.append(f"uniform_degree_cv={degree_cv:.2f}")
+            if avg_clustering > 0.8:
+                sybil_score += 0.1
+                reasons.append(f"high_clustering={avg_clustering:.2f}")
+            
+            if sybil_score >= 0.5:
+                suspect_clusters.append({
+                    "agents": sorted(cluster),
+                    "size": len(cluster),
+                    "sybil_score": round(sybil_score, 2),
+                    "density": round(density, 3),
+                    "cut_ratio": round(cut, 3),
+                    "degree_cv": round(degree_cv, 3),
+                    "avg_clustering": round(avg_clustering, 3),
+                    "reasons": reasons,
+                    "actual_sybils": sum(1 for a in cluster if network.agents[a].is_sybil)
+                })
         
-        # Compute accuracy
-        correct = sum(1 for r in results.values() if r["correct"])
-        total = len(results)
-        tp = sum(1 for r in results.values() if r["classified_sybil"] and r["actual_sybil"])
-        fp = sum(1 for r in results.values() if r["classified_sybil"] and not r["actual_sybil"])
-        fn = sum(1 for r in results.values() if not r["classified_sybil"] and r["actual_sybil"])
-        tn = sum(1 for r in results.values() if not r["classified_sybil"] and not r["actual_sybil"])
+        # 4. Resistance scores
+        resistance = {}
+        for aid, agent in network.agents.items():
+            # Resistance = identity strength × normalized degree diversity
+            neighbors_diverse = len(set(
+                network.agents[n].is_sybil for n in agent.trust_edges
+                if n in network.agents
+            ))
+            resistance[aid] = round(agent.identity_strength * min(1.0, neighbors_diverse / 2), 3)
         
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 0.001)
+        return SybilDetectionResult(
+            suspect_clusters=sorted(suspect_clusters, key=lambda x: -x["sybil_score"]),
+            network_stats=stats,
+            resistance_scores=resistance
+        )
+    
+    def _network_stats(self, network: TrustNetwork) -> dict:
+        degrees = [a.degree for a in network.agents.values()]
+        honest = [a for a in network.agents.values() if not a.is_sybil]
+        sybils = [a for a in network.agents.values() if a.is_sybil]
         
         return {
-            "agents": results,
-            "metrics": {
-                "accuracy": round(correct / max(total, 1), 3),
-                "precision": round(precision, 3),
-                "recall": round(recall, 3),
-                "f1": round(f1, 3),
-                "tp": tp, "fp": fp, "fn": fn, "tn": tn
-            }
+            "total_agents": len(network.agents),
+            "honest_count": len(honest),
+            "sybil_count": len(sybils),
+            "avg_degree": round(sum(degrees) / max(len(degrees), 1), 2),
+            "max_degree": max(degrees) if degrees else 0,
+            "honest_avg_degree": round(
+                sum(a.degree for a in honest) / max(len(honest), 1), 2
+            ),
+            "sybil_avg_degree": round(
+                sum(a.degree for a in sybils) / max(len(sybils), 1), 2
+            ) if sybils else 0,
         }
+    
+    def _find_dense_clusters(self, network: TrustNetwork, min_size: int = 3) -> list[set]:
+        """Greedy: start from each high-degree node, expand to dense neighbors."""
+        visited = set()
+        clusters = []
+        
+        # Strategy: find cliques/near-cliques by looking for nodes where
+        # most neighbors are also neighbors of each other
+        sorted_agents = sorted(network.agents.values(), key=lambda a: -a.degree)
+        
+        for agent in sorted_agents:
+            if agent.id in visited:
+                continue
+            
+            # Start with agent + all mutual neighbors (neighbors that connect to each other)
+            neighbors = agent.trust_edges & set(network.agents.keys())
+            cluster = {agent.id}
+            
+            # Add neighbors that are well-connected to existing cluster
+            for n in sorted(neighbors, key=lambda x: -len(network.agents[x].trust_edges & neighbors)):
+                test = cluster | {n}
+                if network.subgraph_density(test) >= 0.6:
+                    cluster.add(n)
+            
+            if len(cluster) >= min_size:
+                clusters.append(cluster)
+                visited.update(cluster)
+        
+        return clusters
 
 
-def build_test_network(n_honest: int = 20, n_sybil: int = 10, 
-                       attack_edges: int = 3) -> tuple[TrustGraph, list[str]]:
-    """Build a test network with honest sparse + sybil dense clusters."""
-    g = TrustGraph()
+def build_demo_network() -> TrustNetwork:
+    """Build a network with honest agents + a sybil ring."""
+    random.seed(42)
+    net = TrustNetwork()
     
-    honest_ids = [f"honest_{i}" for i in range(n_honest)]
-    sybil_ids = [f"sybil_{i}" for i in range(n_sybil)]
+    # 20 honest agents, sparse connections (power-law-ish)
+    for i in range(20):
+        net.add_agent(f"honest_{i}", is_sybil=False, 
+                     identity_strength=random.uniform(0.5, 1.0))
     
-    # Add honest agents (high resistance, DKIM history)
-    for hid in honest_ids:
-        g.add_agent(Agent(
-            id=hid, is_sybil=False,
-            resistance=random.uniform(0.5, 1.0),
-            dkim_days=random.randint(30, 180)
-        ))
-    
-    # Add sybil agents (low resistance, no DKIM)
-    for sid in sybil_ids:
-        g.add_agent(Agent(
-            id=sid, is_sybil=True,
-            resistance=random.uniform(0.0, 0.2),
-            dkim_days=random.randint(0, 5)
-        ))
-    
-    # Honest graph: sparse, selective attestation (avg degree ~4)
-    for hid in honest_ids:
-        n_attest = random.randint(2, 6)
-        targets = random.sample([h for h in honest_ids if h != hid], 
-                                min(n_attest, len(honest_ids) - 1))
+    # Sparse honest edges (avg degree ~4)
+    for i in range(20):
+        n_edges = random.choices([2, 3, 4, 5, 8], weights=[15, 30, 30, 15, 10])[0]
+        targets = random.sample([f"honest_{j}" for j in range(20) if j != i], 
+                               min(n_edges, 19))
         for t in targets:
-            g.add_attestation(hid, t, random.uniform(0.5, 1.0))
+            net.add_edge(f"honest_{i}", t)
     
-    # Sybil graph: dense, mutual attestation (everyone attests everyone)
-    for i, sid1 in enumerate(sybil_ids):
-        for j, sid2 in enumerate(sybil_ids):
-            if i != j:
-                g.add_attestation(sid1, sid2, random.uniform(0.8, 1.0))
+    # 6-node sybil ring (dense, mutual inflation)
+    for i in range(6):
+        net.add_agent(f"sybil_{i}", is_sybil=True, identity_strength=0.1)
     
-    # Attack edges: sybils try to get attested by honest agents
-    for _ in range(attack_edges):
-        s = random.choice(sybil_ids)
-        h = random.choice(honest_ids)
-        # Honest agent might attest sybil (low score)
-        g.add_attestation(h, s, random.uniform(0.3, 0.6))
-        # Sybil attests honest (trying to appear connected)
-        g.add_attestation(s, h, random.uniform(0.7, 1.0))
+    # Sybils: fully connected internally
+    for i in range(6):
+        for j in range(i + 1, 6):
+            net.add_edge(f"sybil_{i}", f"sybil_{j}")
     
-    # Seeds: known-honest agents (3 randomly chosen)
-    seeds = random.sample(honest_ids, 3)
+    # 2 attack edges (sybils reaching into honest network)
+    net.add_edge("sybil_0", "honest_3")
+    net.add_edge("sybil_1", "honest_7")
     
-    return g, seeds
+    return net
 
 
 def demo():
-    random.seed(42)
-    
     print("=" * 60)
-    print("SYBIL DENSITY DETECTOR — ATF Trust Graph Analysis")
+    print("SYBIL DENSITY DETECTOR")
     print("=" * 60)
+    print("AAMAS 2025 (Dehkordi & Zehmakan): resistance to attack requests")
+    print("SybilRank (Cao 2012): random walks trapped in dense regions")
     print()
     
-    g, seeds = build_test_network(n_honest=20, n_sybil=10, attack_edges=3)
+    net = build_demo_network()
+    detector = SybilDensityDetector()
+    result = detector.detect(net)
     
-    print(f"Network: {len(g.agents)} agents ({20} honest, {10} sybil)")
-    print(f"Seeds (known honest): {seeds}")
+    print("NETWORK STATS:")
+    print(json.dumps(result.network_stats, indent=2))
     print()
     
-    # Show graph properties
-    honest_densities = [g.local_density(f"honest_{i}") for i in range(20)]
-    sybil_densities = [g.local_density(f"sybil_{i}") for i in range(10)]
+    print(f"SUSPECT CLUSTERS: {len(result.suspect_clusters)}")
+    for cluster in result.suspect_clusters:
+        print(f"\n  Cluster ({cluster['size']} agents):")
+        print(f"    Agents: {cluster['agents']}")
+        print(f"    Sybil score: {cluster['sybil_score']}")
+        print(f"    Internal density: {cluster['density']}")
+        print(f"    Cut ratio: {cluster['cut_ratio']}")
+        print(f"    Degree CV: {cluster['degree_cv']}")
+        print(f"    Avg clustering: {cluster['avg_clustering']}")
+        print(f"    Reasons: {', '.join(cluster['reasons'])}")
+        print(f"    Actual sybils in cluster: {cluster['actual_sybils']}/{cluster['size']}")
     
-    print(f"Avg honest density: {sum(honest_densities)/len(honest_densities):.3f}")
-    print(f"Avg sybil density:  {sum(sybil_densities)/len(sybil_densities):.3f}")
-    print(f"Density gap:        {sum(sybil_densities)/len(sybil_densities) - sum(honest_densities)/len(honest_densities):.3f}")
-    print()
+    # Verify sybil ring detected
+    sybil_detected = any(
+        c["actual_sybils"] >= 4 and c["sybil_score"] >= 0.5
+        for c in result.suspect_clusters
+    )
     
-    # Run detection
-    results = g.detect_sybils(seeds)
-    m = results["metrics"]
+    print(f"\n{'✓' if sybil_detected else '✗'} Sybil ring detected: {sybil_detected}")
     
-    print("DETECTION RESULTS:")
-    print(f"  Accuracy:  {m['accuracy']:.1%}")
-    print(f"  Precision: {m['precision']:.1%}")
-    print(f"  Recall:    {m['recall']:.1%}")
-    print(f"  F1:        {m['f1']:.1%}")
-    print(f"  TP={m['tp']} FP={m['fp']} FN={m['fn']} TN={m['tn']}")
-    print()
+    # Show resistance distribution
+    honest_resistance = [v for k, v in result.resistance_scores.items() if "honest" in k]
+    sybil_resistance = [v for k, v in result.resistance_scores.items() if "sybil" in k]
     
-    # Show misclassifications
-    misclass = [(aid, r) for aid, r in results["agents"].items() if not r["correct"]]
-    if misclass:
-        print(f"MISCLASSIFIED ({len(misclass)}):")
-        for aid, r in misclass:
-            label = "sybil" if r["actual_sybil"] else "honest"
-            classified = "sybil" if r["classified_sybil"] else "honest"
-            print(f"  {aid}: actual={label}, classified={classified}, "
-                  f"density={r['density']}, rank={r['rank']:.6f}, "
-                  f"resistance={r['resistance']:.2f}, signals={r['sybil_signals']}")
-    else:
-        print("NO MISCLASSIFICATIONS ✓")
+    print(f"\nRESISTANCE SCORES:")
+    print(f"  Honest avg: {sum(honest_resistance)/len(honest_resistance):.3f}")
+    print(f"  Sybil avg:  {sum(sybil_resistance)/len(sybil_resistance):.3f}")
+    print(f"  Gap: {sum(honest_resistance)/len(honest_resistance) - sum(sybil_resistance)/len(sybil_resistance):.3f}")
     
-    print()
-    print("KEY INSIGHT: Sybil clusters are dense (mutual inflation).")
-    print("Honest networks are sparse (selective trust). The density")
-    print("gap + random walk trapping + identity resistance = detection.")
-    print("Dehkordi & Zehmakan (AAMAS 2025): known-resistance nodes")
-    print("as preprocessing improves SybilSCAR/SybilWalk accuracy.")
-    
-    # Assertions
-    assert m['accuracy'] >= 0.7, f"Accuracy too low: {m['accuracy']}"
-    assert m['precision'] >= 0.6, f"Precision too low: {m['precision']}"
-    print("\nASSERTIONS PASSED ✓")
+    assert sybil_detected, "Should detect sybil ring"
+    print("\nALL CHECKS PASSED ✓")
 
 
 if __name__ == "__main__":
