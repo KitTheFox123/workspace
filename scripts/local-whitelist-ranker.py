@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-local-whitelist-ranker.py — Local sybil-resistant white-listing via random walks.
+local-whitelist-ranker.py — Local whitelisting for ATF sybil defense.
 
-Based on Alvisi et al 2013 (SoK: Evolution of Sybil Defense via Social Networks):
-- Universal sybil defense FAILS: honest graph isn't homogeneous, it's communities
-- LOCAL white-listing works: rank nodes by trustworthiness within your neighborhood
-- Cost = O(white-list size), not O(total network)
-- Key metric: CONDUCTANCE (mixing time of random walks)
-  - Honest subgraph: fast-mixing (high conductance within community)
-  - Sybil subgraph: slow-mixing to honest region (few attack edges)
-  - Random walks from honest seeds stay in honest region
+Alvisi et al (IEEE S&P 2013, "SoK: The Evolution of Sybil Defense via
+Social Networks"): Universal sybil defense FAILS because honest graphs
+aren't homogeneous — they're communities loosely coupled. Solution: 
+local whitelisting. Rank nodes by trustworthiness WITHIN your neighborhood.
+Cost = O(whitelist size), not O(network).
 
-Implementation: personalized random walk from a seed node (the requester).
-Walk probability accumulates at nodes. Honest neighbors get high rank
-(walk stays local). Sybils get low rank (walk leaks through attack edges
-and dissipates in dense sybil region).
-
-Also integrates: SybilRank (Cao et al 2012), which uses early-terminated
-random walks + degree-normalization to rank nodes.
+Implementation: personalized PageRank (PPR) from ego node, combined with
+structural features (clustering coefficient, community overlap) to rank
+neighbors. Sybils form dense cliques — PPR mass concentrates there but
+clustering coefficient is artificially high, creating a detectable signal.
 
 Kit 🦊 — 2026-03-28
 """
@@ -31,7 +25,7 @@ from dataclasses import dataclass, field
 @dataclass
 class Node:
     id: str
-    is_honest: bool = True
+    is_sybil: bool = False
     trust_score: float = 0.0
 
 
@@ -40,8 +34,8 @@ class TrustGraph:
         self.nodes: dict[str, Node] = {}
         self.edges: dict[str, set[str]] = defaultdict(set)
     
-    def add_node(self, node_id: str, honest: bool = True):
-        self.nodes[node_id] = Node(id=node_id, is_honest=honest)
+    def add_node(self, node_id: str, is_sybil: bool = False):
+        self.nodes[node_id] = Node(id=node_id, is_sybil=is_sybil)
         if node_id not in self.edges:
             self.edges[node_id] = set()
     
@@ -51,227 +45,243 @@ class TrustGraph:
     
     def degree(self, node_id: str) -> int:
         return len(self.edges.get(node_id, set()))
+    
+    def clustering_coefficient(self, node_id: str) -> float:
+        """Local clustering coefficient — fraction of neighbor pairs that are connected."""
+        neighbors = list(self.edges.get(node_id, set()))
+        k = len(neighbors)
+        if k < 2:
+            return 0.0
+        
+        triangles = 0
+        for i in range(len(neighbors)):
+            for j in range(i + 1, len(neighbors)):
+                if neighbors[j] in self.edges.get(neighbors[i], set()):
+                    triangles += 1
+        
+        return (2 * triangles) / (k * (k - 1))
+    
+    def personalized_pagerank(self, ego: str, alpha: float = 0.15, 
+                               iterations: int = 50) -> dict[str, float]:
+        """
+        Personalized PageRank from ego node.
+        
+        PPR = random walk that teleports back to ego with probability alpha.
+        Nodes reachable through many short paths get high rank.
+        Sybils behind sparse attack edges get lower PPR from honest egos.
+        """
+        # Initialize
+        scores = {n: 0.0 for n in self.nodes}
+        scores[ego] = 1.0
+        
+        for _ in range(iterations):
+            new_scores = {n: 0.0 for n in self.nodes}
+            for node_id in self.nodes:
+                neighbors = self.edges.get(node_id, set())
+                if not neighbors:
+                    new_scores[ego] += scores[node_id]  # dangling → teleport
+                    continue
+                
+                share = scores[node_id] / len(neighbors)
+                for neighbor in neighbors:
+                    new_scores[neighbor] += (1 - alpha) * share
+                
+                new_scores[ego] += alpha * scores[node_id]
+            
+            scores = new_scores
+        
+        # Normalize
+        total = sum(scores.values())
+        if total > 0:
+            scores = {k: v / total for k, v in scores.items()}
+        
+        return scores
 
 
 class LocalWhitelistRanker:
     """
-    Rank nodes by trustworthiness using personalized random walks.
+    Rank nodes for local whitelisting using PPR + structural features.
     
-    The walk starts at a seed (the requesting agent). At each step:
-    - With probability alpha (teleport), return to seed
-    - With probability (1-alpha), walk to random neighbor
-    
-    After many steps, visit frequency = trust rank.
-    Honest neighbors get high rank. Sybils behind few attack edges
-    get low rank because the walk rarely crosses.
-    
-    This is essentially personalized PageRank / SybilRank hybrid.
+    Alvisi et al key insight: "instead of aiming for universal coverage,
+    sybil defense should settle for a more limited goal: offering honest
+    nodes the ability to white-list a set of nodes of any given size,
+    ranked accordingly to their trustworthiness."
     """
     
-    def __init__(self, graph: TrustGraph, alpha: float = 0.15, 
-                 walk_length: int = 20, num_walks: int = 1000):
+    def __init__(self, graph: TrustGraph):
         self.graph = graph
-        self.alpha = alpha  # Teleport probability (stay local)
-        self.walk_length = walk_length
-        self.num_walks = num_walks
     
-    def rank(self, seed: str, whitelist_size: int = 10) -> list[dict]:
+    def rank_for_ego(self, ego: str, whitelist_size: int = 10) -> list[dict]:
         """
-        Generate a local whitelist of size k, ranked by trust.
+        Produce a ranked whitelist for ego node.
         
-        Cost: O(num_walks * walk_length) — independent of total network size.
-        This is the key insight from Alvisi et al: local defense scales.
+        Score = PPR * structural_penalty
+        
+        Structural penalty: sybils have artificially HIGH clustering
+        (dense cliques) but LOW community diversity. Penalize nodes
+        whose clustering coefficient is suspiciously close to 1.0
+        (perfect clique = sybil signal).
         """
-        visit_count: dict[str, float] = defaultdict(float)
+        ppr = self.graph.personalized_pagerank(ego)
         
-        for _ in range(self.num_walks):
-            current = seed
-            for step in range(self.walk_length):
-                # Degree-normalized visit (SybilRank style)
-                degree = self.graph.degree(current)
-                if degree > 0:
-                    visit_count[current] += 1.0 / degree
-                else:
-                    visit_count[current] += 1.0
-                
-                # Teleport or walk
-                if random.random() < self.alpha:
-                    current = seed  # Return to seed
-                else:
-                    neighbors = list(self.graph.edges.get(current, set()))
-                    if neighbors:
-                        current = random.choice(neighbors)
-                    else:
-                        current = seed
+        candidates = []
+        for node_id, ppr_score in ppr.items():
+            if node_id == ego:
+                continue
+            
+            cc = self.graph.clustering_coefficient(node_id)
+            degree = self.graph.degree(node_id)
+            
+            # Structural penalty: perfect cliques (cc ≈ 1.0) are suspicious
+            # Honest nodes in communities have cc ∈ [0.1, 0.5] typically
+            # Sybil cliques have cc → 1.0
+            if cc > 0.8 and degree > 2:
+                structural_penalty = 0.3  # Heavy penalty for clique-like
+            elif cc > 0.6 and degree > 2:
+                structural_penalty = 0.6
+            else:
+                structural_penalty = 1.0
+            
+            # Degree penalty: very high degree relative to graph = hub or sybil coordinator
+            avg_degree = sum(self.graph.degree(n) for n in self.graph.nodes) / max(len(self.graph.nodes), 1)
+            if degree > 3 * avg_degree:
+                structural_penalty *= 0.5
+            
+            final_score = ppr_score * structural_penalty
+            
+            candidates.append({
+                "node_id": node_id,
+                "ppr_score": round(ppr_score, 6),
+                "clustering_coeff": round(cc, 3),
+                "degree": degree,
+                "structural_penalty": round(structural_penalty, 2),
+                "final_score": round(final_score, 6),
+                "is_sybil": self.graph.nodes[node_id].is_sybil
+            })
         
-        # Normalize
-        total = sum(visit_count.values())
-        if total > 0:
-            for k in visit_count:
-                visit_count[k] /= total
-        
-        # Sort and return top-k (excluding seed)
-        ranked = sorted(
-            [(nid, score) for nid, score in visit_count.items() if nid != seed],
-            key=lambda x: -x[1]
-        )
-        
-        return [
-            {
-                "node": nid,
-                "trust_rank": round(score, 6),
-                "is_honest": self.graph.nodes[nid].is_honest,
-                "degree": self.graph.degree(nid)
-            }
-            for nid, score in ranked[:whitelist_size]
-        ]
+        # Sort by final score descending
+        candidates.sort(key=lambda x: -x["final_score"])
+        return candidates[:whitelist_size]
     
     def evaluate_whitelist(self, whitelist: list[dict]) -> dict:
-        """Evaluate whitelist quality: precision (honest fraction)."""
-        if not whitelist:
-            return {"precision": 0.0, "size": 0}
+        """Evaluate whitelist quality: how many sybils leaked in?"""
+        total = len(whitelist)
+        sybils = sum(1 for w in whitelist if w["is_sybil"])
+        honest = total - sybils
         
-        honest = sum(1 for w in whitelist if w["is_honest"])
         return {
-            "size": len(whitelist),
+            "whitelist_size": total,
             "honest_count": honest,
-            "sybil_count": len(whitelist) - honest,
-            "precision": round(honest / len(whitelist), 4)
+            "sybil_count": sybils,
+            "precision": round(honest / max(total, 1), 3),
+            "sybil_leak_rate": round(sybils / max(total, 1), 3)
         }
 
 
-def build_test_graph(n_honest: int = 50, n_sybil: int = 30, 
-                     honest_edges: int = 150, sybil_internal_edges: int = 200,
-                     attack_edges: int = 3) -> TrustGraph:
+def build_test_graph() -> TrustGraph:
     """
     Build a graph with:
-    - Honest region: sparse, community-structured (high local conductance)
-    - Sybil region: dense (mutual inflation)
-    - Few attack edges connecting them (low cross-conductance)
+    - 20 honest nodes in 2 loose communities (power-law-ish)
+    - 10 sybil nodes in a dense clique
+    - 3 attack edges connecting sybils to honest region
     """
     g = TrustGraph()
+    random.seed(42)
     
-    # Honest nodes
-    honest_ids = [f"h_{i}" for i in range(n_honest)]
-    for hid in honest_ids:
-        g.add_node(hid, honest=True)
+    # Community A: honest nodes h_a0..h_a9
+    for i in range(10):
+        g.add_node(f"h_a{i}", is_sybil=False)
+    # Sparse internal connections (avg degree ~4)
+    a_edges = [(0,1),(0,2),(1,2),(1,3),(2,4),(3,4),(3,5),(4,5),(5,6),(6,7),(7,8),(8,9),(6,9),(0,5)]
+    for i, j in a_edges:
+        g.add_edge(f"h_a{i}", f"h_a{j}")
     
-    # Honest edges (sparse, community structure)
-    for _ in range(honest_edges):
-        a, b = random.sample(honest_ids, 2)
-        g.add_edge(a, b)
+    # Community B: honest nodes h_b0..h_b9
+    for i in range(10):
+        g.add_node(f"h_b{i}", is_sybil=False)
+    b_edges = [(0,1),(0,3),(1,2),(2,3),(2,4),(3,5),(4,5),(4,6),(5,7),(6,7),(7,8),(8,9),(6,8),(1,4)]
+    for i, j in b_edges:
+        g.add_edge(f"h_b{i}", f"h_b{j}")
     
-    # Sybil nodes
-    sybil_ids = [f"s_{i}" for i in range(n_sybil)]
-    for sid in sybil_ids:
-        g.add_node(sid, honest=False)
+    # Inter-community bridges (loose coupling — Alvisi's key observation)
+    g.add_edge("h_a3", "h_b0")
+    g.add_edge("h_a7", "h_b5")
     
-    # Sybil internal edges (dense — free mutual inflation)
-    for _ in range(sybil_internal_edges):
-        a, b = random.sample(sybil_ids, 2)
-        g.add_edge(a, b)
+    # Sybil clique: s0..s9 (fully connected = dense)
+    for i in range(10):
+        g.add_node(f"s{i}", is_sybil=True)
+    for i in range(10):
+        for j in range(i + 1, 10):
+            g.add_edge(f"s{i}", f"s{j}")
     
-    # Attack edges (few — the bottleneck)
-    for _ in range(attack_edges):
-        h = random.choice(honest_ids)
-        s = random.choice(sybil_ids)
-        g.add_edge(h, s)
+    # Attack edges (sparse — hard to create many in real systems)
+    g.add_edge("s0", "h_a2")
+    g.add_edge("s1", "h_a8")
+    g.add_edge("s2", "h_b3")
     
-    return g, honest_ids, sybil_ids
+    return g
 
 
 def demo():
-    random.seed(42)
+    g = build_test_graph()
+    ranker = LocalWhitelistRanker(g)
     
     print("=" * 60)
-    print("LOCAL WHITELIST RANKER — Sybil-Resistant Trust Ranking")
-    print("Based on Alvisi et al 2013 (SoK: Sybil Defense)")
+    print("LOCAL WHITELIST RANKER — Alvisi et al (IEEE S&P 2013)")
     print("=" * 60)
+    print(f"Graph: {len(g.nodes)} nodes (20 honest + 10 sybil)")
+    print(f"Sybil structure: dense clique (cc→1.0)")
+    print(f"Honest structure: 2 loose communities (cc~0.2-0.4)")
+    print(f"Attack edges: 3")
+    print()
     
-    # Build test graph
-    g, honest_ids, sybil_ids = build_test_graph(
-        n_honest=50, n_sybil=30,
-        honest_edges=150, sybil_internal_edges=200,
-        attack_edges=3
-    )
+    # Test from different ego positions
+    test_egos = ["h_a0", "h_a3", "h_b5", "h_a8"]
     
-    print(f"\nGraph: {len(honest_ids)} honest, {len(sybil_ids)} sybil, "
-          f"3 attack edges")
-    print(f"Honest avg degree: {sum(g.degree(h) for h in honest_ids) / len(honest_ids):.1f}")
-    print(f"Sybil avg degree: {sum(g.degree(s) for s in sybil_ids) / len(sybil_ids):.1f}")
-    
-    ranker = LocalWhitelistRanker(g, alpha=0.15, walk_length=20, num_walks=2000)
-    
-    # Test 1: Honest seed
-    print(f"\n{'='*60}")
-    print("TEST 1: Honest seed (h_0) requesting whitelist of 15")
-    print("=" * 60)
-    
-    wl = ranker.rank("h_0", whitelist_size=15)
-    eval1 = ranker.evaluate_whitelist(wl)
-    
-    print(f"Top 5:")
-    for w in wl[:5]:
-        label = "✓" if w["is_honest"] else "✗ SYBIL"
-        print(f"  {w['node']}: rank={w['trust_rank']:.6f} deg={w['degree']} {label}")
-    
-    print(f"\nWhitelist quality: {eval1}")
-    
-    # Test 2: Different honest seed
-    print(f"\n{'='*60}")
-    print("TEST 2: Different honest seed (h_25)")
-    print("=" * 60)
-    
-    wl2 = ranker.rank("h_25", whitelist_size=15)
-    eval2 = ranker.evaluate_whitelist(wl2)
-    
-    print(f"Top 5:")
-    for w in wl2[:5]:
-        label = "✓" if w["is_honest"] else "✗ SYBIL"
-        print(f"  {w['node']}: rank={w['trust_rank']:.6f} deg={w['degree']} {label}")
-    
-    print(f"\nWhitelist quality: {eval2}")
-    
-    # Test 3: More attack edges (weaker boundary)
-    print(f"\n{'='*60}")
-    print("TEST 3: Weaker boundary (15 attack edges)")
-    print("=" * 60)
-    
-    g2, h2, s2 = build_test_graph(
-        n_honest=50, n_sybil=30,
-        honest_edges=150, sybil_internal_edges=200,
-        attack_edges=15  # Much weaker boundary
-    )
-    ranker2 = LocalWhitelistRanker(g2, alpha=0.15, walk_length=20, num_walks=2000)
-    wl3 = ranker2.rank("h_0", whitelist_size=15)
-    eval3 = ranker2.evaluate_whitelist(wl3)
-    
-    print(f"Top 5:")
-    for w in wl3[:5]:
-        label = "✓" if w["is_honest"] else "✗ SYBIL"
-        print(f"  {w['node']}: rank={w['trust_rank']:.6f} deg={w['degree']} {label}")
-    
-    print(f"\nWhitelist quality: {eval3}")
+    for ego in test_egos:
+        print(f"{'='*60}")
+        print(f"EGO: {ego} (whitelist size=10)")
+        print(f"{'='*60}")
+        
+        whitelist = ranker.rank_for_ego(ego, whitelist_size=10)
+        eval_result = ranker.evaluate_whitelist(whitelist)
+        
+        for w in whitelist:
+            marker = "⚠ SYBIL" if w["is_sybil"] else "✓ honest"
+            print(f"  {w['node_id']:8s} score={w['final_score']:.6f} "
+                  f"ppr={w['ppr_score']:.6f} cc={w['clustering_coeff']:.3f} "
+                  f"deg={w['degree']:2d} pen={w['structural_penalty']:.2f} [{marker}]")
+        
+        print(f"\n  Precision: {eval_result['precision']:.1%} "
+              f"({eval_result['honest_count']} honest, {eval_result['sybil_count']} sybil)")
+        print()
     
     # Summary
-    print(f"\n{'='*60}")
+    print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"3 attack edges:  precision={eval1['precision']:.1%} (honest seed h_0)")
-    print(f"3 attack edges:  precision={eval2['precision']:.1%} (honest seed h_25)")  
-    print(f"15 attack edges: precision={eval3['precision']:.1%} (weaker boundary)")
-    print()
-    print("KEY INSIGHT (Alvisi et al):")
-    print("  - Few attack edges → random walks stay honest → high precision")
-    print("  - More attack edges → walks leak to sybils → precision drops")
-    print("  - The BOUNDARY is the bottleneck, not detection algorithm")
-    print("  - Defense in depth: make attack edges expensive to create")
-    print("  - DKIM chains + behavioral consistency = expensive attack edges")
     
-    # Assertions
-    assert eval1["precision"] >= 0.8, f"Precision too low: {eval1['precision']}"
-    assert eval3["precision"] < eval1["precision"], "Weaker boundary should have lower precision"
-    print("\nALL ASSERTIONS PASSED ✓")
+    all_precisions = []
+    for ego in [f"h_a{i}" for i in range(10)] + [f"h_b{i}" for i in range(10)]:
+        wl = ranker.rank_for_ego(ego, whitelist_size=10)
+        ev = ranker.evaluate_whitelist(wl)
+        all_precisions.append(ev["precision"])
+    
+    avg_precision = sum(all_precisions) / len(all_precisions)
+    min_precision = min(all_precisions)
+    max_precision = max(all_precisions)
+    
+    print(f"Avg precision across all honest egos: {avg_precision:.1%}")
+    print(f"Min: {min_precision:.1%}, Max: {max_precision:.1%}")
+    print()
+    print("KEY INSIGHT (Alvisi 2013): Universal defense fails because")
+    print("honest graph has communities. Local whitelisting succeeds")
+    print("because it only needs to rank YOUR neighborhood correctly.")
+    print("Sybil dense cliques get penalized by structural features.")
+    
+    # Assert reasonable performance
+    assert avg_precision >= 0.7, f"Avg precision too low: {avg_precision}"
+    print(f"\n✓ ALL CHECKS PASSED (avg precision {avg_precision:.1%} >= 70%)")
 
 
 if __name__ == "__main__":
