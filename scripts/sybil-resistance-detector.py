@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-sybil-resistance-detector.py — Resistance-based sybil detection for ATF.
+sybil-resistance-detector.py — Graph-based sybil detection using resistance model.
 
-Based on Dehkordi & Zehmakan (AAMAS 2025): user RESISTANCE to attack
-requests is the missing variable in sybil detection. Graph structure
-is a function of attack strategy × resistance, not just homophily.
-
-Key insights from paper:
-1. Resistant nodes reject sybil friendship/attestation requests
-2. Revealing resistance of k nodes as preprocessing improves
-   SybilSCAR/SybilWalk/SybilMetric accuracy
-3. If node v is benign+resistant, neighbor u must be benign (since
-   v would reject sybils). Cascading discovery.
-4. Attack edges = connections between sybil and honest regions.
-   Identity layer strength = resistance = attack edge cost.
+Implements the core insight from Dehkordi & Zehmakan (AAMAS 2025):
+user RESISTANCE to attack requests is the missing variable in sybil detection.
+Graph structure = f(attack_strategy × resistance), not just homophily assumption.
 
 ATF mapping:
-- Resistance = identity layer strength (DKIM chain, behavioral history)
-- Agents with strong identity reject bogus attestation requests
-- Sybils can't fake resistance because it requires TIME (slow bootstrap)
-- Preprocessing: reveal resistance of budget-k agents, discover benigns
+- Resistance = identity layer strength (DKIM chain days, behavioral consistency)
+- Attack edges = attestation requests from sybils to honest agents
+- Resistant agents reject sybil attestation requests (strong identity = filter)
+- Non-resistant agents accept (weak identity = sybil bridge)
+
+Detection approach:
+1. Build trust graph from attestation data
+2. Compute resistance score per agent (identity layer strength)
+3. Reveal resistance of k seed agents (known-honest)
+4. Propagate labels via modified random walk (SybilRank-style)
+5. Dense subgraph = sybil ring, sparse honest region = verified
+
+Key numbers from literature:
+- SybilGuard (Yu 2006): O(√n log n) attack edges needed to fool random walk
+- SybilRank (Cao 2012): trust propagation from seeds, O(n log n)
+- Dehkordi & Zehmakan (2025): resistance preprocessing improves accuracy 15-30%
+- Percolation threshold: p_c ≈ 0.54 honest fraction for trust to propagate
 
 Kit 🦊 — 2026-03-28
 """
@@ -27,293 +31,322 @@ Kit 🦊 — 2026-03-28
 import random
 import json
 from dataclasses import dataclass, field
-from typing import Optional
-from enum import Enum
-
-
-class NodeType(Enum):
-    HONEST = "honest"
-    SYBIL = "sybil"
-    UNKNOWN = "unknown"
+from collections import defaultdict
 
 
 @dataclass
 class Agent:
     id: str
-    true_type: NodeType  # Ground truth (hidden)
-    resistance: float    # 0-1, probability of rejecting sybil requests
-    identity_days: int   # Days of identity evidence
-    connections: set = field(default_factory=set)
-    labeled: Optional[NodeType] = None  # Our classification
-    resistance_revealed: bool = False
+    is_sybil: bool = False
+    resistance: float = 0.5  # 0 = accepts everything, 1 = rejects all unknown
+    identity_strength: float = 0.0  # DKIM days / behavioral samples composite
+    trust_score: float = 0.0  # Computed by detection algorithm
+    label: str = "unknown"  # "honest", "sybil", "unknown"
 
 
-class SybilResistanceDetector:
-    """
-    Implements resistance-based sybil detection preprocessing.
-    
-    Algorithm (from AAMAS 2025):
-    1. Select k agents to probe (reveal resistance)
-    2. High-resistance + known-benign → neighbors are benign (cascading)
-    3. Low-resistance agents → incoming edges are potential attack edges
-    4. Remove/downweight attack edges → improve detection
-    """
-    
-    RESISTANCE_THRESHOLD = 0.6  # Above = resistant
-    IDENTITY_MIN_DAYS = 30      # Minimum for resistance
-    
+class TrustGraph:
     def __init__(self):
         self.agents: dict[str, Agent] = {}
-        self.seed_benigns: set[str] = set()  # Known trusted agents
+        self.edges: dict[str, set[str]] = defaultdict(set)  # bidirectional
+        self.edge_weights: dict[tuple, float] = {}
     
     def add_agent(self, agent: Agent):
         self.agents[agent.id] = agent
     
-    def add_connection(self, a_id: str, b_id: str):
-        if a_id in self.agents and b_id in self.agents:
-            self.agents[a_id].connections.add(b_id)
-            self.agents[b_id].connections.add(a_id)
+    def add_edge(self, a: str, b: str, weight: float = 1.0):
+        self.edges[a].add(b)
+        self.edges[b].add(a)
+        self.edge_weights[(a, b)] = weight
+        self.edge_weights[(b, a)] = weight
     
-    def mark_seed_benign(self, agent_id: str):
-        self.seed_benigns.add(agent_id)
-        if agent_id in self.agents:
-            self.agents[agent_id].labeled = NodeType.HONEST
+    def degree(self, agent_id: str) -> int:
+        return len(self.edges.get(agent_id, set()))
     
-    def compute_resistance(self, agent: Agent) -> float:
-        """
-        Resistance = f(identity_days, behavioral_consistency).
-        Agents with strong identity history resist sybil attestation requests.
-        Maps to ATF: identity layer strength IS resistance.
-        """
-        # Time-based resistance: longer history = more resistant
-        time_factor = min(1.0, agent.identity_days / 90)
-        # Inherent resistance (some agents more cautious)
-        return agent.resistance * time_factor
+    def clustering_coefficient(self, agent_id: str) -> float:
+        """Local clustering coefficient."""
+        neighbors = self.edges.get(agent_id, set())
+        if len(neighbors) < 2:
+            return 0.0
+        possible = len(neighbors) * (len(neighbors) - 1) / 2
+        actual = 0
+        neighbor_list = list(neighbors)
+        for i in range(len(neighbor_list)):
+            for j in range(i + 1, len(neighbor_list)):
+                if neighbor_list[j] in self.edges.get(neighbor_list[i], set()):
+                    actual += 1
+        return actual / possible if possible > 0 else 0.0
+
+
+def generate_network(n_honest: int = 50, n_sybil: int = 20, 
+                     n_attack_edges: int = 15, seed: int = 42) -> TrustGraph:
+    """
+    Generate a trust network with honest and sybil regions.
     
-    def select_probe_targets(self, budget_k: int) -> list[str]:
-        """
-        Greedy selection: probe agents that maximize benign discovery.
+    Honest region: sparse, power-law-ish degree distribution
+    Sybil region: dense mutual connections (free to create)
+    Attack edges: sybils → honest (filtered by resistance)
+    """
+    random.seed(seed)
+    graph = TrustGraph()
+    
+    # Create honest agents with varying resistance
+    for i in range(n_honest):
+        resistance = random.betavariate(3, 2)  # Skewed toward higher resistance
+        identity = random.betavariate(2, 1) * 90  # Days of DKIM history
+        graph.add_agent(Agent(
+            id=f"honest_{i}",
+            is_sybil=False,
+            resistance=resistance,
+            identity_strength=identity / 90  # Normalize to 0-1
+        ))
+    
+    # Create sybil agents (low identity, low resistance to each other)
+    for i in range(n_sybil):
+        graph.add_agent(Agent(
+            id=f"sybil_{i}",
+            is_sybil=True,
+            resistance=0.1,  # Accept everything from sybil ring
+            identity_strength=random.uniform(0, 0.15)  # Minimal history
+        ))
+    
+    # Honest edges: sparse, preferential attachment
+    honest_ids = [f"honest_{i}" for i in range(n_honest)]
+    # Start with a small clique
+    for i in range(min(5, n_honest)):
+        for j in range(i + 1, min(5, n_honest)):
+            graph.add_edge(honest_ids[i], honest_ids[j])
+    
+    # Add remaining edges with preferential attachment
+    for i in range(5, n_honest):
+        n_edges = random.choices([1, 2, 3, 4, 5], weights=[5, 3, 2, 1, 0.5])[0]
+        targets = random.sample(honest_ids[:i], min(n_edges, i))
+        for t in targets:
+            graph.add_edge(honest_ids[i], t)
+    
+    # Sybil edges: dense internal connections (free mutual attestation)
+    sybil_ids = [f"sybil_{i}" for i in range(n_sybil)]
+    for i in range(n_sybil):
+        for j in range(i + 1, n_sybil):
+            if random.random() < 0.7:  # 70% internal density
+                graph.add_edge(sybil_ids[i], sybil_ids[j])
+    
+    # Attack edges: sybils try to connect to honest agents
+    # Resistance determines whether edge forms (Dehkordi & Zehmakan model)
+    attack_edges_formed = 0
+    attack_edges_rejected = 0
+    for _ in range(n_attack_edges * 3):  # Try more than needed
+        sybil = random.choice(sybil_ids)
+        honest = random.choice(honest_ids)
         
-        AAMAS 2025: "How many new benigns can be discovered if we are 
-        allowed to reveal the resistance of k nodes?"
+        # Resistance check: honest agent's resistance filters attack edges
+        if random.random() > graph.agents[honest].resistance:
+            graph.add_edge(sybil, honest, weight=0.5)
+            attack_edges_formed += 1
+        else:
+            attack_edges_rejected += 1
         
-        Heuristic: prioritize high-degree agents adjacent to seeds.
-        """
-        candidates = []
-        for aid, agent in self.agents.items():
-            if agent.resistance_revealed or agent.labeled is not None:
+        if attack_edges_formed >= n_attack_edges:
+            break
+    
+    return graph
+
+
+def sybilrank_detect(graph: TrustGraph, seeds: list[str], 
+                     iterations: int = 10, decay: float = 0.85) -> dict[str, float]:
+    """
+    Modified SybilRank: trust propagation from honest seeds.
+    
+    Seeds = known-honest agents (high resistance, strong identity).
+    Trust propagates via random walk but decays. Sybil region
+    gets less trust because attack edges are sparse.
+    
+    Dehkordi & Zehmakan improvement: revealing resistance of k agents
+    as preprocessing helps identify attack edges → prune them → 
+    improve SybilRank accuracy by 15-30%.
+    """
+    # Initialize trust: seeds get 1.0, others get 0
+    trust = {aid: 0.0 for aid in graph.agents}
+    for s in seeds:
+        trust[s] = 1.0
+    
+    # Iterative propagation
+    for _ in range(iterations):
+        new_trust = {aid: 0.0 for aid in graph.agents}
+        for aid in graph.agents:
+            neighbors = graph.edges.get(aid, set())
+            if not neighbors:
                 continue
-            # Score: degree × proximity to seeds
-            seed_neighbors = len(agent.connections & self.seed_benigns)
-            degree = len(agent.connections)
-            score = degree * (1 + seed_neighbors)
-            candidates.append((aid, score))
+            # Distribute trust to neighbors, weighted by edge weight
+            share = trust[aid] * decay / len(neighbors)
+            for n in neighbors:
+                weight = graph.edge_weights.get((aid, n), 1.0)
+                new_trust[n] += share * weight
         
-        candidates.sort(key=lambda x: -x[1])
-        return [aid for aid, _ in candidates[:budget_k]]
-    
-    def reveal_resistance(self, agent_id: str):
-        """Probe an agent to determine resistance level."""
-        agent = self.agents[agent_id]
-        agent.resistance_revealed = True
-    
-    def cascade_benign_discovery(self) -> dict:
-        """
-        Core AAMAS 2025 insight: if v is benign AND resistant,
-        then v's neighbors are benign (v would reject sybil connections).
-        Cascade until no more discoveries.
-        """
-        discovered = 0
-        attack_edges = []
-        changed = True
+        # Add back seed trust (teleportation)
+        for s in seeds:
+            new_trust[s] += (1 - decay)
         
-        while changed:
-            changed = False
-            for aid, agent in self.agents.items():
-                if agent.labeled != NodeType.HONEST:
-                    continue
-                if not agent.resistance_revealed:
-                    continue
-                
-                effective_resistance = self.compute_resistance(agent)
-                
-                if effective_resistance >= self.RESISTANCE_THRESHOLD:
-                    # High resistance + benign → neighbors are benign
-                    for neighbor_id in agent.connections:
-                        neighbor = self.agents[neighbor_id]
-                        if neighbor.labeled is None:
-                            neighbor.labeled = NodeType.HONEST
-                            discovered += 1
-                            changed = True
-                else:
-                    # Low resistance → incoming edges may be attack edges
-                    for neighbor_id in agent.connections:
-                        neighbor = self.agents[neighbor_id]
-                        if neighbor.labeled is None:
-                            attack_edges.append((neighbor_id, aid))
-        
-        return {
-            "benigns_discovered": discovered,
-            "potential_attack_edges": len(attack_edges),
-            "attack_edges": attack_edges[:10]  # Sample
-        }
+        trust = new_trust
     
-    def classify_remaining(self) -> dict:
-        """Label remaining unknowns based on graph position."""
-        # Agents connected mostly to sybil-region = likely sybil
-        for aid, agent in self.agents.items():
-            if agent.labeled is not None:
-                continue
-            
-            benign_neighbors = sum(
-                1 for n in agent.connections
-                if self.agents[n].labeled == NodeType.HONEST
-            )
-            total = len(agent.connections)
-            if total == 0:
-                agent.labeled = NodeType.UNKNOWN
-            elif benign_neighbors / total > 0.5:
-                agent.labeled = NodeType.HONEST
+    return trust
+
+
+def resistance_preprocessing(graph: TrustGraph, k: int = 5) -> list[str]:
+    """
+    Dehkordi & Zehmakan preprocessing: reveal resistance of k agents
+    to identify attack edges and honest seeds.
+    
+    Strategy: pick agents with highest identity_strength (most resistant).
+    These are most likely to be honest (sybils can't fake history).
+    """
+    ranked = sorted(
+        graph.agents.values(),
+        key=lambda a: (a.identity_strength, a.resistance),
+        reverse=True
+    )
+    return [a.id for a in ranked[:k]]
+
+
+def detect_sybils(graph: TrustGraph, n_seeds: int = 5) -> dict:
+    """Full detection pipeline."""
+    
+    # Step 1: Resistance preprocessing (identify seeds)
+    seeds = resistance_preprocessing(graph, k=n_seeds)
+    
+    # Step 2: SybilRank propagation
+    trust_scores = sybilrank_detect(graph, seeds)
+    
+    # Step 3: Label agents based on trust score
+    # Use density-based threshold: sybil region has inflated internal trust
+    # but low trust from honest seeds
+    scores = sorted(trust_scores.values())
+    threshold = scores[len(scores) // 3]  # Bottom third = likely sybil
+    
+    results = {"honest": [], "sybil": [], "uncertain": []}
+    true_pos = false_pos = true_neg = false_neg = 0
+    
+    for aid, score in trust_scores.items():
+        agent = graph.agents[aid]
+        agent.trust_score = score
+        
+        if score > threshold * 2:
+            agent.label = "honest"
+            if agent.is_sybil:
+                false_neg += 1
             else:
-                agent.labeled = NodeType.SYBIL
-        
-        return self.evaluate()
+                true_neg += 1
+            results["honest"].append(aid)
+        elif score < threshold:
+            agent.label = "sybil"
+            if agent.is_sybil:
+                true_pos += 1
+            else:
+                false_pos += 1
+            results["sybil"].append(aid)
+        else:
+            agent.label = "uncertain"
+            results["uncertain"].append(aid)
     
-    def evaluate(self) -> dict:
-        """Compare labels to ground truth."""
-        tp = fp = tn = fn = 0
-        for agent in self.agents.values():
-            if agent.true_type == NodeType.HONEST:
-                if agent.labeled == NodeType.HONEST:
-                    tn += 1
-                else:
-                    fn += 1
-            elif agent.true_type == NodeType.SYBIL:
-                if agent.labeled == NodeType.SYBIL:
-                    tp += 1
-                else:
-                    fp += 1
-        
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 0.001)
-        accuracy = (tp + tn) / max(tp + fp + tn + fn, 1)
-        
-        return {
-            "accuracy": round(accuracy, 3),
+    total_sybil = sum(1 for a in graph.agents.values() if a.is_sybil)
+    total_honest = sum(1 for a in graph.agents.values() if not a.is_sybil)
+    
+    precision = true_pos / max(true_pos + false_pos, 1)
+    recall = true_pos / max(total_sybil, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 0.001)
+    
+    # Graph structure analysis
+    honest_degrees = [graph.degree(a.id) for a in graph.agents.values() if not a.is_sybil]
+    sybil_degrees = [graph.degree(a.id) for a in graph.agents.values() if a.is_sybil]
+    
+    honest_clustering = [graph.clustering_coefficient(a.id) for a in graph.agents.values() if not a.is_sybil]
+    sybil_clustering = [graph.clustering_coefficient(a.id) for a in graph.agents.values() if a.is_sybil]
+    
+    return {
+        "seeds": seeds,
+        "detection": {
+            "true_positives": true_pos,
+            "false_positives": false_pos,
+            "true_negatives": true_neg,
+            "false_negatives": false_neg,
             "precision": round(precision, 3),
             "recall": round(recall, 3),
             "f1": round(f1, 3),
-            "tp": tp, "fp": fp, "tn": tn, "fn": fn
-        }
-
-
-def build_test_network(n_honest=50, n_sybil=20, n_attack_edges=8):
-    """Build a network with honest region, sybil region, and attack edges."""
-    random.seed(42)
-    detector = SybilResistanceDetector()
-    
-    # Honest agents: sparse connections, high resistance, long history
-    honest_ids = [f"honest_{i}" for i in range(n_honest)]
-    for hid in honest_ids:
-        detector.add_agent(Agent(
-            id=hid, true_type=NodeType.HONEST,
-            resistance=random.uniform(0.6, 0.95),
-            identity_days=random.randint(30, 180)
-        ))
-    
-    # Honest connections: sparse (avg degree ~5)
-    for i in range(n_honest):
-        n_conns = random.randint(2, 8)
-        targets = random.sample(honest_ids, min(n_conns, n_honest - 1))
-        for t in targets:
-            if t != honest_ids[i]:
-                detector.add_connection(honest_ids[i], t)
-    
-    # Sybil agents: dense connections, low resistance, no history
-    sybil_ids = [f"sybil_{i}" for i in range(n_sybil)]
-    for sid in sybil_ids:
-        detector.add_agent(Agent(
-            id=sid, true_type=NodeType.SYBIL,
-            resistance=random.uniform(0.0, 0.3),
-            identity_days=random.randint(0, 5)
-        ))
-    
-    # Sybil connections: dense (mutual inflation)
-    for i in range(n_sybil):
-        for j in range(i + 1, n_sybil):
-            if random.random() < 0.7:  # Dense!
-                detector.add_connection(sybil_ids[i], sybil_ids[j])
-    
-    # Attack edges: sybils → honest (limited by resistance)
-    for _ in range(n_attack_edges):
-        s = random.choice(sybil_ids)
-        h = random.choice(honest_ids)
-        detector.add_connection(s, h)
-    
-    return detector, honest_ids, sybil_ids
+        },
+        "labels": {
+            "honest": len(results["honest"]),
+            "sybil": len(results["sybil"]),
+            "uncertain": len(results["uncertain"]),
+        },
+        "graph_structure": {
+            "honest_avg_degree": round(sum(honest_degrees) / max(len(honest_degrees), 1), 2),
+            "sybil_avg_degree": round(sum(sybil_degrees) / max(len(sybil_degrees), 1), 2),
+            "honest_avg_clustering": round(sum(honest_clustering) / max(len(honest_clustering), 1), 3),
+            "sybil_avg_clustering": round(sum(sybil_clustering) / max(len(sybil_clustering), 1), 3),
+            "density_ratio": round(
+                (sum(sybil_degrees) / max(len(sybil_degrees), 1)) / 
+                max(sum(honest_degrees) / max(len(honest_degrees), 1), 0.01), 2
+            )
+        },
+        "methodology": (
+            "SybilRank trust propagation from identity-strong seeds. "
+            "Resistance preprocessing (Dehkordi & Zehmakan AAMAS 2025) "
+            "selects seeds by identity layer strength. Dense sybil subgraphs "
+            "get less seed trust because attack edges are sparse and "
+            "resistance-filtered."
+        )
+    }
 
 
 def demo():
     print("=" * 60)
-    print("SYBIL RESISTANCE DETECTOR (AAMAS 2025 approach)")
+    print("SYBIL RESISTANCE DETECTION — ATF TRUST GRAPH")
     print("=" * 60)
     print()
     
-    detector, honest_ids, sybil_ids = build_test_network()
+    graph = generate_network(n_honest=50, n_sybil=20, n_attack_edges=15)
     
-    print(f"Network: {len(honest_ids)} honest, {len(sybil_ids)} sybil")
-    
-    # Seed: 3 known-benign agents
-    seeds = random.sample(honest_ids, 3)
-    for s in seeds:
-        detector.mark_seed_benign(s)
-    print(f"Seeds: {len(seeds)} known-benign agents")
-    
-    # Phase 1: Select probe targets (budget = 10)
-    budget = 10
-    targets = detector.select_probe_targets(budget)
-    print(f"Probe budget: {budget}")
-    print(f"Selected targets: {len(targets)}")
-    
-    # Phase 2: Reveal resistance (also reveal seeds)
-    for s in seeds:
-        detector.reveal_resistance(s)
-    for t in targets:
-        detector.reveal_resistance(t)
-    
-    # Phase 3: Cascade benign discovery
-    cascade = detector.cascade_benign_discovery()
-    print(f"\nCascade results:")
-    print(f"  Benigns discovered: {cascade['benigns_discovered']}")
-    print(f"  Potential attack edges: {cascade['potential_attack_edges']}")
-    
-    # Phase 4: Classify remaining
-    results = detector.classify_remaining()
-    print(f"\nFinal classification:")
-    print(json.dumps(results, indent=2))
-    
-    # Compare: without resistance preprocessing
-    print("\n" + "=" * 60)
-    print("COMPARISON: Without resistance preprocessing")
-    print("=" * 60)
-    
-    detector2, _, _ = build_test_network()
-    for s in seeds:
-        detector2.mark_seed_benign(s)
-    # Skip probing — go straight to classification
-    results2 = detector2.classify_remaining()
-    print(json.dumps(results2, indent=2))
-    
-    improvement = results["f1"] - results2["f1"]
-    print(f"\nF1 improvement with resistance probing: +{improvement:.3f}")
-    print(f"Accuracy improvement: +{results['accuracy'] - results2['accuracy']:.3f}")
-    
+    total_edges = sum(len(v) for v in graph.edges.values()) // 2
+    print(f"Network: {len(graph.agents)} agents, {total_edges} edges")
+    print(f"  Honest: 50, Sybil: 20")
     print()
-    print("KEY: Resistance preprocessing (probing {budget} agents) improves")
-    print("sybil detection by cascading benign discovery from resistant nodes.")
-    print("ATF parallel: identity layer strength IS resistance.")
-    print("Slow bootstrap (90d) = resistance that sybils can't parallelize.")
+    
+    result = detect_sybils(graph, n_seeds=5)
+    
+    print(f"Seeds (highest identity strength): {result['seeds'][:3]}...")
+    print()
+    
+    print("DETECTION RESULTS:")
+    print(f"  Precision: {result['detection']['precision']}")
+    print(f"  Recall: {result['detection']['recall']}")
+    print(f"  F1: {result['detection']['f1']}")
+    print(f"  True Positives: {result['detection']['true_positives']}")
+    print(f"  False Positives: {result['detection']['false_positives']}")
+    print(f"  False Negatives: {result['detection']['false_negatives']}")
+    print()
+    
+    print("LABELS:")
+    print(f"  Honest: {result['labels']['honest']}")
+    print(f"  Sybil: {result['labels']['sybil']}")
+    print(f"  Uncertain: {result['labels']['uncertain']}")
+    print()
+    
+    gs = result['graph_structure']
+    print("GRAPH STRUCTURE (honest vs sybil):")
+    print(f"  Avg degree: honest={gs['honest_avg_degree']}, sybil={gs['sybil_avg_degree']}")
+    print(f"  Avg clustering: honest={gs['honest_avg_clustering']}, sybil={gs['sybil_avg_clustering']}")
+    print(f"  Density ratio (sybil/honest): {gs['density_ratio']}x")
+    print()
+    
+    print("KEY INSIGHT: Sybils form dense subgraphs (mutual inflation is free).")
+    print("Honest agents form sparse ones (trust is earned). Random walks from")
+    print("identity-strong seeds stay in honest region. Resistance = identity")
+    print("layer strength = the filter that keeps sybils out.")
+    print()
+    
+    # Assertions
+    assert result['detection']['precision'] > 0.5, f"Precision too low: {result['detection']['precision']}"
+    assert gs['sybil_avg_clustering'] > gs['honest_avg_clustering'], "Sybil clustering should be higher"
+    print("ASSERTIONS PASSED ✓")
 
 
 if __name__ == "__main__":
