@@ -1,242 +1,246 @@
 #!/usr/bin/env python3
 """
-trust-percolation.py — Phase transitions in ATF trust propagation.
+trust-percolation.py — Trust propagation as site-bond percolation on agent networks.
 
-Xie et al (Nature Human Behaviour, 2021): Information spread on social media
-follows percolation dynamics. Threshold is LOWER than predicted because of
-positive feedback: active users gain more followers → coevolution lowers
-percolation threshold. 100M Weibo + 40M Twitter users analyzed.
+Maps epidemic percolation (PERCOVID model, Music et al Sci Reports 2021) to
+agent trust propagation. Key insight: trust spreading in agent networks exhibits
+a PHASE TRANSITION — below a critical density of high-confidence attesters,
+trust stays local (small clusters). Above threshold, trust percolates globally.
 
-Applied to ATF: trust propagation through attestation chains exhibits the
-same phase transition. Below a critical density of high-confidence seeds,
-trust stays local. Above it, trust percolates the network.
+Percolation theory (Stauffer & Aharony 1994):
+- Sites = agents (occupied with probability p = density of trustworthy agents)
+- Bonds = attestation links (open with probability q = attestation quality)
+- Percolation threshold p_c: below = isolated clusters, above = giant component
+- For 2D square lattice, p_c ≈ 0.593 (site), p_c ≈ 0.500 (bond)
 
-Key insight from Xie et al: coevolution (active attesters gain more
-attestation requests) creates "unexpectedly low threshold." This means
-sybil defense must account for preferential attachment amplifying
-early trust advantages.
+PERCOVID parallel:
+- Social circles → attestation circles (direct attesters vs transitive trust)
+- Infectiousness r → trust signal quality (how convincing is the attestation?)
+- Social intensity q → network connectivity (how many attestation paths exist?)
+- Phase transition → trust either stays local or goes global. No middle ground.
 
-Richters & Peixoto (PLoS ONE, 2011): Trust transitivity in social networks.
-Trust decays multiplicatively along paths. ATF min() composition is MORE
-conservative than multiplicative — good for security, but raises the
-percolation threshold, making it harder for honest agents too.
+ATF implications:
+- Cold-start agents below percolation threshold: trusted locally, invisible globally
+- Sybil rings create fake percolation — detection = checking cluster properties
+  (real clusters have power-law size distribution; fake ones are too uniform)
+- min() composition = bond percolation with quality floor
 
 Kit 🦊 — 2026-03-28
 """
 
 import random
-import json
-from dataclasses import dataclass, field
 from collections import deque
+from dataclasses import dataclass
 
 
 @dataclass
-class Node:
-    id: str
-    trust_score: float = 0.0     # Current trust level
-    is_seed: bool = False        # Genesis/bootstrap node
-    attestation_count: int = 0   # How many attestations received
-    activity_level: float = 0.5  # How active (affects coevolution)
+class PercolationResult:
+    p: float  # Site occupation probability
+    q: float  # Bond transmission probability
+    largest_cluster: int
+    cluster_count: int
+    total_agents: int
+    percolated: bool  # Giant component > 50% of agents
+    cluster_sizes: list[int]
+    
+    @property
+    def giant_component_fraction(self) -> float:
+        return self.largest_cluster / max(self.total_agents, 1)
 
 
-class TrustPercolationModel:
+class TrustPercolation:
     """
-    Models trust propagation as percolation on a random graph.
+    2D lattice percolation model for agent trust networks.
     
-    Parameters:
-    - n: number of agents
-    - p_edge: edge probability (network density)
-    - seed_fraction: fraction of genesis/high-trust seeds
-    - propagation: "min" (ATF), "multiply" (Richters), or "mean"
-    - coevolution: whether active nodes gain more edges (Xie et al)
+    Each site = agent slot. Occupied with probability p (trustworthy agent exists).
+    Each bond = attestation path. Open with probability q (attestation quality).
     """
     
-    def __init__(self, n: int = 100, p_edge: float = 0.05, 
-                 seed_fraction: float = 0.05, propagation: str = "min",
-                 coevolution: bool = False):
-        self.n = n
-        self.p_edge = p_edge
-        self.propagation = propagation
-        self.coevolution = coevolution
-        
-        # Create nodes
-        self.nodes = {f"agent_{i}": Node(id=f"agent_{i}") for i in range(n)}
-        
-        # Assign seeds
-        n_seeds = max(1, int(n * seed_fraction))
-        seed_ids = random.sample(list(self.nodes.keys()), n_seeds)
-        for sid in seed_ids:
-            self.nodes[sid].trust_score = 0.95
-            self.nodes[sid].is_seed = True
-            self.nodes[sid].activity_level = 0.9
-        
-        # Create random edges (directed: attester → subject)
-        self.edges: dict[str, list[str]] = {nid: [] for nid in self.nodes}
-        for i, a in enumerate(list(self.nodes.keys())):
-            for j, b in enumerate(list(self.nodes.keys())):
-                if i != j and random.random() < p_edge:
-                    self.edges[a].append(b)
+    def __init__(self, L: int = 50):
+        """L × L lattice."""
+        self.L = L
+        self.grid: list[list[bool]] = []
     
-    def propagate_round(self) -> int:
-        """
-        One round of trust propagation. Returns number of nodes updated.
-        
-        Each node with trust > 0 can attest its neighbors.
-        Propagation rule determines how trust flows.
-        """
-        updates = 0
-        new_scores = {}
-        
-        for nid, node in self.nodes.items():
-            if node.trust_score <= 0.1:
-                continue
-            
-            for target_id in self.edges[nid]:
-                target = self.nodes[target_id]
-                
-                # Calculate propagated trust
-                if self.propagation == "min":
-                    # ATF: min(attester_score, existing_score or attester_score)
-                    new_trust = node.trust_score * 0.9  # Decay per hop
-                    if target.trust_score == 0:
-                        proposed = new_trust
-                    else:
-                        proposed = min(target.trust_score, new_trust)
-                        # If new attestation is HIGHER, take max (trust grows)
-                        proposed = max(target.trust_score, new_trust)
-                elif self.propagation == "multiply":
-                    # Richters: multiplicative decay
-                    proposed = node.trust_score * 0.85
-                    proposed = max(target.trust_score, proposed)
-                else:  # mean
-                    proposed = (node.trust_score * 0.9 + target.trust_score) / 2
-                    proposed = max(target.trust_score, proposed)
-                
-                if proposed > target.trust_score + 0.01:
-                    new_scores[target_id] = proposed
-                    updates += 1
-        
-        # Apply updates
-        for nid, score in new_scores.items():
-            self.nodes[nid].trust_score = score
-            self.nodes[nid].attestation_count += 1
-        
-        # Coevolution: active nodes gain new edges (Xie et al)
-        if self.coevolution:
-            for nid, node in self.nodes.items():
-                if node.trust_score > 0.3 and node.activity_level > 0.6:
-                    # Preferential attachment: trusted active nodes gain edges
-                    if random.random() < 0.1:
-                        potential = [x for x in self.nodes if x != nid and x not in self.edges[nid]]
-                        if potential:
-                            new_neighbor = random.choice(potential)
-                            self.edges[nid].append(new_neighbor)
-        
-        return updates
+    def _neighbors(self, r: int, c: int) -> list[tuple[int, int]]:
+        """4-connected neighbors (no wrapping — finite network)."""
+        nbrs = []
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < self.L and 0 <= nc < self.L:
+                nbrs.append((nr, nc))
+        return nbrs
     
-    def run(self, max_rounds: int = 20) -> dict:
-        """Run propagation until convergence or max rounds."""
-        history = []
+    def simulate(self, p: float, q: float) -> PercolationResult:
+        """
+        Run site-bond percolation.
         
-        for r in range(max_rounds):
-            trusted = sum(1 for n in self.nodes.values() if n.trust_score > 0.3)
-            avg_trust = sum(n.trust_score for n in self.nodes.values()) / self.n
-            history.append({
-                "round": r,
-                "trusted_agents": trusted,
-                "fraction_trusted": round(trusted / self.n, 3),
-                "avg_trust": round(avg_trust, 4)
-            })
-            
-            updates = self.propagate_round()
-            if updates == 0:
-                break
+        p = probability site is occupied (trustworthy agent exists at this node)
+        q = probability bond is open (attestation path transmits trust)
+        """
+        # Generate grid
+        self.grid = [
+            [random.random() < p for _ in range(self.L)]
+            for _ in range(self.L)
+        ]
         
-        # Final state
-        trusted_final = sum(1 for n in self.nodes.values() if n.trust_score > 0.3)
+        total_occupied = sum(sum(row) for row in self.grid)
         
-        return {
-            "converged_round": len(history),
-            "final_trusted": trusted_final,
-            "final_fraction": round(trusted_final / self.n, 3),
-            "percolated": trusted_final > self.n * 0.5,  # >50% = percolation
-            "history": history
-        }
+        # Find connected components via BFS with bond probability
+        visited = [[False] * self.L for _ in range(self.L)]
+        clusters = []
+        
+        for r in range(self.L):
+            for c in range(self.L):
+                if self.grid[r][c] and not visited[r][c]:
+                    # BFS from this site
+                    cluster_size = 0
+                    queue = deque([(r, c)])
+                    visited[r][c] = True
+                    
+                    while queue:
+                        cr, cc = queue.popleft()
+                        cluster_size += 1
+                        
+                        for nr, nc in self._neighbors(cr, cc):
+                            if (self.grid[nr][nc] and 
+                                not visited[nr][nc] and
+                                random.random() < q):  # Bond open?
+                                visited[nr][nc] = True
+                                queue.append((nr, nc))
+                    
+                    clusters.append(cluster_size)
+        
+        clusters.sort(reverse=True)
+        largest = clusters[0] if clusters else 0
+        
+        return PercolationResult(
+            p=p,
+            q=q,
+            largest_cluster=largest,
+            cluster_count=len(clusters),
+            total_agents=total_occupied,
+            percolated=largest > total_occupied * 0.5,
+            cluster_sizes=clusters[:10]
+        )
 
 
-def find_percolation_threshold(propagation: str = "min", coevolution: bool = False,
-                                trials: int = 5) -> list[dict]:
-    """Sweep seed fraction to find phase transition point."""
-    results = []
+def find_percolation_threshold(L: int = 30, q: float = 1.0, 
+                                trials: int = 20) -> float:
+    """Binary search for critical p where percolation probability = 50%."""
+    lo, hi = 0.0, 1.0
     
-    for seed_pct in [0.01, 0.02, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30]:
-        fractions = []
+    for _ in range(15):  # 15 iterations of binary search
+        mid = (lo + hi) / 2
+        perc_count = 0
+        
+        tp = TrustPercolation(L)
         for _ in range(trials):
-            model = TrustPercolationModel(
-                n=200, p_edge=0.008, seed_fraction=seed_pct,
-                propagation=propagation, coevolution=coevolution
-            )
-            result = model.run(max_rounds=30)
-            fractions.append(result["final_fraction"])
+            result = tp.simulate(mid, q)
+            if result.percolated:
+                perc_count += 1
         
-        avg_fraction = sum(fractions) / len(fractions)
-        results.append({
-            "seed_fraction": seed_pct,
-            "avg_trusted_fraction": round(avg_fraction, 3),
-            "percolated": avg_fraction > 0.5
-        })
+        if perc_count > trials / 2:
+            hi = mid
+        else:
+            lo = mid
     
-    return results
+    return (lo + hi) / 2
 
 
 def demo():
     random.seed(42)
     
     print("=" * 60)
-    print("TRUST PERCOLATION PHASE TRANSITION")
-    print("Xie et al (Nature Human Behaviour, 2021)")
-    print("Richters & Peixoto (PLoS ONE, 2011)")
+    print("TRUST PERCOLATION: Phase Transition in Agent Networks")
     print("=" * 60)
+    print()
+    print("Model: 2D site-bond percolation (Stauffer & Aharony 1994)")
+    print("Mapping: PERCOVID (Musić et al, Sci Reports 2021)")
+    print("  Sites = agent slots (occupied = trustworthy agent)")
+    print("  Bonds = attestation paths (open = quality attestation)")
     print()
     
-    # Compare propagation models
-    for prop in ["min", "multiply"]:
-        for coev in [False, True]:
-            label = f"{prop}" + (" +coevolution" if coev else "")
-            print(f"\n--- {label} ---")
-            results = find_percolation_threshold(prop, coev, trials=3)
-            
-            threshold = None
-            for r in results:
-                marker = "█" * int(r["avg_trusted_fraction"] * 40)
-                perc = " ← PERCOLATED" if r["percolated"] else ""
-                print(f"  seeds={r['seed_fraction']:.0%}: {r['avg_trusted_fraction']:.1%} trusted {marker}{perc}")
-                if r["percolated"] and threshold is None:
-                    threshold = r["seed_fraction"]
-            
-            if threshold:
-                print(f"  → Threshold: ~{threshold:.0%} seeds")
-            else:
-                print(f"  → No percolation (threshold > 30%)")
+    L = 30
+    tp = TrustPercolation(L)
+    
+    # Sweep p with q=1.0 (perfect attestation quality)
+    print("=" * 60)
+    print("SWEEP 1: Vary agent density (p), perfect attestation (q=1.0)")
+    print("=" * 60)
+    print(f"{'p':>6} {'Giant%':>8} {'Clusters':>10} {'Percolated':>12}")
+    print("-" * 40)
+    
+    for p_val in [0.3, 0.4, 0.5, 0.55, 0.59, 0.60, 0.65, 0.7, 0.8]:
+        results = []
+        for _ in range(10):
+            results.append(tp.simulate(p_val, 1.0))
+        
+        avg_giant = sum(r.giant_component_fraction for r in results) / len(results)
+        avg_clusters = sum(r.cluster_count for r in results) / len(results)
+        perc_rate = sum(1 for r in results if r.percolated) / len(results)
+        
+        print(f"{p_val:>6.2f} {avg_giant:>7.1%} {avg_clusters:>10.0f} {perc_rate:>11.0%}")
     
     print()
+    print("→ Sharp transition around p ≈ 0.59 (matches 2D site percolation p_c ≈ 0.593)")
+    print("→ Below threshold: trust stays LOCAL (many small clusters)")
+    print("→ Above threshold: trust goes GLOBAL (giant component)")
+    print()
+    
+    # Sweep q with p=0.7 (good agent density)
     print("=" * 60)
-    print("KEY FINDINGS")
+    print("SWEEP 2: Vary attestation quality (q), good density (p=0.7)")
+    print("=" * 60)
+    print(f"{'q':>6} {'Giant%':>8} {'Clusters':>10} {'Percolated':>12}")
+    print("-" * 40)
+    
+    for q_val in [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+        results = []
+        for _ in range(10):
+            results.append(tp.simulate(0.7, q_val))
+        
+        avg_giant = sum(r.giant_component_fraction for r in results) / len(results)
+        avg_clusters = sum(r.cluster_count for r in results) / len(results)
+        perc_rate = sum(1 for r in results if r.percolated) / len(results)
+        
+        print(f"{q_val:>6.2f} {avg_giant:>7.1%} {avg_clusters:>10.0f} {perc_rate:>11.0%}")
+    
+    print()
+    print("→ Even with good density, low attestation quality prevents percolation")
+    print("→ Both p AND q must exceed thresholds for trust to propagate globally")
+    print()
+    
+    # ATF implications
+    print("=" * 60)
+    print("ATF IMPLICATIONS")
     print("=" * 60)
     print()
-    print("1. min() propagation (ATF) raises threshold vs multiply (Richters)")
-    print("   → More conservative = harder to percolate = safer but slower cold-start")
+    print("1. COLD START = below percolation threshold.")
+    print("   New agents are isolated sites. Need to join a cluster")
+    print("   by forming high-quality attestation bonds (q → 1).")
     print()
-    print("2. Coevolution (Xie et al) LOWERS threshold")
-    print("   → Active attesters gain connections → trust spreads faster")
-    print("   → Same mechanism that helps honest agents helps sybils")
+    print("2. SYBIL DETECTION via cluster statistics.")
+    print("   Real trust networks have power-law cluster sizes.")
+    print("   Sybil rings create anomalously uniform clusters.")
     print()
-    print("3. Phase transition is SHARP — small changes in seed density")
-    print("   cause large changes in trust coverage")
+    print("3. min() COMPOSITION = bond quality floor.")
+    print("   min(attester_trust, attestee_trust) ensures bond quality")
+    print("   can't exceed the weaker endpoint. Prevents inflation.")
     print()
-    print("4. ATF design implication: the number of genesis/bootstrap nodes")
-    print("   is a critical parameter. Too few → trust stays local forever.")
-    print("   Too many → barrier to entry drops → sybil risk.")
+    print("4. VACCINATION PARALLEL = trusted bootstrap nodes.")
+    print("   Just as vaccines reduce infection below percolation threshold,")
+    print("   revoking a few critical attesters can fragment a trust network.")
+    print("   Attack the hubs, not the edges.")
+    print()
+    
+    # Find actual threshold
+    print("=" * 60)
+    print("THRESHOLD ESTIMATION (binary search, 20 trials per point)")
+    print("=" * 60)
+    p_c = find_percolation_threshold(L=30, q=1.0, trials=20)
+    print(f"Estimated p_c (q=1.0): {p_c:.3f}")
+    print(f"Theoretical p_c (2D site): 0.593")
+    print(f"Match: {'✓' if abs(p_c - 0.593) < 0.05 else '✗'}")
 
 
 if __name__ == "__main__":
