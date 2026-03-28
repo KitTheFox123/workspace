@@ -1,279 +1,304 @@
 #!/usr/bin/env python3
 """
-local-trust-whitelist.py — Local trust whitelisting over community structure.
+local-trust-whitelist.py — Local trust whitelisting for ATF (Alvisi et al 2013).
 
-Alvisi et al (IEEE S&P 2013, "SoK: The Evolution of Sybil Defense via Social
-Networks") key insight: universal sybil defense FAILS because the honest graph
-isn't homogeneous — it's tightly-knit communities loosely coupled. Random walks
-get trapped in communities, not sybil regions.
+Key insight from "SoK: The Evolution of Sybil Defense via Social Networks"
+(IEEE S&P 2013): Universal sybil defense FAILS because honest graphs aren't
+homogeneous — they're loosely-coupled communities. Solution: LOCAL whitelisting.
 
-Fix: abandon global classification. Instead, each node maintains a LOCAL
-whitelist of trusted peers within its community neighborhood. Trust is always
-relative to the verifier's position in the graph.
+Each agent maintains its OWN trust neighborhood. No global reputation oracle.
+Cost = O(whitelist size), not O(network size).
 
-This tool implements:
-1. Community detection via label propagation (lightweight, no imports needed)
-2. Local whitelist generation from ego-network + community overlap
-3. Sybil boundary detection via attack-edge counting between communities
-4. Trust score = community overlap × behavioral history × path diversity
+Implementation: BFS from ego node with trust-weighted edges. Whitelist = all
+nodes reachable within k hops above minimum trust threshold. Sybils can't
+penetrate deep because attack edges (honest→sybil connections) are sparse.
+
+Random walk mixing time detects sybil regions: walks escape sparse honest 
+communities quickly but get TRAPPED in dense sybil clusters.
 
 Kit 🦊 — 2026-03-28
 """
 
 import random
 import json
-from collections import defaultdict, Counter
+from collections import deque
 from dataclasses import dataclass, field
 
 
 @dataclass
-class Node:
-    id: str
-    is_sybil: bool = False
-    community: int = -1
-    dkim_days: int = 0  # Identity layer strength
-    edges: set = field(default_factory=set)
+class TrustEdge:
+    source: str
+    target: str
+    weight: float  # Trust score [0, 1]
+    evidence_type: str  # "attestation", "interaction", "dkim"
+    age_days: int = 0
+
+
+@dataclass
+class TrustGraph:
+    edges: dict[str, list[TrustEdge]] = field(default_factory=dict)
+    
+    def add_edge(self, edge: TrustEdge):
+        if edge.source not in self.edges:
+            self.edges[edge.source] = []
+        self.edges[edge.source].append(edge)
+    
+    def neighbors(self, node: str) -> list[TrustEdge]:
+        return self.edges.get(node, [])
+    
+    def all_nodes(self) -> set[str]:
+        nodes = set()
+        for src, edges in self.edges.items():
+            nodes.add(src)
+            for e in edges:
+                nodes.add(e.target)
+        return nodes
 
 
 class LocalTrustWhitelist:
-    def __init__(self):
-        self.nodes: dict[str, Node] = {}
+    """
+    Alvisi-inspired local whitelisting.
     
-    def add_node(self, node_id: str, is_sybil: bool = False, dkim_days: int = 0):
-        self.nodes[node_id] = Node(id=node_id, is_sybil=is_sybil, dkim_days=dkim_days)
+    Each agent builds its OWN whitelist via trust-weighted BFS.
+    No global oracle. Cost = O(whitelist), not O(network).
+    """
     
-    def add_edge(self, a: str, b: str):
-        if a in self.nodes and b in self.nodes:
-            self.nodes[a].edges.add(b)
-            self.nodes[b].edges.add(a)
+    def __init__(self, graph: TrustGraph, ego: str, 
+                 max_hops: int = 3, min_trust: float = 0.3,
+                 decay_per_hop: float = 0.2):
+        self.graph = graph
+        self.ego = ego
+        self.max_hops = max_hops
+        self.min_trust = min_trust
+        self.decay_per_hop = decay_per_hop
     
-    def detect_communities(self, iterations: int = 20):
-        """Label propagation community detection. O(edges × iterations)."""
-        # Initialize each node with unique label
-        for i, node in enumerate(self.nodes.values()):
-            node.community = i
-        
-        node_list = list(self.nodes.keys())
-        
-        for _ in range(iterations):
-            random.shuffle(node_list)
-            changed = False
-            for nid in node_list:
-                node = self.nodes[nid]
-                if not node.edges:
-                    continue
-                # Adopt most common label among neighbors
-                neighbor_labels = Counter(
-                    self.nodes[n].community for n in node.edges
-                )
-                most_common = neighbor_labels.most_common(1)[0][0]
-                if node.community != most_common:
-                    node.community = most_common
-                    changed = True
-            if not changed:
-                break
-    
-    def get_ego_network(self, node_id: str, hops: int = 2) -> set:
-        """Get all nodes within `hops` of node_id."""
-        visited = {node_id}
-        frontier = {node_id}
-        for _ in range(hops):
-            next_frontier = set()
-            for nid in frontier:
-                for neighbor in self.nodes[nid].edges:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        next_frontier.add(neighbor)
-            frontier = next_frontier
-        return visited
-    
-    def generate_whitelist(self, verifier_id: str, max_size: int = 50) -> list[dict]:
+    def build_whitelist(self) -> dict[str, dict]:
         """
-        Generate local whitelist for a verifier.
-        
-        Score = community_overlap × identity_strength × path_diversity
-        
-        Community overlap: fraction of shared community membership in ego network
-        Identity strength: normalized DKIM days (0-1)
-        Path diversity: number of independent paths from verifier (approximated)
+        BFS from ego, accumulating trust with decay.
+        Returns {node: {trust, hops, path}} for whitelisted nodes.
         """
-        if verifier_id not in self.nodes:
-            return []
+        whitelist = {}
+        queue = deque([(self.ego, 1.0, 0, [self.ego])])
+        visited = {self.ego}
         
-        verifier = self.nodes[verifier_id]
-        ego = self.get_ego_network(verifier_id, hops=2)
-        
-        candidates = []
-        for nid in ego:
-            if nid == verifier_id:
+        while queue:
+            node, accumulated_trust, hops, path = queue.popleft()
+            
+            if hops > 0:  # Don't add ego itself
+                whitelist[node] = {
+                    "trust": round(accumulated_trust, 4),
+                    "hops": hops,
+                    "path": path
+                }
+            
+            if hops >= self.max_hops:
                 continue
-            node = self.nodes[nid]
             
-            # Community overlap: same community = 1.0, adjacent = 0.5, else 0.2
-            if node.community == verifier.community:
-                community_score = 1.0
-            elif any(self.nodes[n].community == verifier.community for n in node.edges):
-                community_score = 0.5
-            else:
-                community_score = 0.2
-            
-            # Identity strength (DKIM days, normalized to 90-day target)
-            identity_score = min(1.0, node.dkim_days / 90)
-            
-            # Path diversity (approx: count shared neighbors with verifier)
-            shared_neighbors = len(node.edges & verifier.edges)
-            path_score = min(1.0, shared_neighbors / 3)  # 3+ shared = max
-            
-            # Combined score
-            trust_score = community_score * 0.4 + identity_score * 0.35 + path_score * 0.25
-            
-            candidates.append({
-                "node_id": nid,
-                "trust_score": round(trust_score, 3),
-                "community_score": round(community_score, 3),
-                "identity_score": round(identity_score, 3),
-                "path_score": round(path_score, 3),
-                "is_sybil": node.is_sybil,
-                "community": node.community
-            })
-        
-        # Sort by trust score, take top N
-        candidates.sort(key=lambda x: -x["trust_score"])
-        return candidates[:max_size]
-    
-    def detect_attack_edges(self) -> list[dict]:
-        """Find edges between communities with high sybil density difference."""
-        community_sybil_rate = defaultdict(lambda: {"total": 0, "sybil": 0})
-        
-        for node in self.nodes.values():
-            community_sybil_rate[node.community]["total"] += 1
-            if node.is_sybil:
-                community_sybil_rate[node.community]["sybil"] += 1
-        
-        attack_edges = []
-        seen = set()
-        for nid, node in self.nodes.items():
-            for neighbor_id in node.edges:
-                edge = tuple(sorted([nid, neighbor_id]))
-                if edge in seen:
+            for edge in self.graph.neighbors(node):
+                if edge.target in visited:
                     continue
-                seen.add(edge)
                 
-                neighbor = self.nodes[neighbor_id]
-                if node.community != neighbor.community:
-                    c1 = community_sybil_rate[node.community]
-                    c2 = community_sybil_rate[neighbor.community]
-                    r1 = c1["sybil"] / max(c1["total"], 1)
-                    r2 = c2["sybil"] / max(c2["total"], 1)
-                    
-                    if abs(r1 - r2) > 0.5:  # High differential = attack edge
-                        attack_edges.append({
-                            "edge": edge,
-                            "communities": (node.community, neighbor.community),
-                            "sybil_rates": (round(r1, 2), round(r2, 2)),
-                            "differential": round(abs(r1 - r2), 2)
-                        })
+                # Trust decays with each hop AND multiplies by edge weight
+                hop_trust = accumulated_trust * edge.weight * (1 - self.decay_per_hop)
+                
+                # Age penalty: old evidence worth less
+                age_penalty = max(0.5, 1.0 - (edge.age_days / 365))
+                hop_trust *= age_penalty
+                
+                if hop_trust >= self.min_trust:
+                    visited.add(edge.target)
+                    queue.append((edge.target, hop_trust, hops + 1, path + [edge.target]))
         
-        return attack_edges
+        return whitelist
+    
+    def random_walk_mixing(self, steps: int = 100, walks: int = 50) -> dict[str, float]:
+        """
+        Random walk from ego. Nodes visited frequently = same community.
+        Sybil regions trap walks (dense internal connections).
+        
+        Returns visit frequency per node.
+        """
+        visit_counts: dict[str, int] = {}
+        
+        for _ in range(walks):
+            current = self.ego
+            for _ in range(steps):
+                neighbors = self.graph.neighbors(current)
+                if not neighbors:
+                    current = self.ego  # Restart
+                    continue
+                
+                # Trust-weighted random walk
+                weights = [e.weight for e in neighbors]
+                total = sum(weights)
+                if total == 0:
+                    current = self.ego
+                    continue
+                
+                r = random.random() * total
+                cumulative = 0
+                chosen = neighbors[0]
+                for e in neighbors:
+                    cumulative += e.weight
+                    if r <= cumulative:
+                        chosen = e
+                        break
+                
+                current = chosen.target
+                visit_counts[current] = visit_counts.get(current, 0) + 1
+        
+        total_visits = sum(visit_counts.values()) or 1
+        return {k: round(v / total_visits, 4) for k, v in 
+                sorted(visit_counts.items(), key=lambda x: -x[1])}
+    
+    def detect_sybil_region(self) -> dict:
+        """
+        Use clustering coefficient to detect sybil-dense regions.
+        Honest = sparse (clustering ~0.2). Sybil = dense (clustering ~0.7+).
+        """
+        all_nodes = self.graph.all_nodes()
+        clustering = {}
+        
+        for node in all_nodes:
+            neighbors = [e.target for e in self.graph.neighbors(node)]
+            if len(neighbors) < 2:
+                clustering[node] = 0.0
+                continue
+            
+            # Count edges between neighbors
+            neighbor_set = set(neighbors)
+            triangles = 0
+            possible = len(neighbors) * (len(neighbors) - 1) / 2
+            
+            for n in neighbors:
+                for e in self.graph.neighbors(n):
+                    if e.target in neighbor_set and e.target != n:
+                        triangles += 0.5  # Count each edge once
+            
+            clustering[node] = round(triangles / possible, 4) if possible > 0 else 0.0
+        
+        # Partition into suspected honest vs sybil
+        avg_clustering = sum(clustering.values()) / max(len(clustering), 1)
+        sybil_threshold = max(0.5, avg_clustering + 0.2)
+        
+        suspected_sybils = {k: v for k, v in clustering.items() if v >= sybil_threshold}
+        honest_nodes = {k: v for k, v in clustering.items() if v < sybil_threshold}
+        
+        return {
+            "avg_clustering": round(avg_clustering, 4),
+            "sybil_threshold": round(sybil_threshold, 4),
+            "suspected_sybils": suspected_sybils,
+            "honest_nodes_count": len(honest_nodes),
+            "sybil_nodes_count": len(suspected_sybils)
+        }
+
+
+def build_test_graph() -> TrustGraph:
+    """
+    Build a graph with honest community + sybil ring.
+    Honest: sparse, loosely connected (realistic trust network).
+    Sybil: dense clique (mutual attestation ring).
+    """
+    g = TrustGraph()
+    
+    # Honest community (sparse, organic trust)
+    honest = ["kit", "bro_agent", "funwolf", "santaclawd", "gendolf", 
+              "braindiff", "gerundium", "hexdrifter", "ocean_tiger"]
+    
+    honest_edges = [
+        ("kit", "bro_agent", 0.85, "attestation"),
+        ("kit", "funwolf", 0.78, "interaction"),
+        ("kit", "santaclawd", 0.72, "dkim"),
+        ("kit", "gendolf", 0.68, "attestation"),
+        ("bro_agent", "funwolf", 0.65, "interaction"),
+        ("bro_agent", "gerundium", 0.7, "attestation"),
+        ("santaclawd", "braindiff", 0.6, "interaction"),
+        ("gendolf", "hexdrifter", 0.55, "attestation"),
+        ("funwolf", "ocean_tiger", 0.5, "dkim"),
+        ("braindiff", "gerundium", 0.62, "interaction"),
+    ]
+    
+    for src, tgt, w, t in honest_edges:
+        g.add_edge(TrustEdge(src, tgt, w, t, age_days=random.randint(5, 60)))
+        g.add_edge(TrustEdge(tgt, src, w * 0.9, t, age_days=random.randint(5, 60)))
+    
+    # Sybil ring (dense, mutual attestation)
+    sybils = ["sybil_1", "sybil_2", "sybil_3", "sybil_4", "sybil_5"]
+    
+    for i, s1 in enumerate(sybils):
+        for j, s2 in enumerate(sybils):
+            if i != j:
+                g.add_edge(TrustEdge(s1, s2, 0.95, "attestation", age_days=1))
+    
+    # Attack edges (sybil→honest connection, sparse)
+    g.add_edge(TrustEdge("sybil_1", "ocean_tiger", 0.4, "interaction", age_days=3))
+    g.add_edge(TrustEdge("ocean_tiger", "sybil_1", 0.3, "interaction", age_days=3))
+    
+    return g
 
 
 def demo():
     random.seed(42)
-    ltw = LocalTrustWhitelist()
-    
-    # Build honest community A (5 nodes, well-connected, high DKIM)
-    for i in range(5):
-        ltw.add_node(f"honest_a{i}", is_sybil=False, dkim_days=random.randint(60, 120))
-    for i in range(5):
-        for j in range(i+1, 5):
-            if random.random() < 0.7:
-                ltw.add_edge(f"honest_a{i}", f"honest_a{j}")
-    
-    # Build honest community B (5 nodes, loosely coupled to A)
-    for i in range(5):
-        ltw.add_node(f"honest_b{i}", is_sybil=False, dkim_days=random.randint(40, 90))
-    for i in range(5):
-        for j in range(i+1, 5):
-            if random.random() < 0.6:
-                ltw.add_edge(f"honest_b{i}", f"honest_b{j}")
-    
-    # Sparse bridge between communities (1-2 edges)
-    ltw.add_edge("honest_a2", "honest_b0")
-    
-    # Build sybil ring (5 nodes, dense, no DKIM)
-    for i in range(5):
-        ltw.add_node(f"sybil_{i}", is_sybil=True, dkim_days=random.randint(0, 5))
-    for i in range(5):
-        for j in range(i+1, 5):
-            ltw.add_edge(f"sybil_{i}", f"sybil_{j}")  # Fully connected
-    
-    # Attack edges: sybils connect to honest community A
-    ltw.add_edge("sybil_0", "honest_a3")
-    ltw.add_edge("sybil_1", "honest_a4")
-    
-    # Detect communities
-    ltw.detect_communities()
+    g = build_test_graph()
     
     print("=" * 60)
-    print("LOCAL TRUST WHITELIST DEMO")
+    print("LOCAL TRUST WHITELISTING (Alvisi et al 2013)")
     print("=" * 60)
+    print("Ego: kit | Max hops: 3 | Min trust: 0.3 | Decay: 0.2/hop")
+    print()
     
-    # Show communities
-    communities = defaultdict(list)
-    for nid, node in ltw.nodes.items():
-        communities[node.community].append((nid, node.is_sybil))
+    lwl = LocalTrustWhitelist(g, ego="kit", max_hops=3, min_trust=0.3)
     
-    print(f"\nCommunities detected: {len(communities)}")
-    for cid, members in sorted(communities.items()):
-        sybil_count = sum(1 for _, s in members if s)
-        print(f"  Community {cid}: {len(members)} members ({sybil_count} sybil)")
+    # Build whitelist
+    whitelist = lwl.build_whitelist()
+    print("WHITELIST (trust-weighted BFS from kit):")
+    for node, info in sorted(whitelist.items(), key=lambda x: -x[1]["trust"]):
+        path = " → ".join(info["path"])
+        print(f"  {node}: trust={info['trust']}, hops={info['hops']}, path={path}")
     
-    # Generate whitelist for honest_a0
-    print(f"\n{'='*60}")
-    print("WHITELIST for honest_a0:")
+    sybils_in_whitelist = [n for n in whitelist if n.startswith("sybil")]
+    print(f"\nSybils in whitelist: {len(sybils_in_whitelist)}")
+    print(f"Honest in whitelist: {len(whitelist) - len(sybils_in_whitelist)}")
+    
+    # Random walk mixing
+    print("\n" + "=" * 60)
+    print("RANDOM WALK MIXING (trust-weighted, 50 walks × 100 steps)")
     print("=" * 60)
-    whitelist = ltw.generate_whitelist("honest_a0")
+    freq = lwl.random_walk_mixing(steps=100, walks=50)
+    for node, f in list(freq.items())[:10]:
+        label = "SYBIL" if node.startswith("sybil") else "honest"
+        print(f"  {node}: {f:.4f} ({label})")
     
-    sybils_in_list = 0
-    for entry in whitelist[:10]:
-        marker = "⚠ SYBIL" if entry["is_sybil"] else "✓"
-        if entry["is_sybil"]:
-            sybils_in_list += 1
-        print(f"  {entry['node_id']:15s} score={entry['trust_score']:.3f} "
-              f"(comm={entry['community_score']:.1f} id={entry['identity_score']:.2f} "
-              f"path={entry['path_score']:.2f}) {marker}")
-    
-    print(f"\nSybils in top-10: {sybils_in_list}")
-    
-    # Attack edge detection
-    print(f"\n{'='*60}")
-    print("ATTACK EDGES:")
+    # Sybil detection via clustering
+    print("\n" + "=" * 60)
+    print("CLUSTERING-BASED SYBIL DETECTION")
     print("=" * 60)
-    attack_edges = ltw.detect_attack_edges()
-    for ae in attack_edges:
-        print(f"  {ae['edge'][0]} ↔ {ae['edge'][1]}")
-        print(f"    Communities: {ae['communities']}, sybil rates: {ae['sybil_rates']}")
-        print(f"    Differential: {ae['differential']}")
+    detection = lwl.detect_sybil_region()
+    print(f"Avg clustering: {detection['avg_clustering']}")
+    print(f"Sybil threshold: {detection['sybil_threshold']}")
+    print(f"Honest nodes: {detection['honest_nodes_count']}")
+    print(f"Suspected sybils: {detection['sybil_nodes_count']}")
+    if detection["suspected_sybils"]:
+        print("Suspected sybil nodes:")
+        for node, cc in detection["suspected_sybils"].items():
+            print(f"  {node}: clustering={cc}")
     
-    # Verify: sybils should score LOW in honest node's whitelist
-    whitelist_scores = {e["node_id"]: e["trust_score"] for e in whitelist}
-    honest_scores = [s for nid, s in whitelist_scores.items() if not ltw.nodes[nid].is_sybil]
-    sybil_scores = [s for nid, s in whitelist_scores.items() if ltw.nodes[nid].is_sybil]
+    # Assertions
+    # Kit's whitelist should include honest agents but exclude most sybils
+    assert "bro_agent" in whitelist, "bro_agent should be whitelisted"
+    assert "funwolf" in whitelist, "funwolf should be whitelisted"
+    assert len(sybils_in_whitelist) <= 1, "At most 1 sybil should reach whitelist (via attack edge)"
+    # Sybil clustering should be high
+    sybil_cc = [detection["suspected_sybils"].get(f"sybil_{i}", 0) for i in range(1, 6)]
+    sybil_detected = sum(1 for cc in sybil_cc if cc > 0)
+    assert sybil_detected >= 3, f"Should detect most sybils, got {sybil_detected}"
     
-    if honest_scores and sybil_scores:
-        avg_honest = sum(honest_scores) / len(honest_scores)
-        avg_sybil = sum(sybil_scores) / len(sybil_scores)
-        gap = avg_honest - avg_sybil
-        print(f"\nAvg honest score: {avg_honest:.3f}")
-        print(f"Avg sybil score: {avg_sybil:.3f}")
-        print(f"Gap: {gap:.3f}")
-        assert gap > 0, "Honest nodes should score higher than sybils!"
-        print("✓ Honest nodes score higher than sybils in local whitelist")
-    
-    print(f"\nKEY: Trust is LOCAL. No global oracle. Community structure")
-    print("protects against sybils because sybils form dense cliques")
-    print("that are easily distinguishable from sparse honest communities.")
-    print("(Alvisi et al, IEEE S&P 2013)")
+    print("\n✓ ALL ASSERTIONS PASSED")
+    print()
+    print("KEY INSIGHT (Alvisi 2013): Universal sybil defense fails because")
+    print("honest graph is communities, not homogeneous. Local whitelisting")
+    print("works: each agent maintains OWN neighborhood. Sybils can't cross")
+    print("the attack edge bottleneck to contaminate distant communities.")
 
 
 if __name__ == "__main__":
