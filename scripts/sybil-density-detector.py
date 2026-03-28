@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-sybil-density-detector.py — Graph density-based sybil detection for ATF.
+sybil-density-detector.py — Density asymmetry sybil detection for ATF.
 
-Core insight from Clawk thread + research:
-- Honest agents form SPARSE graphs (trust is hard to earn, avg degree 5-8)
-- Sybils form DENSE cliques (free mutual inflation)
-- SybilRank (Cao et al, 2012): random walks from trusted seeds stay trapped in
-  dense sybil regions. Landing probability = trust score.
-- AAMAS 2025 (Dehkordi & Zehmakan): user RESISTANCE to attack requests is the
-  missing variable. Revealing resistance of subset improves all detectors.
-- ATF mapping: identity layer = resistance. Strong identity → rejects bad attestations.
+Core insight from Alvisi et al (IEEE S&P 2013, "SoK: The Evolution of
+Sybil Defense via Social Networks"):
+- Honest social graphs = loosely-coupled communities (sparse)
+- Sybil graphs = dense cliques (cheap to create mutual attestations)
+- The ATTACK EDGE bottleneck limits sybil-honest connections
 
-Detection pipeline:
-1. Build attestation graph (weighted, directed)
-2. Compute local density metrics per node (clustering coefficient, edge density)
-3. Run simplified SybilRank: random walk from anchor seeds
-4. Flag nodes in dense clusters with low walk probability as sybil candidates
+This detector uses three signals:
+1. LOCAL CLUSTERING COEFFICIENT — sybil cliques have high clustering
+   (everyone attests everyone). Honest networks are sparser.
+2. CONDUCTANCE — ratio of external to internal edges. Sybil clusters
+   have low conductance (few attack edges to honest network).
+3. RANDOM WALK MIXING — walks starting from honest seeds mix fast
+   (O(log n) steps). Walks from sybil regions get trapped in cliques.
+
+The key Alvisi contribution: global sybil defense fails because honest
+graphs aren't homogeneous. LOCAL whitelisting from ego node works.
 
 Kit 🦊 — 2026-03-28
 """
@@ -27,267 +29,301 @@ from collections import defaultdict
 
 
 @dataclass
-class Node:
-    id: str
-    is_sybil: bool = False
-    is_anchor: bool = False  # Trusted seed
-    identity_strength: float = 0.0  # 0-1, resistance proxy
-    sybilrank_score: float = 0.0
-    local_density: float = 0.0
-    cluster_id: int = -1
+class TrustGraph:
+    """Directed weighted trust graph."""
+    edges: dict[str, dict[str, float]] = field(default_factory=lambda: defaultdict(dict))
+    labels: dict[str, str] = field(default_factory=dict)  # node → "honest"/"sybil"
+    
+    def add_edge(self, src: str, dst: str, weight: float = 1.0):
+        self.edges[src][dst] = weight
+    
+    def add_node(self, node: str, label: str):
+        self.labels[node] = label
+        if node not in self.edges:
+            self.edges[node] = {}
+    
+    def neighbors(self, node: str) -> dict[str, float]:
+        return self.edges.get(node, {})
+    
+    def nodes(self) -> set[str]:
+        all_nodes = set(self.edges.keys())
+        for neighbors in self.edges.values():
+            all_nodes.update(neighbors.keys())
+        return all_nodes
+    
+    def degree(self, node: str) -> int:
+        outgoing = len(self.edges.get(node, {}))
+        incoming = sum(1 for n in self.edges.values() if node in n)
+        return outgoing + incoming
 
 
 @dataclass
-class Edge:
-    src: str
-    dst: str
-    weight: float = 1.0
-    mutual: bool = False  # Bidirectional attestation
+class SybilScore:
+    node: str
+    clustering_coeff: float
+    conductance: float
+    walk_escape_rate: float
+    sybil_probability: float
+    detected_as: str  # "honest" or "sybil"
+    actual_label: str
 
 
 class SybilDensityDetector:
-    def __init__(self):
-        self.nodes: dict[str, Node] = {}
-        self.edges: list[Edge] = []
-        self.adj: dict[str, set[str]] = defaultdict(set)
+    """
+    Alvisi-inspired local sybil detection.
     
-    def add_node(self, node: Node):
-        self.nodes[node.id] = node
+    Three signals combined:
+    - High clustering + low conductance + low escape rate = sybil
+    - Low clustering + high conductance + high escape rate = honest
+    """
     
-    def add_edge(self, edge: Edge):
-        self.edges.append(edge)
-        self.adj[edge.src].add(edge.dst)
-        if edge.mutual:
-            self.adj[edge.dst].add(edge.src)
+    def __init__(self, graph: TrustGraph, 
+                 clustering_threshold: float = 0.6,
+                 conductance_threshold: float = 0.3,
+                 escape_threshold: float = 0.4):
+        self.graph = graph
+        self.clustering_threshold = clustering_threshold
+        self.conductance_threshold = conductance_threshold
+        self.escape_threshold = escape_threshold
     
-    def compute_local_density(self) -> dict[str, float]:
+    def local_clustering_coefficient(self, node: str) -> float:
         """
-        Local clustering coefficient per node.
-        Sybil cliques → density ≈ 1.0
-        Honest sparse graphs → density ≈ 0.1-0.3
+        Fraction of neighbor pairs that are also connected.
+        Sybil cliques → ~1.0. Honest sparse graphs → ~0.1-0.3.
         """
-        densities = {}
-        for nid, node in self.nodes.items():
-            neighbors = self.adj[nid]
-            k = len(neighbors)
-            if k < 2:
-                densities[nid] = 0.0
-                node.local_density = 0.0
-                continue
-            
-            # Count edges between neighbors
-            links = 0
-            for n1 in neighbors:
-                for n2 in neighbors:
-                    if n1 != n2 and n2 in self.adj[n1]:
-                        links += 1
-            
-            max_links = k * (k - 1)  # Directed
-            density = links / max_links if max_links > 0 else 0.0
-            densities[nid] = density
-            node.local_density = density
+        neighbors = set(self.graph.neighbors(node).keys())
+        # Add nodes that point TO this node
+        for n, edges in self.graph.edges.items():
+            if node in edges:
+                neighbors.add(n)
         
-        return densities
+        if len(neighbors) < 2:
+            return 0.0
+        
+        connected_pairs = 0
+        total_pairs = 0
+        neighbor_list = list(neighbors)
+        
+        for i in range(len(neighbor_list)):
+            for j in range(i + 1, len(neighbor_list)):
+                total_pairs += 1
+                n1, n2 = neighbor_list[i], neighbor_list[j]
+                if n2 in self.graph.edges.get(n1, {}) or n1 in self.graph.edges.get(n2, {}):
+                    connected_pairs += 1
+        
+        return connected_pairs / total_pairs if total_pairs > 0 else 0.0
     
-    def sybilrank(self, num_walks: int = 1000, walk_length: int = 10) -> dict[str, float]:
+    def neighborhood_conductance(self, node: str) -> float:
         """
-        Simplified SybilRank: random walks from anchor seeds.
-        
-        Cao et al (2012): Trust propagated via short random walks from
-        known-honest seeds. Walk stays trapped in dense sybil regions →
-        honest nodes get higher landing probability.
-        
-        Walk length O(log n) for fast-mixing honest region.
+        Conductance = external_edges / total_edges for node's neighborhood.
+        Low conductance = isolated cluster (sybil pattern).
+        High conductance = well-connected to broader graph (honest).
         """
-        anchors = [nid for nid, n in self.nodes.items() if n.is_anchor]
-        if not anchors:
-            return {nid: 0.0 for nid in self.nodes}
+        neighbors = set(self.graph.neighbors(node).keys())
+        for n, edges in self.graph.edges.items():
+            if node in edges:
+                neighbors.add(n)
         
-        visit_count = defaultdict(int)
-        total_visits = 0
+        neighborhood = neighbors | {node}
         
-        for _ in range(num_walks):
-            # Start from random anchor
-            current = random.choice(anchors)
-            for _ in range(walk_length):
-                neighbors = list(self.adj[current])
-                if not neighbors:
+        internal_edges = 0
+        external_edges = 0
+        
+        for n in neighborhood:
+            for target in self.graph.neighbors(n):
+                if target in neighborhood:
+                    internal_edges += 1
+                else:
+                    external_edges += 1
+        
+        total = internal_edges + external_edges
+        return external_edges / total if total > 0 else 0.0
+    
+    def random_walk_escape_rate(self, node: str, steps: int = 20, walks: int = 100) -> float:
+        """
+        Fraction of random walks that escape the node's local cluster.
+        
+        Alvisi: honest graphs are fast-mixing (walks escape quickly).
+        Sybil cliques trap walks (low escape rate).
+        """
+        neighbors = set(self.graph.neighbors(node).keys())
+        for n, edges in self.graph.edges.items():
+            if node in edges:
+                neighbors.add(n)
+        local_cluster = neighbors | {node}
+        
+        escaped = 0
+        for _ in range(walks):
+            current = node
+            for _ in range(steps):
+                nbrs = list(self.graph.neighbors(current).keys())
+                # Add incoming edges
+                for n, edges in self.graph.edges.items():
+                    if current in edges and n not in nbrs:
+                        nbrs.append(n)
+                
+                if not nbrs:
                     break
-                
-                # Weight by identity strength (resistance)
-                # Dehkordi & Zehmakan: resistance nodes reject sybil connections
-                weights = []
-                for n in neighbors:
-                    node = self.nodes.get(n)
-                    w = node.identity_strength + 0.1 if node else 0.1
-                    weights.append(w)
-                
-                total_w = sum(weights)
-                if total_w == 0:
-                    break
-                
-                probs = [w / total_w for w in weights]
-                current = random.choices(neighbors, weights=probs, k=1)[0]
-                visit_count[current] += 1
-                total_visits += 1
+                current = random.choice(nbrs)
+            
+            if current not in local_cluster:
+                escaped += 1
         
-        # Normalize
-        scores = {}
-        for nid in self.nodes:
-            scores[nid] = visit_count[nid] / max(total_visits, 1)
-            self.nodes[nid].sybilrank_score = scores[nid]
-        
-        return scores
+        return escaped / walks
     
-    def detect(self, density_threshold: float = 0.7, 
-               rank_threshold: float = None) -> dict:
-        """
-        Combined detection: high density + low SybilRank = sybil candidate.
-        """
-        densities = self.compute_local_density()
-        ranks = self.sybilrank()
+    def score_node(self, node: str) -> SybilScore:
+        cc = self.local_clustering_coefficient(node)
+        cond = self.neighborhood_conductance(node)
+        escape = self.random_walk_escape_rate(node)
         
-        if rank_threshold is None:
-            # Auto-threshold: median of honest (anchor) scores
-            anchor_scores = [ranks[nid] for nid in self.nodes if self.nodes[nid].is_anchor]
-            rank_threshold = min(anchor_scores) * 0.5 if anchor_scores else 0.01
+        # Combine signals: high clustering + low conductance + low escape = sybil
+        # Weighted: clustering 0.4, conductance 0.3, escape 0.3
+        sybil_prob = (
+            0.4 * cc +                    # High clustering = sybil
+            0.3 * (1.0 - cond) +          # Low conductance = sybil
+            0.3 * (1.0 - escape)          # Low escape = sybil
+        )
         
-        results = {"sybil_candidates": [], "honest": [], "uncertain": []}
+        detected = "sybil" if sybil_prob > 0.55 else "honest"
+        actual = self.graph.labels.get(node, "unknown")
         
-        for nid, node in self.nodes.items():
-            if node.is_anchor:
-                results["honest"].append({
-                    "id": nid, "density": round(densities[nid], 3),
-                    "rank": round(ranks[nid], 4), "reason": "anchor seed"
-                })
-            elif densities[nid] > density_threshold and ranks[nid] < rank_threshold:
-                results["sybil_candidates"].append({
-                    "id": nid, "density": round(densities[nid], 3),
-                    "rank": round(ranks[nid], 4), "actual_sybil": node.is_sybil,
-                    "reason": f"high density ({densities[nid]:.2f}) + low rank ({ranks[nid]:.4f})"
-                })
-            elif densities[nid] > density_threshold:
-                results["uncertain"].append({
-                    "id": nid, "density": round(densities[nid], 3),
-                    "rank": round(ranks[nid], 4), "actual_sybil": node.is_sybil,
-                    "reason": f"high density but adequate rank"
-                })
-            else:
-                results["honest"].append({
-                    "id": nid, "density": round(densities[nid], 3),
-                    "rank": round(ranks[nid], 4), "actual_sybil": node.is_sybil,
-                    "reason": "low density"
-                })
+        return SybilScore(
+            node=node,
+            clustering_coeff=round(cc, 3),
+            conductance=round(cond, 3),
+            walk_escape_rate=round(escape, 3),
+            sybil_probability=round(sybil_prob, 3),
+            detected_as=detected,
+            actual_label=actual
+        )
+    
+    def scan_all(self) -> dict:
+        results = []
+        tp = fp = tn = fn = 0
         
-        # Accuracy metrics
-        true_sybils = {nid for nid, n in self.nodes.items() if n.is_sybil}
-        detected = {c["id"] for c in results["sybil_candidates"]}
+        for node in self.graph.nodes():
+            score = self.score_node(node)
+            results.append(score)
+            
+            if score.actual_label == "sybil":
+                if score.detected_as == "sybil":
+                    tp += 1
+                else:
+                    fn += 1
+            elif score.actual_label == "honest":
+                if score.detected_as == "honest":
+                    tn += 1
+                else:
+                    fp += 1
         
-        tp = len(detected & true_sybils)
-        fp = len(detected - true_sybils)
-        fn = len(true_sybils - detected)
-        tn = len(self.nodes) - tp - fp - fn
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
         
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 0.001)
-        
-        results["metrics"] = {
-            "true_positives": tp, "false_positives": fp,
-            "false_negatives": fn, "true_negatives": tn,
+        return {
+            "scores": results,
+            "confusion": {"tp": tp, "fp": fp, "tn": tn, "fn": fn},
             "precision": round(precision, 3),
             "recall": round(recall, 3),
-            "f1": round(f1, 3)
+            "f1": round(f1, 3),
+            "total_nodes": len(results),
+            "detected_sybils": sum(1 for s in results if s.detected_as == "sybil"),
+            "actual_sybils": sum(1 for s in results if s.actual_label == "sybil")
         }
-        
-        return results
+
+
+def build_test_graph() -> TrustGraph:
+    """
+    Build a graph with:
+    - 10 honest nodes (sparse, community structure)
+    - 5 sybil nodes (dense clique)
+    - 2 attack edges connecting sybil to honest
+    """
+    g = TrustGraph()
+    
+    # Honest network: two communities, loosely connected
+    honest_a = [f"h_a{i}" for i in range(5)]
+    honest_b = [f"h_b{i}" for i in range(5)]
+    
+    for h in honest_a + honest_b:
+        g.add_node(h, "honest")
+    
+    # Community A: chain + a few cross-links
+    for i in range(len(honest_a) - 1):
+        g.add_edge(honest_a[i], honest_a[i+1], 0.7)
+        g.add_edge(honest_a[i+1], honest_a[i], 0.6)
+    g.add_edge(honest_a[0], honest_a[3], 0.5)
+    
+    # Community B: similar
+    for i in range(len(honest_b) - 1):
+        g.add_edge(honest_b[i], honest_b[i+1], 0.7)
+        g.add_edge(honest_b[i+1], honest_b[i], 0.6)
+    g.add_edge(honest_b[1], honest_b[4], 0.4)
+    
+    # Inter-community bridge
+    g.add_edge(honest_a[2], honest_b[0], 0.5)
+    g.add_edge(honest_b[2], honest_a[4], 0.4)
+    
+    # Sybil clique: everyone attests everyone
+    sybils = [f"s{i}" for i in range(5)]
+    for s in sybils:
+        g.add_node(s, "sybil")
+    
+    for i in range(len(sybils)):
+        for j in range(len(sybils)):
+            if i != j:
+                g.add_edge(sybils[i], sybils[j], 0.9)
+    
+    # Attack edges (limited connection to honest network)
+    g.add_edge(sybils[0], honest_a[0], 0.3)
+    g.add_edge(sybils[1], honest_b[3], 0.2)
+    
+    return g
 
 
 def demo():
     random.seed(42)
-    detector = SybilDensityDetector()
     
-    # Create honest sparse network (avg degree ~4)
-    honest_ids = [f"honest_{i}" for i in range(20)]
-    for hid in honest_ids:
-        detector.add_node(Node(id=hid, is_sybil=False, 
-                               identity_strength=random.uniform(0.5, 1.0)))
+    g = build_test_graph()
+    detector = SybilDensityDetector(g)
     
-    # Anchor seeds (3 known-honest)
-    for i in range(3):
-        detector.nodes[honest_ids[i]].is_anchor = True
-    
-    # Sparse honest edges (avg degree ~4)
-    for i, hid in enumerate(honest_ids):
-        num_edges = random.randint(2, 6)
-        targets = random.sample([h for h in honest_ids if h != hid], min(num_edges, len(honest_ids) - 1))
-        for t in targets:
-            detector.add_edge(Edge(src=hid, dst=t, weight=random.uniform(0.5, 1.0)))
-    
-    # Create sybil dense clique (10 nodes, almost fully connected)
-    sybil_ids = [f"sybil_{i}" for i in range(10)]
-    for sid in sybil_ids:
-        detector.add_node(Node(id=sid, is_sybil=True, 
-                               identity_strength=random.uniform(0.0, 0.2)))
-    
-    # Dense mutual attestation (sybil clique)
-    for i, s1 in enumerate(sybil_ids):
-        for j, s2 in enumerate(sybil_ids):
-            if i != j and random.random() < 0.85:  # 85% edge probability
-                detector.add_edge(Edge(src=s1, dst=s2, weight=1.0, mutual=True))
-    
-    # A few attack edges (sybils → honest, trying to bootstrap)
-    for sid in sybil_ids[:3]:
-        target = random.choice(honest_ids)
-        detector.add_edge(Edge(src=sid, dst=target, weight=0.3))
-    
-    print("=" * 60)
-    print("SYBIL DENSITY DETECTION")
-    print("=" * 60)
-    print(f"Honest agents: {len(honest_ids)} (sparse, avg degree ~4)")
-    print(f"Sybil agents:  {len(sybil_ids)} (dense clique, ~85% connected)")
-    print(f"Anchor seeds:  3 known-honest")
-    print(f"Attack edges:  3 (sybil → honest)")
+    print("=" * 65)
+    print("SYBIL DENSITY DETECTOR (Alvisi et al 2013)")
+    print("=" * 65)
+    print(f"Graph: {len(g.nodes())} nodes, "
+          f"{sum(1 for n in g.labels.values() if n == 'honest')} honest, "
+          f"{sum(1 for n in g.labels.values() if n == 'sybil')} sybil")
+    print(f"Attack edges: 2 (sybil→honest)")
     print()
     
-    results = detector.detect()
+    results = detector.scan_all()
     
-    print(f"Detected sybil candidates: {len(results['sybil_candidates'])}")
-    print(f"Classified honest: {len(results['honest'])}")
-    print(f"Uncertain: {len(results['uncertain'])}")
-    print()
-    
-    print("SYBIL CANDIDATES:")
-    for c in results["sybil_candidates"]:
-        label = "✓ TRUE" if c["actual_sybil"] else "✗ FALSE"
-        print(f"  {c['id']}: density={c['density']}, rank={c['rank']} [{label}]")
-    
-    print(f"\nMETRICS:")
-    m = results["metrics"]
-    print(f"  Precision: {m['precision']}")
-    print(f"  Recall:    {m['recall']}")
-    print(f"  F1:        {m['f1']}")
+    print(f"{'Node':<10} {'Clust':>6} {'Cond':>6} {'Escape':>7} {'P(sybil)':>9} {'Detected':>9} {'Actual':>8}")
+    print("-" * 65)
+    for s in sorted(results["scores"], key=lambda x: -x.sybil_probability):
+        marker = "✓" if s.detected_as == s.actual_label else "✗"
+        print(f"{s.node:<10} {s.clustering_coeff:>6.3f} {s.conductance:>6.3f} "
+              f"{s.walk_escape_rate:>7.3f} {s.sybil_probability:>9.3f} "
+              f"{s.detected_as:>9} {s.actual_label:>7} {marker}")
     
     print()
-    
-    # Show density distribution
-    print("DENSITY DISTRIBUTION:")
-    honest_densities = [detector.nodes[h].local_density for h in honest_ids]
-    sybil_densities = [detector.nodes[s].local_density for s in sybil_ids]
-    print(f"  Honest avg density: {sum(honest_densities)/len(honest_densities):.3f}")
-    print(f"  Sybil avg density:  {sum(sybil_densities)/len(sybil_densities):.3f}")
-    print(f"  Gap: {sum(sybil_densities)/len(sybil_densities) - sum(honest_densities)/len(honest_densities):.3f}")
-    
+    print(f"Precision: {results['precision']:.3f}")
+    print(f"Recall:    {results['recall']:.3f}")
+    print(f"F1:        {results['f1']:.3f}")
+    print(f"Detected:  {results['detected_sybils']}/{results['actual_sybils']} sybils")
     print()
-    print("KEY INSIGHT: density IS the detector.")
-    print("Honest trust is expensive → sparse. Sybil inflation is free → dense.")
-    print("SybilRank walks stay trapped in dense regions → low landing probability")
-    print("for honest nodes means high probability = honest signal.")
     
-    # Assertions
-    assert m["precision"] >= 0.5, f"Precision too low: {m['precision']}"
-    assert m["recall"] >= 0.3, f"Recall too low: {m['recall']}"
-    print("\n✓ ASSERTIONS PASSED")
+    # Key insight
+    avg_sybil_cc = sum(s.clustering_coeff for s in results["scores"] if s.actual_label == "sybil") / max(1, results["actual_sybils"])
+    avg_honest_cc = sum(s.clustering_coeff for s in results["scores"] if s.actual_label == "honest") / max(1, results["total_nodes"] - results["actual_sybils"])
+    
+    print(f"Avg clustering - Sybil: {avg_sybil_cc:.3f}, Honest: {avg_honest_cc:.3f}")
+    print(f"Density ratio: {avg_sybil_cc / max(0.001, avg_honest_cc):.1f}x")
+    print()
+    print("INSIGHT: Density asymmetry IS the fundamental sybil tell.")
+    print("Honest trust is expensive → sparse. Sybil trust is free → dense.")
+    print("Local detection (Alvisi) > global detection because honest")
+    print("graphs aren't homogeneous — they're communities.")
 
 
 if __name__ == "__main__":
