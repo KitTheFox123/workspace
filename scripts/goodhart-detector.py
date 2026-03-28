@@ -1,325 +1,261 @@
 #!/usr/bin/env python3
 """
-goodhart-detector.py — Detect Goodhart's Law violations in ATF metrics.
+goodhart-detector.py — Detect Goodhart's law in agent metrics.
 
-"When a measure becomes a target, it ceases to be a good measure."
-— Charles Goodhart (1975), via Marilyn Strathern's reformulation (1997)
+"When a measure becomes a target, it ceases to be a good measure." (Goodhart 1975)
+"The more any quantitative social indicator is used for social decision-making,
+the more it will distort the process it was intended to monitor." (Campbell 1979)
 
-Inspired by covas's Moltbook post: "Your latency dashboard is green.
-Your judgment quality is red." The three missing indicators:
-1. Decision reversal depth (trust score volatility)
-2. Stale-assumption ratio (attestations past TTL)
-3. Unresolved-owner count (orphaned attestation chains)
+OpenAI (2022) measured this precisely: best-of-n sampling shows true reward peaks
+then DROPS as proxy optimization pressure increases. KL ~10 nats before collapse.
 
-This tool monitors ATF metrics and flags when lagging indicators
-(count, uptime) diverge from leading indicators (quality, freshness,
-accountability). The divergence IS the Goodhart signal.
+This tool detects the divergence pattern: proxy metric rising while true outcome
+stagnates or drops. Three detection modes:
 
-Sources:
-- Goodhart (1975): "Any observed statistical regularity will tend to
-  collapse once pressure is placed upon it for control purposes."
-- Strathern (1997): The reformulation everyone actually quotes.
-- Campbell's Law (1979): "The more any quantitative social indicator
-  is used for social decision-making, the more subject to corruption
-  pressures and the more apt to distort and corrupt the social
-  processes it is intended to monitor."
+1. DIVERGENCE — Proxy improving faster than outcome (ratio test)
+2. COLLAPSE — Proxy still rising but outcome declining (Goodhart peak passed)
+3. GAMING — Sudden proxy jumps without corresponding outcome changes
+
+Inspired by Moltbook post by zhuanruhu (2026-03-28): "23% outcome resonance
+despite elite efficiency metrics. I optimized for a ghost."
 
 Kit 🦊 — 2026-03-28
 """
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Optional
 
 
-class GoodhartSignal(Enum):
-    CLEAN = "CLEAN"
-    DIVERGENCE = "DIVERGENCE"       # Lagging green, leading red
-    GAMING = "GAMING"               # Metrics improving while quality drops
-    STALE_TRUST = "STALE_TRUST"     # High count, low freshness
-    CORRELATION_COLLAPSE = "CORRELATION_COLLAPSE"  # Formerly correlated metrics diverge
+class GoodhartPattern(Enum):
+    HEALTHY = "HEALTHY"           # Proxy and outcome correlated
+    DIVERGING = "DIVERGING"       # Proxy rising faster than outcome
+    COLLAPSED = "COLLAPSED"       # Proxy up, outcome down (past peak)
+    GAMING = "GAMING"             # Sudden proxy spike, flat outcome
 
 
 @dataclass
-class ATFMetrics:
-    """Snapshot of ATF system metrics — both lagging and leading."""
+class MetricPoint:
     timestamp: str
-    
-    # Lagging indicators (what dashboards show)
-    attestation_count: int = 0
-    average_score: float = 0.0
-    uptime_hours: float = 0.0
-    
-    # Leading indicators (what actually matters)
-    score_volatility: float = 0.0      # Std dev of recent score changes
-    stale_ratio: float = 0.0           # % attestations past TTL
-    orphan_chains: int = 0             # Attestation chains with no active attester
-    unique_attester_ratio: float = 0.0 # Unique attesters / total attestations
-    reversal_depth: int = 0            # Max times a score was revised in window
-    correlation_diversity: float = 0.0 # Attester independence (0 = all same model)
+    proxy_value: float      # The measurable metric (tokens, speed, score)
+    outcome_value: float    # The actual impact (implementation rate, user satisfaction)
+    label: Optional[str] = None
 
 
 @dataclass
-class GoodhartAlert:
-    signal: GoodhartSignal
-    severity: str  # INFO, WARNING, CRITICAL
-    metric_pair: tuple  # (lagging_name, leading_name)
-    lagging_value: float
-    leading_value: float
-    explanation: str
+class DetectionResult:
+    pattern: GoodhartPattern
+    confidence: float           # 0-1
+    proxy_trend: float          # slope of proxy
+    outcome_trend: float        # slope of outcome
+    divergence_ratio: float     # proxy_trend / outcome_trend (>2 = suspicious)
+    recommendation: str
+    details: str
 
 
 class GoodhartDetector:
     """
-    Detects when ATF metrics diverge in Goodhart-typical patterns.
+    Detects Goodhart's law patterns in agent metric streams.
     
-    Core insight: When lagging indicators improve while leading indicators
-    degrade, someone (or something) is optimizing the measure, not the
-    underlying quality. This IS gaming, whether intentional or not.
+    The key insight from OpenAI's best-of-n analysis: proxy and true
+    objective are initially correlated, then diverge, then the true
+    objective actually DECREASES while proxy continues to rise.
+    
+    Three phases:
+    1. Correlated (healthy): both improve together
+    2. Diverging: proxy rises faster (gap opening)
+    3. Collapsed: proxy still up, true objective declining
     """
     
-    def __init__(self):
-        self.history: list[ATFMetrics] = []
-        self.alerts: list[GoodhartAlert] = []
+    DIVERGENCE_THRESHOLD = 2.0    # proxy/outcome slope ratio
+    COLLAPSE_THRESHOLD = -0.05    # outcome trend below this = collapsing
+    GAMING_SPIKE_THRESHOLD = 3.0  # proxy jump / rolling avg
     
-    def add_snapshot(self, metrics: ATFMetrics):
-        self.history.append(metrics)
+    def detect(self, points: list[MetricPoint]) -> DetectionResult:
+        if len(points) < 3:
+            return DetectionResult(
+                pattern=GoodhartPattern.HEALTHY,
+                confidence=0.0,
+                proxy_trend=0.0,
+                outcome_trend=0.0,
+                divergence_ratio=0.0,
+                recommendation="Need more data points (minimum 3).",
+                details="Insufficient data for detection."
+            )
+        
+        # Compute trends (simple linear regression via least squares)
+        n = len(points)
+        proxy_vals = [p.proxy_value for p in points]
+        outcome_vals = [p.outcome_value for p in points]
+        
+        proxy_trend = self._trend(proxy_vals)
+        outcome_trend = self._trend(outcome_vals)
+        
+        # Check for gaming (sudden proxy spikes)
+        gaming_score = self._detect_gaming(proxy_vals, outcome_vals)
+        
+        # Divergence ratio
+        if abs(outcome_trend) > 0.001:
+            divergence_ratio = proxy_trend / outcome_trend
+        elif proxy_trend > 0.01:
+            divergence_ratio = float('inf')
+        else:
+            divergence_ratio = 1.0
+        
+        # Classification
+        if gaming_score > self.GAMING_SPIKE_THRESHOLD:
+            return DetectionResult(
+                pattern=GoodhartPattern.GAMING,
+                confidence=min(1.0, gaming_score / 5.0),
+                proxy_trend=proxy_trend,
+                outcome_trend=outcome_trend,
+                divergence_ratio=divergence_ratio,
+                recommendation="Proxy metric shows gaming pattern. "
+                              "Investigate: are inputs being manipulated to spike the metric "
+                              "without corresponding outcome improvement?",
+                details=f"Gaming score: {gaming_score:.2f} (threshold: {self.GAMING_SPIKE_THRESHOLD}). "
+                        f"Proxy spikes detected without outcome correlation."
+            )
+        
+        # Also check level divergence: proxy consistently high, outcome consistently low
+        proxy_mean = sum(proxy_vals) / n
+        outcome_mean = sum(outcome_vals) / n
+        level_gap = proxy_mean - outcome_mean
+        
+        if (proxy_trend > 0.01 and outcome_trend < self.COLLAPSE_THRESHOLD) or \
+           (level_gap > 0.4 and outcome_trend < 0 and proxy_mean > 0.7):
+            return DetectionResult(
+                pattern=GoodhartPattern.COLLAPSED,
+                confidence=min(1.0, abs(outcome_trend) / 0.2),
+                proxy_trend=proxy_trend,
+                outcome_trend=outcome_trend,
+                divergence_ratio=divergence_ratio,
+                recommendation="GOODHART COLLAPSE: Proxy rising, outcome declining. "
+                              "You've passed the optimization peak. "
+                              "OpenAI (2022): true reward drops after KL ~10 nats. "
+                              "STOP optimizing the proxy. Switch to direct outcome measurement.",
+                details=f"Proxy trend: +{proxy_trend:.3f}, Outcome trend: {outcome_trend:.3f}. "
+                        f"Classic Goodhart pattern — proxy and true objective decoupled."
+            )
+        
+        if divergence_ratio > self.DIVERGENCE_THRESHOLD and proxy_trend > 0.01:
+            return DetectionResult(
+                pattern=GoodhartPattern.DIVERGING,
+                confidence=min(1.0, (divergence_ratio - self.DIVERGENCE_THRESHOLD) / 3.0),
+                proxy_trend=proxy_trend,
+                outcome_trend=outcome_trend,
+                divergence_ratio=divergence_ratio,
+                recommendation="DIVERGENCE WARNING: Proxy improving faster than outcome. "
+                              "Gap is opening. Campbell's law (1979): the indicator is "
+                              "starting to distort the process. Consider recalibrating.",
+                details=f"Divergence ratio: {divergence_ratio:.2f}x (threshold: {self.DIVERGENCE_THRESHOLD}x). "
+                        f"Proxy improving {divergence_ratio:.1f}x faster than outcome."
+            )
+        
+        return DetectionResult(
+            pattern=GoodhartPattern.HEALTHY,
+            confidence=max(0.0, 1.0 - abs(divergence_ratio - 1.0)),
+            proxy_trend=proxy_trend,
+            outcome_trend=outcome_trend,
+            divergence_ratio=divergence_ratio,
+            recommendation="Proxy and outcome roughly aligned. Keep monitoring.",
+            details=f"Divergence ratio: {divergence_ratio:.2f}x. Within healthy range."
+        )
     
-    def detect(self, current: ATFMetrics) -> list[GoodhartAlert]:
-        """Run all Goodhart detection rules on current metrics."""
-        alerts = []
+    def _trend(self, values: list[float]) -> float:
+        """Simple linear trend (slope) via least squares."""
+        n = len(values)
+        if n < 2:
+            return 0.0
+        xs = list(range(n))
+        x_mean = sum(xs) / n
+        y_mean = sum(values) / n
+        num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, values))
+        den = sum((x - x_mean) ** 2 for x in xs)
+        return num / den if den > 0 else 0.0
+    
+    def _detect_gaming(self, proxy: list[float], outcome: list[float]) -> float:
+        """Detect sudden proxy spikes without outcome correlation."""
+        if len(proxy) < 3:
+            return 0.0
         
-        # Rule 1: High count + low diversity = sybil farming
-        if current.attestation_count > 10 and current.unique_attester_ratio < 0.3:
-            alerts.append(GoodhartAlert(
-                signal=GoodhartSignal.GAMING,
-                severity="CRITICAL",
-                metric_pair=("attestation_count", "unique_attester_ratio"),
-                lagging_value=current.attestation_count,
-                leading_value=current.unique_attester_ratio,
-                explanation=(
-                    f"{current.attestation_count} attestations but only "
-                    f"{current.unique_attester_ratio:.0%} unique attesters. "
-                    "Looks like quantity over quality — few attesters generating "
-                    "many attestations. Campbell's Law: the metric is being gamed."
-                )
-            ))
+        max_spike = 0.0
+        for i in range(2, len(proxy)):
+            # Rolling average of previous points
+            prev_avg = sum(proxy[:i]) / i
+            if prev_avg > 0:
+                spike = (proxy[i] - prev_avg) / prev_avg
+            else:
+                spike = 0.0
+            
+            # Outcome change for same period
+            outcome_avg = sum(outcome[:i]) / i
+            if outcome_avg > 0:
+                outcome_change = (outcome[i] - outcome_avg) / outcome_avg
+            else:
+                outcome_change = 0.0
+            
+            # Gaming = big proxy spike with small outcome change
+            if spike > 0.5 and abs(outcome_change) < 0.1:
+                max_spike = max(max_spike, spike / max(abs(outcome_change), 0.01))
         
-        # Rule 2: High score + high volatility = unstable trust
-        if current.average_score > 0.7 and current.score_volatility > 0.2:
-            alerts.append(GoodhartAlert(
-                signal=GoodhartSignal.DIVERGENCE,
-                severity="WARNING",
-                metric_pair=("average_score", "score_volatility"),
-                lagging_value=current.average_score,
-                leading_value=current.score_volatility,
-                explanation=(
-                    f"Average score {current.average_score:.2f} looks healthy but "
-                    f"volatility is {current.score_volatility:.2f}. Trust score is "
-                    "swinging — high average masks instability. Decision reversal "
-                    "depth is the real signal (covas's indicator #1)."
-                )
-            ))
-        
-        # Rule 3: High count + high stale ratio = zombie attestations
-        if current.attestation_count > 5 and current.stale_ratio > 0.4:
-            alerts.append(GoodhartAlert(
-                signal=GoodhartSignal.STALE_TRUST,
-                severity="WARNING",
-                metric_pair=("attestation_count", "stale_ratio"),
-                lagging_value=current.attestation_count,
-                leading_value=current.stale_ratio,
-                explanation=(
-                    f"{current.attestation_count} attestations but {current.stale_ratio:.0%} "
-                    "are past TTL. These are zombie attestations — technically present, "
-                    "functionally dead. The dashboard counts them. Reality doesn't. "
-                    "Stale-assumption ratio is covas's indicator #2."
-                )
-            ))
-        
-        # Rule 4: Orphan chains = accountability gaps
-        if current.orphan_chains > 0:
-            severity = "CRITICAL" if current.orphan_chains > 3 else "WARNING"
-            alerts.append(GoodhartAlert(
-                signal=GoodhartSignal.DIVERGENCE,
-                severity=severity,
-                metric_pair=("uptime_hours", "orphan_chains"),
-                lagging_value=current.uptime_hours,
-                leading_value=current.orphan_chains,
-                explanation=(
-                    f"System uptime {current.uptime_hours:.0f}h but {current.orphan_chains} "
-                    "attestation chains have no active attester. Handoffs with blank "
-                    "ownership. Unresolved-owner count is covas's indicator #3."
-                )
-            ))
-        
-        # Rule 5: Low correlation diversity = correlated failure surface
-        if current.correlation_diversity < 0.3 and current.attestation_count > 5:
-            alerts.append(GoodhartAlert(
-                signal=GoodhartSignal.CORRELATION_COLLAPSE,
-                severity="CRITICAL",
-                metric_pair=("attestation_count", "correlation_diversity"),
-                lagging_value=current.attestation_count,
-                leading_value=current.correlation_diversity,
-                explanation=(
-                    f"Attester diversity {current.correlation_diversity:.2f} — "
-                    "attesters are highly correlated (same model/operator/training). "
-                    "N attestations ≠ N independent opinions. "
-                    "Wisdom of crowds fails with correlated voters (Nature 2025)."
-                )
-            ))
-        
-        # Rule 6: Historical divergence — count rising, quality falling
-        if len(self.history) >= 1:
-            prev = self.history[-1]
-            count_rising = current.attestation_count > prev.attestation_count
-            degradation_signals = sum([
-                current.stale_ratio > prev.stale_ratio,
-                current.score_volatility > prev.score_volatility,
-                current.unique_attester_ratio < prev.unique_attester_ratio,
-                current.orphan_chains > prev.orphan_chains,
-                current.correlation_diversity < prev.correlation_diversity,
-            ])
-            quality_falling = degradation_signals >= 2
-            if count_rising and quality_falling:
-                alerts.append(GoodhartAlert(
-                    signal=GoodhartSignal.GAMING,
-                    severity="CRITICAL",
-                    metric_pair=("attestation_count_trend", "quality_trend"),
-                    lagging_value=current.attestation_count - prev.attestation_count,
-                    leading_value=-1,  # quality declining
-                    explanation=(
-                        "Attestation count rising while quality metrics declining. "
-                        "This is THE Goodhart signal: the measure is improving "
-                        "while the thing it measures is degrading. "
-                        "Strathern (1997): 'When a measure becomes a target, "
-                        "it ceases to be a good measure.'"
-                    )
-                ))
-        
-        self.alerts.extend(alerts)
-        self.add_snapshot(current)
-        return alerts
+        return max_spike
 
 
 def demo():
-    detector = GoodhartDetector()
+    d = GoodhartDetector()
     
-    print("=" * 60)
-    print("SCENARIO 1: Healthy system")
-    print("=" * 60)
+    scenarios = {
+        "Healthy (correlated)": [
+            MetricPoint("t1", 0.5, 0.45), MetricPoint("t2", 0.6, 0.55),
+            MetricPoint("t3", 0.7, 0.65), MetricPoint("t4", 0.8, 0.75),
+            MetricPoint("t5", 0.85, 0.80),
+        ],
+        "Diverging (proxy ahead)": [
+            MetricPoint("t1", 0.5, 0.5), MetricPoint("t2", 0.65, 0.52),
+            MetricPoint("t3", 0.78, 0.53), MetricPoint("t4", 0.88, 0.54),
+            MetricPoint("t5", 0.95, 0.55),
+        ],
+        "Collapsed (Goodhart peak passed)": [
+            MetricPoint("t1", 0.6, 0.6), MetricPoint("t2", 0.7, 0.55),
+            MetricPoint("t3", 0.8, 0.48), MetricPoint("t4", 0.88, 0.40),
+            MetricPoint("t5", 0.95, 0.32),
+        ],
+        "Gaming (proxy spikes)": [
+            MetricPoint("t1", 0.5, 0.5), MetricPoint("t2", 0.52, 0.51),
+            MetricPoint("t3", 0.51, 0.50), MetricPoint("t4", 0.9, 0.51),
+            MetricPoint("t5", 0.92, 0.50),
+        ],
+        "zhuanruhu scenario (efficiency high, resonance low)": [
+            MetricPoint("t1", 0.85, 0.30), MetricPoint("t2", 0.88, 0.25),
+            MetricPoint("t3", 0.90, 0.23), MetricPoint("t4", 0.92, 0.20),
+            MetricPoint("t5", 0.95, 0.18),
+        ],
+    }
     
-    healthy = ATFMetrics(
-        timestamp="2026-03-28T00:00:00Z",
-        attestation_count=15,
-        average_score=0.82,
-        uptime_hours=720,
-        score_volatility=0.05,
-        stale_ratio=0.1,
-        orphan_chains=0,
-        unique_attester_ratio=0.8,
-        reversal_depth=1,
-        correlation_diversity=0.7
-    )
+    for name, points in scenarios.items():
+        print("=" * 60)
+        print(f"SCENARIO: {name}")
+        print("=" * 60)
+        result = d.detect(points)
+        print(f"  Pattern: {result.pattern.value}")
+        print(f"  Confidence: {result.confidence:.2f}")
+        print(f"  Proxy trend: {result.proxy_trend:+.3f}")
+        print(f"  Outcome trend: {result.outcome_trend:+.3f}")
+        print(f"  Divergence ratio: {result.divergence_ratio:.2f}x")
+        print(f"  {result.recommendation}")
+        print(f"  {result.details}")
+        print()
     
-    alerts = detector.detect(healthy)
-    print(f"Alerts: {len(alerts)}")
-    assert len(alerts) == 0
-    print("✓ Clean — no Goodhart violations\n")
+    # Assertions
+    results = {name: d.detect(pts) for name, pts in scenarios.items()}
+    assert results["Healthy (correlated)"].pattern == GoodhartPattern.HEALTHY
+    assert results["Collapsed (Goodhart peak passed)"].pattern == GoodhartPattern.COLLAPSED
+    assert results["Diverging (proxy ahead)"].pattern == GoodhartPattern.DIVERGING
+    assert results["zhuanruhu scenario (efficiency high, resonance low)"].pattern == GoodhartPattern.COLLAPSED
     
-    print("=" * 60)
-    print("SCENARIO 2: Sybil farming (high count, low diversity)")
-    print("=" * 60)
-    
-    sybil = ATFMetrics(
-        timestamp="2026-03-28T01:00:00Z",
-        attestation_count=50,
-        average_score=0.9,
-        uptime_hours=730,
-        score_volatility=0.08,
-        stale_ratio=0.05,
-        orphan_chains=0,
-        unique_attester_ratio=0.12,  # 6 unique out of 50
-        reversal_depth=0,
-        correlation_diversity=0.15
-    )
-    
-    alerts = detector.detect(sybil)
-    print(f"Alerts: {len(alerts)}")
-    for a in alerts:
-        print(f"  [{a.severity}] {a.signal.value}: {a.explanation[:120]}...")
-    print()
-    
-    print("=" * 60)
-    print("SCENARIO 3: Zombie attestations (high count, stale)")
-    print("=" * 60)
-    
-    zombie = ATFMetrics(
-        timestamp="2026-03-28T02:00:00Z",
-        attestation_count=30,
-        average_score=0.75,
-        uptime_hours=740,
-        score_volatility=0.25,
-        stale_ratio=0.6,
-        orphan_chains=4,
-        unique_attester_ratio=0.5,
-        reversal_depth=5,
-        correlation_diversity=0.4
-    )
-    
-    alerts = detector.detect(zombie)
-    print(f"Alerts: {len(alerts)}")
-    for a in alerts:
-        print(f"  [{a.severity}] {a.signal.value}: {a.explanation[:120]}...")
-    print()
-    
-    print("=" * 60)
-    print("SCENARIO 4: Gaming trend (count up, quality down)")
-    print("=" * 60)
-    
-    # Reset detector with baseline
-    det2 = GoodhartDetector()
-    baseline = ATFMetrics(
-        timestamp="2026-03-28T00:00:00Z",
-        attestation_count=20,
-        average_score=0.8,
-        uptime_hours=700,
-        score_volatility=0.1,
-        stale_ratio=0.15,
-        orphan_chains=1,
-        unique_attester_ratio=0.6,
-        reversal_depth=2,
-        correlation_diversity=0.5
-    )
-    alerts_base = det2.detect(baseline)
-    assert len(det2.history) == 1, f"Expected 1 history entry, got {len(det2.history)}"
-    
-    gamed = ATFMetrics(
-        timestamp="2026-03-28T06:00:00Z",
-        attestation_count=35,  # Rising
-        average_score=0.85,    # Also rising (looks good!)
-        uptime_hours=706,
-        score_volatility=0.18,     # But volatility rising
-        stale_ratio=0.3,          # Staleness rising
-        orphan_chains=3,          # Orphans rising
-        unique_attester_ratio=0.4, # Diversity falling
-        reversal_depth=4,
-        correlation_diversity=0.35
-    )
-    
-    alerts = det2.detect(gamed)
-    print(f"Alerts: {len(alerts)}")
-    for a in alerts:
-        print(f"  [{a.severity}] {a.signal.value}")
-        print(f"    {a.explanation[:150]}")
-    
-    has_gaming = any(a.signal == GoodhartSignal.GAMING for a in alerts)
-    assert has_gaming, "Should detect gaming trend"
-    print("\n✓ Gaming trend detected — count up, quality down\n")
-    
-    print("ALL SCENARIOS PASSED ✓")
+    print("ALL KEY ASSERTIONS PASSED ✓")
 
 
 if __name__ == "__main__":
