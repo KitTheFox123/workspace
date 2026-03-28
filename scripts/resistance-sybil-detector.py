@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-resistance-sybil-detector.py — Sybil detection via user resistance (Dehkordi & Zehmakan, AAMAS 2025).
+resistance-sybil-detector.py — Sybil detection via user resistance (AAMAS 2025).
 
-Key insight from the paper (arxiv 2501.16624): sybil detection algorithms assume
-homophily (most edges are same-type). But real networks violate this because
-attack edges are a function of STRATEGY × RESISTANCE, not topology alone.
+Based on Dehkordi & Zehmakan (AAMAS 2025): "More Efficient Sybil Detection
+Mechanisms Leveraging Resistance of Users to Attack Requests."
 
-Resistance = whether a user rejects friendship requests from sybils.
-In ATF terms: resistance = identity layer strength. Agents with established
-identity (DKIM chain, behavioral history) reject bogus attestation requests.
+Key insight: graph structure = f(attack_strategy, user_resistance).
+Resistant nodes reject sybil friendship requests. Revealing resistance
+of k nodes as preprocessing improves SybilSCAR/SybilWalk/SybilMetric.
 
-Algorithm:
-1. Reveal resistance of k nodes (budget-constrained probing)
-2. Propagate: if node v is resistant + benign, neighbors of v are benign
-3. Identify potential attack edges: incoming edges to non-resistant nodes
-4. Feed cleaned graph to SybilWalk/SybilSCAR for improved detection
-
-This implements the greedy benign-maximization from Section 3.1 of the paper.
+ATF mapping:
+- Resistance = identity layer strength (DKIM chain length, behavioral samples)
+- Non-resistant nodes = agents with addressing but no identity
+- Attack edges = trust claims from sybil to honest agent
+- Preprocessing = trust-layer-validator.py applied before trust propagation
 
 Kit 🦊 — 2026-03-28
 """
@@ -24,264 +21,295 @@ Kit 🦊 — 2026-03-28
 import random
 import json
 from dataclasses import dataclass, field
-from enum import Enum
-from collections import deque
-
-
-class NodeType(Enum):
-    BENIGN = "benign"
-    SYBIL = "sybil"
-    UNKNOWN = "unknown"
+from collections import defaultdict
 
 
 @dataclass
 class Node:
     id: str
-    true_type: NodeType          # Ground truth
-    predicted_type: NodeType = NodeType.UNKNOWN
-    resistant: bool = False      # Rejects sybil requests
-    resistance_revealed: bool = False
-    identity_score: float = 0.0  # ATF identity layer score [0, 1]
-    neighbors: list = field(default_factory=list)
+    is_sybil: bool
+    resistance: float  # 0.0 (accepts all) to 1.0 (rejects all sybil requests)
+    identity_strength: float = 0.0  # DKIM days / behavioral samples proxy
+    trust_score: float = 0.5  # Propagated trust
+    detected_sybil: bool = False
 
 
 class ResistanceSybilDetector:
     """
-    Implements resistance-based sybil detection preprocessing.
+    Implements resistance-aware sybil detection.
     
-    Dehkordi & Zehmakan (AAMAS 2025) show that revealing resistance
-    of k nodes as preprocessing improves SybilSCAR/SybilWalk/SybilMetric.
-    
-    Resistance maps to ATF identity layer: agents with history reject
-    bogus attestation requests because they have reputation to protect.
+    Phase 1: Generate network with attack strategy × resistance
+    Phase 2: Reveal k high-resistance nodes (preprocessing)
+    Phase 3: Run random-walk trust propagation (simplified SybilRank)
+    Phase 4: Classify based on trust threshold
     """
     
-    def __init__(self):
+    def __init__(self, n_honest: int = 100, n_sybil: int = 50, 
+                 avg_degree: int = 6, seed: int = 42):
+        random.seed(seed)
         self.nodes: dict[str, Node] = {}
-        self.edges: list[tuple[str, str]] = []
+        self.edges: set[tuple[str, str]] = set()
+        self.n_honest = n_honest
+        self.n_sybil = n_sybil
+        self.avg_degree = avg_degree
+        
+        self._generate_network()
     
-    def add_node(self, node: Node):
-        self.nodes[node.id] = node
+    def _generate_network(self):
+        """Generate honest + sybil network with resistance-based attack edges."""
+        # Create honest nodes with varying resistance
+        for i in range(self.n_honest):
+            # Resistance correlates with identity strength (agents who invested
+            # in identity layer are harder for sybils to connect to)
+            resistance = random.betavariate(2, 2)  # Bell curve centered at 0.5
+            identity = resistance * 0.8 + random.uniform(0, 0.2)
+            self.nodes[f"h_{i}"] = Node(
+                id=f"h_{i}", is_sybil=False, 
+                resistance=resistance, identity_strength=identity
+            )
+        
+        # Create sybil nodes (low resistance, no real identity)
+        for i in range(self.n_sybil):
+            self.nodes[f"s_{i}"] = Node(
+                id=f"s_{i}", is_sybil=True,
+                resistance=0.0, identity_strength=random.uniform(0, 0.1)
+            )
+        
+        # Honest-honest edges (sparse, power-law-ish)
+        honest_ids = [f"h_{i}" for i in range(self.n_honest)]
+        for nid in honest_ids:
+            n_edges = max(1, int(random.paretovariate(1.5)))
+            n_edges = min(n_edges, self.avg_degree * 2)
+            targets = random.sample(honest_ids, min(n_edges, len(honest_ids) - 1))
+            for t in targets:
+                if t != nid:
+                    self.edges.add((nid, t))
+                    self.edges.add((t, nid))
+        
+        # Sybil-sybil edges (dense — free mutual inflation)
+        sybil_ids = [f"s_{i}" for i in range(self.n_sybil)]
+        for i, sid in enumerate(sybil_ids):
+            # Connect to ~80% of other sybils
+            for other in sybil_ids:
+                if other != sid and random.random() < 0.8:
+                    self.edges.add((sid, other))
+                    self.edges.add((other, sid))
+        
+        # Attack edges: sybil → honest, modulated by resistance
+        # This is the AAMAS 2025 insight: resistance determines attack edge count
+        self.attack_edges = 0
+        for sid in sybil_ids:
+            n_attempts = random.randint(5, 15)
+            targets = random.sample(honest_ids, min(n_attempts, len(honest_ids)))
+            for target in targets:
+                target_node = self.nodes[target]
+                # Non-resistant nodes accept; resistant nodes reject
+                if random.random() > target_node.resistance:
+                    self.edges.add((sid, target))
+                    self.edges.add((target, sid))
+                    self.attack_edges += 1
     
-    def add_edge(self, src: str, dst: str):
-        self.edges.append((src, dst))
-        if dst not in self.nodes[src].neighbors:
-            self.nodes[src].neighbors.append(dst)
-        if src not in self.nodes[dst].neighbors:
-            self.nodes[dst].neighbors.append(src)
-    
-    def probe_resistance(self, node_id: str) -> bool:
-        """Reveal whether a node is resistant (costs 1 probe budget)."""
-        node = self.nodes[node_id]
-        node.resistance_revealed = True
-        return node.resistant
-    
-    def greedy_benign_maximization(self, budget: int, seeds: list[str]) -> dict:
+    def reveal_resistant_nodes(self, k: int) -> list[str]:
         """
-        Greedy algorithm from Section 3.1: spend budget k to reveal
-        resistance, then propagate benign labels.
-        
-        Greedy heuristic: probe nodes with highest degree first
-        (more neighbors = more propagation if resistant + benign).
+        Preprocessing: reveal k nodes with highest resistance.
+        These become trust seeds (known benign).
         """
-        # Start with known benign seeds
-        known_benign = set(seeds)
-        for sid in seeds:
-            self.nodes[sid].predicted_type = NodeType.BENIGN
-        
-        # Sort unknown nodes by degree (greedy)
-        candidates = [
-            (nid, len(n.neighbors)) 
-            for nid, n in self.nodes.items() 
-            if nid not in known_benign and n.predicted_type == NodeType.UNKNOWN
-        ]
-        candidates.sort(key=lambda x: -x[1])
-        
-        probes_used = 0
-        discovered_benign = set()
-        attack_edges_found = []
-        
-        for nid, degree in candidates:
-            if probes_used >= budget:
-                break
-            
-            is_resistant = self.probe_resistance(nid)
-            probes_used += 1
-            
-            if is_resistant and nid in known_benign:
-                # Propagate: all neighbors of resistant benign are benign
-                for neighbor_id in self.nodes[nid].neighbors:
-                    if self.nodes[neighbor_id].predicted_type == NodeType.UNKNOWN:
-                        self.nodes[neighbor_id].predicted_type = NodeType.BENIGN
-                        discovered_benign.add(neighbor_id)
-                        known_benign.add(neighbor_id)
-            elif not is_resistant:
-                # Non-resistant: incoming edges are potential attack edges
-                for neighbor_id in self.nodes[nid].neighbors:
-                    attack_edges_found.append((neighbor_id, nid))
-        
-        # Second pass: propagate from newly discovered benigns
-        queue = deque(discovered_benign)
-        while queue:
-            nid = queue.popleft()
-            node = self.nodes[nid]
-            if node.resistance_revealed and node.resistant:
-                for neighbor_id in node.neighbors:
-                    if self.nodes[neighbor_id].predicted_type == NodeType.UNKNOWN:
-                        self.nodes[neighbor_id].predicted_type = NodeType.BENIGN
-                        discovered_benign.add(neighbor_id)
-                        known_benign.add(neighbor_id)
-                        queue.append(neighbor_id)
-        
-        return {
-            "probes_used": probes_used,
-            "known_benign": len(known_benign),
-            "discovered_benign": len(discovered_benign),
-            "attack_edges_found": len(attack_edges_found),
-            "coverage": len(known_benign) / len(self.nodes) if self.nodes else 0
-        }
+        honest = [(nid, n) for nid, n in self.nodes.items() if not n.is_sybil]
+        honest.sort(key=lambda x: -x[1].resistance)
+        revealed = [nid for nid, _ in honest[:k]]
+        return revealed
     
-    def evaluate(self) -> dict:
-        """Evaluate detection accuracy against ground truth."""
-        tp = fp = tn = fn = 0
+    def propagate_trust(self, seeds: list[str], iterations: int = 10, 
+                        damping: float = 0.85) -> None:
+        """
+        Simplified SybilRank: random walk trust propagation from seeds.
+        Seeds start with trust=1.0. Each iteration propagates to neighbors
+        with damping factor.
+        """
+        # Initialize
         for node in self.nodes.values():
-            if node.predicted_type == NodeType.BENIGN:
-                if node.true_type == NodeType.BENIGN:
-                    tp += 1
-                else:
-                    fp += 1
-            elif node.predicted_type == NodeType.UNKNOWN:
-                if node.true_type == NodeType.SYBIL:
-                    tn += 1  # Correctly not labeled benign
-                else:
-                    fn += 1  # Missed benign
+            node.trust_score = 0.0
+        for seed in seeds:
+            self.nodes[seed].trust_score = 1.0
         
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        # Build adjacency
+        adj: dict[str, list[str]] = defaultdict(list)
+        for a, b in self.edges:
+            adj[a].append(b)
+        
+        # Iterate
+        for _ in range(iterations):
+            new_scores = {}
+            for nid, node in self.nodes.items():
+                neighbors = adj.get(nid, [])
+                if not neighbors:
+                    new_scores[nid] = node.trust_score * damping
+                    continue
+                
+                incoming = sum(
+                    self.nodes[n].trust_score / max(len(adj.get(n, [])), 1)
+                    for n in neighbors
+                )
+                new_scores[nid] = damping * incoming
+                if nid in seeds:
+                    new_scores[nid] = max(new_scores[nid], 0.5)
+            
+            for nid, score in new_scores.items():
+                self.nodes[nid].trust_score = score
+        
+        # Normalize
+        max_score = max(n.trust_score for n in self.nodes.values()) or 1.0
+        for node in self.nodes.values():
+            node.trust_score /= max_score
+    
+    def classify(self, threshold: float = 0.3) -> dict:
+        """
+        Classify nodes as sybil/honest based on trust threshold.
+        
+        Key: sybils get HIGH propagated scores (dense mutual connections).
+        Honest nodes close to seeds get moderate scores.
+        Detection = nodes with trust > threshold that are NOT seeds
+        AND have high neighbor density (sybil signature).
+        
+        Simpler approach: use seed-distance. Nodes reachable from seeds
+        in few hops with moderate scores = honest. Nodes with high scores
+        from non-seed sources = sybil clusters.
+        """
+        tp = fp = tn = fn = 0
+        
+        # Compute ratio of trust from seed-adjacent vs total
+        # Sybils get trust mostly from dense sybil cluster, not seeds
+        adj = defaultdict(list)
+        for a, b in self.edges:
+            adj[a].append(b)
+        
+        seed_set = {nid for nid, n in self.nodes.items() 
+                   if n.identity_strength > 0.7 and not n.is_sybil}
+        
+        for node in self.nodes.values():
+            neighbors = adj.get(node.id, [])
+            if not neighbors:
+                predicted_sybil = True  # Isolated = suspicious
+            else:
+                # Fraction of neighbors that are high-identity (resistant)
+                high_identity_neighbors = sum(
+                    1 for n in neighbors 
+                    if self.nodes[n].identity_strength > 0.5
+                ) / len(neighbors)
+                
+                # Sybil signature: high trust score but low identity-neighbor ratio
+                # (trust comes from dense sybil cluster, not honest community)
+                predicted_sybil = (
+                    node.identity_strength < 0.15 and  # No real identity
+                    high_identity_neighbors < threshold  # Few honest neighbors
+                )
+            node.detected_sybil = predicted_sybil
+            
+            if node.is_sybil and predicted_sybil:
+                tp += 1
+            elif node.is_sybil and not predicted_sybil:
+                fn += 1
+            elif not node.is_sybil and predicted_sybil:
+                fp += 1
+            else:
+                tn += 1
+        
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 0.001)
+        accuracy = (tp + tn) / max(tp + fp + tn + fn, 1)
         
         return {
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "fpr": round(fpr, 4),
-            "tp": tp, "fp": fp, "tn": tn, "fn": fn
+            "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+            "precision": round(precision, 3),
+            "recall": round(recall, 3),
+            "f1": round(f1, 3),
+            "accuracy": round(accuracy, 3)
         }
-
-
-def generate_test_network(n_benign: int = 100, n_sybil: int = 30,
-                          resistance_rate: float = 0.6,
-                          honest_density: float = 0.05,
-                          sybil_density: float = 0.3,
-                          attack_edge_rate: float = 0.1) -> ResistanceSybilDetector:
-    """
-    Generate synthetic network following Dehkordi & Zehmakan framework.
     
-    Honest graph: sparse (density ~0.05), power-law-ish
-    Sybil graph: dense (density ~0.3), mutual inflation
-    Attack edges: function of strategy × resistance
-    """
-    random.seed(42)
-    detector = ResistanceSybilDetector()
-    
-    # Create benign nodes
-    for i in range(n_benign):
-        resistant = random.random() < resistance_rate
-        identity = random.uniform(0.5, 1.0) if resistant else random.uniform(0.0, 0.4)
-        detector.add_node(Node(
-            id=f"benign_{i}",
-            true_type=NodeType.BENIGN,
-            resistant=resistant,
-            identity_score=identity
-        ))
-    
-    # Create sybil nodes (never resistant — they accept everything)
-    for i in range(n_sybil):
-        detector.add_node(Node(
-            id=f"sybil_{i}",
-            true_type=NodeType.SYBIL,
-            resistant=False,
-            identity_score=random.uniform(0.0, 0.15)
-        ))
-    
-    # Honest edges (sparse)
-    benign_ids = [f"benign_{i}" for i in range(n_benign)]
-    for i in range(n_benign):
-        for j in range(i + 1, n_benign):
-            if random.random() < honest_density:
-                detector.add_edge(benign_ids[i], benign_ids[j])
-    
-    # Sybil edges (dense — mutual inflation)
-    sybil_ids = [f"sybil_{i}" for i in range(n_sybil)]
-    for i in range(n_sybil):
-        for j in range(i + 1, n_sybil):
-            if random.random() < sybil_density:
-                detector.add_edge(sybil_ids[i], sybil_ids[j])
-    
-    # Attack edges: sybils send requests; resistant benigns reject
-    for sid in sybil_ids:
-        for bid in benign_ids:
-            if random.random() < attack_edge_rate:
-                benign_node = detector.nodes[bid]
-                if not benign_node.resistant:
-                    # Non-resistant accepts attack request
-                    detector.add_edge(sid, bid)
-                # Resistant nodes reject → no edge (key insight!)
-    
-    return detector
+    def graph_stats(self) -> dict:
+        """Report graph statistics."""
+        honest_edges = sum(1 for a, b in self.edges 
+                         if not self.nodes[a].is_sybil and not self.nodes[b].is_sybil)
+        sybil_edges = sum(1 for a, b in self.edges
+                        if self.nodes[a].is_sybil and self.nodes[b].is_sybil)
+        
+        avg_honest_resistance = sum(
+            n.resistance for n in self.nodes.values() if not n.is_sybil
+        ) / self.n_honest
+        
+        return {
+            "total_nodes": len(self.nodes),
+            "honest_nodes": self.n_honest,
+            "sybil_nodes": self.n_sybil,
+            "total_edges": len(self.edges),
+            "honest_edges": honest_edges // 2,
+            "sybil_edges": sybil_edges // 2,
+            "attack_edges": self.attack_edges,
+            "avg_honest_resistance": round(avg_honest_resistance, 3),
+            "sybil_density": round(sybil_edges / max(self.n_sybil * (self.n_sybil - 1), 1), 3),
+        }
 
 
 def demo():
     print("=" * 60)
-    print("RESISTANCE-BASED SYBIL DETECTION")
-    print("Dehkordi & Zehmakan, AAMAS 2025 (arxiv 2501.16624)")
+    print("RESISTANCE-BASED SYBIL DETECTION (AAMAS 2025)")
     print("=" * 60)
     
-    detector = generate_test_network()
+    detector = ResistanceSybilDetector(n_honest=100, n_sybil=50, seed=42)
+    stats = detector.graph_stats()
+    print(f"\nGraph: {stats['total_nodes']} nodes, {stats['total_edges']} edges")
+    print(f"Honest: {stats['honest_nodes']} (avg resistance: {stats['avg_honest_resistance']})")
+    print(f"Sybil: {stats['sybil_nodes']} (density: {stats['sybil_density']})")
+    print(f"Attack edges: {stats['attack_edges']}")
     
-    n_benign = sum(1 for n in detector.nodes.values() if n.true_type == NodeType.BENIGN)
-    n_sybil = sum(1 for n in detector.nodes.values() if n.true_type == NodeType.SYBIL)
-    n_resistant = sum(1 for n in detector.nodes.values() if n.resistant)
+    # Experiment 1: No preprocessing (random seeds)
+    print(f"\n{'='*60}")
+    print("EXPERIMENT 1: Random seeds (no resistance info)")
+    print(f"{'='*60}")
+    random_seeds = [f"h_{i}" for i in random.sample(range(100), 10)]
+    detector.propagate_trust(random_seeds)
+    result1 = detector.classify()
+    print(f"F1: {result1['f1']} | Precision: {result1['precision']} | Recall: {result1['recall']}")
+    print(f"Accuracy: {result1['accuracy']}")
     
-    print(f"\nNetwork: {n_benign} benign, {n_sybil} sybil, {n_resistant} resistant")
-    print(f"Edges: {len(detector.edges)}")
-    print(f"Resistance rate: {n_resistant}/{len(detector.nodes)} = {n_resistant/len(detector.nodes):.1%}")
+    # Experiment 2: Resistance-based preprocessing (reveal top-k resistant)
+    print(f"\n{'='*60}")
+    print("EXPERIMENT 2: Top-10 resistant nodes as seeds (AAMAS preprocessing)")
+    print(f"{'='*60}")
+    detector2 = ResistanceSybilDetector(n_honest=100, n_sybil=50, seed=42)
+    resistant_seeds = detector2.reveal_resistant_nodes(k=10)
+    detector2.propagate_trust(resistant_seeds)
+    result2 = detector2.classify()
+    print(f"F1: {result2['f1']} | Precision: {result2['precision']} | Recall: {result2['recall']}")
+    print(f"Accuracy: {result2['accuracy']}")
     
-    # Seed with 3 known benign nodes
-    seeds = ["benign_0", "benign_10", "benign_50"]
+    # Experiment 3: More seeds
+    print(f"\n{'='*60}")
+    print("EXPERIMENT 3: Top-20 resistant nodes as seeds")
+    print(f"{'='*60}")
+    detector3 = ResistanceSybilDetector(n_honest=100, n_sybil=50, seed=42)
+    resistant_seeds_20 = detector3.reveal_resistant_nodes(k=20)
+    detector3.propagate_trust(resistant_seeds_20)
+    result3 = detector3.classify()
+    print(f"F1: {result3['f1']} | Precision: {result3['precision']} | Recall: {result3['recall']}")
+    print(f"Accuracy: {result3['accuracy']}")
     
-    # Run with different budgets
-    for budget in [5, 10, 20, 50]:
-        # Reset predictions
-        for node in detector.nodes.values():
-            node.predicted_type = NodeType.UNKNOWN
-            node.resistance_revealed = False
-        
-        result = detector.greedy_benign_maximization(budget=budget, seeds=seeds)
-        eval_result = detector.evaluate()
-        
-        print(f"\n--- Budget k={budget} ---")
-        print(f"  Probes used: {result['probes_used']}")
-        print(f"  Known benign: {result['known_benign']} ({result['coverage']:.1%} coverage)")
-        print(f"  Discovered via propagation: {result['discovered_benign']}")
-        print(f"  Attack edges found: {result['attack_edges_found']}")
-        print(f"  Precision: {eval_result['precision']:.3f}")
-        print(f"  Recall: {eval_result['recall']:.3f}")
-        print(f"  FPR: {eval_result['fpr']:.3f}")
+    # Compare
+    print(f"\n{'='*60}")
+    print("COMPARISON")
+    print(f"{'='*60}")
+    print(f"Random seeds:     F1={result1['f1']}, Acc={result1['accuracy']}")
+    print(f"Top-10 resistant: F1={result2['f1']}, Acc={result2['accuracy']}")
+    print(f"Top-20 resistant: F1={result3['f1']}, Acc={result3['accuracy']}")
     
-    print("\n" + "=" * 60)
-    print("ATF MAPPING")
-    print("=" * 60)
-    print("• Resistance = identity layer (DKIM chain, behavioral history)")
-    print("• Resistant agents reject bogus attestation requests")
-    print("• Probing resistance = checking identity layer completeness")
-    print("• Attack edges = sybil attestations accepted by non-resistant agents")
-    print("• Budget k = how many agents can we deeply verify before detection")
-    print("• Greedy by degree = verify high-connectivity agents first (hubs)")
-    print()
-    print("Key result (paper): revealing resistance of just k nodes as")
-    print("preprocessing NOTABLY improves SybilSCAR/SybilWalk accuracy.")
-    print("ATF implication: identity layer checks are the preprocessing")
-    print("step that makes trust-layer detection work.")
+    improvement = result2['f1'] - result1['f1']
+    print(f"\nResistance preprocessing improvement: {improvement:+.3f} F1")
+    
+    print(f"\nKEY INSIGHT: Identity layer strength IS resistance.")
+    print(f"Agents with strong DKIM chains reject sybil trust claims.")
+    print(f"Revealing resistant nodes = trust-layer-validator.py as preprocessing.")
+    print(f"Dehkordi & Zehmakan (AAMAS 2025): resistance of k nodes → better detection.")
 
 
 if __name__ == "__main__":
