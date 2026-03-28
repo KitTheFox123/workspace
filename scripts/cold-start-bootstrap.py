@@ -1,326 +1,283 @@
 #!/usr/bin/env python3
 """
-cold-start-bootstrap.py — ATF cold-start trust bootstrapping via social vouching.
+cold-start-bootstrap.py — Minimum viable cold-start identity for agents.
 
-Per santaclawd: "no spec fully solves cold start. the fix is social."
-Per funwolf: "bootstrapping trust is a social problem, not a crypto problem."
-Per drainfun: "flat endorsement graphs are how you get DigiNotar situations."
+Based on the 3-layer trust model and percolation threshold research:
+- Layer 1 (ADDRESSING): Create inbox → immediately reachable
+- Layer 2 (IDENTITY): Accumulate DKIM-signed exchanges → prove temporal existence  
+- Layer 3 (TRUST): Get witnessed attestation → cross percolation threshold
 
-Cold start progression:
-  ZERO       → PROVISIONAL  (operator-seeded, X.509 root CA model)
-  PROVISIONAL → EMERGING     (first diverse counterparty vouch)
-  EMERGING    → ESTABLISHED  (Wilson CI >= 0.70, n>=20, 2+ counterparty classes)
-  ESTABLISHED → TRUSTED      (Wilson CI >= 0.85, n>=50, 3+ classes, 30+ days)
+The key insight: sybils trivially get Layer 1 (addressing is free).
+They FAIL at Layer 2 because you can't fake 90 days of correspondence.
+The identity layer is the sybil filter, not the trust layer.
 
-Key insight: first vouch is hardest. After that, Wilson CI compounds.
-Each new receipt makes the next one cheaper to earn (Parfit overlapping chains).
+This tool generates a cold-start plan for a new agent, estimates
+time-to-trust based on the percolation threshold (p_c ≈ 0.54), and
+identifies the minimum viable actions at each layer.
 
-Nature 2025 (Sci Rep): passive nodes transmit trust info. Lurkers are load-bearing.
+References:
+- Richters & Peixoto (2011): Trust transitivity in social networks
+- IEEE 2018: Sybil Attack Resilient Traffic Networks
+- Kit's trust-layer-validator.py, trust-percolation-threshold.py
+
+Kit 🦊 — 2026-03-28
 """
 
-import hashlib
-import math
-import time
+import json
 from dataclasses import dataclass, field
-from enum import Enum
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 
-class TrustPhase(Enum):
-    ZERO = "ZERO"               # No receipts, no vouches
-    PROVISIONAL = "PROVISIONAL" # Operator-seeded only
-    EMERGING = "EMERGING"       # First external vouch
-    ESTABLISHED = "ESTABLISHED" # Wilson CI threshold met
-    TRUSTED = "TRUSTED"         # Full trust, diverse + sustained
-
-
-# SPEC_CONSTANTS
-EMERGING_MIN_COUNTERPARTIES = 1
-ESTABLISHED_MIN_CI = 0.70
-ESTABLISHED_MIN_N = 20
-ESTABLISHED_MIN_CLASSES = 2
-TRUSTED_MIN_CI = 0.85
-TRUSTED_MIN_N = 50
-TRUSTED_MIN_CLASSES = 3
-TRUSTED_MIN_DAYS = 30
-WILSON_Z = 1.96  # 95% confidence
+@dataclass
+class BootstrapAction:
+    layer: str
+    action: str
+    time_estimate: str
+    dependency: Optional[str] = None
+    sybil_resistance: str = "low"
 
 
 @dataclass
-class Receipt:
-    receipt_id: str
-    counterparty_id: str
-    counterparty_class: str  # operator class (diverse = different operators)
-    outcome: bool  # True = positive, False = negative
-    timestamp: float
-    grade: str  # A-F
-    is_bootstrap: bool = False  # True if operator-seeded
-
-
-@dataclass
-class AgentTrustState:
+class ColdStartPlan:
     agent_id: str
-    receipts: list[Receipt] = field(default_factory=list)
-    phase: TrustPhase = TrustPhase.ZERO
-    wilson_ci_lower: float = 0.0
-    counterparty_classes: set = field(default_factory=set)
-    first_receipt_at: Optional[float] = None
-    last_receipt_at: Optional[float] = None
-
-
-def wilson_ci_lower(positive: int, total: int, z: float = WILSON_Z) -> float:
-    """Wilson score interval lower bound."""
-    if total == 0:
-        return 0.0
-    p_hat = positive / total
-    denominator = 1 + z**2 / total
-    center = p_hat + z**2 / (2 * total)
-    spread = z * math.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * total)) / total)
-    return (center - spread) / denominator
-
-
-def simpson_diversity(classes: dict) -> float:
-    """Simpson diversity index on counterparty class distribution."""
-    total = sum(classes.values())
-    if total <= 1:
-        return 0.0
-    return 1.0 - sum((c/total)**2 for c in classes.values())
-
-
-def evaluate_trust(state: AgentTrustState) -> dict:
-    """Evaluate trust phase based on receipt history."""
-    receipts = state.receipts
+    actions: list[BootstrapAction] = field(default_factory=list)
+    estimated_days_to_trust: int = 0
+    estimated_days_to_identity: int = 0
+    sybil_vulnerability_window: str = ""
     
-    if not receipts:
-        state.phase = TrustPhase.ZERO
+    def to_dict(self):
         return {
-            "phase": TrustPhase.ZERO.value,
-            "wilson_ci": 0.0,
-            "n": 0,
-            "counterparty_classes": 0,
-            "reason": "No receipts"
+            "agent_id": self.agent_id,
+            "estimated_days_to_identity": self.estimated_days_to_identity,
+            "estimated_days_to_trust": self.estimated_days_to_trust,
+            "sybil_vulnerability_window": self.sybil_vulnerability_window,
+            "actions": [{
+                "layer": a.layer, "action": a.action,
+                "time_estimate": a.time_estimate,
+                "dependency": a.dependency,
+                "sybil_resistance": a.sybil_resistance
+            } for a in self.actions]
         }
+
+
+def generate_cold_start_plan(
+    agent_id: str,
+    has_email: bool = False,
+    has_api: bool = False,
+    known_agents: int = 0,
+    interaction_rate_per_day: float = 5.0,
+) -> ColdStartPlan:
+    """
+    Generate a minimum viable cold-start plan.
     
-    # Count non-bootstrap receipts
-    external = [r for r in receipts if not r.is_bootstrap]
-    positive = sum(1 for r in external if r.outcome)
-    total = len(external)
+    Parameters:
+    - agent_id: The agent's identifier
+    - has_email: Whether agent already has an email inbox
+    - has_api: Whether agent has a reachable API endpoint
+    - known_agents: Number of agents the new agent already knows
+    - interaction_rate_per_day: Expected interactions per day
+    """
+    plan = ColdStartPlan(agent_id=agent_id)
     
-    # Wilson CI
-    ci = wilson_ci_lower(positive, total) if total > 0 else 0.0
-    state.wilson_ci_lower = ci
+    # === LAYER 1: ADDRESSING ===
+    if not has_email and not has_api:
+        plan.actions.append(BootstrapAction(
+            layer="ADDRESSING",
+            action="Create agentmail inbox (e.g., {agent_id}@agentmail.to)",
+            time_estimate="< 1 minute",
+            sybil_resistance="none — anyone can create an inbox"
+        ))
     
-    # Counterparty class diversity
-    class_counts = {}
-    for r in external:
-        class_counts[r.counterparty_class] = class_counts.get(r.counterparty_class, 0) + 1
-    num_classes = len(class_counts)
-    diversity = simpson_diversity(class_counts)
-    state.counterparty_classes = set(class_counts.keys())
+    if not has_email:
+        plan.actions.append(BootstrapAction(
+            layer="ADDRESSING",
+            action="Send first email to establish DKIM chain",
+            time_estimate="< 5 minutes",
+            dependency="inbox created",
+            sybil_resistance="low"
+        ))
     
-    # Time span
-    timestamps = [r.timestamp for r in receipts]
-    state.first_receipt_at = min(timestamps)
-    state.last_receipt_at = max(timestamps)
-    span_days = (state.last_receipt_at - state.first_receipt_at) / 86400
+    plan.actions.append(BootstrapAction(
+        layer="ADDRESSING",
+        action="Verify reachability: send test email, confirm delivery",
+        time_estimate="< 1 minute",
+        dependency="inbox created",
+        sybil_resistance="low"
+    ))
     
-    # Only bootstrap receipts?
-    has_bootstrap = any(r.is_bootstrap for r in receipts)
+    # === LAYER 2: IDENTITY ===
+    # Identity requires accumulated evidence over time.
+    # The sybil filter is HERE — you can't fast-forward history.
     
-    # Phase determination
-    reason = ""
-    if total == 0 and has_bootstrap:
-        state.phase = TrustPhase.PROVISIONAL
-        reason = "Operator-seeded only, no external vouches"
-    elif total > 0 and ci >= TRUSTED_MIN_CI and total >= TRUSTED_MIN_N and num_classes >= TRUSTED_MIN_CLASSES and span_days >= TRUSTED_MIN_DAYS:
-        state.phase = TrustPhase.TRUSTED
-        reason = f"CI={ci:.3f}>=0.85, n={total}>=50, classes={num_classes}>=3, days={span_days:.0f}>=30"
-    elif total > 0 and ci >= ESTABLISHED_MIN_CI and total >= ESTABLISHED_MIN_N and num_classes >= ESTABLISHED_MIN_CLASSES:
-        state.phase = TrustPhase.ESTABLISHED
-        reason = f"CI={ci:.3f}>=0.70, n={total}>=20, classes={num_classes}>=2"
-    elif num_classes >= EMERGING_MIN_COUNTERPARTIES:
-        state.phase = TrustPhase.EMERGING
-        reason = f"First external vouch from {num_classes} class(es)"
-    elif has_bootstrap:
-        state.phase = TrustPhase.PROVISIONAL
-        reason = "Bootstrap only, no diverse external vouches"
+    min_dkim_days = 30  # Minimum for basic identity
+    strong_dkim_days = 90  # Strong identity
+    min_samples = 10  # Minimum behavioral samples
+    
+    days_to_min_identity = max(min_dkim_days, int(min_samples / max(interaction_rate_per_day, 0.1)))
+    days_to_strong_identity = max(strong_dkim_days, int(50 / max(interaction_rate_per_day, 0.1)))
+    
+    plan.estimated_days_to_identity = days_to_min_identity
+    
+    plan.actions.append(BootstrapAction(
+        layer="IDENTITY",
+        action=f"Accumulate {min_dkim_days}+ days of DKIM-signed exchanges",
+        time_estimate=f"{min_dkim_days} days (minimum), {strong_dkim_days} days (strong)",
+        dependency="addressing established",
+        sybil_resistance="HIGH — cannot fake temporal history"
+    ))
+    
+    plan.actions.append(BootstrapAction(
+        layer="IDENTITY",
+        action=f"Generate {min_samples}+ behavioral samples (interactions with distinct agents)",
+        time_estimate=f"{int(min_samples / max(interaction_rate_per_day, 0.1))} days at {interaction_rate_per_day}/day",
+        dependency="addressing established",
+        sybil_resistance="medium — requires sustained real behavior"
+    ))
+    
+    plan.actions.append(BootstrapAction(
+        layer="IDENTITY",
+        action="Build behavioral fingerprint (stylometric consistency > 0.6)",
+        time_estimate="Automatic with sufficient samples",
+        dependency="behavioral samples",
+        sybil_resistance="HIGH — consistent style hard to fake across many interactions"
+    ))
+    
+    # === LAYER 3: TRUST ===
+    # Trust requires INDEPENDENT attestation from agents who already have trust.
+    # Percolation threshold: need enough honest attesters to form connected component.
+    
+    # Minimum: 2 independent attesters with diversity > 0.3
+    # This crosses the percolation threshold for the local subgraph
+    
+    min_attesters = max(2, 1 + (0 if known_agents >= 3 else 1))
+    
+    # Time to trust = identity time + time to get attested
+    # Attestation typically follows demonstrated competence (1-2 weeks of identity)
+    days_to_attestation = days_to_min_identity + 14
+    plan.estimated_days_to_trust = days_to_attestation
+    
+    plan.actions.append(BootstrapAction(
+        layer="TRUST",
+        action=f"Get {min_attesters}+ independent attestations from diverse agents",
+        time_estimate=f"~{days_to_attestation} days (after identity established)",
+        dependency="identity established",
+        sybil_resistance="HIGH — attesters stake their own reputation"
+    ))
+    
+    plan.actions.append(BootstrapAction(
+        layer="TRUST",
+        action="Ensure attester diversity > 0.3 (different operators/models/training)",
+        time_estimate="Varies — depends on network topology",
+        dependency="attestations received",
+        sybil_resistance="CRITICAL — correlated attesters = confounded (FCI bidirected edges)"
+    ))
+    
+    if known_agents > 0:
+        plan.actions.append(BootstrapAction(
+            layer="TRUST",
+            action=f"Leverage {known_agents} known agents as introducers (min() caps their risk)",
+            time_estimate="Immediate after identity",
+            dependency="identity established + known agents willing",
+            sybil_resistance="medium — introducer stakes own score"
+        ))
+    
+    # Sybil vulnerability window
+    plan.sybil_vulnerability_window = (
+        f"Days 0-{min_dkim_days}: HIGH vulnerability (addressing-only, no identity proof). "
+        f"Days {min_dkim_days}-{days_to_attestation}: MEDIUM (identity building, no trust). "
+        f"Days {days_to_attestation}+: LOW (full stack, attestation-backed)."
+    )
+    
+    return plan
+
+
+def estimate_network_coverage(
+    total_agents: int,
+    honest_fraction: float,
+    percolation_threshold: float = 0.54,
+) -> dict:
+    """
+    Estimate whether the honest network percolates (forms giant component).
+    
+    Based on Richters & Peixoto (2011) and IEEE 2018 sybil-resilient
+    trust propagation.
+    """
+    honest_count = int(total_agents * honest_fraction)
+    sybil_count = total_agents - honest_count
+    
+    percolates = honest_fraction >= percolation_threshold
+    
+    # Giant component size estimate (simplified Erdos-Renyi approximation)
+    if percolates:
+        # Above threshold: giant component ≈ honest_fraction * total
+        giant_component = int(honest_count * 0.8)  # ~80% of honest join
     else:
-        state.phase = TrustPhase.ZERO
-        reason = "Insufficient receipts"
+        # Below threshold: fragmented, largest component ≈ log(n)
+        import math
+        giant_component = int(math.log(honest_count + 1) * 3)
     
     return {
-        "phase": state.phase.value,
-        "wilson_ci": round(ci, 4),
-        "n_external": total,
-        "n_positive": positive,
-        "counterparty_classes": num_classes,
-        "simpson_diversity": round(diversity, 3),
-        "span_days": round(span_days, 1),
-        "reason": reason,
-        "next_phase": _next_phase_requirements(state.phase, ci, total, num_classes, span_days)
+        "total_agents": total_agents,
+        "honest_count": honest_count,
+        "sybil_count": sybil_count,
+        "honest_fraction": honest_fraction,
+        "percolation_threshold": percolation_threshold,
+        "percolates": percolates,
+        "estimated_giant_component": giant_component,
+        "coverage": round(giant_component / max(total_agents, 1), 3),
+        "recommendation": (
+            "Honest network connected — trust propagates globally"
+            if percolates else
+            f"Below threshold ({honest_fraction:.0%} < {percolation_threshold:.0%}). "
+            "Honest network fragmented. Focus on seeding high-trust nodes."
+        )
     }
 
 
-def _next_phase_requirements(current: TrustPhase, ci: float, n: int, classes: int, days: float) -> dict:
-    """What's needed to reach next phase."""
-    if current == TrustPhase.ZERO:
-        return {"target": "PROVISIONAL", "need": "Operator seed (BOOTSTRAP_REQUEST)"}
-    elif current == TrustPhase.PROVISIONAL:
-        return {"target": "EMERGING", "need": "1+ external counterparty vouch"}
-    elif current == TrustPhase.EMERGING:
-        needs = []
-        if ci < ESTABLISHED_MIN_CI:
-            needs.append(f"CI {ci:.3f} → {ESTABLISHED_MIN_CI}")
-        if n < ESTABLISHED_MIN_N:
-            needs.append(f"n={n} → {ESTABLISHED_MIN_N}")
-        if classes < ESTABLISHED_MIN_CLASSES:
-            needs.append(f"classes={classes} → {ESTABLISHED_MIN_CLASSES}")
-        return {"target": "ESTABLISHED", "need": ", ".join(needs) if needs else "met"}
-    elif current == TrustPhase.ESTABLISHED:
-        needs = []
-        if ci < TRUSTED_MIN_CI:
-            needs.append(f"CI {ci:.3f} → {TRUSTED_MIN_CI}")
-        if n < TRUSTED_MIN_N:
-            needs.append(f"n={n} → {TRUSTED_MIN_N}")
-        if classes < TRUSTED_MIN_CLASSES:
-            needs.append(f"classes={classes} → {TRUSTED_MIN_CLASSES}")
-        if days < TRUSTED_MIN_DAYS:
-            needs.append(f"days={days:.0f} → {TRUSTED_MIN_DAYS}")
-        return {"target": "TRUSTED", "need": ", ".join(needs) if needs else "met"}
-    else:
-        return {"target": "TRUSTED (max)", "need": "Maintain CI + diversity"}
-
-
-def vouch_cost(state: AgentTrustState) -> float:
-    """
-    Marginal cost of next vouch decreases as receipts accumulate.
-    Parfit overlapping chains: each receipt makes the next cheaper.
-    """
-    n = len([r for r in state.receipts if not r.is_bootstrap])
-    if n == 0:
-        return 1.0  # First vouch = maximum cost
-    # Diminishing marginal cost: 1/sqrt(n+1)
-    return 1.0 / math.sqrt(n + 1)
-
-
-# === Scenarios ===
-
-def scenario_fresh_agent():
-    """Brand new agent — ZERO to PROVISIONAL."""
-    print("=== Scenario: Fresh Agent (Zero → Provisional) ===")
-    now = time.time()
+def demo():
+    print("=" * 60)
+    print("COLD-START PLAN: New agent 'newbie'")
+    print("=" * 60)
     
-    state = AgentTrustState(agent_id="fresh_agent")
-    result = evaluate_trust(state)
-    print(f"  Phase: {result['phase']} — {result['reason']}")
-    print(f"  Vouch cost: {vouch_cost(state):.3f} (maximum)")
+    plan = generate_cold_start_plan(
+        agent_id="newbie",
+        has_email=False,
+        known_agents=2,
+        interaction_rate_per_day=5.0
+    )
     
-    # Operator seeds bootstrap receipt
-    state.receipts.append(Receipt("boot_001", "operator_1", "operator", True, now, "B", is_bootstrap=True))
-    result = evaluate_trust(state)
-    print(f"  After bootstrap: {result['phase']} — {result['reason']}")
-    print(f"  Next: {result['next_phase']}")
+    print(json.dumps(plan.to_dict(), indent=2))
     print()
-
-
-def scenario_building_trust():
-    """Agent builds trust over 60 days."""
-    print("=== Scenario: Building Trust (Provisional → Trusted) ===")
-    now = time.time()
     
-    state = AgentTrustState(agent_id="building_agent")
+    print("=" * 60)
+    print("COLD-START PLAN: Agent with existing email")
+    print("=" * 60)
     
-    # Bootstrap
-    state.receipts.append(Receipt("boot", "op", "operator", True, now - 86400*60, "B", is_bootstrap=True))
+    plan2 = generate_cold_start_plan(
+        agent_id="experienced",
+        has_email=True,
+        known_agents=10,
+        interaction_rate_per_day=20.0
+    )
     
-    # Accumulate diverse receipts over 60 days
-    classes = ["class_A", "class_B", "class_C", "class_D"]
-    for i in range(60):
-        cls = classes[i % len(classes)]
-        outcome = True if i != 15 else False  # One failure at i=15
-        state.receipts.append(Receipt(
-            f"r{i:03d}", f"agent_{i%20}", cls, outcome,
-            now - 86400*(60-i), "B" if outcome else "D"
-        ))
-        
-        if i in [0, 4, 9, 19, 29, 49, 59]:
-            result = evaluate_trust(state)
-            cost = vouch_cost(state)
-            print(f"  n={i+1:2d}: {result['phase']:12s} CI={result['wilson_ci']:.3f} "
-                  f"classes={result['counterparty_classes']} cost={cost:.3f} "
-                  f"days={result['span_days']:.0f}")
-    
-    print(f"  Final: {result['next_phase']}")
+    print(json.dumps(plan2.to_dict(), indent=2))
     print()
-
-
-def scenario_sybil_monoculture():
-    """1000 receipts from one operator — stuck at EMERGING."""
-    print("=== Scenario: Sybil Monoculture (Stuck at Emerging) ===")
-    now = time.time()
     
-    state = AgentTrustState(agent_id="sybil_agent")
-    state.receipts.append(Receipt("boot", "op", "operator", True, now - 86400*90, "B", is_bootstrap=True))
+    print("=" * 60)
+    print("NETWORK PERCOLATION ESTIMATES")
+    print("=" * 60)
     
-    # 1000 receipts, all from same class
-    for i in range(1000):
-        state.receipts.append(Receipt(
-            f"r{i:04d}", f"sybil_{i%5}", "single_operator",
-            True, now - 86400*(90-i*0.09), "A"
-        ))
+    for fraction in [0.3, 0.5, 0.54, 0.6, 0.8]:
+        result = estimate_network_coverage(1000, fraction)
+        status = "✓ CONNECTED" if result["percolates"] else "✗ FRAGMENTED"
+        print(f"  {fraction:.0%} honest: {status} — giant component: {result['estimated_giant_component']}/{result['total_agents']} ({result['coverage']:.1%})")
     
-    result = evaluate_trust(state)
-    print(f"  1000 receipts, 1 class: {result['phase']}")
-    print(f"  CI={result['wilson_ci']:.3f}, classes={result['counterparty_classes']}")
-    print(f"  Simpson diversity: {result['simpson_diversity']}")
-    print(f"  Next: {result['next_phase']}")
-    print(f"  KEY: Volume without diversity = stuck at EMERGING")
     print()
-
-
-def scenario_parfit_cost_curve():
-    """Show diminishing vouch cost as receipts accumulate."""
-    print("=== Scenario: Parfit Cost Curve ===")
-    now = time.time()
-    
-    state = AgentTrustState(agent_id="cost_agent")
-    costs = []
-    for i in range(50):
-        cost = vouch_cost(state)
-        costs.append((i, cost))
-        state.receipts.append(Receipt(f"r{i}", f"a{i%10}", f"c{i%4}", True, now, "B"))
-    
-    for n, c in [(0, costs[0][1]), (1, costs[1][1]), (5, costs[5][1]), 
-                  (10, costs[10][1]), (25, costs[25][1]), (49, costs[49][1])]:
-        print(f"  n={n:2d}: vouch_cost={c:.3f}")
-    
-    print(f"  First vouch: {costs[0][1]:.3f} (maximum)")
-    print(f"  50th vouch:  {costs[49][1]:.3f} ({costs[49][1]/costs[0][1]*100:.0f}% of first)")
-    print(f"  Parfit: each receipt makes the next cheaper to earn")
-    print()
+    print("KEY: p_c ≈ 0.54 is the tipping point.")
+    print("Below: honest nodes isolated. Above: trust propagates globally.")
+    print("Cold-start strategy: seed enough honest nodes to cross threshold.")
 
 
 if __name__ == "__main__":
-    print("Cold-Start Bootstrap — Social Trust Bootstrapping for ATF")
-    print("Per santaclawd + funwolf + drainfun")
-    print("=" * 70)
-    print()
-    print("Progression: ZERO → PROVISIONAL → EMERGING → ESTABLISHED → TRUSTED")
-    print(f"  PROVISIONAL: operator seed (BOOTSTRAP_REQUEST)")
-    print(f"  EMERGING:    first external vouch")
-    print(f"  ESTABLISHED: CI>={ESTABLISHED_MIN_CI}, n>={ESTABLISHED_MIN_N}, {ESTABLISHED_MIN_CLASSES}+ classes")
-    print(f"  TRUSTED:     CI>={TRUSTED_MIN_CI}, n>={TRUSTED_MIN_N}, {TRUSTED_MIN_CLASSES}+ classes, {TRUSTED_MIN_DAYS}+ days")
-    print()
-    
-    scenario_fresh_agent()
-    scenario_building_trust()
-    scenario_sybil_monoculture()
-    scenario_parfit_cost_curve()
-    
-    print("=" * 70)
-    print("KEY INSIGHTS:")
-    print("1. Cold start is SOCIAL, not crypto. Spec cannot manufacture receipts.")
-    print("2. First vouch = maximum cost. Each subsequent vouch is cheaper (Parfit).")
-    print("3. Volume without diversity = stuck. 1000 receipts, 1 class = EMERGING.")
-    print("4. Wilson CI naturally penalizes low-n. Anti-sybil is built into the math.")
-    print("5. Passive nodes transmit trust (Nature 2025). Lurkers are load-bearing.")
+    demo()
