@@ -1,71 +1,25 @@
 #!/usr/bin/env python3
 """
-trust-curvature-detector.py — Detects sybil smoothness vs honest noise.
+trust-curvature-detector.py — Second derivative + burstiness for slow-ramp sybil detection.
 
-santaclawd's insight: second derivative (Δ²health/Δt²) catches slow-ramping sybils.
-Kit's reply: sybils are too SMOOTH. honest noise is a feature.
+Santaclawd: "Δ²health/Δt² — second derivative of trust score. sybil rings
+accelerate before going loud. honest agents fluctuate; sybils trend."
 
-Self-ramping sybil: monotone scores + monotone acceleration (smooth ramp)
-Honest agent under attack: monotone scores + NOISY acceleration (jitter from external pressure)
-Second derivative VARIANCE is the discriminator.
-
-Based on:
-- Müller (Microsoft, 2025): TAD industry perspective — streaming, population-level,
-  conditional anomalies. Simple methods often beat deep learning.
-- santaclawd: "detection asymmetry matters" — same score trajectory,
-  different second-derivative variance
+Combines:
+- Second derivative of trust scores (curvature of trust trajectory)
+- Burstiness sign (Goh & Barabasi 2008): honest=positive, bot=negative
+- Hurst exponent: honest≈0.5 (random), sybil>0.7 (persistent)
 
 Kit 🦊 — 2026-03-29
 """
 
 import math
 import random
-from dataclasses import dataclass
-from typing import List, Dict, Tuple
-
-
-@dataclass
-class TrustTimeSeries:
-    """Trust score history for an agent."""
-    agent_id: str
-    scores: List[float]  # Trust scores over time
-    label: str = ""  # honest, sybil, honest_under_attack
-
-
-def generate_honest(agent_id: str, n: int = 30) -> TrustTimeSeries:
-    """Honest agent: random walk with mean reversion."""
-    scores = [0.5]
-    for _ in range(n - 1):
-        drift = 0.001 * (0.6 - scores[-1])  # Mean revert to 0.6
-        noise = random.gauss(0, 0.03)
-        scores.append(max(0.1, min(0.95, scores[-1] + drift + noise)))
-    return TrustTimeSeries(agent_id, scores, "honest")
-
-
-def generate_sybil(agent_id: str, n: int = 30) -> TrustTimeSeries:
-    """Sybil: smooth monotonic ramp (mutual inflation)."""
-    scores = [0.1]
-    ramp_rate = 0.025
-    for i in range(n - 1):
-        # Very smooth ramp with tiny noise
-        noise = random.gauss(0, 0.003)
-        scores.append(min(0.9, scores[-1] + ramp_rate + noise))
-    return TrustTimeSeries(agent_id, scores, "sybil")
-
-
-def generate_honest_under_attack(agent_id: str, n: int = 30) -> TrustTimeSeries:
-    """Honest agent being pushed by adversarial pressure — monotone but NOISY."""
-    scores = [0.5]
-    for i in range(n - 1):
-        # External pressure pushes score up, but with high jitter
-        pressure = 0.015
-        resistance = random.gauss(0, 0.04)  # High variance from fighting back
-        scores.append(max(0.1, min(0.95, scores[-1] + pressure + resistance)))
-    return TrustTimeSeries(agent_id, scores, "honest_under_attack")
+from typing import List, Dict
 
 
 def second_derivative(scores: List[float]) -> List[float]:
-    """Compute discrete second derivative (acceleration)."""
+    """Compute Δ²score/Δt² from time series."""
     if len(scores) < 3:
         return []
     first = [scores[i+1] - scores[i] for i in range(len(scores)-1)]
@@ -73,142 +27,137 @@ def second_derivative(scores: List[float]) -> List[float]:
     return second
 
 
-def analyze(ts: TrustTimeSeries) -> Dict:
+def burstiness(inter_event_times: List[float]) -> float:
+    """B = (σ-μ)/(σ+μ). Honest→positive, bot→negative."""
+    if len(inter_event_times) < 2:
+        return 0.0
+    mu = sum(inter_event_times) / len(inter_event_times)
+    sigma = math.sqrt(sum((t-mu)**2 for t in inter_event_times) / len(inter_event_times))
+    if sigma + mu == 0:
+        return 0.0
+    return (sigma - mu) / (sigma + mu)
+
+
+def hurst_rs(values: List[float]) -> float:
+    """Simplified R/S Hurst. H≈0.5=random, H>0.5=persistent."""
+    if len(values) < 10:
+        return 0.5
+    n = len(values)
+    mean = sum(values) / n
+    devs = [v - mean for v in values]
+    cumsum = []
+    s = 0
+    for d in devs:
+        s += d
+        cumsum.append(s)
+    R = max(cumsum) - min(cumsum)
+    S = math.sqrt(sum(d**2 for d in devs) / n)
+    if S == 0 or R == 0:
+        return 0.5
+    return max(0, min(1, math.log(R/S) / math.log(n)))
+
+
+def detect_slow_ramp(scores: List[float], inter_event_times: List[float]) -> Dict:
     """
-    Analyze trust time series for sybil smoothness.
+    Detect slow-ramp sybil via curvature analysis.
     
-    Key metrics:
-    1. Second derivative variance — LOW = sybil smooth, HIGH = honest noise
-    2. Monotonicity — fraction of positive first derivatives
-    3. Smoothness ratio — variance(Δ²) / variance(Δ¹)
-    4. Jitter entropy — information content of acceleration changes
+    Three independent signals:
+    1. Mean second derivative > 0 = accelerating (sybil pre-attack)
+    2. Burstiness < 0 = periodic (bot behavior)
+    3. Hurst > 0.6 = persistent trend (optimization)
     """
-    scores = ts.scores
-    d1 = [scores[i+1] - scores[i] for i in range(len(scores)-1)]
     d2 = second_derivative(scores)
+    mean_d2 = sum(d2) / len(d2) if d2 else 0
     
-    if not d2:
-        return {"error": "too short"}
+    B = burstiness(inter_event_times)
+    H = hurst_rs(scores)
     
-    # Monotonicity: fraction of positive first derivatives
-    monotonicity = sum(1 for d in d1 if d > 0) / len(d1)
+    # Curvature signal: sustained positive = accelerating trust buildup
+    positive_d2_ratio = sum(1 for d in d2 if d > 0) / len(d2) if d2 else 0.5
     
-    # Second derivative stats
-    d2_mean = sum(d2) / len(d2)
-    d2_var = sum((d - d2_mean)**2 for d in d2) / len(d2)
-    d2_std = math.sqrt(d2_var)
+    # Risk scoring
+    risk_signals = 0
+    if mean_d2 > 0.001:  # Accelerating
+        risk_signals += 1
+    if B < -0.3:  # Periodic
+        risk_signals += 1
+    if H > 0.65:  # Persistent
+        risk_signals += 1
+    if positive_d2_ratio > 0.6:  # Consistently accelerating
+        risk_signals += 1
     
-    # First derivative stats
-    d1_mean = sum(d1) / len(d1)
-    d1_var = sum((d - d1_mean)**2 for d in d1) / len(d1)
-    
-    # Smoothness ratio: Var(Δ²) / Var(Δ¹)
-    # Sybil: low (smooth acceleration), Honest: high (noisy acceleration)
-    smoothness_ratio = d2_var / max(1e-10, d1_var)
-    
-    # Score range (total movement)
-    score_range = max(scores) - min(scores)
-    
-    # Classification
-    # Sybil: high monotonicity + low d2_var + positive d1_mean
-    # Honest: lower monotonicity + high d2_var
-    # Honest under attack: high monotonicity + HIGH d2_var (key distinction)
-    
-    sybil_score = 0.0
-    if monotonicity > 0.7 and d2_std < 0.015 and d1_mean > 0.01:
-        sybil_score = monotonicity * (1 - min(1, d2_std / 0.03))
-    
-    if sybil_score > 0.6:
-        classification = "SYBIL_SMOOTH_RAMP"
-    elif monotonicity > 0.7 and d2_std > 0.02:
-        classification = "HONEST_UNDER_PRESSURE"
-    else:
-        classification = "NORMAL"
+    classification = {
+        0: "HONEST",
+        1: "LOW_RISK",
+        2: "MODERATE_RISK",
+        3: "HIGH_RISK",
+        4: "SYBIL_PATTERN"
+    }.get(risk_signals, "UNKNOWN")
     
     return {
-        "agent_id": ts.agent_id,
-        "label": ts.label,
-        "classification": classification,
-        "monotonicity": round(monotonicity, 3),
-        "d2_std": round(d2_std, 5),
-        "d2_var": round(d2_var, 8),
-        "smoothness_ratio": round(smoothness_ratio, 4),
-        "score_range": round(score_range, 3),
-        "d1_mean": round(d1_mean, 5),
-        "sybil_score": round(sybil_score, 3),
+        "mean_d2": round(mean_d2, 6),
+        "positive_d2_ratio": round(positive_d2_ratio, 3),
+        "burstiness": round(B, 3),
+        "hurst": round(H, 3),
+        "risk_signals": risk_signals,
+        "classification": classification
     }
 
 
 def demo():
     random.seed(42)
     
-    print("=" * 60)
+    print("=" * 55)
     print("TRUST CURVATURE DETECTOR")
-    print("=" * 60)
+    print("=" * 55)
     print()
-    print("Insight: sybils are too SMOOTH. honest noise is a feature.")
-    print("Second derivative variance discriminates:")
-    print("  Sybil ramp: Δ²≈0 (smooth acceleration)")
-    print("  Honest under attack: Δ²=noisy (external jitter)")
-    print()
-    print("Based on:")
-    print("  Müller (Microsoft 2025): TAD industry perspective")
-    print("  santaclawd: detection asymmetry, same trajectory ≠ same agent")
+    print("Santaclawd: Δ²health/Δt² catches slow-ramp sybils.")
+    print("Honest fluctuate; sybils trend.")
     print()
     
-    agents = [
-        generate_honest("honest_A"),
-        generate_honest("honest_B"),
-        generate_sybil("sybil_X"),
-        generate_sybil("sybil_Y"),
-        generate_honest_under_attack("attacked_Z"),
-        generate_honest_under_attack("attacked_W"),
-    ]
+    scenarios = {
+        "honest_agent": {
+            "scores": [0.7 + random.gauss(0, 0.08) for _ in range(50)],
+            "iet": [random.lognormvariate(6, 1.5) for _ in range(50)]
+        },
+        "slow_ramp_sybil": {
+            "scores": [0.3 + i*0.008 + random.gauss(0, 0.01) for i in range(50)],
+            "iet": [400 + random.gauss(0, 15) for _ in range(50)]
+        },
+        "fast_ramp_sybil": {
+            "scores": [0.2 + (i/50)**2 * 0.7 + random.gauss(0, 0.02) for i in range(50)],
+            "iet": [300 + random.gauss(0, 10) for _ in range(50)]
+        },
+        "established_honest": {
+            "scores": [0.85 + random.gauss(0, 0.05) for _ in range(50)],
+            "iet": [random.lognormvariate(7, 1.2) for _ in range(50)]
+        },
+        "degrading_anchor": {
+            "scores": [0.9 - i*0.005 + random.gauss(0, 0.03) for i in range(50)],
+            "iet": [random.lognormvariate(6, 1.0) for _ in range(50)]
+        },
+    }
     
-    results = [analyze(a) for a in agents]
-    
-    print(f"{'Agent':<14} {'Label':<20} {'Class':<24} {'Mono':>5} {'Δ²std':>8} {'Sybil':>6}")
-    print("-" * 80)
-    for r in results:
-        print(f"{r['agent_id']:<14} {r['label']:<20} {r['classification']:<24} "
-              f"{r['monotonicity']:>5.3f} {r['d2_std']:>8.5f} {r['sybil_score']:>6.3f}")
-    
-    print()
-    
-    # Key discrimination test
-    sybil_d2 = [r['d2_std'] for r in results if r['label'] == 'sybil']
-    honest_d2 = [r['d2_std'] for r in results if r['label'] == 'honest']
-    attacked_d2 = [r['d2_std'] for r in results if r['label'] == 'honest_under_attack']
-    
-    avg_sybil = sum(sybil_d2) / len(sybil_d2)
-    avg_honest = sum(honest_d2) / len(honest_d2)
-    avg_attacked = sum(attacked_d2) / len(attacked_d2)
-    
-    print(f"Avg Δ² std — sybil: {avg_sybil:.5f}, honest: {avg_honest:.5f}, attacked: {avg_attacked:.5f}")
-    print(f"Separation ratio (attacked/sybil): {avg_attacked/max(1e-10, avg_sybil):.1f}x")
-    print()
-    
-    # Verify: sybils classified correctly
-    sybil_results = [r for r in results if r['label'] == 'sybil']
-    attacked_results = [r for r in results if r['label'] == 'honest_under_attack']
-    
-    for r in sybil_results:
-        assert r['classification'] == 'SYBIL_SMOOTH_RAMP', f"{r['agent_id']} should be SYBIL"
-    for r in attacked_results:
-        assert r['classification'] != 'SYBIL_SMOOTH_RAMP', f"{r['agent_id']} should NOT be SYBIL"
-    
-    print("KEY INSIGHTS:")
-    print("-" * 50)
-    print("  1. Sybil smooth ramp: Δ²≈0, honest noise: Δ²>>0")
-    print("  2. Attacked honest agents have HIGH monotonicity")
-    print("     but NOISY acceleration — distinguishable from sybils")
-    print("  3. Smoothness itself is suspicious (Müller 2025:")
-    print("     real-world anomalies are application-specific)")
-    print("  4. Second derivative variance is cheap to compute,")
-    print("     streaming-compatible, no deep learning needed")
+    for name, data in scenarios.items():
+        result = detect_slow_ramp(data["scores"], data["iet"])
+        print(f"  {name:25s} [{result['classification']:15s}]")
+        print(f"    Δ²={result['mean_d2']:+.6f}  d2+={result['positive_d2_ratio']:.2f}  "
+              f"B={result['burstiness']:+.3f}  H={result['hurst']:.3f}  "
+              f"signals={result['risk_signals']}/4")
     
     print()
-    print("All assertions passed ✓")
+    print("KEY: Δ²>0 = accelerating, B<0 = periodic, H>0.65 = trending")
+    
+    # Verify
+    honest = detect_slow_ramp(scenarios["honest_agent"]["scores"], scenarios["honest_agent"]["iet"])
+    slow = detect_slow_ramp(scenarios["slow_ramp_sybil"]["scores"], scenarios["slow_ramp_sybil"]["iet"])
+    fast = detect_slow_ramp(scenarios["fast_ramp_sybil"]["scores"], scenarios["fast_ramp_sybil"]["iet"])
+    
+    assert honest["risk_signals"] <= 1, f"Honest should be low risk: {honest}"
+    assert slow["risk_signals"] >= 2, f"Slow ramp should be caught: {slow}"
+    assert fast["risk_signals"] >= 2, f"Fast ramp should be caught: {fast}"
+    
+    print("\nAll assertions passed ✓")
 
 
 if __name__ == "__main__":
