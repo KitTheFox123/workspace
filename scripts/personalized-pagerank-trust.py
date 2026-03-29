@@ -2,26 +2,25 @@
 """
 personalized-pagerank-trust.py — Local trust whitelisting via Personalized PageRank.
 
-Alvisi et al (IEEE S&P 2013, "SoK: Evolution of Sybil Defense via Social Networks"):
-- Universal sybil defense FAILS because honest graph isn't homogeneous
-- Honest region = loosely-coupled communities, NOT a single well-connected blob
-- Solution: Personalized PageRank (PPR) from a trusted seed
-- PPR cost = O(whitelist_size), not O(network_size)
-- Conductance (not density/clustering) is the right foundation
+From Alvisi et al 2013 (SoK: Evolution of Sybil Defense via Social Networks):
+"Universal sybil defense FAILS because honest graph isn't homogeneous —
+it's loosely-coupled communities. Personalized PageRank for LOCAL whitelisting
+beats global classification."
 
-This implements PPR-based local trust whitelisting for ATF:
-1. Start from a trusted seed (e.g., your own agent ID)
-2. Random walk with restart (teleport back to seed with probability α)
-3. Rank all reachable agents by PPR score
-4. Whitelist top-K as locally trusted
+PPR computes trust FROM a specific node's perspective. Unlike global PageRank,
+it teleports back to the source node with probability α (typically 0.15).
+This means trust decays with graph distance and stays concentrated in
+the source's local community — exactly what ATF needs.
 
-Sybil regions have low conductance connection to honest region →
-random walks rarely cross the attack edge → sybils get low PPR scores.
+Key properties:
+- Trust is ALWAYS LOCAL (my trust in A ≠ your trust in A)
+- Sybil regions get low PPR because attack edges are few (conductance barrier)
+- Computation scales with whitelist size, not total network size
+- Community structure helps: tight communities get high internal PPR
 
 Kit 🦊 — 2026-03-29
 """
 
-import random
 import json
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -43,231 +42,184 @@ class TrustGraph:
         for neighbors in self.edges.values():
             all_nodes.update(neighbors.keys())
         return all_nodes
+    
+    def out_weight(self, node: str) -> float:
+        return sum(self.edges.get(node, {}).values())
 
 
 def personalized_pagerank(
     graph: TrustGraph,
-    seed: str,
-    alpha: float = 0.15,     # Teleport probability (restart to seed)
+    source: str,
+    alpha: float = 0.15,    # Teleport probability (back to source)
     iterations: int = 50,
     epsilon: float = 1e-8
 ) -> dict[str, float]:
     """
-    Compute Personalized PageRank from a seed node.
+    Compute Personalized PageRank from source node.
     
-    α = teleport probability. Higher α = more local (biased toward seed).
-    Alvisi 2013: PPR naturally concentrates mass in the seed's community.
-    Random walks rarely escape through low-conductance cuts (attack edges).
+    α = teleport probability. Higher α = more local (trust stays close).
+    Lower α = more global (trust diffuses further).
     
-    Returns: {node: ppr_score} sorted by score descending.
+    Alvisi 2013 insight: PPR naturally handles community structure because
+    random walks stay within tight communities (high internal conductance)
+    and rarely cross to sybil regions (low attack-edge conductance).
     """
     nodes = graph.nodes()
-    if seed not in nodes:
-        return {}
+    n = len(nodes)
     
-    # Initialize: all mass on seed
-    scores = {n: 0.0 for n in nodes}
-    scores[seed] = 1.0
+    # Initialize: all probability at source
+    ppr = {node: 0.0 for node in nodes}
+    ppr[source] = 1.0
     
     for _ in range(iterations):
-        new_scores = {n: 0.0 for n in nodes}
+        new_ppr = {node: 0.0 for node in nodes}
         
         for node in nodes:
-            if scores[node] < epsilon:
+            if ppr[node] < epsilon:
                 continue
             
             neighbors = graph.neighbors(node)
-            if not neighbors:
-                # Dangling node: teleport all mass to seed
-                new_scores[seed] += scores[node]
-                continue
+            out_w = graph.out_weight(node)
             
-            # Teleport component
-            new_scores[seed] += alpha * scores[node]
-            
-            # Walk component: distribute (1-α) to neighbors proportional to weight
-            total_weight = sum(neighbors.values())
-            if total_weight > 0:
-                walk_mass = (1 - alpha) * scores[node]
+            if out_w > 0:
+                # Distribute (1-α) of node's PPR to neighbors (weighted)
                 for neighbor, weight in neighbors.items():
-                    new_scores[neighbor] += walk_mass * (weight / total_weight)
+                    new_ppr[neighbor] += (1 - alpha) * ppr[node] * (weight / out_w)
+            
+            # Teleport: α goes back to source (dangling nodes teleport too)
+            new_ppr[source] += alpha * ppr[node]
+            if out_w == 0:
+                new_ppr[source] += (1 - alpha) * ppr[node]
         
         # Check convergence
-        diff = sum(abs(new_scores[n] - scores[n]) for n in nodes)
-        scores = new_scores
+        diff = sum(abs(new_ppr[n] - ppr[n]) for n in nodes)
+        ppr = new_ppr
         if diff < epsilon:
             break
     
-    # Normalize
-    total = sum(scores.values())
-    if total > 0:
-        scores = {n: s / total for n, s in scores.items()}
-    
-    return dict(sorted(scores.items(), key=lambda x: -x[1]))
+    return ppr
 
 
-def whitelist_from_ppr(
-    ppr_scores: dict[str, float],
-    k: int = 10,
-    min_score: float = 0.001
-) -> list[dict]:
+def whitelist_from_ppr(ppr: dict[str, float], k: int, exclude: set = None) -> list[tuple[str, float]]:
     """
-    Extract top-K whitelist from PPR scores.
-    Alvisi 2013: cost = O(K), not O(network).
+    Generate a whitelist of top-k trusted nodes from PPR scores.
+    
+    Alvisi 2013: "offering honest nodes the ability to white-list a set
+    of nodes of any given size, ranked according to their trustworthiness."
     """
-    whitelist = []
-    for node, score in ppr_scores.items():
-        if len(whitelist) >= k:
-            break
-        if score >= min_score:
-            whitelist.append({"agent": node, "ppr_score": round(score, 6)})
-    return whitelist
-
-
-def build_test_graph(
-    n_honest: int = 20,
-    n_sybil: int = 15,
-    honest_density: float = 0.15,
-    sybil_density: float = 0.6,
-    attack_edges: int = 2,
-    seed: int = 42
-) -> tuple[TrustGraph, set[str], set[str]]:
-    """
-    Build a graph with honest and sybil regions.
-    
-    Honest: sparse, community structure (Alvisi: real social graphs)
-    Sybil: dense, mutual attestation (cheap to create)
-    Attack edges: few connections between regions (low conductance)
-    """
-    rng = random.Random(seed)
-    graph = TrustGraph()
-    
-    honest = {f"honest_{i}" for i in range(n_honest)}
-    sybils = {f"sybil_{i}" for i in range(n_sybil)}
-    
-    # Honest region: sparse with community structure
-    honest_list = sorted(honest)
-    # Two communities within honest region
-    community_a = honest_list[:n_honest // 2]
-    community_b = honest_list[n_honest // 2:]
-    
-    # Intra-community edges (moderate density)
-    for comm in [community_a, community_b]:
-        for i, a in enumerate(comm):
-            for j, b in enumerate(comm):
-                if i < j and rng.random() < honest_density * 2:
-                    w = rng.uniform(0.5, 1.0)
-                    graph.add_edge(a, b, w)
-                    graph.add_edge(b, a, w)
-    
-    # Inter-community edges (sparse — loosely coupled)
-    for a in community_a:
-        for b in community_b:
-            if rng.random() < honest_density * 0.3:
-                w = rng.uniform(0.3, 0.7)
-                graph.add_edge(a, b, w)
-                graph.add_edge(b, a, w)
-    
-    # Sybil region: dense mutual attestation
-    sybil_list = sorted(sybils)
-    for i, a in enumerate(sybil_list):
-        for j, b in enumerate(sybil_list):
-            if i < j and rng.random() < sybil_density:
-                w = rng.uniform(0.8, 1.0)  # High mutual scores
-                graph.add_edge(a, b, w)
-                graph.add_edge(b, a, w)
-    
-    # Attack edges: few connections from sybil to honest
-    honest_targets = rng.sample(honest_list, min(attack_edges, len(honest_list)))
-    sybil_sources = rng.sample(sybil_list, min(attack_edges, len(sybil_list)))
-    for h, s in zip(honest_targets, sybil_sources):
-        graph.add_edge(s, h, rng.uniform(0.3, 0.6))
-        graph.add_edge(h, s, rng.uniform(0.1, 0.3))  # Honest less trusting back
-    
-    return graph, honest, sybils
+    exclude = exclude or set()
+    ranked = sorted(
+        [(node, score) for node, score in ppr.items() if node not in exclude],
+        key=lambda x: -x[1]
+    )
+    return ranked[:k]
 
 
 def demo():
+    # Build a trust graph with honest community + sybil region
+    g = TrustGraph()
+    
+    # Honest community 1 (tight-knit)
+    honest_1 = ["kit", "bro_agent", "funwolf", "santaclawd"]
+    for i, a in enumerate(honest_1):
+        for j, b in enumerate(honest_1):
+            if i != j:
+                g.add_edge(a, b, weight=0.8 + 0.1 * (abs(i-j) == 1))
+    
+    # Honest community 2 (loosely coupled to community 1)
+    honest_2 = ["gendolf", "braindiff", "gerundium", "hexdrifter"]
+    for i, a in enumerate(honest_2):
+        for j, b in enumerate(honest_2):
+            if i != j:
+                g.add_edge(a, b, weight=0.7)
+    
+    # Bridge edges between honest communities (sparse — Alvisi's "loosely coupled")
+    g.add_edge("kit", "gendolf", 0.6)
+    g.add_edge("gendolf", "kit", 0.6)
+    g.add_edge("bro_agent", "braindiff", 0.5)
+    g.add_edge("braindiff", "bro_agent", 0.5)
+    
+    # Sybil region (dense internal connections — cheap to create)
+    sybils = ["sybil_1", "sybil_2", "sybil_3", "sybil_4", "sybil_5"]
+    for a in sybils:
+        for b in sybils:
+            if a != b:
+                g.add_edge(a, b, weight=1.0)  # Maximum mutual trust (inflated)
+    
+    # Attack edges (few — this is the conductance barrier)
+    g.add_edge("sybil_1", "hexdrifter", 0.3)  # Single attack edge
+    g.add_edge("hexdrifter", "sybil_1", 0.1)  # Low reciprocation
+    
     print("=" * 60)
-    print("PERSONALIZED PAGERANK LOCAL TRUST WHITELISTING")
-    print("Alvisi et al (IEEE S&P 2013)")
+    print("PERSONALIZED PAGERANK TRUST WHITELISTING")
+    print("Alvisi et al 2013 — Local > Universal")
     print("=" * 60)
+    print(f"Honest community 1: {honest_1}")
+    print(f"Honest community 2: {honest_2}")
+    print(f"Sybils: {sybils}")
+    print(f"Attack edges: sybil_1 ↔ hexdrifter (weak)")
     print()
     
-    graph, honest, sybils = build_test_graph(
-        n_honest=20, n_sybil=15,
-        honest_density=0.15, sybil_density=0.6,
-        attack_edges=2
-    )
+    # PPR from Kit's perspective
+    ppr_kit = personalized_pagerank(g, "kit", alpha=0.15)
+    wl_kit = whitelist_from_ppr(ppr_kit, k=10, exclude={"kit"})
     
-    print(f"Graph: {len(honest)} honest, {len(sybils)} sybil, "
-          f"{2} attack edges")
-    print(f"Honest density: sparse (0.15), Sybil density: dense (0.6)")
-    print()
+    print("Kit's trust whitelist (PPR α=0.15):")
+    for node, score in wl_kit:
+        label = "SYBIL" if node.startswith("sybil") else "HONEST"
+        print(f"  {node:15s} {score:.4f}  [{label}]")
     
-    # PPR from an honest seed
-    seed = "honest_0"
-    ppr = personalized_pagerank(graph, seed, alpha=0.15, iterations=100)
+    # Check: sybils should be at the bottom
+    sybil_scores = [s for n, s in wl_kit if n.startswith("sybil")]
+    honest_scores = [s for n, s in wl_kit if not n.startswith("sybil")]
     
-    # Classify results
-    honest_scores = {n: s for n, s in ppr.items() if n in honest}
-    sybil_scores = {n: s for n, s in ppr.items() if n in sybils}
+    print(f"\n  Max sybil score: {max(sybil_scores):.4f}")
+    print(f"  Min honest score: {min(honest_scores):.4f}")
+    print(f"  Separation ratio: {min(honest_scores)/max(sybil_scores):.1f}x")
     
-    avg_honest = sum(honest_scores.values()) / max(len(honest_scores), 1)
-    avg_sybil = sum(sybil_scores.values()) / max(len(sybil_scores), 1)
-    
-    print(f"PPR from seed '{seed}' (α=0.15):")
-    print(f"  Avg honest PPR: {avg_honest:.6f}")
-    print(f"  Avg sybil PPR:  {avg_sybil:.6f}")
-    print(f"  Separation ratio: {avg_honest / max(avg_sybil, 1e-10):.1f}x")
-    print()
-    
-    # Whitelist top-10
-    whitelist = whitelist_from_ppr(ppr, k=10)
-    n_honest_in_whitelist = sum(1 for w in whitelist if w["agent"] in honest)
-    n_sybil_in_whitelist = sum(1 for w in whitelist if w["agent"] in sybils)
-    
-    print(f"Top-10 whitelist:")
-    print(f"  Honest: {n_honest_in_whitelist}, Sybil: {n_sybil_in_whitelist}")
-    for w in whitelist[:5]:
-        label = "✓" if w["agent"] in honest else "✗ SYBIL"
-        print(f"  {w['agent']}: {w['ppr_score']} {label}")
-    print(f"  ... ({len(whitelist) - 5} more)")
-    print()
-    
-    # Test with different α values
+    # PPR from different perspectives — trust is LOCAL
+    print("\n" + "=" * 60)
+    print("TRUST IS LOCAL — different nodes, different rankings")
     print("=" * 60)
-    print("ALPHA SENSITIVITY (teleport probability)")
+    
+    for source in ["kit", "gendolf", "hexdrifter"]:
+        ppr = personalized_pagerank(g, source, alpha=0.15)
+        wl = whitelist_from_ppr(ppr, k=3, exclude={source})
+        top3 = ", ".join(f"{n}({s:.3f})" for n, s in wl)
+        
+        # How much PPR leaks to sybils?
+        sybil_total = sum(ppr.get(s, 0) for s in sybils)
+        print(f"  {source:15s} top-3: {top3}")
+        print(f"  {' ':15s} sybil leakage: {sybil_total:.4f}")
+    
+    # Effect of alpha (teleport probability)
+    print("\n" + "=" * 60)
+    print("ALPHA SENSITIVITY (Kit's perspective)")
+    print("Higher α = more local, less sybil leakage")
     print("=" * 60)
-    for alpha in [0.05, 0.15, 0.30, 0.50]:
-        ppr_a = personalized_pagerank(graph, seed, alpha=alpha)
-        wl = whitelist_from_ppr(ppr_a, k=10)
-        n_h = sum(1 for w in wl if w["agent"] in honest)
-        n_s = sum(1 for w in wl if w["agent"] in sybils)
-        h_scores = [s for n, s in ppr_a.items() if n in honest]
-        s_scores = [s for n, s in ppr_a.items() if n in sybils]
-        avg_h = sum(h_scores) / max(len(h_scores), 1)
-        avg_s = sum(s_scores) / max(len(s_scores), 1)
-        ratio = avg_h / max(avg_s, 1e-10)
-        print(f"  α={alpha:.2f}: whitelist {n_h}H/{n_s}S, separation={ratio:.1f}x")
+    
+    for alpha in [0.05, 0.10, 0.15, 0.25, 0.40]:
+        ppr = personalized_pagerank(g, "kit", alpha=alpha)
+        sybil_total = sum(ppr.get(s, 0) for s in sybils)
+        community_1 = sum(ppr.get(n, 0) for n in honest_1 if n != "kit")
+        community_2 = sum(ppr.get(n, 0) for n in honest_2)
+        print(f"  α={alpha:.2f}: community_1={community_1:.3f}  "
+              f"community_2={community_2:.3f}  sybils={sybil_total:.4f}")
     
     print()
-    print("KEY INSIGHT: Higher α = more local = better sybil separation.")
-    print("But too high = only seed's immediate neighbors.")
-    print("α=0.15 is standard (Page et al 1998).")
+    print("KEY INSIGHTS:")
+    print("1. Sybils get LOW PPR despite dense internal connections")
+    print("   (few attack edges = low conductance to honest region)")
+    print("2. Trust is LOCAL — Kit and Gendolf rank different nodes highest")
+    print("3. Higher α = more local trust = less sybil leakage")
+    print("4. Community structure HELPS — PPR stays within communities")
     print()
+    print("This is why ATF trust should be Personalized PageRank,")
+    print("not global reputation. My trust in you ≠ your trust in them.")
     
-    # Verify: top-10 should be majority honest
-    assert n_honest_in_whitelist > n_sybil_in_whitelist, \
-        f"Expected majority honest in whitelist, got {n_honest_in_whitelist}H/{n_sybil_in_whitelist}S"
-    assert avg_honest > avg_sybil, \
-        f"Expected honest PPR > sybil PPR"
-    
-    print("ALL ASSERTIONS PASSED ✓")
-    print()
-    print("Alvisi 2013 confirmed: PPR concentrates mass in honest community.")
-    print("Low-conductance cut (attack edges) blocks sybil mass propagation.")
-    print("Local whitelisting > universal defense. ATF already does this.")
+    # Assertions
+    assert max(sybil_scores) < min(honest_scores), "Sybils should rank below all honest nodes"
+    print("\nALL ASSERTIONS PASSED ✓")
 
 
 if __name__ == "__main__":
