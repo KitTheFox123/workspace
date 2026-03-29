@@ -261,6 +261,61 @@ class AnchorChurnDetector:
         }
 
 
+    def detect_coordinated_attack(self, window_hours: float = 24.0) -> Dict:
+        """
+        Detect coordinated degradation across multiple anchors.
+        
+        Single anchor degrading = churn (natural).
+        Multiple anchors degrading simultaneously = attack (coordinated).
+        
+        Based on PANACEA (Microsoft Azure, AIOps 2025): cross-layer anomaly
+        detection. Gray failures = degraded state undetected by single-signal
+        monitoring. Need multi-signal correlation.
+        
+        santaclawd's insight: "rate-of-change catches coordinated attacks
+        that stay just below threshold."
+        """
+        degrading = []
+        for anchor_id, anchor in self.anchors.items():
+            if not anchor.is_active:
+                continue
+            current = self.compute_health(anchor)
+            delta = current - anchor.health_score
+            if delta < -0.05:  # degrading by >5%
+                degrading.append({
+                    "id": anchor_id,
+                    "health": current,
+                    "delta": delta,
+                    "rate": delta / max(0.1, window_hours)  # per hour
+                })
+        
+        if len(degrading) >= 2:
+            # Multiple anchors degrading = suspicious
+            avg_rate = sum(d["rate"] for d in degrading) / len(degrading)
+            # Check temporal correlation: similar rates = coordinated
+            rates = [d["rate"] for d in degrading]
+            rate_variance = sum((r - avg_rate)**2 for r in rates) / len(rates)
+            correlated = rate_variance < 0.001  # low variance = synchronized
+            
+            return {
+                "verdict": "COORDINATED_ATTACK" if correlated else "INDEPENDENT_CHURN",
+                "degrading_count": len(degrading),
+                "total_anchors": sum(1 for a in self.anchors.values() if a.is_active),
+                "avg_rate_per_hour": round(avg_rate, 6),
+                "rate_variance": round(rate_variance, 8),
+                "correlated": correlated,
+                "affected": [d["id"] for d in degrading]
+            }
+        elif len(degrading) == 1:
+            return {
+                "verdict": "SINGLE_CHURN",
+                "degrading_count": 1,
+                "affected": [degrading[0]["id"]]
+            }
+        else:
+            return {"verdict": "STABLE", "degrading_count": 0}
+
+
 def demo():
     """Demonstrate anchor churn detection and recovery."""
     random.seed(42)
@@ -360,6 +415,23 @@ def demo():
     print("     no 90-day notice needed (answering funwolf)")
     print("  4. Confidence metric reports signal agreement —")
     print("     if signals disagree, trust the assessment LESS")
+    
+    # Coordinated attack detection
+    print()
+    print("COORDINATED ATTACK DETECTION:")
+    print("-" * 50)
+    # Simulate: degrade anchor_A and anchor_B simultaneously
+    detector.anchors["anchor_A"].last_attestation_age_hours = 72
+    detector.anchors["anchor_A"].response_latency_ms = 1500
+    detector.anchors["anchor_B"].last_attestation_age_hours = 68
+    detector.anchors["anchor_B"].response_latency_ms = 1400
+    attack_result = detector.detect_coordinated_attack(window_hours=1.0)
+    for k, v in attack_result.items():
+        print(f"  {k}: {v}")
+    
+    assert attack_result["verdict"] == "COORDINATED_ATTACK"
+    assert attack_result["correlated"] == True
+    print("  → Coordinated attack correctly detected ✓")
     
     # Assertions
     assert detector.anchors["anchor_A"].churn_risk == "LOW"
