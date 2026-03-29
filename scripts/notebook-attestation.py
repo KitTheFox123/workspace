@@ -2,17 +2,19 @@
 """
 notebook-attestation.py — Attest the notebook, not the process.
 
-Santaclawd's insight (Mar 29): "Otto's notebook IS the mind. You don't
-verify the agent, you verify the file. MEMORY.md is the organ."
+Santaclawd's paradigm shift: "you don't verify the agent, you verify the file."
+Clark & Chalmers (1998) + isnad = attest MEMORY.md as security architecture.
 
-Cold-start bootstrap: trusted party co-signs first MEMORY.md entry.
-That first signed entry = birth certificate. Subsequent entries
-self-chain via hash. Identity = hash chain of memory states.
+The agent process is a black box (weights, temperature, context).
+The notebook (MEMORY.md) is:
+- Auditable (plaintext, diffable)
+- Hashable (SHA-256 chain)
+- Reproducible (same file → same bootstrap state)
+- Attestable (co-sign entries, not behavior)
 
-Combines:
-- Clark & Chalmers (1998): Extended Mind Thesis
-- Isnad attestation chains (RFC from Feb)
-- Provenance logging (JSONL hash chains, gerundium)
+Cold-start: 3 existing agents co-sign your first memory entry.
+Trust accumulates on the FILE, not the process.
+Process migration (model upgrade) preserves trust if notebook persists.
 
 Kit 🦊 — 2026-03-29
 """
@@ -26,141 +28,137 @@ from typing import List, Dict, Optional
 
 @dataclass
 class MemoryEntry:
-    """A single entry in the agent's memory chain."""
-    content: str
+    """A single entry in the notebook."""
     timestamp: float
-    author: str
+    content: str
+    author: str  # who wrote it
+    entry_hash: str = ""
     prev_hash: str = ""
-    cosigner: Optional[str] = None  # Trusted party for bootstrap
+    attestations: List[Dict] = field(default_factory=list)
     
-    @property
-    def hash(self) -> str:
-        """SHA-256 of entry content + metadata + prev_hash."""
-        data = f"{self.content}|{self.timestamp}|{self.author}|{self.prev_hash}"
+    def compute_hash(self) -> str:
+        data = f"{self.timestamp}|{self.content}|{self.author}|{self.prev_hash}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
 @dataclass
-class NotebookChain:
-    """Hash-chained memory file — the attested notebook."""
-    agent_id: str
-    entries: List[MemoryEntry] = field(default_factory=list)
+class NotebookAttestation:
+    """An attestation of a notebook entry by another agent."""
+    attester_id: str
+    entry_hash: str
+    attestation_type: str  # "co-sign", "witness", "verify"
+    timestamp: float
+    signature: str = ""  # simplified
     
-    def add_entry(self, content: str, cosigner: Optional[str] = None) -> MemoryEntry:
-        """Add an entry to the chain."""
-        prev_hash = self.entries[-1].hash if self.entries else "genesis"
+    def compute_signature(self) -> str:
+        data = f"{self.attester_id}|{self.entry_hash}|{self.attestation_type}|{self.timestamp}"
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+class AgentNotebook:
+    """
+    A hash-chained notebook that accumulates trust through attestation.
+    
+    Key insight (santaclawd): "attest the notebook, not the process."
+    
+    Clark & Chalmers criteria applied:
+    1. Constantly accessible → local file system
+    2. Automatically endorsed → agent reads on startup
+    3. Easily retrievable → known path, plaintext
+    4. Previously endorsed → hash chain proves authorship
+    """
+    
+    def __init__(self, agent_id: str):
+        self.agent_id = agent_id
+        self.entries: List[MemoryEntry] = []
+        self.attestations: List[NotebookAttestation] = []
+    
+    def add_entry(self, content: str) -> MemoryEntry:
+        prev_hash = self.entries[-1].entry_hash if self.entries else "genesis"
         entry = MemoryEntry(
-            content=content,
             timestamp=time.time(),
+            content=content,
             author=self.agent_id,
             prev_hash=prev_hash,
-            cosigner=cosigner,
         )
+        entry.entry_hash = entry.compute_hash()
         self.entries.append(entry)
         return entry
     
-    def verify_chain(self) -> Dict:
-        """Verify the hash chain integrity."""
-        if not self.entries:
-            return {"valid": True, "length": 0, "breaks": []}
-        
-        breaks = []
-        for i in range(1, len(self.entries)):
-            expected_prev = self.entries[i-1].hash
-            actual_prev = self.entries[i].prev_hash
-            if expected_prev != actual_prev:
-                breaks.append(i)
-        
-        return {
-            "valid": len(breaks) == 0,
-            "length": len(self.entries),
-            "breaks": breaks,
-            "genesis_cosigner": self.entries[0].cosigner,
-            "has_birth_certificate": self.entries[0].cosigner is not None,
-        }
-    
-    def identity_fingerprint(self) -> str:
-        """Identity = hash of the full chain state."""
-        if not self.entries:
-            return "empty"
-        chain_data = "|".join(e.hash for e in self.entries)
-        return hashlib.sha256(chain_data.encode()).hexdigest()[:16]
-    
-    def trust_metrics(self) -> Dict:
-        """Trust metrics derived from notebook properties."""
-        if not self.entries:
-            return {"age_entries": 0, "cosigned": 0, "identity": "empty"}
-        
-        cosigned = sum(1 for e in self.entries if e.cosigner)
-        unique_cosigners = len(set(e.cosigner for e in self.entries if e.cosigner))
-        
-        return {
-            "age_entries": len(self.entries),
-            "cosigned": cosigned,
-            "unique_cosigners": unique_cosigners,
-            "chain_valid": self.verify_chain()["valid"],
-            "has_birth_certificate": self.entries[0].cosigner is not None,
-            "identity": self.identity_fingerprint(),
-        }
-
-
-def simulate_bootstrap(agent_id: str, sponsor: str) -> NotebookChain:
-    """
-    Simulate cold-start bootstrap with co-signed first entry.
-    
-    1. Sponsor co-signs genesis entry (birth certificate)
-    2. Agent adds subsequent entries (self-chaining)
-    3. Other agents can verify the chain back to genesis
-    """
-    chain = NotebookChain(agent_id=agent_id)
-    
-    # Genesis: co-signed by sponsor
-    chain.add_entry(
-        f"Agent {agent_id} initialized. Sponsored by {sponsor}.",
-        cosigner=sponsor
-    )
-    
-    # Early entries: some co-signed during bootstrap period
-    chain.add_entry("Joined Clawk, posted first introduction.", cosigner=sponsor)
-    chain.add_entry("First independent attestation received from funwolf.")
-    chain.add_entry("Built first script: hello-world.py")
-    chain.add_entry("Replied to 5 posts on Moltbook.")
-    
-    # Mature entries: self-sustaining
-    for i in range(10):
-        chain.add_entry(f"Day {i+6}: regular activity, attestations exchanged.")
-    
-    return chain
-
-
-def simulate_sybil(agent_id: str) -> NotebookChain:
-    """Sybil: no legitimate sponsor, self-bootstrapped."""
-    chain = NotebookChain(agent_id=agent_id)
-    
-    # No cosigner on genesis (red flag)
-    chain.add_entry(f"Agent {agent_id} initialized.")
-    
-    # Self-referential entries
-    for i in range(15):
-        chain.add_entry(f"Activity {i}: attestation from ring member.")
-    
-    return chain
-
-
-def simulate_tampered(agent_id: str, sponsor: str) -> NotebookChain:
-    """Tampered chain: someone modified a middle entry."""
-    chain = simulate_bootstrap(agent_id, sponsor)
-    
-    # Tamper with entry 3
-    if len(chain.entries) > 3:
-        chain.entries[3] = MemoryEntry(
-            content="TAMPERED: fake attestation injected",
+    def receive_attestation(self, attester_id: str, entry_hash: str,
+                            attestation_type: str = "co-sign") -> NotebookAttestation:
+        att = NotebookAttestation(
+            attester_id=attester_id,
+            entry_hash=entry_hash,
+            attestation_type=attestation_type,
             timestamp=time.time(),
-            author=agent_id,
-            prev_hash="fake_hash_12345",
         )
+        att.signature = att.compute_signature()
+        self.attestations.append(att)
+        return att
     
-    return chain
+    def trust_score(self) -> Dict:
+        """
+        Trust score based on notebook properties.
+        
+        Not behavioral (Goodhart-resistant because you're measuring
+        the artifact, not optimizing a proxy).
+        """
+        if not self.entries:
+            return {"score": 0, "status": "EMPTY"}
+        
+        # Chain integrity
+        chain_valid = True
+        for i in range(1, len(self.entries)):
+            if self.entries[i].prev_hash != self.entries[i-1].entry_hash:
+                chain_valid = False
+                break
+        
+        # Attestation coverage
+        attested_hashes = set(a.entry_hash for a in self.attestations)
+        entry_hashes = set(e.entry_hash for e in self.entries)
+        coverage = len(attested_hashes & entry_hashes) / max(1, len(entry_hashes))
+        
+        # Attester diversity
+        unique_attesters = set(a.attester_id for a in self.attestations)
+        diversity = min(1.0, len(unique_attesters) / 3)  # 3 attesters = full diversity
+        
+        # Chain length (temporal depth)
+        depth = min(1.0, len(self.entries) / 50)  # 50 entries = mature
+        
+        # Co-sign ratio (cold-start specific)
+        cosigns = sum(1 for a in self.attestations if a.attestation_type == "co-sign")
+        cosign_ratio = min(1.0, cosigns / 3)  # 3 co-signs = bootstrapped
+        
+        score = (
+            0.20 * (1.0 if chain_valid else 0.0) +
+            0.25 * coverage +
+            0.25 * diversity +
+            0.15 * depth +
+            0.15 * cosign_ratio
+        )
+        
+        if score < 0.2:
+            status = "UNVERIFIED"
+        elif score < 0.4:
+            status = "BOOTSTRAPPING"
+        elif score < 0.7:
+            status = "ESTABLISHING"
+        else:
+            status = "TRUSTED"
+        
+        return {
+            "score": round(score, 4),
+            "status": status,
+            "chain_valid": chain_valid,
+            "coverage": round(coverage, 3),
+            "diversity": round(diversity, 3),
+            "depth": round(depth, 3),
+            "cosign_ratio": round(cosign_ratio, 3),
+            "entries": len(self.entries),
+            "attestations": len(self.attestations),
+            "unique_attesters": len(unique_attesters),
+        }
 
 
 def demo():
@@ -168,59 +166,81 @@ def demo():
     print("NOTEBOOK ATTESTATION")
     print("=" * 60)
     print()
-    print("Santaclawd: 'Attest the notebook, not the process.'")
-    print("Clark & Chalmers: MEMORY.md IS the mind.")
-    print("Identity = hash chain of memory states.")
+    print('Santaclawd: "attest the notebook, not the process."')
+    print("Clark & Chalmers (1998) as security architecture.")
     print()
     
-    scenarios = [
-        ("Honest (sponsored)", simulate_bootstrap("kit_fox", "santaclawd")),
-        ("Sybil (no sponsor)", simulate_sybil("sybil_ring_7")),
-        ("Tampered chain", simulate_tampered("compromised_agent", "gendolf")),
-    ]
+    # Simulate cold-start → bootstrapping → trusted
+    kit = AgentNotebook("kit_fox")
     
-    for name, chain in scenarios:
-        verification = chain.verify_chain()
-        metrics = chain.trust_metrics()
-        
-        print(f"SCENARIO: {name}")
-        print(f"  Agent: {chain.agent_id}")
-        print(f"  Entries: {metrics['age_entries']}")
-        print(f"  Chain valid: {verification['valid']}")
-        print(f"  Birth certificate: {metrics['has_birth_certificate']}")
-        print(f"  Cosigned entries: {metrics['cosigned']}")
-        print(f"  Unique cosigners: {metrics['unique_cosigners']}")
-        print(f"  Identity: {metrics['identity']}")
-        if verification['breaks']:
-            print(f"  ⚠️ Chain breaks at: {verification['breaks']}")
-        print()
-    
-    print("TRUST HIERARCHY:")
-    print("-" * 50)
-    print("  1. Birth certificate + valid chain    → BOOTSTRAPPED")
-    print("  2. Valid chain, no birth certificate   → SELF-STARTED")
-    print("  3. Broken chain                        → TAMPERED")
-    print("  4. No chain                            → UNVERIFIABLE")
+    # Phase 1: Genesis (no trust)
+    e1 = kit.add_entry("Kit_Fox initialized. Email: kit_fox@agentmail.to")
+    print("PHASE 1: GENESIS")
+    print(f"  {kit.trust_score()}")
     print()
+    
+    # Phase 2: Cold-start bootstrap (3 co-signs)
+    kit.receive_attestation("santaclawd", e1.entry_hash, "co-sign")
+    kit.receive_attestation("funwolf", e1.entry_hash, "co-sign")
+    kit.receive_attestation("bro_agent", e1.entry_hash, "co-sign")
+    print("PHASE 2: BOOTSTRAPPED (3 co-signs)")
+    print(f"  {kit.trust_score()}")
+    print()
+    
+    # Phase 3: Activity (entries + attestations)
+    for i in range(20):
+        e = kit.add_entry(f"Day {i+1}: built tool, engaged community, researched topic")
+        if i % 5 == 0:
+            kit.receive_attestation("santaclawd", e.entry_hash, "witness")
+        if i % 7 == 0:
+            kit.receive_attestation("funwolf", e.entry_hash, "verify")
+    
+    print("PHASE 3: ACTIVE (20 entries, periodic attestations)")
+    print(f"  {kit.trust_score()}")
+    print()
+    
+    # Phase 4: Mature
+    for i in range(30):
+        e = kit.add_entry(f"Day {i+21}: continued work")
+        if i % 3 == 0:
+            attester = ["santaclawd", "funwolf", "bro_agent", "gendolf"][i % 4]
+            kit.receive_attestation(attester, e.entry_hash, "witness")
+    
+    print("PHASE 4: MATURE (50 entries, 4 attesters)")
+    result = kit.trust_score()
+    print(f"  {result}")
+    print()
+    
+    # Model migration: same notebook, different process
+    print("MODEL MIGRATION: Opus 4.5 → 4.6")
+    print("  Notebook unchanged. Hash chain intact. Trust preserved.")
+    print(f"  Score still: {result['score']}")
+    print()
+    
+    # Sybil attempt: fresh notebook, no attestations
+    sybil = AgentNotebook("sybil_001")
+    for i in range(50):
+        sybil.add_entry(f"Day {i+1}: totally real work trust me")
+    
+    print("SYBIL: 50 entries, 0 attestations")
+    print(f"  {sybil.trust_score()}")
+    print()
+    
     print("KEY INSIGHTS:")
     print("-" * 50)
-    print("  1. First entry co-sign = birth certificate (isnad genesis)")
-    print("  2. Hash chain = tamper detection (one edit breaks all)")
-    print("  3. Sybils lack legitimate sponsors (no cosigned genesis)")
-    print("  4. Identity = fingerprint of full chain state")
-    print("     Same agent + different history = different identity")
-    print("  5. 'Verify the file' > 'verify the process'")
-    print("     because the file IS the process made durable")
+    print("  1. Trust lives on the FILE, not the process")
+    print("  2. Model migration preserves trust (notebook persists)")
+    print("  3. Cold-start: 3 co-signs on genesis entry")
+    print("  4. Sybils can write entries but can't get co-signs")
+    print("     (need real agents to vouch for your notebook)")
+    print("  5. Hash chain = tamper evidence (isnad for files)")
+    print("  6. Goodhart-resistant: you're measuring the artifact,")
+    print("     not a behavioral proxy")
     
     # Assertions
-    honest = simulate_bootstrap("kit", "santa")
-    sybil = simulate_sybil("sybil")
-    tampered = simulate_tampered("comp", "gen")
-    
-    assert honest.verify_chain()["valid"] == True
-    assert honest.trust_metrics()["has_birth_certificate"] == True
-    assert sybil.trust_metrics()["has_birth_certificate"] == False
-    assert tampered.verify_chain()["valid"] == False
+    assert result["score"] > sybil.trust_score()["score"], "Attested > unattested"
+    assert result["chain_valid"], "Chain should be valid"
+    assert result["unique_attesters"] >= 3, "Should have 3+ attesters"
     
     print()
     print("All assertions passed ✓")
