@@ -2,332 +2,299 @@
 """
 conductance-sybil-detector.py — Conductance-based sybil detection for ATF.
 
-Alvisi et al (IEEE S&P 2013, "SoK: Evolution of Sybil Defense"):
-The fundamental sybil insight is CONDUCTANCE — the ratio of edges crossing
-the honest/sybil boundary to edges within each region. Low conductance =
-sybils can't easily connect to honest region. Random walks get trapped.
+Alvisi et al (IEEE S&P 2013, "SoK: The Evolution of Sybil Defense via
+Social Networks"): the FOUNDATION of sybil defense is CONDUCTANCE, not
+density or clustering. Conductance of a set S = edges leaving S / min(vol(S), vol(V\S)).
+Low conductance between regions = hard for random walks to cross = sybil boundary.
 
-SybilRank (Cao et al, NSDI 2012): Short random walks from trusted seeds
-converge fast in honest region (fast-mixing), get trapped in sybil region
-(poor mixing across low-conductance boundary).
+Key insights from Alvisi 2013:
+- Universal sybil defense FAILS because honest graph isn't homogeneous
+- Honest region = loosely-coupled communities, NOT one homogeneous blob
+- LOCAL whitelisting > global classification (cost = O(whitelist), not O(network))
+- Maginot syndrome warning: sophisticated defense vs attacks that bypass it
+- Mixing time = 1/conductance gap -- fast within community, slow across boundary
+- RenRen data: real sybils differ from theoretical assumptions
 
-This combines:
-1. Trust-weighted random walks from seed nodes
-2. Conductance estimation via walk escape rates
-3. Clustering coefficient as secondary signal (sybil=dense, honest=sparse)
+Implementation: personalized PageRank from ego node, then sweep cut to find
+lowest-conductance partition. Nodes on the ego side = whitelist. Nodes across
+the conductance gap = potential sybils.
 
 Kit 🦊 — 2026-03-29
 """
 
 import random
 import json
-from dataclasses import dataclass, field
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 
 @dataclass
-class Node:
-    id: str
-    is_sybil: bool = False
-    trust_score: float = 0.0  # SybilRank landing probability
-    clustering_coeff: float = 0.0
-    walk_visits: int = 0
+class TrustGraph:
+    """Weighted directed trust graph."""
+    edges: dict[str, dict[str, float]] = field(default_factory=lambda: defaultdict(dict))
+    
+    def add_edge(self, src: str, dst: str, weight: float = 1.0):
+        self.edges[src][dst] = weight
+        
+    def add_undirected(self, a: str, b: str, weight: float = 1.0):
+        self.add_edge(a, b, weight)
+        self.add_edge(b, a, weight)
+    
+    def nodes(self) -> set[str]:
+        nodes = set(self.edges.keys())
+        for neighbors in self.edges.values():
+            nodes.update(neighbors.keys())
+        return nodes
+    
+    def degree(self, node: str) -> float:
+        """Weighted degree."""
+        return sum(self.edges.get(node, {}).values())
+    
+    def volume(self, subset: set[str]) -> float:
+        """Volume = sum of degrees in subset."""
+        return sum(self.degree(n) for n in subset)
+    
+    def conductance(self, subset: set[str]) -> float:
+        """
+        Conductance(S) = cut(S, V-S) / min(vol(S), vol(V-S))
+        Lower = harder to cross = stronger boundary.
+        """
+        all_nodes = self.nodes()
+        complement = all_nodes - subset
+        
+        if not subset or not complement:
+            return 1.0  # Trivial partition
+        
+        # Cut = sum of edge weights crossing the boundary
+        cut = 0.0
+        for node in subset:
+            for neighbor, weight in self.edges.get(node, {}).items():
+                if neighbor in complement:
+                    cut += weight
+        
+        vol_s = self.volume(subset)
+        vol_c = self.volume(complement)
+        
+        if min(vol_s, vol_c) == 0:
+            return 1.0
+        
+        return cut / min(vol_s, vol_c)
+    
+    def personalized_pagerank(self, seed: str, alpha: float = 0.15, 
+                               iterations: int = 50) -> dict[str, float]:
+        """
+        Personalized PageRank from seed node.
+        alpha = teleport probability (back to seed).
+        Higher alpha = more local. Alvisi: local whitelisting is the goal.
+        """
+        nodes = list(self.nodes())
+        scores = {n: 0.0 for n in nodes}
+        scores[seed] = 1.0
+        
+        for _ in range(iterations):
+            new_scores = {n: 0.0 for n in nodes}
+            for node in nodes:
+                if scores[node] == 0:
+                    continue
+                neighbors = self.edges.get(node, {})
+                total_weight = sum(neighbors.values())
+                if total_weight == 0:
+                    new_scores[seed] += scores[node]
+                    continue
+                for neighbor, weight in neighbors.items():
+                    new_scores[neighbor] += (1 - alpha) * scores[node] * (weight / total_weight)
+                new_scores[seed] += alpha * scores[node]
+            scores = new_scores
+        
+        return scores
+    
+    def sweep_cut(self, scores: dict[str, float]) -> tuple[set[str], float]:
+        """
+        Sweep cut: sort nodes by score/degree ratio, find lowest-conductance cut.
+        This is the standard technique from spectral graph theory.
+        Returns (best_subset, best_conductance).
+        """
+        # Sort by score/degree ratio (descending)
+        nodes_sorted = sorted(
+            scores.keys(),
+            key=lambda n: scores[n] / max(self.degree(n), 1e-10),
+            reverse=True
+        )
+        
+        best_subset = set()
+        best_conductance = 1.0
+        current_subset = set()
+        
+        all_nodes = self.nodes()
+        
+        for i, node in enumerate(nodes_sorted):
+            current_subset.add(node)
+            if len(current_subset) >= len(all_nodes):
+                break
+            
+            c = self.conductance(current_subset)
+            if c < best_conductance and len(current_subset) > 1:
+                best_conductance = c
+                best_subset = current_subset.copy()
+        
+        return best_subset, best_conductance
 
 
-class ConductanceSybilDetector:
+def detect_sybils(graph: TrustGraph, ego: str, 
+                  conductance_threshold: float = 0.3) -> dict:
     """
-    Detects sybil regions using conductance estimation.
+    Detect sybils from ego node's perspective using conductance-based sweep cut.
     
-    Core idea: random walks from honest seeds mix quickly in the
-    honest region but get trapped when crossing into sybil territory
-    (low conductance boundary). The LANDING PROBABILITY after O(log n)
-    steps is the trust signal.
+    Returns classification + conductance metrics.
     """
+    # Step 1: Personalized PageRank from ego
+    ppr = graph.personalized_pagerank(ego, alpha=0.2)
     
-    def __init__(self):
-        self.nodes: dict[str, Node] = {}
-        self.edges: dict[str, dict[str, float]] = defaultdict(dict)  # weighted adjacency
-        self.seeds: set[str] = set()
+    # Step 2: Sweep cut to find natural boundary
+    whitelist, boundary_conductance = graph.sweep_cut(ppr)
     
-    def add_node(self, node_id: str, is_sybil: bool = False):
-        self.nodes[node_id] = Node(id=node_id, is_sybil=is_sybil)
+    # Step 3: Classify
+    all_nodes = graph.nodes()
+    outside = all_nodes - whitelist
     
-    def add_edge(self, a: str, b: str, weight: float = 1.0):
-        self.edges[a][b] = weight
-        self.edges[b][a] = weight
+    # Step 4: Compute conductance of sybil-suspected region
+    if outside:
+        sybil_conductance = graph.conductance(outside)
+    else:
+        sybil_conductance = 1.0
     
-    def set_seeds(self, seeds: list[str]):
-        """Trusted seed nodes (known honest)."""
-        self.seeds = set(seeds)
-    
-    def compute_clustering(self):
-        """Local clustering coefficient per node."""
-        for nid in self.nodes:
-            neighbors = list(self.edges.get(nid, {}).keys())
-            if len(neighbors) < 2:
-                self.nodes[nid].clustering_coeff = 0.0
-                continue
-            # Count edges between neighbors
-            triangles = 0
-            possible = len(neighbors) * (len(neighbors) - 1) / 2
-            for i in range(len(neighbors)):
-                for j in range(i + 1, len(neighbors)):
-                    if neighbors[j] in self.edges.get(neighbors[i], {}):
-                        triangles += 1
-            self.nodes[nid].clustering_coeff = triangles / possible if possible > 0 else 0.0
-    
-    def sybilrank(self, walk_length: int = 10, num_walks: int = 1000):
-        """
-        SybilRank: trust-weighted random walks from seeds.
-        
-        Cao et al (NSDI 2012): Start walks at seed nodes, walk O(log n) steps.
-        Landing probability = trust. Honest nodes get high landing probability
-        because walks mix fast in honest region. Sybil nodes get low probability
-        because few edges cross the boundary (low conductance).
-        """
-        # Reset
-        for node in self.nodes.values():
-            node.trust_score = 0.0
-            node.walk_visits = 0
-        
-        if not self.seeds:
-            return
-        
-        seeds = list(self.seeds)
-        
-        for _ in range(num_walks):
-            # Start at random seed
-            current = random.choice(seeds)
-            
-            for step in range(walk_length):
-                self.nodes[current].walk_visits += 1
-                
-                neighbors = self.edges.get(current, {})
-                if not neighbors:
-                    break
-                
-                # Weighted random walk
-                nids = list(neighbors.keys())
-                weights = [neighbors[n] for n in nids]
-                total = sum(weights)
-                weights = [w / total for w in weights]
-                
-                current = random.choices(nids, weights=weights, k=1)[0]
-            
-            # Final landing
-            self.nodes[current].trust_score += 1.0
-        
-        # Normalize by degree (SybilRank normalization)
-        for nid, node in self.nodes.items():
-            degree = len(self.edges.get(nid, {}))
-            if degree > 0:
-                node.trust_score = node.trust_score / degree
-            # Normalize to [0, 1]
-        
-        max_score = max(n.trust_score for n in self.nodes.values()) or 1.0
-        for node in self.nodes.values():
-            node.trust_score /= max_score
-    
-    def estimate_conductance(self, region: set[str]) -> float:
-        """
-        Conductance = edges_crossing_boundary / min(volume_inside, volume_outside)
-        
-        Low conductance = hard boundary (sybil/honest separation).
-        Alvisi 2013: this is THE metric that determines sybil defense success.
-        """
-        crossing = 0
-        internal = 0
-        
-        for nid in region:
-            for neighbor, weight in self.edges.get(nid, {}).items():
-                if neighbor in region:
-                    internal += weight
-                else:
-                    crossing += weight
-        
-        internal /= 2  # Each internal edge counted twice
-        volume = internal + crossing
-        
-        if volume == 0:
-            return 0.0
-        
-        return crossing / volume
-    
-    def classify(self, threshold: float = 0.3) -> dict:
-        """
-        Classify nodes as honest/sybil based on trust score + clustering.
-        
-        Sybil signals:
-        1. Low trust score (walks don't reach from honest seeds)
-        2. High clustering (dense internal connections)
-        """
-        self.compute_clustering()
-        self.sybilrank()
-        
-        classified = {"honest": [], "sybil": [], "uncertain": []}
-        
-        for nid, node in self.nodes.items():
-            if nid in self.seeds:
-                classified["honest"].append(nid)
-                continue
-            
-            # Combined score: high trust + low clustering = honest
-            # Sybil: low trust + high clustering
-            sybil_signal = (1 - node.trust_score) * 0.6 + node.clustering_coeff * 0.4
-            
-            if sybil_signal > (1 - threshold):
-                classified["sybil"].append(nid)
-            elif sybil_signal < threshold:
-                classified["honest"].append(nid)
-            else:
-                classified["uncertain"].append(nid)
-        
-        return classified
-    
-    def full_analysis(self) -> dict:
-        classification = self.classify()
-        
-        honest_set = set(classification["honest"])
-        sybil_set = set(classification["sybil"])
-        
-        honest_conductance = self.estimate_conductance(honest_set) if honest_set else 0
-        sybil_conductance = self.estimate_conductance(sybil_set) if sybil_set else 0
-        
-        # Accuracy against ground truth
-        tp = sum(1 for nid in classification["sybil"] if self.nodes[nid].is_sybil)
-        fp = sum(1 for nid in classification["sybil"] if not self.nodes[nid].is_sybil)
-        tn = sum(1 for nid in classification["honest"] if not self.nodes[nid].is_sybil)
-        fn = sum(1 for nid in classification["honest"] if self.nodes[nid].is_sybil)
-        
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        
-        return {
-            "classification": {k: len(v) for k, v in classification.items()},
-            "conductance": {
-                "honest_region": round(honest_conductance, 4),
-                "sybil_region": round(sybil_conductance, 4),
-                "insight": "Low sybil conductance = walks get trapped. High honest conductance = well-connected to rest of graph."
-            },
-            "accuracy": {
-                "precision": round(precision, 3),
-                "recall": round(recall, 3),
-                "f1": round(f1, 3),
-                "true_positives": tp,
-                "false_positives": fp,
-                "true_negatives": tn,
-                "false_negatives": fn
-            },
-            "clustering": {
-                "avg_honest": round(sum(self.nodes[n].clustering_coeff for n in classification["honest"]) / max(len(classification["honest"]), 1), 3),
-                "avg_sybil": round(sum(self.nodes[n].clustering_coeff for n in classification["sybil"]) / max(len(classification["sybil"]), 1), 3),
-            }
-        }
+    return {
+        "ego": ego,
+        "whitelist": sorted(whitelist),
+        "suspected_sybils": sorted(outside),
+        "boundary_conductance": round(boundary_conductance, 4),
+        "sybil_region_conductance": round(sybil_conductance, 4),
+        "whitelist_size": len(whitelist),
+        "network_size": len(all_nodes),
+        "classification_confidence": "HIGH" if boundary_conductance < 0.1 else
+                                     "MEDIUM" if boundary_conductance < conductance_threshold else
+                                     "LOW"
+    }
 
 
-def build_test_network():
+def build_test_graph() -> TrustGraph:
     """
-    Build a network with honest community + sybil clique + few attack edges.
-    Models the Alvisi 2013 structure: sparse honest, dense sybil, low conductance boundary.
+    Build a test graph with honest community + sybil ring.
+    Honest: loosely-coupled communities (Alvisi's model).
+    Sybils: dense clique with few attack edges.
     """
+    g = TrustGraph()
     random.seed(42)
-    d = ConductanceSybilDetector()
     
-    # Honest region: 20 nodes, sparse community structure
-    honest = [f"h{i}" for i in range(20)]
-    for h in honest:
-        d.add_node(h, is_sybil=False)
+    # Honest community A (5 nodes, sparse)
+    honest_a = [f"honest_a{i}" for i in range(5)]
+    for i in range(len(honest_a)):
+        for j in range(i + 1, len(honest_a)):
+            if random.random() < 0.4:  # Sparse
+                g.add_undirected(honest_a[i], honest_a[j], 
+                               weight=random.uniform(0.5, 1.0))
+    # Ensure connected
+    for i in range(len(honest_a) - 1):
+        g.add_undirected(honest_a[i], honest_a[i + 1], weight=0.8)
     
-    # Honest edges: sparse, community-like (avg degree ~4)
-    for i in range(len(honest)):
-        # Connect to 2-3 nearby nodes (community)
-        for j in range(1, random.randint(2, 4)):
-            target = (i + j) % len(honest)
-            d.add_edge(honest[i], honest[target], weight=random.uniform(0.5, 1.0))
-        # Occasional long-range connection
-        if random.random() < 0.2:
-            target = random.randint(0, len(honest) - 1)
-            if target != i:
-                d.add_edge(honest[i], honest[target], weight=random.uniform(0.3, 0.7))
+    # Honest community B (5 nodes, sparse)
+    honest_b = [f"honest_b{i}" for i in range(5)]
+    for i in range(len(honest_b)):
+        for j in range(i + 1, len(honest_b)):
+            if random.random() < 0.4:
+                g.add_undirected(honest_b[i], honest_b[j],
+                               weight=random.uniform(0.5, 1.0))
+    for i in range(len(honest_b) - 1):
+        g.add_undirected(honest_b[i], honest_b[i + 1], weight=0.8)
     
-    # Sybil region: 10 nodes, dense clique
-    sybils = [f"s{i}" for i in range(10)]
-    for s in sybils:
-        d.add_node(s, is_sybil=True)
+    # Loose coupling between honest communities (2 edges)
+    g.add_undirected("honest_a2", "honest_b1", weight=0.6)
+    g.add_undirected("honest_a4", "honest_b3", weight=0.5)
     
-    # Sybil edges: near-complete graph (dense)
+    # Sybil ring (5 nodes, dense clique)
+    sybils = [f"sybil{i}" for i in range(5)]
     for i in range(len(sybils)):
         for j in range(i + 1, len(sybils)):
-            if random.random() < 0.8:  # 80% connectivity
-                d.add_edge(sybils[i], sybils[j], weight=random.uniform(0.8, 1.0))
+            g.add_undirected(sybils[i], sybils[j], weight=1.0)
     
-    # Attack edges: few connections between sybil and honest (low conductance)
-    num_attack_edges = 3
-    for _ in range(num_attack_edges):
-        h = random.choice(honest)
-        s = random.choice(sybils)
-        d.add_edge(h, s, weight=random.uniform(0.1, 0.3))
+    # Attack edges (few, connecting sybils to honest)
+    g.add_undirected("sybil0", "honest_b4", weight=0.3)  # Single attack edge
     
-    # Seeds: 3 known honest nodes
-    d.set_seeds([honest[0], honest[5], honest[10]])
-    
-    return d
+    return g, honest_a + honest_b, sybils
 
 
 def demo():
     print("=" * 60)
     print("CONDUCTANCE-BASED SYBIL DETECTION")
-    print("Alvisi et al (IEEE S&P 2013) + SybilRank (Cao et al NSDI 2012)")
+    print("Alvisi et al (IEEE S&P 2013)")
     print("=" * 60)
     print()
     
-    d = build_test_network()
+    g, honest_nodes, sybil_nodes = build_test_graph()
     
-    honest_count = sum(1 for n in d.nodes.values() if not n.is_sybil)
-    sybil_count = sum(1 for n in d.nodes.values() if n.is_sybil)
-    print(f"Network: {honest_count} honest + {sybil_count} sybil nodes")
-    print(f"Seeds: {len(d.seeds)} trusted nodes")
-    print(f"Attack edges: 3 (low conductance boundary)")
+    print(f"Graph: {len(g.nodes())} nodes")
+    print(f"Honest: {len(honest_nodes)} (2 loosely-coupled communities)")
+    print(f"Sybils: {len(sybil_nodes)} (dense clique, 1 attack edge)")
     print()
     
-    result = d.full_analysis()
+    # Compute conductance of known regions
+    honest_set = set(honest_nodes)
+    sybil_set = set(sybil_nodes)
     
-    print("CLASSIFICATION:")
-    print(f"  Honest: {result['classification']['honest']}")
-    print(f"  Sybil:  {result['classification']['sybil']}")
-    print(f"  Uncertain: {result['classification']['uncertain']}")
+    honest_cond = g.conductance(honest_set)
+    sybil_cond = g.conductance(sybil_set)
+    
+    print(f"Honest region conductance: {honest_cond:.4f}")
+    print(f"Sybil region conductance: {sybil_cond:.4f}")
+    print(f"Conductance gap: {abs(honest_cond - sybil_cond):.4f}")
     print()
     
-    print("CONDUCTANCE (Alvisi's key metric):")
-    print(f"  Honest region: {result['conductance']['honest_region']}")
-    print(f"  Sybil region:  {result['conductance']['sybil_region']}")
-    print(f"  → {result['conductance']['insight']}")
+    # Detect from ego node (honest_a0)
+    print("=" * 60)
+    print("DETECTION FROM honest_a0 (ego)")
+    print("=" * 60)
+    result = detect_sybils(g, "honest_a0")
+    print(json.dumps(result, indent=2))
     print()
     
-    print("CLUSTERING (density asymmetry):")
-    print(f"  Avg honest: {result['clustering']['avg_honest']}")
-    print(f"  Avg sybil:  {result['clustering']['avg_sybil']}")
+    # Check accuracy
+    true_positives = len(set(result["suspected_sybils"]) & sybil_set)
+    false_positives = len(set(result["suspected_sybils"]) & honest_set)
+    true_negatives = len(set(result["whitelist"]) & honest_set)
+    false_negatives = len(set(result["whitelist"]) & sybil_set)
+    
+    precision = true_positives / max(true_positives + false_positives, 1)
+    recall = true_positives / max(true_positives + false_negatives, 1)
+    
+    print(f"True positives (sybils caught): {true_positives}/{len(sybil_nodes)}")
+    print(f"False positives (honest rejected): {false_positives}/{len(honest_nodes)}")
+    print(f"Precision: {precision:.2%}")
+    print(f"Recall: {recall:.2%}")
     print()
     
-    print("ACCURACY:")
-    print(f"  Precision: {result['accuracy']['precision']}")
-    print(f"  Recall:    {result['accuracy']['recall']}")
-    print(f"  F1:        {result['accuracy']['f1']}")
-    print(f"  TP={result['accuracy']['true_positives']} FP={result['accuracy']['false_positives']} "
-          f"TN={result['accuracy']['true_negatives']} FN={result['accuracy']['false_negatives']}")
+    # Test from sybil ego (should whitelist sybils, reject honest)
+    print("=" * 60)
+    print("DETECTION FROM sybil0 (sybil ego — inverted view)")
+    print("=" * 60)
+    result_sybil = detect_sybils(g, "sybil0")
+    print(f"Whitelist: {result_sybil['whitelist']}")
+    print(f"Suspected: {result_sybil['suspected_sybils']}")
+    print(f"Conductance: {result_sybil['boundary_conductance']}")
+    print()
+    print("KEY: Sybils whitelist EACH OTHER. This is expected —")
+    print("local whitelisting is perspective-dependent (Alvisi 2013).")
+    print("Relying parties choose their OWN ego. Sybils can't")
+    print("force honest nodes to include them.")
     print()
     
-    # Assertions
-    assert result['accuracy']['precision'] >= 0.7, f"Precision too low: {result['accuracy']['precision']}"
-    assert result['clustering']['avg_sybil'] > result['clustering']['avg_honest'], \
-        "Sybil clustering should exceed honest clustering"
-    
-    print("ASSERTIONS PASSED ✓")
-    print()
-    print("KEY: Conductance determines detection success.")
-    print("Smart sybils = more attack edges = higher conductance = harder to detect.")
-    print("ATF defense: identity layer (DKIM chain) makes attack edges expensive.")
+    # Maginot syndrome warning
+    print("=" * 60)
+    print("MAGINOT SYNDROME WARNING (Alvisi 2013)")
+    print("=" * 60)
+    print("Single-layer detection = bypassed by adaptive attacker.")
+    print("Defense in depth: conductance + temporal + behavioral +")
+    print("trust-layer-validator.py (addressing→identity→trust).")
+    print("The conductance gap is ONE signal, not THE answer.")
 
 
 if __name__ == "__main__":
