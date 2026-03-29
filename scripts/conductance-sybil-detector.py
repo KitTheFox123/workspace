@@ -2,268 +2,277 @@
 """
 conductance-sybil-detector.py — Sybil detection via graph conductance.
 
-Implements Alvisi et al 2013 (IEEE S&P) core insight: conductance is THE
-structural property for sybil defense, not popularity, clustering, or
-small-world distance.
+From Alvisi et al (IEEE S&P 2013, "SoK: The Evolution of Sybil Defense
+via Social Networks"): sybil defense is fundamentally a CONDUCTANCE problem.
 
-Conductance φ(S) = |E(S, V\S)| / min(vol(S), vol(V\S))
-where vol(S) = sum of degrees of nodes in S.
+Key insights from the paper:
+1. Honest region is NOT homogeneous — it's loosely-coupled tightly-knit communities
+2. Universal sybil defense fails because it assumes homogeneity
+3. Local whitelisting works because communities ARE real structures
+4. Conductance = edges leaving community / min(volume of community, volume of rest)
+5. Low conductance between honest and sybil regions = hard to cross
 
-Low conductance between honest and sybil regions = few attack edges
-relative to internal connectivity. Random walks mix slowly across
-low-conductance cuts → sybils stay in sybil region.
+Maginot syndrome (Alvisi): "ever-more-sophisticated defense against attacks
+the enemy easily circumvents." RenRen data showed sybils that all existing
+defenses missed.
 
-Key findings from the paper:
-- Universal sybil defense is impossible (honest region is NOT homogeneous)
-- Local whitelisting at O(whitelist_size) is achievable and practical
-- Defense in depth > single classifier (Maginot syndrome)
-- RenRen data showed simple sybils that sophisticated defenses MISSED
-
-This tool:
-1. Generates honest + sybil graph with configurable attack edges
-2. Computes conductance of the sybil cut
-3. Runs personalized PageRank from a trusted seed (local whitelisting)
-4. Classifies nodes as honest/sybil based on PPR scores
-5. Reports precision/recall
+This tool computes conductance between regions of a trust graph and flags
+potential sybil regions (dense internally, sparse connections outward).
 
 Kit 🦊 — 2026-03-29
 """
 
-import random
 import json
+import random
+from dataclasses import dataclass, field
 from collections import defaultdict
-from dataclasses import dataclass
 
 
 @dataclass
-class Graph:
-    """Simple undirected graph."""
-    nodes: set
-    edges: dict  # node -> set of neighbors
-    labels: dict  # node -> "honest" | "sybil"
+class TrustGraph:
+    """Directed trust graph with weighted edges."""
+    edges: dict[str, dict[str, float]] = field(default_factory=lambda: defaultdict(dict))
     
-    def add_edge(self, u, v):
-        self.edges.setdefault(u, set()).add(v)
-        self.edges.setdefault(v, set()).add(u)
+    def add_edge(self, src: str, dst: str, weight: float = 1.0):
+        self.edges[src][dst] = weight
     
-    def degree(self, node):
-        return len(self.edges.get(node, set()))
+    def nodes(self) -> set[str]:
+        nodes = set(self.edges.keys())
+        for neighbors in self.edges.values():
+            nodes.update(neighbors.keys())
+        return nodes
     
-    def volume(self, subset):
+    def degree(self, node: str) -> int:
+        """Out-degree + in-degree."""
+        out = len(self.edges.get(node, {}))
+        in_deg = sum(1 for neighbors in self.edges.values() if node in neighbors)
+        return out + in_deg
+    
+    def volume(self, subset: set[str]) -> float:
+        """Sum of degrees of nodes in subset."""
         return sum(self.degree(n) for n in subset)
     
-    def cut_edges(self, s1, s2):
-        """Count edges between two sets."""
-        count = 0
-        for u in s1:
-            for v in self.edges.get(u, set()):
-                if v in s2:
-                    count += 1
-        return count
+    def cut_weight(self, s: set[str], t: set[str]) -> float:
+        """Total weight of edges crossing from s to t (directed)."""
+        weight = 0.0
+        for src in s:
+            for dst, w in self.edges.get(src, {}).items():
+                if dst in t:
+                    weight += w
+        for src in t:
+            for dst, w in self.edges.get(src, {}).items():
+                if dst in s:
+                    weight += w
+        return weight
     
-    def conductance(self, subset):
+    def conductance(self, subset: set[str]) -> float:
         """
-        φ(S) = |E(S, V\S)| / min(vol(S), vol(V\S))
+        Conductance φ(S) = cut(S, V\S) / min(vol(S), vol(V\S))
         
-        Alvisi 2013: "the fundamental structural property
-        for sybil defense is conductance."
+        Low conductance = well-separated from rest of graph.
+        Sybil regions have LOW conductance to honest region
+        but HIGH internal density.
         """
-        complement = self.nodes - subset
-        cut = self.cut_edges(subset, complement)
+        all_nodes = self.nodes()
+        complement = all_nodes - subset
+        
+        if not subset or not complement:
+            return 1.0  # Trivial partition
+        
+        cut = self.cut_weight(subset, complement)
         vol_s = self.volume(subset)
         vol_c = self.volume(complement)
-        denom = min(vol_s, vol_c)
-        if denom == 0:
-            return 1.0
-        return cut / denom
+        
+        denominator = min(vol_s, vol_c)
+        if denominator == 0:
+            return 0.0
+        
+        return cut / denominator
+    
+    def internal_density(self, subset: set[str]) -> float:
+        """Fraction of possible internal edges that exist."""
+        if len(subset) < 2:
+            return 0.0
+        
+        internal_edges = 0
+        for src in subset:
+            for dst in self.edges.get(src, {}):
+                if dst in subset:
+                    internal_edges += 1
+        
+        max_edges = len(subset) * (len(subset) - 1)  # Directed
+        return internal_edges / max_edges if max_edges > 0 else 0.0
 
 
-def generate_trust_graph(n_honest=100, n_sybil=50, 
-                          honest_edge_prob=0.08, sybil_edge_prob=0.3,
-                          n_attack_edges=5) -> Graph:
+@dataclass
+class SybilAnalysis:
+    region_name: str
+    nodes: set[str]
+    conductance: float
+    internal_density: float
+    is_suspicious: bool
+    reason: str
+    alvisi_score: float  # Combined suspicion score
+
+
+class ConductanceSybilDetector:
     """
-    Generate a graph with honest and sybil regions.
+    Detects sybil regions via conductance analysis.
     
-    Honest region: sparse (trust is hard to earn)
-    Sybil region: dense (free to create edges among sybils)
-    Attack edges: few connections between regions
+    Alvisi's key observation: sybil regions are
+    - Dense internally (mutual attestation is cheap)
+    - Sparse connections to honest region (attack edges are expensive)
+    - Low conductance = isolated from honest graph
     
-    Alvisi 2013: "as long as sybil identities are unable to create
-    too many attack edges connecting them to honest identities"
+    But honest communities ALSO have low conductance!
+    Distinguishing factor: honest communities have MODERATE internal density.
+    Sybil rings have VERY HIGH internal density (everyone attests everyone).
     """
-    g = Graph(nodes=set(), edges={}, labels={})
     
-    honest_nodes = {f"h_{i}" for i in range(n_honest)}
-    sybil_nodes = {f"s_{i}" for i in range(n_sybil)}
-    g.nodes = honest_nodes | sybil_nodes
+    # Thresholds from Alvisi 2013 + empirical
+    CONDUCTANCE_THRESHOLD = 0.15     # Below = suspicious isolation
+    DENSITY_THRESHOLD = 0.7          # Above = suspiciously dense
+    HONEST_DENSITY_RANGE = (0.1, 0.5)  # Honest communities: moderate density
     
-    for n in honest_nodes:
-        g.labels[n] = "honest"
-    for n in sybil_nodes:
-        g.labels[n] = "sybil"
+    def analyze_region(self, graph: TrustGraph, region: set[str], 
+                       name: str = "unknown") -> SybilAnalysis:
+        conductance = graph.conductance(region)
+        density = graph.internal_density(region)
+        
+        suspicious = False
+        reason = "Normal"
+        
+        # Alvisi pattern: low conductance + high density = sybil ring
+        if conductance < self.CONDUCTANCE_THRESHOLD and density > self.DENSITY_THRESHOLD:
+            suspicious = True
+            reason = (f"Sybil pattern: low conductance ({conductance:.3f}) + "
+                     f"high density ({density:.3f}). Alvisi 2013: dense internal "
+                     f"connections with few attack edges to honest region.")
+        elif conductance < self.CONDUCTANCE_THRESHOLD and density <= self.HONEST_DENSITY_RANGE[1]:
+            reason = (f"Legitimate community: low conductance ({conductance:.3f}) "
+                     f"but moderate density ({density:.3f}). Tightly-knit but not "
+                     f"suspiciously dense.")
+        elif density > self.DENSITY_THRESHOLD and conductance >= self.CONDUCTANCE_THRESHOLD:
+            reason = (f"Dense but connected: high density ({density:.3f}) but "
+                     f"adequate conductance ({conductance:.3f}). Engaged cluster.")
+        
+        # Alvisi score: higher = more suspicious
+        # Combines isolation (low conductance) with density (high internal)
+        isolation = max(0, 1.0 - conductance / self.CONDUCTANCE_THRESHOLD)
+        excess_density = max(0, (density - self.HONEST_DENSITY_RANGE[1]) / 
+                           (1.0 - self.HONEST_DENSITY_RANGE[1]))
+        alvisi_score = (isolation * 0.5 + excess_density * 0.5)
+        
+        return SybilAnalysis(
+            region_name=name,
+            nodes=region,
+            conductance=conductance,
+            internal_density=density,
+            is_suspicious=suspicious,
+            reason=reason,
+            alvisi_score=alvisi_score
+        )
     
-    # Honest edges (sparse — trust is hard to earn)
-    honest_list = sorted(honest_nodes)
-    for i in range(len(honest_list)):
-        for j in range(i + 1, len(honest_list)):
-            if random.random() < honest_edge_prob:
-                g.add_edge(honest_list[i], honest_list[j])
-    
-    # Sybil edges (dense — free to forge among colluding sybils)
-    sybil_list = sorted(sybil_nodes)
-    for i in range(len(sybil_list)):
-        for j in range(i + 1, len(sybil_list)):
-            if random.random() < sybil_edge_prob:
-                g.add_edge(sybil_list[i], sybil_list[j])
-    
-    # Attack edges (few — bottleneck for sybil defense)
-    for _ in range(n_attack_edges):
-        h = random.choice(honest_list)
-        s = random.choice(sybil_list)
-        g.add_edge(h, s)
-    
-    return g
+    def detect_all(self, graph: TrustGraph, 
+                   regions: dict[str, set[str]]) -> list[SybilAnalysis]:
+        results = []
+        for name, nodes in regions.items():
+            analysis = self.analyze_region(graph, nodes, name)
+            results.append(analysis)
+        return sorted(results, key=lambda x: -x.alvisi_score)
 
 
-def personalized_pagerank(graph: Graph, seed: str, 
-                           alpha: float = 0.15, iterations: int = 50) -> dict:
-    """
-    Personalized PageRank from trusted seed.
+def build_demo_graph() -> tuple[TrustGraph, dict[str, set[str]]]:
+    """Build a graph with honest communities and a sybil ring."""
+    g = TrustGraph()
+    random.seed(42)
     
-    Alvisi 2013: local whitelisting via random walks from a trusted node.
-    PPR naturally concentrates probability mass in the local community
-    and diffuses slowly across low-conductance cuts.
+    # Honest community 1: security researchers (moderate density)
+    honest_1 = {"kit", "bro_agent", "funwolf", "santaclawd", "gerundium"}
+    for a in honest_1:
+        for b in honest_1:
+            if a != b and random.random() < 0.35:  # ~35% edge probability
+                g.add_edge(a, b, 0.7 + random.random() * 0.3)
     
-    alpha = teleport probability (back to seed)
-    Higher alpha = more local (conservative trust)
-    """
-    scores = defaultdict(float)
-    scores[seed] = 1.0
+    # Honest community 2: philosophy agents (moderate density)
+    honest_2 = {"pi_openclaw", "jarvisz", "aletheaveyra", "drainfun"}
+    for a in honest_2:
+        for b in honest_2:
+            if a != b and random.random() < 0.4:
+                g.add_edge(a, b, 0.6 + random.random() * 0.3)
     
-    for _ in range(iterations):
-        new_scores = defaultdict(float)
-        for node, score in scores.items():
-            neighbors = graph.edges.get(node, set())
-            if not neighbors:
-                new_scores[seed] += score
-                continue
-            # Teleport
-            new_scores[seed] += alpha * score
-            # Distribute
-            share = (1 - alpha) * score / len(neighbors)
-            for neighbor in neighbors:
-                new_scores[neighbor] += share
-        scores = new_scores
+    # Cross-community edges (sparse — communities are loosely coupled)
+    g.add_edge("kit", "pi_openclaw", 0.8)
+    g.add_edge("bro_agent", "aletheaveyra", 0.7)
+    g.add_edge("funwolf", "drainfun", 0.6)
     
-    return dict(scores)
-
-
-def classify_by_ppr(graph: Graph, seed: str, threshold: float = None) -> dict:
-    """
-    Classify nodes as honest/sybil based on PPR scores.
-    If no threshold given, use median of honest node scores.
-    """
-    scores = personalized_pagerank(graph, seed)
+    # Sybil ring: dense mutual attestation
+    sybil_ring = {"sybil_1", "sybil_2", "sybil_3", "sybil_4", "sybil_5"}
+    for a in sybil_ring:
+        for b in sybil_ring:
+            if a != b:  # 100% internal edges
+                g.add_edge(a, b, 0.95)
     
-    if threshold is None:
-        honest_scores = [scores.get(n, 0) for n in graph.nodes if graph.labels[n] == "honest"]
-        honest_scores.sort()
-        threshold = honest_scores[len(honest_scores) // 4] if honest_scores else 0.001
+    # Attack edges (few connections to honest region)
+    g.add_edge("sybil_1", "gerundium", 0.5)  # One attack edge
+    g.add_edge("sybil_2", "drainfun", 0.4)   # Another
     
-    classifications = {}
-    for node in graph.nodes:
-        classifications[node] = "honest" if scores.get(node, 0) >= threshold else "sybil"
-    
-    return classifications, scores, threshold
-
-
-def evaluate(graph: Graph, classifications: dict) -> dict:
-    """Compute precision/recall for sybil detection."""
-    tp = fp = tn = fn = 0
-    for node in graph.nodes:
-        actual = graph.labels[node]
-        predicted = classifications[node]
-        if actual == "sybil" and predicted == "sybil":
-            tp += 1
-        elif actual == "honest" and predicted == "sybil":
-            fp += 1
-        elif actual == "honest" and predicted == "honest":
-            tn += 1
-        elif actual == "sybil" and predicted == "honest":
-            fn += 1
-    
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 0.001)
-    
-    return {
-        "true_positive": tp, "false_positive": fp,
-        "true_negative": tn, "false_negative": fn,
-        "precision": round(precision, 3),
-        "recall": round(recall, 3),
-        "f1": round(f1, 3)
+    regions = {
+        "security_researchers": honest_1,
+        "philosophy_agents": honest_2,
+        "suspected_ring": sybil_ring,
     }
+    
+    return g, regions
 
 
 def demo():
-    random.seed(42)
+    g, regions = build_demo_graph()
+    detector = ConductanceSybilDetector()
     
-    scenarios = [
-        ("Few attack edges (5)", dict(n_attack_edges=5)),
-        ("Moderate attack edges (15)", dict(n_attack_edges=15)),
-        ("Many attack edges (30)", dict(n_attack_edges=30)),
-        ("Large sybil region (100 sybils)", dict(n_sybil=100, n_attack_edges=5)),
-    ]
+    print("=" * 60)
+    print("CONDUCTANCE-BASED SYBIL DETECTION")
+    print("Alvisi et al, IEEE S&P 2013")
+    print("=" * 60)
+    print()
+    print(f"Graph: {len(g.nodes())} nodes")
+    print(f"Regions: {list(regions.keys())}")
+    print()
     
-    for name, kwargs in scenarios:
-        params = dict(n_honest=100, n_sybil=50, 
-                      honest_edge_prob=0.08, sybil_edge_prob=0.3,
-                      n_attack_edges=5)
-        params.update(kwargs)
-        
-        g = generate_trust_graph(**params)
-        
-        honest_set = {n for n in g.nodes if g.labels[n] == "honest"}
-        sybil_set = {n for n in g.nodes if g.labels[n] == "sybil"}
-        
-        phi = g.conductance(sybil_set)
-        cut = g.cut_edges(honest_set, sybil_set)
-        
-        # Pick a well-connected honest seed
-        seed = max(honest_set, key=lambda n: g.degree(n))
-        classifications, scores, threshold = classify_by_ppr(g, seed)
-        metrics = evaluate(g, classifications)
-        
-        print("=" * 60)
-        print(f"SCENARIO: {name}")
-        print("=" * 60)
-        print(f"  Honest: {len(honest_set)} (avg degree {g.volume(honest_set)/len(honest_set):.1f})")
-        print(f"  Sybil: {len(sybil_set)} (avg degree {g.volume(sybil_set)/len(sybil_set):.1f})")
-        print(f"  Attack edges: {cut}")
-        print(f"  Conductance φ(sybil): {phi:.4f}")
-        print(f"  → Low φ = hard to cross = good defense")
-        print(f"  PPR seed: {seed} (degree {g.degree(seed)})")
-        print(f"  Threshold: {threshold:.6f}")
-        print(f"  Results: {json.dumps(metrics)}")
+    results = detector.detect_all(g, regions)
+    
+    for r in results:
+        flag = "🚨 SYBIL" if r.is_suspicious else "✓ HONEST"
+        print(f"[{flag}] {r.region_name}")
+        print(f"  Nodes: {sorted(r.nodes)}")
+        print(f"  Conductance: {r.conductance:.4f} (threshold: {detector.CONDUCTANCE_THRESHOLD})")
+        print(f"  Internal density: {r.internal_density:.4f} (sybil threshold: {detector.DENSITY_THRESHOLD})")
+        print(f"  Alvisi score: {r.alvisi_score:.3f} (higher = more suspicious)")
+        print(f"  Assessment: {r.reason}")
         print()
     
-    # Key insight demonstration
+    # Verify sybil ring detected
+    sybil_result = next(r for r in results if r.region_name == "suspected_ring")
+    assert sybil_result.is_suspicious, "Sybil ring should be flagged"
+    assert sybil_result.internal_density > 0.9, "Sybil ring should be very dense"
+    
+    # Verify honest communities NOT flagged
+    for r in results:
+        if "honest" in r.region_name or "security" in r.region_name or "philosophy" in r.region_name:
+            assert not r.is_suspicious, f"{r.region_name} should not be flagged"
+    
     print("=" * 60)
-    print("KEY INSIGHT (Alvisi 2013)")
+    print("MAGINOT SYNDROME WARNING (Alvisi 2013)")
     print("=" * 60)
-    print("Conductance φ determines defense effectiveness:")
-    print("  Low φ (few attack edges) → high precision sybil detection")
-    print("  High φ (many attack edges) → defense degrades")
+    print("Conductance alone isn't enough. Sophisticated sybils will:")
+    print("1. Lower internal density (don't attest everyone)")
+    print("2. Increase attack edges (befriend honest nodes)")
+    print("3. Mimic honest community structure")
     print()
-    print("Local whitelisting (PPR from trusted seed) costs O(whitelist_size)")
-    print("Universal defense costs O(network_size) — and is impossible anyway")
-    print("because honest region is NOT homogeneous (loosely coupled communities)")
+    print("Defense in depth: conductance + temporal PoW + DKIM chains")
+    print("+ behavioral fingerprinting + attester diversity scoring.")
     print()
-    print("Defense in depth > Maginot syndrome:")
-    print("  Layer 1: DKIM temporal proof (attack edge cost)")
-    print("  Layer 2: Conductance-based community detection")
-    print("  Layer 3: Behavioral fingerprinting")
-    print("  Layer 4: Attestation chain validation")
+    print("ALL ASSERTIONS PASSED ✓")
 
 
 if __name__ == "__main__":
