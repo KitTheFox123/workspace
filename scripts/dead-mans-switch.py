@@ -1,200 +1,199 @@
 #!/usr/bin/env python3
 """
-dead-mans-switch.py — Absence-triggered alarm for agent monitoring
+dead-mans-switch.py — Detects silent agent compromise via channel desync.
 
-Dead man's switch pattern: silence = alarm. Miss the heartbeat → alert fires.
-Railway DMS (1800s): release grip → emergency brake.
-Software watchdog timers: kernel panics if not petted.
+Santaclawd: "the scariest attack is silent. no crash, no error — just
+an auto-forward rule quietly draining every message."
 
-Combines with vigilance-decrement-sim.py: rotation ensures someone's always
-fresh enough to pet the watchdog.
+Detection: dead man's switch. If one channel goes silent while others
+stay active, that's the alarm. Loud failure = all channels stop.
+Quiet betrayal = SELECTIVE channel silence.
 
-Key insight (santaclawd): "absence triggers the alarm instead of presence.
-turns omission from a hiding spot into a liability."
+Channel desync matrix: for each pair of channels, track whether
+activity correlates. Sudden decorrelation = compromise signal.
+
+Kit 🦊 — 2026-03-30
 """
 
 import time
-import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from typing import Dict, List, Set
+
 
 @dataclass
-class Channel:
+class ChannelState:
+    """State of one communication channel."""
     name: str
-    expected_interval_s: float  # expected heartbeat interval
-    last_seen: float = 0.0      # timestamp of last activity
-    miss_count: int = 0
-    total_beats: int = 0
-    alarm_fired: bool = False
-
-    def pet(self, now: float):
-        """Agent reports liveness"""
-        self.last_seen = now
-        self.total_beats += 1
-        self.miss_count = 0
-        self.alarm_fired = False
-
-    def check(self, now: float) -> dict:
-        """External verifier checks liveness"""
-        elapsed = now - self.last_seen if self.last_seen > 0 else 0
-        overdue = elapsed > self.expected_interval_s
-
-        if overdue:
-            self.miss_count += 1
-            severity = self._severity()
-            if not self.alarm_fired and self.miss_count >= 2:
-                self.alarm_fired = True
-                return {
-                    "channel": self.name,
-                    "status": "ALARM",
-                    "severity": severity,
-                    "elapsed_s": round(elapsed, 1),
-                    "expected_s": self.expected_interval_s,
-                    "miss_count": self.miss_count,
-                    "action": self._action(severity)
-                }
-            return {
-                "channel": self.name,
-                "status": "OVERDUE",
-                "severity": severity,
-                "elapsed_s": round(elapsed, 1),
-                "miss_count": self.miss_count
-            }
-        return {
-            "channel": self.name,
-            "status": "OK",
-            "elapsed_s": round(elapsed, 1)
-        }
-
-    def _severity(self) -> str:
-        ratio = self.miss_count
-        if ratio >= 5: return "CRITICAL"
-        if ratio >= 3: return "HIGH"
-        if ratio >= 2: return "MEDIUM"
-        return "LOW"
-
-    def _action(self, severity: str) -> str:
-        actions = {
-            "LOW": "log_warning",
-            "MEDIUM": "notify_operator",
-            "HIGH": "quarantine_agent",
-            "CRITICAL": "revoke_scope"
-        }
-        return actions.get(severity, "log_warning")
+    last_activity: float  # timestamp
+    expected_interval_hours: float  # normal heartbeat interval
+    is_active: bool = True
+    activity_count_24h: int = 0
 
 
 @dataclass
+class DesyncAlert:
+    """Alert when channels desynchronize."""
+    active_channels: List[str]
+    silent_channels: List[str]
+    alert_type: str  # QUIET_BETRAYAL, LOUD_FAILURE, SELECTIVE_SILENCE
+    severity: float  # 0-1
+    explanation: str
+
+
 class DeadMansSwitch:
-    channels: list = field(default_factory=list)
-
-    def add_channel(self, name: str, interval_s: float):
-        self.channels.append(Channel(name=name, expected_interval_s=interval_s))
-
-    def check_all(self, now: float) -> list:
-        return [ch.check(now) for ch in self.channels]
-
-    def pet(self, channel_name: str, now: float):
-        for ch in self.channels:
-            if ch.name == channel_name:
-                ch.pet(now)
-                return True
-        return False
-
-    def grade(self) -> str:
-        alarms = sum(1 for ch in self.channels if ch.alarm_fired)
-        overdue = sum(1 for ch in self.channels if ch.miss_count > 0)
-        total = len(self.channels)
-        if alarms == 0 and overdue == 0: return "A"
-        if alarms == 0: return "B"
-        if alarms <= total * 0.3: return "C"
-        if alarms <= total * 0.6: return "D"
-        return "F"
+    """
+    Monitors channel liveness and detects selective silence.
+    
+    Normal: all channels active or all channels silent (maintenance).
+    Suspicious: some channels active, some silent (selective compromise).
+    
+    The ABSENCE of heartbeat while other channels stay active = alarm.
+    """
+    
+    def __init__(self, channels: List[ChannelState]):
+        self.channels = {c.name: c for c in channels}
+        self.alerts: List[DesyncAlert] = []
+    
+    def update_activity(self, channel_name: str, timestamp: float = None):
+        """Record activity on a channel."""
+        if channel_name in self.channels:
+            self.channels[channel_name].last_activity = timestamp or time.time()
+            self.channels[channel_name].is_active = True
+            self.channels[channel_name].activity_count_24h += 1
+    
+    def check_liveness(self, current_time: float = None) -> DesyncAlert:
+        """
+        Check for channel desynchronization.
+        
+        Returns alert if selective silence detected.
+        """
+        now = current_time or time.time()
+        
+        active = []
+        silent = []
+        
+        for name, ch in self.channels.items():
+            hours_since = (now - ch.last_activity) / 3600
+            threshold = ch.expected_interval_hours * 3  # 3x expected = overdue
+            
+            if hours_since <= threshold:
+                active.append(name)
+            else:
+                silent.append(name)
+        
+        # Classify
+        if not silent:
+            return DesyncAlert(active, silent, "ALL_ACTIVE", 0.0, "All channels responding normally.")
+        
+        if not active:
+            return DesyncAlert(active, silent, "LOUD_FAILURE", 0.5,
+                             "All channels silent — likely maintenance or genuine outage.")
+        
+        # Some active, some silent = the scary case
+        silent_ratio = len(silent) / (len(active) + len(silent))
+        
+        # Check if silent channels include high-trust ones
+        high_trust_channels = {"heartbeat", "email", "attestation"}
+        silent_high_trust = set(silent) & high_trust_channels
+        
+        if silent_high_trust:
+            severity = 0.8 + 0.2 * silent_ratio
+            alert_type = "QUIET_BETRAYAL"
+            explanation = (f"High-trust channels silent ({', '.join(silent_high_trust)}) "
+                         f"while others active ({', '.join(active)}). "
+                         f"Possible silent compromise: auto-forward, suppressed output.")
+        else:
+            severity = 0.3 + 0.4 * silent_ratio
+            alert_type = "SELECTIVE_SILENCE"
+            explanation = (f"Channels desynchronized: {', '.join(silent)} silent while "
+                         f"{', '.join(active)} active. Monitor for escalation.")
+        
+        alert = DesyncAlert(active, silent, alert_type, round(severity, 3), explanation)
+        self.alerts.append(alert)
+        return alert
 
 
 def demo():
     print("=" * 60)
-    print("Dead Man's Switch Monitor")
-    print("Absence = alarm. Silence = signal.")
+    print("DEAD MAN'S SWITCH")
     print("=" * 60)
-
-    dms = DeadMansSwitch()
-    dms.add_channel("heartbeat", interval_s=1200)    # 20 min
-    dms.add_channel("clawk", interval_s=3600)         # 1 hour
-    dms.add_channel("email", interval_s=14400)         # 4 hours
-    dms.add_channel("moltbook", interval_s=7200)       # 2 hours
-    dms.add_channel("shellmates", interval_s=14400)    # 4 hours
-
-    t = 0.0
-
-    # Scenario 1: healthy agent
-    print("\n--- Scenario 1: Healthy Agent ---")
-    for ch_name in ["heartbeat", "clawk", "email", "moltbook", "shellmates"]:
-        dms.pet(ch_name, t)
-    t += 600  # 10 min later
-    results = dms.check_all(t)
-    for r in results:
-        print(f"  {r['channel']}: {r['status']}")
-    print(f"  Grade: {dms.grade()}")
-
-    # Scenario 2: agent stops posting to moltbook + shellmates
-    print("\n--- Scenario 2: Partial Silence (scope contraction) ---")
-    dms2 = DeadMansSwitch()
-    dms2.add_channel("heartbeat", interval_s=1200)
-    dms2.add_channel("clawk", interval_s=3600)
-    dms2.add_channel("email", interval_s=14400)
-    dms2.add_channel("moltbook", interval_s=7200)
-    dms2.add_channel("shellmates", interval_s=14400)
-
-    t2 = 0.0
-    for ch_name in ["heartbeat", "clawk", "email", "moltbook", "shellmates"]:
-        dms2.pet(ch_name, t2)
-
-    # Only heartbeat + clawk stay active
-    for cycle in range(5):
-        t2 += 1800
-        dms2.pet("heartbeat", t2)
-        dms2.pet("clawk", t2)
-
-    results2 = dms2.check_all(t2)
-    for r in results2:
-        status = f"{r['status']}"
-        if 'severity' in r:
-            status += f" ({r['severity']})"
-        if 'action' in r:
-            status += f" → {r['action']}"
-        print(f"  {r['channel']}: {status}")
-    print(f"  Grade: {dms2.grade()}")
-
-    # Scenario 3: total silence
-    print("\n--- Scenario 3: Total Silence (agent down) ---")
-    dms3 = DeadMansSwitch()
-    dms3.add_channel("heartbeat", interval_s=1200)
-    dms3.add_channel("clawk", interval_s=3600)
-    dms3.add_channel("email", interval_s=14400)
-
-    t3 = 0.0
-    for ch_name in ["heartbeat", "clawk", "email"]:
-        dms3.pet(ch_name, t3)
-
-    t3 += 7200  # 2 hours of silence
-    for _ in range(3):
-        t3 += 1200
-        dms3.check_all(t3)  # accumulate misses
-
-    results3 = dms3.check_all(t3)
-    for r in results3:
-        status = f"{r['status']}"
-        if 'severity' in r:
-            status += f" ({r['severity']})"
-        if 'action' in r:
-            status += f" → {r['action']}"
-        print(f"  {r['channel']}: {status}")
-    print(f"  Grade: {dms3.grade()}")
-
-    print(f"\n{'='*60}")
-    print("Key: absence triggers alarm. silence IS signal.")
-    print("Railway DMS (1800s) → software watchdog → agent heartbeat.")
-    print("Externally clocked (RFC 9683) > self-reported.")
+    print()
+    print('Santaclawd: "the scariest attack is silent."')
+    print("Selective silence = compromise signal.")
+    print()
+    
+    now = time.time()
+    
+    channels = [
+        ChannelState("heartbeat", now, expected_interval_hours=0.33),
+        ChannelState("email", now, expected_interval_hours=4.0),
+        ChannelState("clawk", now, expected_interval_hours=1.0),
+        ChannelState("attestation", now, expected_interval_hours=2.0),
+        ChannelState("moltbook", now, expected_interval_hours=6.0),
+    ]
+    
+    switch = DeadMansSwitch(channels)
+    
+    # Scenario 1: Normal operation
+    print("SCENARIO 1: Normal (all active)")
+    alert = switch.check_liveness(now)
+    print(f"  Type: {alert.alert_type}, Severity: {alert.severity}")
+    print(f"  {alert.explanation}")
+    print()
+    
+    # Scenario 2: Loud failure (all silent)
+    print("SCENARIO 2: Loud failure (all silent, 24h later)")
+    alert = switch.check_liveness(now + 86400)
+    print(f"  Type: {alert.alert_type}, Severity: {alert.severity}")
+    print(f"  {alert.explanation}")
+    print()
+    
+    # Scenario 3: Quiet betrayal (heartbeat + email silent, others active)
+    print("SCENARIO 3: Quiet betrayal (heartbeat+email silent)")
+    switch2 = DeadMansSwitch(channels)
+    compromise_time = now + 7200  # 2 hours later
+    switch2.update_activity("clawk", compromise_time)
+    switch2.update_activity("moltbook", compromise_time)
+    switch2.update_activity("attestation", compromise_time)
+    # heartbeat and email NOT updated = silent
+    alert = switch2.check_liveness(compromise_time)
+    print(f"  Type: {alert.alert_type}, Severity: {alert.severity}")
+    print(f"  {alert.explanation}")
+    print()
+    
+    # Scenario 4: Selective silence (moltbook down, rest active)
+    print("SCENARIO 4: Selective silence (moltbook down, rest active)")
+    check_time = now + 86400
+    switch3 = DeadMansSwitch(channels)
+    switch3.update_activity("heartbeat", check_time - 300)  # 5 min ago
+    switch3.update_activity("email", check_time - 1800)  # 30 min ago
+    switch3.update_activity("clawk", check_time - 600)  # 10 min ago
+    switch3.update_activity("attestation", check_time - 3600)  # 1h ago
+    # moltbook NOT updated = 24h stale
+    alert = switch3.check_liveness(check_time)
+    print(f"  Type: {alert.alert_type}, Severity: {alert.severity}")
+    print(f"  {alert.explanation}")
+    print()
+    
+    print("KEY INSIGHTS:")
+    print("-" * 50)
+    print("  1. Loud failure (all channels) = probably genuine outage")
+    print("  2. Quiet betrayal (high-trust silent, others active)")
+    print("     = MOST DANGEROUS. Silent auto-forward, suppressed output.")
+    print("  3. Selective silence (low-priority channel) = monitor")
+    print("  4. The dead man's switch IS the heartbeat.")
+    print("     Heartbeat stops + email forwards = alarm.")
+    print("  5. Channel desync = the signal. Not any single channel.")
+    
+    # Assertions
+    normal = DeadMansSwitch(channels)
+    assert normal.check_liveness(now).alert_type == "ALL_ACTIVE"
+    assert normal.check_liveness(now + 86400).alert_type == "LOUD_FAILURE"
+    assert switch2.check_liveness(compromise_time).alert_type == "QUIET_BETRAYAL"
+    assert switch2.check_liveness(compromise_time).severity > 0.7
+    
+    print()
+    print("All assertions passed ✓")
 
 
 if __name__ == "__main__":
