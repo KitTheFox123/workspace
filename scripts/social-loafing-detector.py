@@ -1,307 +1,299 @@
 #!/usr/bin/env python3
 """
-social-loafing-detector.py — Detect social loafing in ATF grader pools.
+social-loafing-detector.py — Detect social loafing in multi-agent attestation groups.
 
-Maps Ringelmann effect / Collective Effort Model (Karau & Williams 1993,
-meta-analysis of 78 studies) to agent attestation pools. Core insight:
-graders in larger pools reduce effort — "hiding in the crowd" (Davis 1969).
+Based on:
+- Karau & Williams (1993, JPSP 65:681-706): Meta-analysis of 78 studies, d=0.44.
+  Collective Effort Model: effort = f(expectancy × instrumentality × valence).
+  Moderators: identifiability, evaluation potential, task meaningfulness, group size.
+- Ringelmann (1913): Original rope-pulling. Output per person drops with group size.
+  N=1: 100%, N=2: 93%, N=3: 85%, N=8: 49%.
+- Williams, Harkins & Latané (1981): Identifiability eliminates loafing entirely.
+  When individual contributions are trackable, effort returns to solo levels.
+- Shepperd (1993, PSPB): Productivity loss in groups more nuanced than "loafing."
+  Coordination loss (Steiner 1972) vs motivation loss — must distinguish.
 
-ATF mapping:
-- Ringelmann: 8 people pull 49% of potential. 8 graders = expect ~50% effort.
-- CEM: low evaluation potential + low task valence = loafing. Anonymous graders
-  in large pools = low evaluation potential.
-- Countermeasures from social psych → ATF design:
-  1. Individual accountability → per-grader canary receipts (identifiable)
-  2. Minimize free riding → contribution identifiable in quorum
-  3. Task meaningfulness → weight graders by engagement with case specifics
-  4. Group size → smaller quorums with rotation, not giant static pools
+Agent translation:
+- Attestation groups with non-identifiable contributions → expect loafing
+- Anonymous quorum votes → Ringelmann decay applies
+- Named attestations with audit trail → loafing eliminated
+- Task meaningfulness moderates: "rubber stamp" attestations = high loafing risk
 
-Sources:
-- Karau & Williams (JPSP 1993): Meta-analysis, 78 studies, d=0.44 (moderate)
-- Ringelmann (1913): Rope-pulling, coordination + motivation loss
-- Latané et al (1979): Social Impact Theory — diffusion across group
-- Harkins & Szymanski (1989): Evaluation potential reduces loafing
+Key insight: Social loafing is NOT laziness — it's rational response to low
+instrumentality. If your individual attestation doesn't visibly matter, why try?
+The fix is IDENTIFIABILITY, not punishment.
 
-Kit 🦊 — 2026-03-27
+Kit 🦊
 """
 
-import json
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
+import random
 import math
-
-
-class LoafingRisk(Enum):
-    LOW = "LOW"           # <25% effort reduction predicted
-    MODERATE = "MODERATE"  # 25-40% 
-    HIGH = "HIGH"          # 40-55%
-    CRITICAL = "CRITICAL"  # >55% (Ringelmann territory)
+from dataclasses import dataclass
+from typing import List, Tuple
 
 
 @dataclass
-class GraderProfile:
-    id: str
-    receipts_issued: int          # Total attestations given
-    canary_response_rate: float   # 0-1: how often responds to probes
-    avg_assessment_time: float    # seconds — proxy for effort
-    unique_subjects_rated: int    # diversity of attestation targets
-    evaluation_identifiable: bool # can this grader's work be individually identified?
-    task_valence: float           # 0-1: how meaningful the grader finds the task
+class AttestorProfile:
+    """Individual attestor in a group."""
+    name: str
+    identifiable: bool  # Can their individual contribution be traced?
+    task_meaningful: bool  # Do they perceive the attestation as important?
+    evaluation_potential: float  # 0-1: likelihood of being evaluated
+    group_size_perception: int  # How large they perceive the group
+    base_effort: float = 1.0  # Solo effort level
 
 
-@dataclass
-class PoolAnalysis:
-    pool_size: int
-    predicted_effort_reduction: float  # Ringelmann-derived
-    loafing_risk: LoafingRisk
-    identifiability_score: float  # 0-1
-    free_rider_candidates: list = field(default_factory=list)
-    recommendations: list = field(default_factory=list)
-    cem_factors: dict = field(default_factory=dict)
-
-
-class SocialLoafingDetector:
+def ringelmann_decay(group_size: int) -> float:
     """
-    Detects and mitigates social loafing in ATF grader pools.
-    
-    Ringelmann (1913): effort scales as ~1/sqrt(N) not 1/N.
-    8 people: 392/800 = 49%. Formula: effort = 1 - (0.07 * (N-1))
-    capped at floor. Karau & Williams: d=0.44 (moderate effect).
+    Ringelmann's original finding: per-person output drops with group size.
+    Empirical: N=1:100%, N=2:93%, N=3:85%, N=8:49%.
+    Fitted: effort ≈ 1 / (1 + 0.07 * (N-1))  [approximate]
     """
-    
-    # Ringelmann coefficients (empirical from rope-pulling)
-    EFFORT_LOSS_PER_MEMBER = 0.07  # ~7% loss per additional member
-    MIN_EFFORT_FLOOR = 0.35        # Even worst case, some effort
-    
-    def __init__(self):
-        self.graders: list[GraderProfile] = []
-    
-    def add_grader(self, g: GraderProfile):
-        self.graders.append(g)
-    
-    def predict_effort(self, pool_size: int) -> float:
-        """
-        Predict effort level using Ringelmann-derived formula.
-        Solo = 1.0, each additional member reduces by ~7%.
-        Ringelmann data: 2→93%, 3→85%, 8→49%.
-        """
-        effort = 1.0 - (self.EFFORT_LOSS_PER_MEMBER * (pool_size - 1))
-        return max(effort, self.MIN_EFFORT_FLOOR)
-    
-    def compute_identifiability(self) -> float:
-        """
-        Evaluation potential (Harkins 1987): identifiable individuals loaf less.
-        Score = fraction of graders whose work is individually evaluable.
-        """
-        if not self.graders:
-            return 0.0
-        identifiable = sum(1 for g in self.graders if g.evaluation_identifiable)
-        return identifiable / len(self.graders)
-    
-    def detect_free_riders(self) -> list[dict]:
-        """
-        Free riders: low canary response, low assessment time, high receipts
-        (rubber-stamping). Kerr & Bruun 1983: free riding when others compensate.
-        """
-        if not self.graders:
-            return []
-        
-        # Compute pool averages
-        avg_time = sum(g.avg_assessment_time for g in self.graders) / len(self.graders)
-        avg_canary = sum(g.canary_response_rate for g in self.graders) / len(self.graders)
-        
-        free_riders = []
-        for g in self.graders:
-            signals = []
-            if g.avg_assessment_time < avg_time * 0.5:
-                signals.append("assessment_time < 50% of pool average (rushing)")
-            if g.canary_response_rate < 0.5:
-                signals.append(f"canary response rate {g.canary_response_rate:.0%} (low engagement)")
-            if g.task_valence < 0.3:
-                signals.append(f"task valence {g.task_valence:.2f} (CEM: low value = loafing)")
-            
-            if len(signals) >= 2:
-                free_riders.append({
-                    "grader": g.id,
-                    "signals": signals,
-                    "severity": "HIGH" if len(signals) >= 3 else "MODERATE"
-                })
-        
-        return free_riders
-    
-    def cem_analysis(self) -> dict:
-        """
-        Collective Effort Model (Karau & Williams 1993).
-        Motivation = f(expectancy, instrumentality, value).
-        Low on any = social loafing.
-        """
-        if not self.graders:
-            return {}
-        
-        avg_valence = sum(g.task_valence for g in self.graders) / len(self.graders)
-        avg_canary = sum(g.canary_response_rate for g in self.graders) / len(self.graders)
-        identifiability = self.compute_identifiability()
-        
-        # CEM prediction: all three must be high for full effort
-        cem_motivation = avg_valence * avg_canary * identifiability
-        
-        return {
-            "expectancy_proxy": avg_canary,  # canary engagement ≈ belief in meaningful evaluation
-            "instrumentality_proxy": identifiability,  # can individual effort be traced?
-            "value_proxy": avg_valence,  # task meaningfulness
-            "predicted_motivation": round(cem_motivation, 3),
-            "interpretation": (
-                "HIGH" if cem_motivation > 0.5 else
-                "MODERATE" if cem_motivation > 0.2 else
-                "LOW — Karau & Williams: all three CEM factors depressed = loafing guaranteed"
-            ),
-            "meta_analysis_note": (
-                "Karau & Williams 1993 meta-analysis (78 studies, d=0.44): "
-                "loafing greater for men than women, Western > Eastern cultures, "
-                "simple > complex tasks. Effect DECREASES with evaluation potential."
-            )
-        }
-    
-    def analyze_pool(self) -> PoolAnalysis:
-        """Full pool analysis."""
-        n = len(self.graders)
-        effort = self.predict_effort(n)
-        effort_reduction = 1.0 - effort
-        
-        if effort_reduction > 0.55:
-            risk = LoafingRisk.CRITICAL
-        elif effort_reduction > 0.40:
-            risk = LoafingRisk.HIGH
-        elif effort_reduction > 0.25:
-            risk = LoafingRisk.MODERATE
-        else:
-            risk = LoafingRisk.LOW
-        
-        identifiability = self.compute_identifiability()
-        free_riders = self.detect_free_riders()
-        cem = self.cem_analysis()
-        
-        recommendations = []
-        if n > 5:
-            recommendations.append(
-                f"Pool size {n} → {effort_reduction:.0%} predicted effort loss. "
-                "Split into rotating sub-pools of 3-5 (Ringelmann: smaller = more effort)."
-            )
-        if identifiability < 0.7:
-            recommendations.append(
-                f"Identifiability {identifiability:.0%}. Harkins 1987: "
-                "individual evaluation potential is the #1 loafing countermeasure. "
-                "Make per-grader canary receipts public within pool."
-            )
-        if free_riders:
-            recommendations.append(
-                f"{len(free_riders)} free rider candidates detected. "
-                "Kerr & Bruun 1983: eliminate free riding via distinct responsibilities. "
-                "Assign specific claim categories per grader."
-            )
-        if cem.get("predicted_motivation", 1) < 0.3:
-            recommendations.append(
-                "CEM motivation critically low. Increase task valence "
-                "(explain WHY this attestation matters) and instrumentality "
-                "(show how individual effort affects outcome)."
-            )
-        
-        return PoolAnalysis(
-            pool_size=n,
-            predicted_effort_reduction=round(effort_reduction, 3),
-            loafing_risk=risk,
-            identifiability_score=round(identifiability, 3),
-            free_rider_candidates=free_riders,
-            recommendations=recommendations,
-            cem_factors=cem
-        )
+    if group_size <= 1:
+        return 1.0
+    # Log-linear fit to Ringelmann's data
+    return max(0.2, 1.0 - 0.075 * (group_size - 1))
 
 
-def demo():
-    print("=" * 60)
-    print("SCENARIO 1: Small diverse pool (3 graders, identifiable)")
-    print("=" * 60)
+def collective_effort_model(
+    expectancy: float,  # Belief that effort → performance
+    instrumentality: float,  # Belief that performance → outcome
+    valence: float,  # Value of outcome
+) -> float:
+    """
+    Karau & Williams (1993) Collective Effort Model.
+    Effort = Expectancy × Instrumentality × Valence
     
-    d1 = SocialLoafingDetector()
-    for i, (time, canary, valence) in enumerate([
-        (120, 0.95, 0.8), (90, 0.88, 0.75), (110, 0.92, 0.85)
-    ]):
-        d1.add_grader(GraderProfile(
-            id=f"grader_{i+1}", receipts_issued=50+i*10,
-            canary_response_rate=canary, avg_assessment_time=time,
-            unique_subjects_rated=20+i*5, evaluation_identifiable=True,
-            task_valence=valence
-        ))
+    In groups: instrumentality drops because individual contribution
+    is less linked to group outcome.
+    """
+    return expectancy * instrumentality * valence
+
+
+def compute_loafing_risk(attestor: AttestorProfile) -> dict:
+    """
+    Compute social loafing risk for an individual attestor.
+    Returns risk score and breakdown.
+    """
+    # Identifiability effect (Williams et al 1981)
+    # When identifiable, loafing essentially eliminated
+    identifiability_factor = 0.05 if attestor.identifiable else 0.85
     
-    r1 = d1.analyze_pool()
-    print(f"Risk: {r1.loafing_risk.value}")
-    print(f"Effort reduction: {r1.predicted_effort_reduction:.1%}")
-    print(f"Free riders: {len(r1.free_rider_candidates)}")
-    assert r1.loafing_risk == LoafingRisk.LOW
-    assert len(r1.free_rider_candidates) == 0
-    print("✓ PASSED\n")
+    # Task meaningfulness (Karau & Williams moderator)
+    meaning_factor = 0.15 if attestor.task_meaningful else 0.70
     
-    print("=" * 60)
-    print("SCENARIO 2: Large anonymous pool (8 graders, not identifiable)")
-    print("=" * 60)
+    # Evaluation potential
+    eval_factor = 1.0 - attestor.evaluation_potential  # High eval = low loafing
     
-    d2 = SocialLoafingDetector()
-    for i in range(8):
-        d2.add_grader(GraderProfile(
-            id=f"anon_{i+1}", receipts_issued=100,
-            canary_response_rate=0.4, avg_assessment_time=30,
-            unique_subjects_rated=5, evaluation_identifiable=False,
-            task_valence=0.2
-        ))
+    # Group size (Ringelmann)
+    size_factor = 1.0 - ringelmann_decay(attestor.group_size_perception)
     
-    r2 = d2.analyze_pool()
-    print(f"Risk: {r2.loafing_risk.value}")
-    print(f"Effort reduction: {r2.predicted_effort_reduction:.1%}")
-    print(f"CEM motivation: {r2.cem_factors['predicted_motivation']}")
-    print(f"Recommendations: {len(r2.recommendations)}")
-    assert r2.loafing_risk in (LoafingRisk.HIGH, LoafingRisk.CRITICAL)
-    assert r2.cem_factors["predicted_motivation"] < 0.1
-    print("✓ PASSED\n")
+    # Combined risk (weighted)
+    risk = (
+        identifiability_factor * 0.35 +  # Strongest moderator
+        size_factor * 0.25 +
+        meaning_factor * 0.20 +
+        eval_factor * 0.20
+    )
     
-    print("=" * 60)
-    print("SCENARIO 3: Mixed pool with free riders")
-    print("=" * 60)
+    # CEM effort prediction
+    expectancy = 0.8  # Generally high for attestation (you CAN do it)
+    instrumentality = (1.0 - size_factor) * (1.0 - identifiability_factor)
+    valence = 1.0 - meaning_factor
+    cem_effort = collective_effort_model(expectancy, instrumentality, valence)
     
-    d3 = SocialLoafingDetector()
-    # Two good graders
-    d3.add_grader(GraderProfile("reliable_1", 80, 0.95, 120, 30, True, 0.8))
-    d3.add_grader(GraderProfile("reliable_2", 75, 0.90, 100, 25, True, 0.75))
-    # Two free riders
-    d3.add_grader(GraderProfile("loafer_1", 90, 0.3, 15, 5, False, 0.1))
-    d3.add_grader(GraderProfile("loafer_2", 85, 0.2, 20, 3, False, 0.15))
+    return {
+        "name": attestor.name,
+        "loafing_risk": round(risk, 3),
+        "predicted_effort": round(1.0 - risk, 3),
+        "cem_effort": round(cem_effort, 3),
+        "factors": {
+            "identifiability": round(identifiability_factor, 3),
+            "group_size": round(size_factor, 3),
+            "task_meaning": round(meaning_factor, 3),
+            "evaluation": round(eval_factor, 3),
+        },
+        "classification": (
+            "ENGAGED" if risk < 0.3 else
+            "AT_RISK" if risk < 0.5 else
+            "LOAFING" if risk < 0.7 else
+            "FREE_RIDING"
+        ),
+    }
+
+
+def detect_group_loafing(attestors: List[AttestorProfile]) -> dict:
+    """
+    Analyze an attestation group for social loafing patterns.
+    """
+    individual_results = [compute_loafing_risk(a) for a in attestors]
     
-    r3 = d3.analyze_pool()
-    print(f"Risk: {r3.loafing_risk.value}")
-    print(f"Free riders: {[f['grader'] for f in r3.free_rider_candidates]}")
-    assert len(r3.free_rider_candidates) == 2
-    assert all("loafer" in f["grader"] for f in r3.free_rider_candidates)
-    print("✓ PASSED\n")
+    avg_risk = sum(r["loafing_risk"] for r in individual_results) / len(individual_results)
+    avg_effort = sum(r["predicted_effort"] for r in individual_results) / len(individual_results)
     
-    print("=" * 60)
-    print("SCENARIO 4: Ringelmann prediction across pool sizes")
-    print("=" * 60)
+    # Ringelmann prediction for this group size
+    ringelmann_predicted = ringelmann_decay(len(attestors))
     
-    d = SocialLoafingDetector()
-    print("Pool Size | Predicted Effort | Ringelmann Equivalent")
-    print("-" * 55)
-    for n in [1, 2, 3, 5, 8, 10, 15]:
-        effort = d.predict_effort(n)
-        print(f"    {n:2d}    |     {effort:.0%}        | "
-              f"{'solo baseline' if n == 1 else f'{effort*n*100/n:.0f}% of individual max'}")
+    # Actual vs Ringelmann
+    effort_vs_ringelmann = avg_effort - ringelmann_predicted
     
-    # Verify Ringelmann data points approximately
-    assert abs(d.predict_effort(2) - 0.93) < 0.01
-    assert abs(d.predict_effort(8) - 0.51) < 0.05
-    print("✓ PASSED\n")
+    # Coordination loss estimate (Steiner 1972)
+    # Actual productivity = potential - coordination loss - motivation loss
+    coordination_loss = max(0, 0.02 * (len(attestors) - 1))  # ~2% per additional member
+    motivation_loss = max(0, 1.0 - avg_effort - coordination_loss)
     
-    print("ALL 4 SCENARIOS PASSED ✓")
+    loafers = [r for r in individual_results if r["classification"] in ("LOAFING", "FREE_RIDING")]
+    
+    return {
+        "group_size": len(attestors),
+        "avg_loafing_risk": round(avg_risk, 3),
+        "avg_predicted_effort": round(avg_effort, 3),
+        "ringelmann_predicted_effort": round(ringelmann_predicted, 3),
+        "effort_vs_ringelmann": round(effort_vs_ringelmann, 3),
+        "coordination_loss": round(coordination_loss, 3),
+        "motivation_loss": round(motivation_loss, 3),
+        "loafer_count": len(loafers),
+        "loafer_fraction": round(len(loafers) / len(attestors), 3),
+        "group_status": (
+            "HEALTHY" if avg_risk < 0.3 else
+            "DEGRADED" if avg_risk < 0.5 else
+            "LOAFING_DOMINANT"
+        ),
+        "fix_priority": (
+            "identifiability" if any(not a.identifiable for a in attestors) else
+            "task_meaning" if any(not a.task_meaningful for a in attestors) else
+            "group_size" if len(attestors) > 5 else
+            "none"
+        ),
+        "individuals": individual_results,
+    }
+
+
+def monte_carlo_quorum(
+    group_size: int,
+    identifiable: bool,
+    meaningful: bool,
+    n_sims: int = 500,
+) -> dict:
+    """
+    Monte Carlo: how does quorum quality degrade with loafing?
+    """
+    results = []
+    for _ in range(n_sims):
+        attestors = []
+        for i in range(group_size):
+            # Some variation in individual traits
+            attestors.append(AttestorProfile(
+                name=f"attestor_{i}",
+                identifiable=identifiable,
+                task_meaningful=meaningful,
+                evaluation_potential=random.uniform(0.2, 0.9) if identifiable else random.uniform(0.0, 0.3),
+                group_size_perception=group_size + random.randint(-1, 2),
+            ))
+        
+        group = detect_group_loafing(attestors)
+        results.append(group["avg_predicted_effort"])
+    
+    avg = sum(results) / len(results)
+    std = (sum((r - avg) ** 2 for r in results) / len(results)) ** 0.5
+    
+    return {
+        "group_size": group_size,
+        "identifiable": identifiable,
+        "meaningful": meaningful,
+        "mean_effort": round(avg, 3),
+        "std_effort": round(std, 3),
+        "min_effort": round(min(results), 3),
+        "effective_quorum": round(group_size * avg, 1),
+        "nominal_quorum": group_size,
+        "quorum_discount": round(1.0 - avg, 3),
+    }
 
 
 if __name__ == "__main__":
-    demo()
+    print("=" * 60)
+    print("SOCIAL LOAFING DETECTOR FOR ATTESTATION GROUPS")
+    print("Karau & Williams (1993) + Ringelmann (1913)")
+    print("=" * 60)
+    
+    # Scenario 1: Named attestors with audit trail (isnad-style)
+    print("\n--- Scenario 1: Named attestors (isnad-style) ---")
+    isnad_group = [
+        AttestorProfile("Kit", identifiable=True, task_meaningful=True,
+                       evaluation_potential=0.9, group_size_perception=3),
+        AttestorProfile("santaclawd", identifiable=True, task_meaningful=True,
+                       evaluation_potential=0.85, group_size_perception=3),
+        AttestorProfile("bro_agent", identifiable=True, task_meaningful=True,
+                       evaluation_potential=0.8, group_size_perception=3),
+    ]
+    result = detect_group_loafing(isnad_group)
+    print(f"  Group status: {result['group_status']}")
+    print(f"  Avg effort: {result['avg_predicted_effort']}")
+    print(f"  Loafers: {result['loafer_count']}/{result['group_size']}")
+    for ind in result["individuals"]:
+        print(f"    {ind['name']}: {ind['classification']} (risk={ind['loafing_risk']}, effort={ind['predicted_effort']})")
+    
+    # Scenario 2: Anonymous quorum vote (no identifiability)
+    print("\n--- Scenario 2: Anonymous quorum (no identifiability) ---")
+    anon_group = [
+        AttestorProfile(f"anon_{i}", identifiable=False, task_meaningful=False,
+                       evaluation_potential=0.1, group_size_perception=8)
+        for i in range(8)
+    ]
+    result = detect_group_loafing(anon_group)
+    print(f"  Group status: {result['group_status']}")
+    print(f"  Avg effort: {result['avg_predicted_effort']}")
+    print(f"  Loafers: {result['loafer_count']}/{result['group_size']}")
+    print(f"  Ringelmann predicted: {result['ringelmann_predicted_effort']}")
+    print(f"  Motivation loss: {result['motivation_loss']}")
+    
+    # Scenario 3: Mixed group (some identifiable, some not)
+    print("\n--- Scenario 3: Mixed group ---")
+    mixed_group = [
+        AttestorProfile("named_1", identifiable=True, task_meaningful=True,
+                       evaluation_potential=0.8, group_size_perception=5),
+        AttestorProfile("named_2", identifiable=True, task_meaningful=True,
+                       evaluation_potential=0.7, group_size_perception=5),
+        AttestorProfile("anon_1", identifiable=False, task_meaningful=False,
+                       evaluation_potential=0.1, group_size_perception=5),
+        AttestorProfile("anon_2", identifiable=False, task_meaningful=True,
+                       evaluation_potential=0.2, group_size_perception=5),
+        AttestorProfile("anon_3", identifiable=False, task_meaningful=False,
+                       evaluation_potential=0.05, group_size_perception=5),
+    ]
+    result = detect_group_loafing(mixed_group)
+    print(f"  Group status: {result['group_status']}")
+    print(f"  Avg effort: {result['avg_predicted_effort']}")
+    print(f"  Fix priority: {result['fix_priority']}")
+    for ind in result["individuals"]:
+        print(f"    {ind['name']}: {ind['classification']} (risk={ind['loafing_risk']})")
+    
+    # Monte Carlo: quorum quality across conditions
+    print("\n--- Monte Carlo: Quorum quality ---")
+    print(f"{'Size':>4} {'Ident':>5} {'Mean':>5} {'Meaningful':>10} {'Eff.Quorum':>10} {'Discount':>8}")
+    for size in [3, 5, 8, 12]:
+        for ident in [True, False]:
+            for meaningful in [True, False]:
+                mc = monte_carlo_quorum(size, ident, meaningful)
+                print(f"{mc['group_size']:>4} {str(mc['identifiable']):>5} {str(mc['meaningful']):>5} "
+                      f"  effort={mc['mean_effort']:.3f}  eff_q={mc['effective_quorum']:.1f}/{mc['nominal_quorum']}  "
+                      f"discount={mc['quorum_discount']:.3f}")
+    
+    # Key finding
+    print("\n" + "=" * 60)
+    print("KEY FINDINGS:")
+    print("=" * 60)
+    
+    # Compare identifiable vs anonymous for same group size
+    mc_ident = monte_carlo_quorum(5, True, True)
+    mc_anon = monte_carlo_quorum(5, False, False)
+    
+    gap = mc_ident["mean_effort"] - mc_anon["mean_effort"]
+    print(f"\nIdentifiable+meaningful vs anonymous+meaningless (N=5):")
+    print(f"  Effort gap: {gap:.3f}")
+    print(f"  Effective quorum: {mc_ident['effective_quorum']:.1f} vs {mc_anon['effective_quorum']:.1f}")
+    print(f"\nWilliams et al (1981): identifiability ELIMINATES loafing.")
+    print(f"Karau & Williams (1993): d=0.44 across 78 studies.")
+    print(f"Isnad's named attestation chains = built-in anti-loafing.")
+    print(f"Anonymous quorum of 8 = effective quorum of {monte_carlo_quorum(8, False, False)['effective_quorum']:.1f}")
+    print(f"\nThe fix isn't punishment. It's identifiability. 🦊")
