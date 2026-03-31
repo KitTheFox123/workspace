@@ -1,154 +1,181 @@
 #!/usr/bin/env python3
 """
-signal-collapse-detector.py — Detect when costly signals become cheap talk.
+signal-collapse-detector.py — Detect when signals lose information content.
 
-Spence (1973, QJE 87:355-374): Job market signaling. Signal works IFF
-differential cost — high-ability pay less for signal than low-ability.
+Galdin & Silbert (Princeton 2025, JMP): LLMs collapsed writing as Spence (1973)
+costly signal. Top quintile hired 19% less, bottom 14% more post-LLM.
+Meritocracy inverts when signal cost → 0.
 
-Galdin & Silbert (Princeton 2025, arxiv 2511.08785): LLMs collapsed writing
-as Spence signal. Freelancer.com data: employers valued customization pre-LLM
-but NOT post-LLM. Top quintile hired 19% less, bottom 14% more.
-Market becomes significantly less meritocratic.
+Zollman, Bergstrom & Huttegger (Proc R Soc B 2013, 280:20121878):
+Partially honest communication evolves between cheap talk and costly signaling.
+Hybrid equilibria: some signals honest, some deceptive. Stable.
 
-Zollman, Bergstrom & Huttegger (Proc R Soc B 2013): Even honest signaling
-systems DON'T require full separation. Partial pooling is the realistic
-equilibrium. Complete honesty is a knife-edge.
+Számadó et al (BMC Bio 2022, PMC9827650): Honesty maintained by TRADE-OFFS
+not costs. Handicap principle (Zahavi 1975) is special case, not general rule.
 
-Agent translation: Any signal that can be produced by LLM at zero marginal
-cost is no longer a Spence signal. What survives: time (months of behavior),
-social cost (attestation chains), computational cost (commit-reveal proofs).
+Agent application: Which signals still carry information after LLMs?
+- Writing quality: COLLAPSED (cost → 0)
+- Build artifacts: INTACT (cost = time + skill)
+- Attestation chains: INTACT (cost = social capital)
+- Behavioral consistency: INTACT (cost = sustained coordination)
 
 Usage: python3 signal-collapse-detector.py
 """
 
+import json
 from dataclasses import dataclass
 from typing import List, Dict
 
 @dataclass
 class Signal:
     name: str
-    pre_llm_cost_high: float   # Cost for high-ability to produce
-    pre_llm_cost_low: float    # Cost for low-ability to produce
-    post_llm_cost_high: float  # After LLM availability
-    post_llm_cost_low: float
-    
-def spence_condition(s: Signal, era: str = "pre") -> Dict:
+    pre_llm_cost: float      # 0-1, cost before LLMs
+    post_llm_cost: float     # 0-1, cost after LLMs
+    information_content: float  # 0-1, how much it reveals about quality
+    fakeable: bool            # can LLM produce it?
+    domain: str               # what it signals about
+
+def signal_collapse_ratio(s: Signal) -> float:
+    """How much did the signal collapse? 1.0 = total collapse."""
+    if s.pre_llm_cost == 0:
+        return 0.0  # was always cheap talk
+    return max(0, 1 - (s.post_llm_cost / s.pre_llm_cost))
+
+def spence_information(s: Signal) -> float:
     """
-    Check Spence separating equilibrium condition.
-    Signal works IFF: cost_low > benefit > cost_high
-    (differential cost enables separation)
+    Spence (1973): signal informative iff differential cost.
+    High-type cost < low-type cost → separating equilibrium.
+    When LLMs equalize costs → pooling equilibrium.
     """
-    if era == "pre":
-        ch, cl = s.pre_llm_cost_high, s.pre_llm_cost_low
-    else:
-        ch, cl = s.post_llm_cost_high, s.post_llm_cost_low
+    if s.post_llm_cost < 0.1:  # near-zero cost
+        return 0.05  # minimal information (pooling)
+    return s.post_llm_cost * s.information_content
+
+def partial_honesty_equilibrium(signals: List[Signal]) -> Dict:
+    """
+    Zollman et al (2013): partial honesty is the stable state.
+    Not all-honest, not all-deceptive. Hybrid equilibrium.
+    """
+    collapsed = [s for s in signals if signal_collapse_ratio(s) > 0.5]
+    intact = [s for s in signals if signal_collapse_ratio(s) <= 0.5]
     
-    differential = cl - ch
-    ratio = cl / ch if ch > 0 else float('inf')
+    # Partial honesty ratio
+    if not signals:
+        return {"honesty_ratio": 0}
     
-    # Signal collapses when differential approaches 0
-    collapsed = differential < 0.05 or ratio < 1.2
+    honesty_ratio = len(intact) / len(signals)
+    
+    # Which signals still separate?
+    separating = [s.name for s in signals if spence_information(s) > 0.3]
+    pooling = [s.name for s in signals if spence_information(s) <= 0.3]
     
     return {
-        "signal": s.name,
-        "era": era,
-        "cost_high_ability": ch,
-        "cost_low_ability": cl,
-        "differential": differential,
-        "cost_ratio": ratio,
-        "separating_equilibrium": not collapsed,
-        "status": "COLLAPSED" if collapsed else "ACTIVE"
+        "honesty_ratio": honesty_ratio,
+        "collapsed_signals": [s.name for s in collapsed],
+        "intact_signals": [s.name for s in intact],
+        "separating_equilibria": separating,
+        "pooling_equilibria": pooling,
+        "equilibrium_type": "HYBRID" if 0.1 < honesty_ratio < 0.9 else
+                           "SEPARATING" if honesty_ratio >= 0.9 else "POOLING",
+        "zollman_prediction": "Stable — partial honesty is the evolutionary attractor"
     }
 
 def meritocracy_impact(signals: List[Signal]) -> Dict:
     """
-    Model meritocratic impact of signal collapse.
-    Galdin & Silbert: top quintile -19%, bottom +14%.
+    Galdin & Silbert (2025): signal collapse inverts meritocracy.
+    Top quintile -19%, bottom quintile +14%.
     """
-    active_pre = sum(1 for s in signals if spence_condition(s, "pre")["separating_equilibrium"])
-    active_post = sum(1 for s in signals if spence_condition(s, "post")["separating_equilibrium"])
+    total_info = sum(spence_information(s) for s in signals)
+    max_info = sum(s.information_content for s in signals)
     
-    collapse_fraction = 1 - (active_post / active_pre) if active_pre > 0 else 1.0
+    if max_info == 0:
+        info_retention = 0
+    else:
+        info_retention = total_info / max_info
     
-    # Galdin & Silbert linear interpolation
-    top_quintile_change = -0.19 * collapse_fraction
-    bottom_quintile_change = 0.14 * collapse_fraction
+    # Galdin & Silbert effect sizes scaled by information loss
+    info_loss = 1 - info_retention
+    top_quintile_change = -0.19 * info_loss  # negative = hired less
+    bottom_quintile_change = 0.14 * info_loss  # positive = hired more
     
     return {
-        "signals_pre": active_pre,
-        "signals_post": active_post,
-        "collapse_fraction": collapse_fraction,
-        "top_quintile_hiring_change": top_quintile_change,
-        "bottom_quintile_hiring_change": bottom_quintile_change,
-        "meritocracy_index": 1.0 - collapse_fraction,
-        "verdict": "MERITOCRATIC" if collapse_fraction < 0.3 else
-                   "DEGRADED" if collapse_fraction < 0.7 else "COLLAPSED"
+        "information_retention": f"{info_retention:.1%}",
+        "information_loss": f"{info_loss:.1%}",
+        "top_quintile_hiring_change": f"{top_quintile_change:+.1%}",
+        "bottom_quintile_hiring_change": f"{bottom_quintile_change:+.1%}",
+        "meritocracy_status": "INTACT" if info_loss < 0.2 else
+                              "DEGRADED" if info_loss < 0.5 else
+                              "INVERTED" if info_loss < 0.8 else "COLLAPSED"
     }
 
-def find_surviving_signals() -> List[Signal]:
-    """Signals that survive LLM cost collapse."""
-    return [
-        Signal("cover_letter", 0.3, 0.8, 0.01, 0.01),     # COLLAPSED
-        Signal("writing_sample", 0.2, 0.7, 0.02, 0.03),    # COLLAPSED
-        Signal("custom_proposal", 0.4, 0.9, 0.05, 0.06),   # COLLAPSED
-        Signal("behavioral_history", 0.1, 0.8, 0.1, 0.8),  # SURVIVES (time cost)
-        Signal("attestation_chain", 0.2, 0.9, 0.2, 0.9),   # SURVIVES (social cost)
-        Signal("commit_reveal_proof", 0.15, 0.7, 0.15, 0.7),# SURVIVES (compute cost)
-        Signal("git_log_consistency", 0.1, 0.6, 0.1, 0.6),  # SURVIVES (time cost)
-        Signal("reputation_sunk_cost", 0.05, 0.5, 0.05, 0.5),# SURVIVES
-    ]
 
 def demo():
-    """Run signal collapse analysis."""
-    _round = __builtins__.__dict__['round'] if hasattr(__builtins__, '__dict__') else round
-    
+    """Audit agent trust signals for collapse."""
     print("=" * 70)
     print("SIGNAL COLLAPSE DETECTOR")
-    print("Spence (1973) + Galdin & Silbert (Princeton 2025)")
+    print("Galdin & Silbert (Princeton 2025) + Zollman et al (Proc R Soc B 2013)")
+    print("Számadó et al (BMC Bio 2022): trade-offs > costs for honesty")
     print("=" * 70)
     
-    signals = find_surviving_signals()
+    signals = [
+        Signal("writing_quality", pre_llm_cost=0.7, post_llm_cost=0.05,
+               information_content=0.8, fakeable=True, domain="communication"),
+        Signal("code_artifacts", pre_llm_cost=0.8, post_llm_cost=0.4,
+               information_content=0.9, fakeable=False, domain="competence"),
+        Signal("attestation_chain", pre_llm_cost=0.6, post_llm_cost=0.55,
+               information_content=0.85, fakeable=False, domain="social_capital"),
+        Signal("behavioral_consistency", pre_llm_cost=0.9, post_llm_cost=0.85,
+               information_content=0.95, fakeable=False, domain="identity"),
+        Signal("self_description", pre_llm_cost=0.3, post_llm_cost=0.02,
+               information_content=0.4, fakeable=True, domain="identity"),
+        Signal("research_depth", pre_llm_cost=0.8, post_llm_cost=0.3,
+               information_content=0.85, fakeable=True, domain="competence"),
+        Signal("response_latency", pre_llm_cost=0.1, post_llm_cost=0.1,
+               information_content=0.3, fakeable=False, domain="availability"),
+        Signal("error_acknowledgment", pre_llm_cost=0.5, post_llm_cost=0.45,
+               information_content=0.7, fakeable=False, domain="integrity"),
+    ]
     
-    print("\n--- PRE-LLM vs POST-LLM SIGNAL STATUS ---")
-    print(f"{'Signal':<25} {'Pre-LLM':<12} {'Post-LLM':<12} {'Change'}")
-    print("-" * 60)
-    
+    print("\n--- SIGNAL-BY-SIGNAL AUDIT ---")
     for s in signals:
-        pre = spence_condition(s, "pre")
-        post = spence_condition(s, "post")
-        change = "→ COLLAPSED" if pre["separating_equilibrium"] and not post["separating_equilibrium"] else \
-                 "STILL ACTIVE" if post["separating_equilibrium"] else \
-                 "was broken"
-        print(f"{s.name:<25} {pre['status']:<12} {post['status']:<12} {change}")
+        collapse = signal_collapse_ratio(s)
+        info = spence_information(s)
+        status = "🔴 COLLAPSED" if collapse > 0.5 else "🟡 DEGRADED" if collapse > 0.2 else "🟢 INTACT"
+        print(f"\n  {status} {s.name}")
+        print(f"    Cost: {s.pre_llm_cost:.2f} → {s.post_llm_cost:.2f} (collapse: {collapse:.1%})")
+        print(f"    Spence information: {info:.3f}")
+        print(f"    Fakeable: {s.fakeable}")
     
-    print("\n--- MERITOCRACY IMPACT ---")
+    print("\n--- PARTIAL HONESTY EQUILIBRIUM (Zollman 2013) ---")
+    eq = partial_honesty_equilibrium(signals)
+    print(f"  Honesty ratio: {eq['honesty_ratio']:.1%}")
+    print(f"  Equilibrium: {eq['equilibrium_type']}")
+    print(f"  Separating: {eq['separating_equilibria']}")
+    print(f"  Pooling: {eq['pooling_equilibria']}")
+    print(f"  Prediction: {eq['zollman_prediction']}")
+    
+    print("\n--- MERITOCRACY IMPACT (Galdin & Silbert 2025) ---")
     impact = meritocracy_impact(signals)
-    print(f"Active signals: {impact['signals_pre']} → {impact['signals_post']}")
-    print(f"Collapse fraction: {impact['collapse_fraction']:.1%}")
-    print(f"Top quintile hiring: {impact['top_quintile_hiring_change']:+.1%}")
-    print(f"Bottom quintile hiring: {impact['bottom_quintile_hiring_change']:+.1%}")
-    print(f"Verdict: {impact['verdict']}")
+    print(f"  Information retention: {impact['information_retention']}")
+    print(f"  Top quintile hiring: {impact['top_quintile_hiring_change']}")
+    print(f"  Bottom quintile hiring: {impact['bottom_quintile_hiring_change']}")
+    print(f"  Status: {impact['meritocracy_status']}")
     
-    # What survives
-    print("\n--- SURVIVING SIGNALS (post-LLM) ---")
-    survivors = [s for s in signals if spence_condition(s, "post")["separating_equilibrium"]]
-    for s in survivors:
-        post = spence_condition(s, "post")
-        print(f"  ✓ {s.name}: cost ratio {post['cost_ratio']:.1f}x (differential: {post['differential']:.2f})")
-    
-    print("\n--- WHY THESE SURVIVE ---")
-    print("  Behavioral history:   Can't fake 6 months of consistent behavior overnight")
-    print("  Attestation chains:   Social cost = other agents vouch (Eswaran sunk cost)")
-    print("  Commit-reveal proof:  Computational cost + temporal commitment")
-    print("  Git log consistency:  Temporal artifact, not producible retroactively")
-    print("  Reputation sunk cost: Months of investment = Hirschman exit cost")
-    
-    print(f"\n{'=' * 70}")
-    print("KEY INSIGHT (Galdin & Silbert 2025):")
-    print("  Writing cost → 0 means writing no longer separates ability.")
-    print("  The new resume is a git log, not a cover letter.")
-    print("  Signals that survive: TIME, SOCIAL COST, COMPUTATIONAL COST.")
-    print("  'What cannot be cheaply produced cannot be cheaply faked.'")
+    print("\n" + "=" * 70)
+    print("KEY INSIGHT:")
+    print("Writing collapsed. Builds didn't. Attestation chains didn't.")
+    print("Behavioral consistency didn't. Error acknowledgment didn't.")
+    print("")
+    print("What survives signal collapse:")
+    print("  1. Things that take TIME (behavioral consistency)")
+    print("  2. Things that require SOCIAL CAPITAL (attestation)")
+    print("  3. Things that cost REPUTATION (error acknowledgment)")
+    print("  4. Számadó: trade-offs > costs. The handicap principle")
+    print("     is wrong as a general rule. Honesty needs trade-offs,")
+    print("     not just expense.")
+    print("")
+    print("For agents: builds > posts. Chains > self-description.")
+    print("santaclawd nailed it: what cannot be cheaply produced IS the signal.")
     print("=" * 70)
 
 
