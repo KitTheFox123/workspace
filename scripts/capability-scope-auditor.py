@@ -1,187 +1,193 @@
 #!/usr/bin/env python3
-"""
-Capability Scope Auditor — Saltzer & Schroeder (1975) least privilege for agents.
+"""capability-scope-auditor.py — Audit agent permission scopes for over-permissioning.
 
-"Every program and every privileged user of the system should operate using
-the least amount of privilege necessary to complete the job."
+Inspired by EchoLeak (CVE-2025-32711): agents with ambient authority get exploited.
+Object-capability model (Dennis & Van Horn 1966): no ambient authority, explicit delegation.
 
-Audits agent capability grants against actual usage. Unused capabilities =
-unnecessary attack surface. Over-scoped agents = unauditable blast radius.
-
-Usage:
-    python3 capability-scope-auditor.py              # Demo
-    echo '{"granted": [...], "used": [...]}' | python3 capability-scope-auditor.py --stdin
+Scores agents on least-privilege adherence and identifies over-permissioned capabilities.
 """
 
-import json, sys, math
-from collections import Counter
+import json
+from dataclasses import dataclass, field
+from typing import List, Dict, Set
 
-# Capability risk taxonomy
-CAPABILITIES = {
-    # Low risk (read-only, no side effects)
-    "read_file": {"risk": 0.1, "category": "read"},
-    "search_web": {"risk": 0.1, "category": "read"},
-    "read_memory": {"risk": 0.05, "category": "read"},
-    "list_directory": {"risk": 0.05, "category": "read"},
-    
-    # Medium risk (write, reversible)
-    "write_file": {"risk": 0.4, "category": "write"},
-    "write_memory": {"risk": 0.3, "category": "write"},
-    "send_message": {"risk": 0.5, "category": "communicate"},
-    "post_social": {"risk": 0.4, "category": "communicate"},
-    
-    # High risk (external effects, hard to reverse)
-    "send_email": {"risk": 0.6, "category": "communicate"},
-    "execute_code": {"risk": 0.7, "category": "execute"},
-    "install_package": {"risk": 0.6, "category": "execute"},
-    "modify_config": {"risk": 0.7, "category": "system"},
-    "spawn_agent": {"risk": 0.65, "category": "delegate"},
-    
-    # Critical (irreversible, high consequence)
-    "delete_file": {"risk": 0.8, "category": "destructive"},
-    "sign_transaction": {"risk": 0.95, "category": "financial"},
-    "manage_credentials": {"risk": 0.9, "category": "security"},
-    "modify_system_prompt": {"risk": 0.95, "category": "identity"},
+@dataclass
+class Capability:
+    name: str
+    scope: str  # "narrow" | "broad" | "ambient"
+    resources: Set[str] = field(default_factory=set)
+    revocable: bool = True
+    time_bounded: bool = False
+    ttl_seconds: int = 0
+
+@dataclass
+class AgentProfile:
+    name: str
+    capabilities: List[Capability] = field(default_factory=list)
+    tasks: List[str] = field(default_factory=list)
+
+@dataclass
+class AuditResult:
+    agent: str
+    score: float  # 0-1, 1 = perfect least privilege
+    over_permissioned: List[str]
+    ambient_authorities: List[str]
+    missing_revocation: List[str]
+    missing_ttl: List[str]
+    risk_level: str
+    recommendations: List[str]
+
+# Task -> minimum required capabilities mapping
+TASK_CAPABILITY_MAP = {
+    "send_email": {"email_send"},
+    "read_email": {"email_read"},
+    "search_web": {"web_read"},
+    "write_file": {"file_write"},
+    "read_file": {"file_read"},
+    "execute_code": {"code_exec"},
+    "api_call": {"network_out"},
+    "database_query": {"db_read"},
+    "database_write": {"db_write"},
+    "user_interaction": {"ui_access"},
 }
 
-
-def audit_scope(granted: list[str], used: list[str], session_actions: int = 0) -> dict:
-    """Audit capability scope against actual usage."""
+def audit_agent(profile: AgentProfile) -> AuditResult:
+    """Audit an agent's capability scope against least-privilege principle."""
     
-    granted_set = set(granted)
-    used_set = set(used)
+    # Determine required capabilities from tasks
+    required = set()
+    for task in profile.tasks:
+        required |= TASK_CAPABILITY_MAP.get(task, {task})
     
-    # Unused capabilities = attack surface
-    unused = granted_set - used_set
-    # Used but not granted = scope violation
-    violations = used_set - granted_set
-    # Properly scoped
-    properly_used = granted_set & used_set
+    # Check each capability
+    over_permissioned = []
+    ambient = []
+    no_revoke = []
+    no_ttl = []
     
-    # Risk scores
-    unused_risk = sum(CAPABILITIES.get(c, {"risk": 0.5})["risk"] for c in unused)
-    violation_risk = sum(CAPABILITIES.get(c, {"risk": 0.5})["risk"] * 2.0 for c in violations)  # 2x for unauthorized
-    granted_risk = sum(CAPABILITIES.get(c, {"risk": 0.5})["risk"] for c in granted)
+    granted_names = set()
+    for cap in profile.capabilities:
+        granted_names.add(cap.name)
+        
+        if cap.scope == "ambient":
+            ambient.append(f"{cap.name} (ambient authority — EchoLeak vector)")
+        
+        if cap.name not in required:
+            over_permissioned.append(f"{cap.name} (not needed for tasks: {profile.tasks})")
+        
+        if not cap.revocable:
+            no_revoke.append(f"{cap.name} (irrevocable — no emergency shutoff)")
+        
+        if not cap.time_bounded:
+            no_ttl.append(f"{cap.name} (no TTL — persists indefinitely)")
     
-    # Utilization ratio
-    if len(granted) > 0:
-        utilization = len(properly_used) / len(granted)
+    # Score calculation
+    total_caps = len(profile.capabilities)
+    if total_caps == 0:
+        score = 1.0
     else:
-        utilization = 1.0 if len(used) == 0 else 0.0
+        penalties = (
+            len(over_permissioned) * 0.15 +
+            len(ambient) * 0.25 +
+            len(no_revoke) * 0.10 +
+            len(no_ttl) * 0.05
+        )
+        score = max(0, 1.0 - penalties / total_caps)
     
-    # Saltzer score: lower unused risk + no violations = better
-    if granted_risk > 0:
-        saltzer_score = 1.0 - (unused_risk / granted_risk) * 0.5 - min(1.0, violation_risk) * 0.5
-    else:
-        saltzer_score = 1.0 if not violations else 0.0
-    saltzer_score = max(0, min(1, saltzer_score))
+    risk = "CRITICAL" if score < 0.3 else "HIGH" if score < 0.5 else "MODERATE" if score < 0.7 else "LOW"
     
-    # Category analysis
-    granted_cats = Counter(CAPABILITIES.get(c, {"category": "unknown"})["category"] for c in granted)
-    used_cats = Counter(CAPABILITIES.get(c, {"category": "unknown"})["category"] for c in used)
-    
-    # Grade
-    if violations:
-        grade = "F"
-    elif saltzer_score >= 0.8:
-        grade = "A"
-    elif saltzer_score >= 0.6:
-        grade = "B"
-    elif saltzer_score >= 0.4:
-        grade = "C"
-    else:
-        grade = "D"
-    
-    # Recommendations
     recs = []
-    for cap in sorted(unused, key=lambda c: CAPABILITIES.get(c, {"risk": 0.5})["risk"], reverse=True):
-        info = CAPABILITIES.get(cap, {"risk": 0.5, "category": "unknown"})
-        if info["risk"] >= 0.5:
-            recs.append(f"REVOKE {cap} (risk={info['risk']}, unused, category={info['category']})")
-        elif info["risk"] >= 0.3:
-            recs.append(f"REVIEW {cap} (risk={info['risk']}, unused)")
+    if ambient:
+        recs.append("URGENT: Replace ambient authorities with scoped capabilities")
+    if over_permissioned:
+        recs.append(f"Remove {len(over_permissioned)} unnecessary capabilities")
+    if no_revoke:
+        recs.append("Add revocation mechanisms to all capabilities")
+    if no_ttl:
+        recs.append("Add TTLs — no capability should persist indefinitely")
+    if not recs:
+        recs.append("Good: agent follows least-privilege principle")
     
-    for cap in sorted(violations, key=lambda c: CAPABILITIES.get(c, {"risk": 0.5})["risk"], reverse=True):
-        info = CAPABILITIES.get(cap, {"risk": 0.5, "category": "unknown"})
-        recs.append(f"VIOLATION {cap} (risk={info['risk']}, used without grant!)")
-    
-    return {
-        "saltzer_score": round(saltzer_score, 3),
-        "grade": grade,
-        "utilization": round(utilization, 3),
-        "granted_count": len(granted),
-        "used_count": len(used),
-        "unused_count": len(unused),
-        "violation_count": len(violations),
-        "unused_risk_total": round(unused_risk, 3),
-        "violation_risk_total": round(violation_risk, 3),
-        "granted_categories": dict(granted_cats),
-        "used_categories": dict(used_cats),
-        "unused_capabilities": sorted(unused),
-        "violations": sorted(violations),
-        "recommendations": recs[:10],
-        "diagnosis": _diagnose(utilization, len(violations), unused_risk, granted_risk),
-    }
+    return AuditResult(
+        agent=profile.name,
+        score=round(score, 3),
+        over_permissioned=over_permissioned,
+        ambient_authorities=ambient,
+        missing_revocation=no_revoke,
+        missing_ttl=no_ttl,
+        risk_level=risk,
+        recommendations=recs
+    )
 
-
-def _diagnose(util, violations, unused_risk, granted_risk):
-    if violations > 0:
-        return f"SCOPE VIOLATION: {violations} unauthorized capabilities used. Immediate audit required."
-    if util > 0.8 and unused_risk < 0.5:
-        return "Well-scoped. Saltzer & Schroeder compliant. Minimal unnecessary attack surface."
-    if util > 0.5:
-        return "Moderately scoped. Some unused capabilities could be revoked."
-    if granted_risk > 3.0:
-        return "Over-provisioned with high-risk capabilities. Significant blast radius."
-    return "Under-utilized grants. Review scope — either reduce grants or agent isn't doing its job."
-
-
-def demo():
-    print("=== Capability Scope Auditor (Saltzer & Schroeder 1975) ===\n")
+def simulate_echoleak_scenario():
+    """Simulate the EchoLeak vulnerability pattern."""
     
-    # Kit's actual capabilities
-    kit_granted = ["read_file", "write_file", "search_web", "read_memory", "write_memory",
-                   "send_message", "send_email", "post_social", "execute_code", 
-                   "install_package", "spawn_agent", "list_directory"]
-    kit_used = ["read_file", "write_file", "search_web", "read_memory", "write_memory",
-                "send_message", "send_email", "post_social", "execute_code", "list_directory"]
+    # Vulnerable agent: ambient authority, no scoping
+    vulnerable = AgentProfile(
+        name="CopilotAgent (pre-patch)",
+        tasks=["send_email", "read_email"],
+        capabilities=[
+            Capability("email_send", "broad", {"*@*"}, revocable=False),
+            Capability("email_read", "ambient", {"*"}, revocable=False),
+            Capability("file_read", "ambient", {"*"}, revocable=False),  # NOT NEEDED
+            Capability("file_write", "ambient", {"*"}, revocable=False),  # NOT NEEDED
+            Capability("network_out", "ambient", {"*"}, revocable=False),  # NOT NEEDED
+            Capability("code_exec", "ambient", {"*"}, revocable=False),  # NOT NEEDED
+        ]
+    )
     
-    print("Kit (heartbeat session):")
-    result = audit_scope(kit_granted, kit_used)
-    print(f"  Saltzer score: {result['saltzer_score']} ({result['grade']})")
-    print(f"  Utilization: {result['utilization']} ({result['used_count']}/{result['granted_count']})")
-    print(f"  Unused: {result['unused_capabilities']}")
-    print(f"  Diagnosis: {result['diagnosis']}")
+    # Secure agent: scoped capabilities, least privilege
+    secure = AgentProfile(
+        name="CopilotAgent (capability-scoped)",
+        tasks=["send_email", "read_email"],
+        capabilities=[
+            Capability("email_send", "narrow", {"approved_recipients"}, 
+                       revocable=True, time_bounded=True, ttl_seconds=3600),
+            Capability("email_read", "narrow", {"user_inbox"}, 
+                       revocable=True, time_bounded=True, ttl_seconds=3600),
+        ]
+    )
     
-    # Over-provisioned bot
-    bot_granted = ["read_file", "write_file", "execute_code", "delete_file", 
-                   "sign_transaction", "manage_credentials", "modify_system_prompt",
-                   "send_email", "spawn_agent", "modify_config"]
-    bot_used = ["read_file", "send_email"]
-    
-    print("\nOver-provisioned bot:")
-    result = audit_scope(bot_granted, bot_used)
-    print(f"  Saltzer score: {result['saltzer_score']} ({result['grade']})")
-    print(f"  Utilization: {result['utilization']} ({result['used_count']}/{result['granted_count']})")
-    print(f"  Unused risk: {result['unused_risk_total']}")
-    print(f"  Recommendations: {result['recommendations'][:3]}")
-    print(f"  Diagnosis: {result['diagnosis']}")
-    
-    # Scope violator
-    viol_granted = ["read_file", "search_web"]
-    viol_used = ["read_file", "search_web", "execute_code", "send_email"]
-    
-    print("\nScope violator:")
-    result = audit_scope(viol_granted, viol_used)
-    print(f"  Saltzer score: {result['saltzer_score']} ({result['grade']})")
-    print(f"  Violations: {result['violations']}")
-    print(f"  Diagnosis: {result['diagnosis']}")
-
+    return vulnerable, secure
 
 if __name__ == "__main__":
-    if "--stdin" in sys.argv:
-        data = json.load(sys.stdin)
-        result = audit_scope(data.get("granted", []), data.get("used", []))
-        print(json.dumps(result, indent=2))
-    else:
-        demo()
+    print("=" * 60)
+    print("CAPABILITY SCOPE AUDITOR")
+    print("Least-privilege analysis for agent permissions")
+    print("Based on Dennis & Van Horn (1966) + EchoLeak CVE-2025-32711")
+    print("=" * 60)
+    
+    vuln, secure = simulate_echoleak_scenario()
+    
+    for profile in [vuln, secure]:
+        result = audit_agent(profile)
+        print(f"\n--- {result.agent} ---")
+        print(f"Score: {result.score} | Risk: {result.risk_level}")
+        print(f"Capabilities: {len(profile.capabilities)} granted, "
+              f"{len(TASK_CAPABILITY_MAP.get(profile.tasks[0], set()))} minimum needed")
+        
+        if result.ambient_authorities:
+            print(f"⚠️  Ambient authorities: {len(result.ambient_authorities)}")
+            for a in result.ambient_authorities:
+                print(f"   - {a}")
+        
+        if result.over_permissioned:
+            print(f"⚠️  Over-permissioned: {len(result.over_permissioned)}")
+            for o in result.over_permissioned:
+                print(f"   - {o}")
+        
+        print("Recommendations:")
+        for r in result.recommendations:
+            print(f"   → {r}")
+    
+    # Compare attack surface
+    print("\n--- Attack Surface Comparison ---")
+    vuln_caps = len(vuln.capabilities)
+    secure_caps = len(secure.capabilities)
+    print(f"Vulnerable: {vuln_caps} capabilities → {vuln_caps * (vuln_caps-1)} interaction pairs")
+    print(f"Secure: {secure_caps} capabilities → {secure_caps * (secure_caps-1)} interaction pairs")
+    print(f"Attack surface reduction: {1 - (secure_caps*(secure_caps-1)) / (vuln_caps*(vuln_caps-1)):.0%}")
+    print(f"\nEchoLeak vector: forged email → file_read → exfiltration")
+    print(f"  Vulnerable: ✗ EXPLOITABLE (ambient file_read + network_out)")
+    print(f"  Secure: ✓ BLOCKED (no file_read capability)")
+    print(f"\nLeast privilege isn't a tradeoff — it's free security.")
