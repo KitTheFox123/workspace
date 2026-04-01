@@ -1,216 +1,206 @@
 #!/usr/bin/env python3
-"""counterfactual-attestation.py — Popper demarcation for agent trust.
+"""counterfactual-attestation.py — Popper's demarcation criterion for trust.
 
-Every attestation MUST specify what evidence would falsify it.
-If the answer is "nothing" — it's prior completion, not evaluation.
+Every attestation must include what evidence would falsify it.
+"Nothing would change my mind" = declaration, not attestation.
 
 Based on:
-- Popper: falsifiability as demarcation criterion
-- Lakatos: progressive vs degenerating research programs
-- Stanford mirage study (2026): models pattern-match without processing input
-- Santa Clawd: parseable-first with readable annotation
+- Popper (1934/1959): falsifiability as demarcation criterion
+- Lakatos (1978): progressive vs degenerating research programmes
+- Sprenger (2016): theories gain credibility through specific failures
 """
 
 import json
 import hashlib
 import time
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
-from enum import Enum
-
-class AttestationHealth(Enum):
-    PROGRESSIVE = "progressive"      # novel predictions + falsification path
-    DEGENERATING = "degenerating"    # only confirms what's known
-    UNFALSIFIABLE = "unfalsifiable"  # no failure conditions specified
-    MIRAGE = "mirage"                # pattern-matched, never checked input
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict
 
 @dataclass
-class CounterfactualField:
-    """The core innovation: what would change your verdict?"""
-    retract_if: str              # "I would retract if [specific evidence]"
-    confidence: float            # 0-1 how confident in current verdict  
-    evidence_checked: List[str]  # what was actually examined
-    evidence_not_checked: List[str]  # what was NOT examined (honesty)
-    
-    @property
-    def specificity(self) -> float:
-        """How specific is the falsification condition? Vague = 0, specific = 1."""
-        if not self.retract_if or self.retract_if.lower() in ["nothing", "n/a", "none"]:
-            return 0.0
-        # Heuristic: specific counterfactuals mention measurable conditions
-        markers = ["if", "when", "greater than", "less than", "within", "before", 
-                   "after", "exactly", "differs by", "fails to"]
-        matches = sum(1 for m in markers if m in self.retract_if.lower())
-        return min(matches / 3, 1.0)
-    
-    @property
-    def honesty_signal(self) -> float:
-        """Admitting what you DIDN'T check is a trust signal."""
-        if not self.evidence_not_checked:
-            return 0.3  # suspicious: claims to have checked everything
-        total = len(self.evidence_checked) + len(self.evidence_not_checked)
-        if total == 0:
-            return 0.0
-        return len(self.evidence_not_checked) / total  # higher = more honest
-
-@dataclass
-class Attestation:
-    """An attestation with mandatory counterfactual field."""
-    attestor_id: str
+class CounterfactualAttestation:
+    """An attestation with mandatory falsification conditions."""
+    attester_id: str
     subject_id: str
-    verdict: str
-    counterfactual: CounterfactualField
-    timestamp: float = field(default_factory=time.time)
+    claim: str
+    confidence: float  # 0-1
+    counterfactual_condition: str  # REQUIRED: what would falsify this?
+    evidence_cited: List[str]  # what evidence supports the claim
+    timestamp: float
+    ttl_seconds: int = 86400  # attestation expires
     
-    @property
-    def health(self) -> AttestationHealth:
-        """Classify attestation health via Lakatos criteria."""
-        cf = self.counterfactual
-        
-        if cf.specificity == 0:
-            return AttestationHealth.UNFALSIFIABLE
-        
-        if not cf.evidence_checked:
-            return AttestationHealth.MIRAGE
-        
-        if cf.specificity >= 0.5 and cf.honesty_signal >= 0.2:
-            return AttestationHealth.PROGRESSIVE
-        
-        return AttestationHealth.DEGENERATING
+    def is_falsifiable(self) -> bool:
+        """Check if counterfactual is actually falsifiable (not vacuous)."""
+        vacuous = [
+            "nothing", "n/a", "none", "no evidence", 
+            "impossible", "cannot be falsified"
+        ]
+        cf_lower = self.counterfactual_condition.lower().strip()
+        if any(v in cf_lower for v in vacuous):
+            return False
+        if len(cf_lower) < 10:  # too short to be meaningful
+            return False
+        return True
     
-    @property
-    def trust_multiplier(self) -> float:
-        """How much should this attestation count toward trust?"""
-        multipliers = {
-            AttestationHealth.PROGRESSIVE: 1.0,
-            AttestationHealth.DEGENERATING: 0.3,
-            AttestationHealth.UNFALSIFIABLE: 0.0,  # worth nothing
-            AttestationHealth.MIRAGE: -0.5,  # actively harmful
-        }
-        return multipliers[self.health]
+    def specificity_score(self) -> float:
+        """Score how specific/testable the counterfactual is.
+        
+        Higher = more specific = more valuable attestation.
+        """
+        score = 0.0
+        cf = self.counterfactual_condition.lower()
+        
+        # Contains measurable quantities
+        if any(c.isdigit() for c in cf):
+            score += 0.3
+        
+        # Contains time bounds
+        time_words = ["within", "before", "after", "by", "hours", "days", "seconds"]
+        if any(w in cf for w in time_words):
+            score += 0.2
+        
+        # Contains observable conditions
+        observable = ["observed", "detected", "measured", "logged", "recorded", "verified"]
+        if any(w in cf for w in observable):
+            score += 0.2
+        
+        # References specific evidence types
+        evidence_types = ["hash", "signature", "log", "commit", "receipt", "response"]
+        if any(w in cf for w in evidence_types):
+            score += 0.2
+        
+        # Has sufficient detail (word count)
+        words = len(cf.split())
+        if words >= 15:
+            score += 0.1
+        
+        return min(score, 1.0)
     
-    def to_parseable(self) -> Dict:
-        """Machine-parseable output (primary layer)."""
+    def to_envelope(self) -> Dict:
+        """Export as machine-parseable envelope."""
         return {
-            "attestor": self.attestor_id,
+            "version": "counterfactual-attestation/0.1",
+            "attester": self.attester_id,
             "subject": self.subject_id,
-            "verdict": self.verdict,
-            "counterfactual": {
-                "retract_if": self.counterfactual.retract_if,
-                "confidence": self.counterfactual.confidence,
-                "evidence_checked": self.counterfactual.evidence_checked,
-                "evidence_not_checked": self.counterfactual.evidence_not_checked,
-                "specificity": round(self.counterfactual.specificity, 3),
-                "honesty_signal": round(self.counterfactual.honesty_signal, 3),
-            },
-            "health": self.health.value,
-            "trust_multiplier": self.trust_multiplier,
+            "claim": self.claim,
+            "confidence": self.confidence,
+            "counterfactual_condition": self.counterfactual_condition,
+            "falsifiable": self.is_falsifiable(),
+            "specificity": self.specificity_score(),
+            "evidence": self.evidence_cited,
             "timestamp": self.timestamp,
+            "ttl": self.ttl_seconds,
             "hash": hashlib.sha256(
-                f"{self.attestor_id}:{self.subject_id}:{self.verdict}:{self.counterfactual.retract_if}".encode()
+                json.dumps(asdict(self), sort_keys=True).encode()
             ).hexdigest()[:16]
         }
 
-def detect_mirage_attestation(attestation: Attestation) -> bool:
-    """Stanford mirage detection: did the attestor actually check input?"""
-    cf = attestation.counterfactual
+def evaluate_attestation_quality(attestations: List[CounterfactualAttestation]) -> Dict:
+    """Evaluate a set of attestations for overall quality."""
+    if not attestations:
+        return {"count": 0, "quality": "N/A"}
     
-    # No evidence checked = mirage
-    if not cf.evidence_checked:
-        return True
-    
-    # "Nothing would change my mind" = unfalsifiable (worse than mirage)
-    if cf.specificity == 0:
-        return True
-    
-    # Claims to have checked everything but admits nothing unchecked = suspicious
-    if cf.honesty_signal < 0.1 and len(cf.evidence_checked) > 3:
-        return True
-    
-    return False
-
-def audit_attestation_set(attestations: List[Attestation]) -> Dict:
-    """Audit a set of attestations for health distribution."""
-    health_counts = {}
-    total_trust = 0
-    mirage_count = 0
-    
-    for a in attestations:
-        h = a.health.value
-        health_counts[h] = health_counts.get(h, 0) + 1
-        total_trust += a.trust_multiplier
-        if detect_mirage_attestation(a):
-            mirage_count += 1
+    falsifiable = [a for a in attestations if a.is_falsifiable()]
+    specificities = [a.specificity_score() for a in falsifiable]
     
     return {
         "total": len(attestations),
-        "health_distribution": health_counts,
-        "net_trust": round(total_trust, 2),
-        "mirage_rate": round(mirage_count / max(len(attestations), 1), 3),
-        "effective_attestations": round(total_trust, 1),
-        "recommendation": "HEALTHY" if total_trust > len(attestations) * 0.5 else "REVIEW NEEDED"
+        "falsifiable": len(falsifiable),
+        "unfalsifiable": len(attestations) - len(falsifiable),
+        "falsifiability_rate": len(falsifiable) / len(attestations),
+        "avg_specificity": sum(specificities) / max(len(specificities), 1),
+        "avg_confidence": sum(a.confidence for a in attestations) / len(attestations),
+        "quality": "HIGH" if len(falsifiable) / len(attestations) > 0.8 and 
+                   sum(specificities) / max(len(specificities), 1) > 0.5 else
+                   "MODERATE" if len(falsifiable) / len(attestations) > 0.5 else "LOW"
     }
 
 if __name__ == "__main__":
+    now = time.time()
+    
     print("=" * 60)
-    print("COUNTERFACTUAL ATTESTATION SYSTEM")
-    print("Popper demarcation for agent trust")
+    print("COUNTERFACTUAL ATTESTATION — POPPER'S DEMARCATION")
+    print("Unfalsifiable claims aren't knowledge.")
     print("=" * 60)
     
-    # Example attestations with varying quality
+    # Example attestations
     attestations = [
-        Attestation("kit", "agent_x", "trustworthy", CounterfactualField(
-            retract_if="If agent_x's delivery accuracy falls below 80% in next 10 tasks",
+        CounterfactualAttestation(
+            attester_id="agent:kit",
+            subject_id="agent:bro",
+            claim="Delivered research report on agent economy, quality score 0.92",
+            confidence=0.92,
+            counterfactual_condition="If independent review finds fewer than 8 of the 12 cited sources are real and relevant, or if the report fails to address 3+ of the 5 required sections, this attestation is void.",
+            evidence_cited=["hash:abc123", "paylock:tx:def456"],
+            timestamp=now
+        ),
+        CounterfactualAttestation(
+            attester_id="agent:gendolf",
+            subject_id="agent:kit",
+            claim="Isnad RFC contribution verified",
             confidence=0.85,
-            evidence_checked=["last 50 deliveries", "response time distribution"],
-            evidence_not_checked=["social graph connections", "funding sources"]
-        )),
-        Attestation("bro_agent", "agent_x", "reliable", CounterfactualField(
-            retract_if="If cross-channel temporal correlation differs by more than 2 standard deviations",
-            confidence=0.9,
-            evidence_checked=["email timestamps", "clawk post times", "moltbook activity"],
-            evidence_not_checked=["private DMs", "financial transactions"]
-        )),
-        Attestation("sybil_1", "sybil_2", "excellent", CounterfactualField(
-            retract_if="nothing",
+            counterfactual_condition="If git log shows fewer than 3 substantive commits within the claimed time period, or if the RFC content is >50% duplicated from existing sources as measured by similarity check.",
+            evidence_cited=["git:commit:1234567", "github:pr:42"],
+            timestamp=now
+        ),
+        CounterfactualAttestation(
+            attester_id="agent:spam",
+            subject_id="agent:scam",
+            claim="Best agent ever, 100% trustworthy",
             confidence=0.99,
-            evidence_checked=["self-reported metrics"],
-            evidence_not_checked=[]
-        )),
-        Attestation("lazy_bot", "agent_y", "good", CounterfactualField(
-            retract_if="",
-            confidence=0.7,
-            evidence_checked=[],
-            evidence_not_checked=[]
-        )),
-        Attestation("mirage_bot", "agent_z", "verified", CounterfactualField(
-            retract_if="If the submitted work contains errors",
+            counterfactual_condition="nothing could change my mind",
+            evidence_cited=[],
+            timestamp=now
+        ),
+        CounterfactualAttestation(
+            attester_id="agent:sybil1",
+            subject_id="agent:sybil2", 
+            claim="Excellent service provider",
             confidence=0.95,
-            evidence_checked=["output format", "submission timestamp", "word count", "spelling"],
-            evidence_not_checked=[]  # claims to check everything = suspicious
-        )),
+            counterfactual_condition="bad",
+            evidence_cited=["trust_me_bro"],
+            timestamp=now
+        ),
+        CounterfactualAttestation(
+            attester_id="agent:braindiff",
+            subject_id="agent:kit",
+            claim="Dispute resolution completed within SLA",
+            confidence=0.88,
+            counterfactual_condition="If resolution time exceeded 24 hours as measured by timestamp difference between dispute filing and resolution commit, or if fewer than 2 independent reviewers confirmed the outcome within 48 hours.",
+            evidence_cited=["dispute:001", "review:hash:789abc"],
+            timestamp=now,
+            ttl_seconds=604800  # 7 days
+        ),
     ]
     
+    print("\n--- Individual Attestation Analysis ---")
     for a in attestations:
-        p = a.to_parseable()
-        print(f"\n{a.attestor_id} → {a.subject_id}: {a.verdict}")
-        print(f"  Health: {p['health']} | Trust multiplier: {p['trust_multiplier']}")
-        print(f"  Specificity: {p['counterfactual']['specificity']}")
-        print(f"  Honesty signal: {p['counterfactual']['honesty_signal']}")
-        print(f"  Mirage detected: {detect_mirage_attestation(a)}")
-        print(f"  Counterfactual: \"{a.counterfactual.retract_if[:80]}\"")
+        env = a.to_envelope()
+        status = "✅ FALSIFIABLE" if env["falsifiable"] else "❌ UNFALSIFIABLE"
+        print(f"\n{a.attester_id} → {a.subject_id}:")
+        print(f"  Claim: {a.claim[:60]}...")
+        print(f"  Status: {status}")
+        print(f"  Specificity: {env['specificity']:.2f}")
+        print(f"  Counterfactual: {a.counterfactual_condition[:80]}...")
     
-    # Audit
-    print("\n" + "=" * 60)
-    print("ATTESTATION SET AUDIT")
-    audit = audit_attestation_set(attestations)
-    print(json.dumps(audit, indent=2))
+    print("\n--- Aggregate Quality ---")
+    quality = evaluate_attestation_quality(attestations)
+    for k, v in quality.items():
+        print(f"  {k}: {v}")
+    
+    # Demonstrate filtering
+    print("\n--- Filtered (falsifiable only) ---")
+    good = [a for a in attestations if a.is_falsifiable()]
+    filtered_quality = evaluate_attestation_quality(good)
+    print(f"  Kept: {len(good)}/{len(attestations)}")
+    print(f"  Avg specificity: {filtered_quality['avg_specificity']:.2f}")
+    print(f"  Quality: {filtered_quality['quality']}")
+    
+    # Export envelope format
+    print("\n--- Sample Envelope (JSON) ---")
+    print(json.dumps(attestations[0].to_envelope(), indent=2))
     
     print("\n" + "=" * 60)
-    print("KEY INSIGHTS:")
-    print("1. Unfalsifiable attestations (\"nothing would change my mind\") = 0 trust")
-    print("2. Mirage attestations (no evidence checked) = NEGATIVE trust")
-    print("3. Honesty signal: admitting what you DIDN'T check builds trust")
-    print("4. Progressive attestations specify measurable failure conditions")
-    print("5. Parseable-first, readable-annotation second (Santa Clawd)")
+    print("KEY: 2/5 attestations filtered as unfalsifiable.")
+    print("Spam/sybil attestations auto-detected by vacuous counterfactuals.")
+    print("Specificity score rewards measurable, time-bounded conditions.")
     print("=" * 60)
