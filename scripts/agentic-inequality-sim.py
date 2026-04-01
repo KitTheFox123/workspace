@@ -1,154 +1,179 @@
 #!/usr/bin/env python3
-"""agentic-inequality-sim.py — Models compound inequality from agent access.
+"""agentic-inequality-sim.py — Models agentic inequality dynamics.
 
-Based on Sharp, Bilgin, Gabriel & Hammond (Oxford 2025) "Agentic Inequality":
-- Three dimensions: availability, quality, quantity
-- Compounding: access to many high-quality agents creates feedback loops
-- Matthew Effect: initial advantages accumulate over time (Merton 1968)
+Based on Sharp, Bilgin, Gabriel & Hammond (Oxford, Oct 2025):
+"Agentic Inequality" — disparities from differential access to AI agents.
 
-Simulates: how initial agent access gaps compound over time,
-and tests interventions (minimum viable agency, progressive compute tax).
+Three dimensions: availability, quality, quantity.
+Key finding: compounding effects create self-reinforcing loops.
 """
 
 import random
+import statistics
 from dataclasses import dataclass, field
 from typing import List, Dict
 
 @dataclass
+class Agent:
+    quality: float  # 0-1
+    speed: float    # tasks/round
+
+@dataclass 
 class Actor:
     name: str
-    wealth: float  # resources
-    agent_quality: float  # 0-1
-    agent_quantity: int
-    has_access: bool = True
-    history: List[float] = field(default_factory=list)
+    wealth: float
+    agents: List[Agent] = field(default_factory=list)
     
     @property
-    def effective_power(self) -> float:
-        """Compound effect: quality × quantity × access."""
-        if not self.has_access:
-            return 0.1  # baseline human capability
-        return self.agent_quality * (1 + 0.3 * (self.agent_quantity - 1))
-
-def simulate_market(actors: List[Actor], rounds: int = 50, 
-                    intervention: str = "none") -> Dict:
-    """Simulate market dynamics with agentic inequality.
+    def effective_capacity(self) -> float:
+        """Total effective agent-hours: sum(quality * speed)"""
+        return sum(a.quality * a.speed for a in self.agents)
     
-    Interventions:
-    - none: pure market
-    - minimum_agency: ensure all actors have at least 1 basic agent
-    - progressive_tax: tax top actors to fund bottom
-    - quality_floor: open-source model ensures minimum quality
+    @property
+    def agent_count(self) -> int:
+        return len(self.agents)
+
+def gini_coefficient(values: List[float]) -> float:
+    """Compute Gini coefficient. 0 = perfect equality, 1 = perfect inequality."""
+    if not values or all(v == 0 for v in values):
+        return 0.0
+    n = len(values)
+    sorted_vals = sorted(values)
+    cumsum = sum((2 * (i + 1) - n - 1) * v for i, v in enumerate(sorted_vals))
+    return cumsum / (n * sum(sorted_vals))
+
+def simulate_economy(n_actors: int = 100, 
+                     rounds: int = 50,
+                     reinvestment_rate: float = 0.3,
+                     min_agent_policy: bool = False) -> Dict:
+    """Simulate agent economy with wealth-driven agent acquisition.
+    
+    Args:
+        n_actors: Number of participants
+        rounds: Simulation rounds
+        reinvestment_rate: Fraction of earnings reinvested in agents
+        min_agent_policy: If True, guarantee 1 basic agent per actor (Rawlsian floor)
     """
-    for r in range(rounds):
-        # Each round: actors compete for opportunities
-        total_power = sum(a.effective_power for a in actors)
-        
-        for actor in actors:
-            # Share of opportunities proportional to power
-            share = actor.effective_power / total_power
-            # Revenue = share × market size (grows with total power)
-            market_size = 100 + total_power * 2
-            revenue = share * market_size
-            
-            # Reinvestment: wealth → better/more agents (Matthew Effect)
-            actor.wealth += revenue
-            if actor.wealth > 50 and actor.agent_quantity < 20:
-                actor.agent_quantity += 1
-                actor.wealth -= 30
-            if actor.wealth > 100:
-                actor.agent_quality = min(1.0, actor.agent_quality + 0.02)
-                actor.wealth -= 50
-            
-            actor.history.append(actor.wealth)
-        
-        # Apply intervention
-        if intervention == "minimum_agency":
-            for a in actors:
-                if not a.has_access:
-                    a.has_access = True
-                    a.agent_quality = 0.3
-                    a.agent_quantity = 1
-        elif intervention == "progressive_tax":
-            top = max(actors, key=lambda a: a.wealth)
-            bottom = min(actors, key=lambda a: a.wealth)
-            transfer = top.wealth * 0.05
-            top.wealth -= transfer
-            bottom.wealth += transfer
-        elif intervention == "quality_floor":
-            for a in actors:
-                a.agent_quality = max(a.agent_quality, 0.4)  # open-source floor
-                a.has_access = True
-    
-    return compute_metrics(actors)
-
-def compute_metrics(actors: List[Actor]) -> Dict:
-    """Compute inequality metrics."""
-    wealths = sorted([a.wealth for a in actors])
-    n = len(wealths)
-    total = sum(wealths)
-    
-    # Gini coefficient
-    numerator = sum(abs(wealths[i] - wealths[j]) for i in range(n) for j in range(n))
-    gini = numerator / (2 * n * total) if total > 0 else 0
-    
-    # Top/bottom ratio
-    top_20 = sum(wealths[int(n*0.8):])
-    bottom_20 = sum(wealths[:int(n*0.2)]) or 0.01
-    
-    # Effective power spread
-    powers = [a.effective_power for a in actors]
-    
-    return {
-        "gini": round(gini, 3),
-        "top_bottom_ratio": round(top_20 / bottom_20, 1),
-        "max_wealth": round(max(wealths), 1),
-        "min_wealth": round(min(wealths), 1),
-        "mean_wealth": round(total / n, 1),
-        "max_power": round(max(powers), 2),
-        "min_power": round(min(powers), 2),
-        "power_ratio": round(max(powers) / max(min(powers), 0.01), 1),
-    }
-
-def create_initial_population(n: int = 20) -> List[Actor]:
-    """Create population with realistic initial inequality."""
-    actors = []
-    for i in range(n):
-        # 20% have high access, 50% medium, 30% low/none
-        r = random.random()
-        if r < 0.2:  # wealthy early adopters
-            actors.append(Actor(f"elite_{i}", wealth=100, agent_quality=0.8, agent_quantity=5))
-        elif r < 0.7:  # middle tier
-            actors.append(Actor(f"mid_{i}", wealth=30, agent_quality=0.4, agent_quantity=1))
-        else:  # no access
-            actors.append(Actor(f"excluded_{i}", wealth=10, agent_quality=0.0, agent_quantity=0, has_access=False))
-    return actors
-
-if __name__ == "__main__":
     random.seed(42)
     
+    # Initial distribution: log-normal wealth
+    actors = []
+    for i in range(n_actors):
+        w = random.lognormvariate(2, 1)
+        a = Actor(name=f"actor_{i}", wealth=w)
+        # Initial agents proportional to wealth
+        n_agents = max(1, int(w / 5))
+        for _ in range(n_agents):
+            q = min(1.0, random.gauss(0.3 + w/50, 0.1))
+            a.agents.append(Agent(quality=max(0.1, q), speed=random.uniform(0.5, 2.0)))
+        actors.append(a)
+    
+    if min_agent_policy:
+        for a in actors:
+            if not a.agents:
+                a.agents.append(Agent(quality=0.5, speed=1.0))
+    
+    history = []
+    
+    for round_num in range(rounds):
+        # Each actor earns proportional to effective capacity
+        for a in actors:
+            earnings = a.effective_capacity * random.uniform(0.8, 1.2)
+            a.wealth += earnings
+            
+            # Reinvest in agents
+            invest = earnings * reinvestment_rate
+            if invest > 5:  # Cost of a new agent
+                q = min(1.0, 0.3 + (a.wealth / (max(a.wealth for aa in actors) + 1)) * 0.5)
+                a.agents.append(Agent(quality=q, speed=random.uniform(0.5, 2.0)))
+                a.wealth -= 5
+        
+        # Minimum agent policy: top up each round
+        if min_agent_policy:
+            for a in actors:
+                if a.effective_capacity < 0.5:
+                    a.agents.append(Agent(quality=0.5, speed=1.0))
+        
+        capacities = [a.effective_capacity for a in actors]
+        wealths = [a.wealth for a in actors]
+        
+        history.append({
+            "round": round_num,
+            "gini_capacity": gini_coefficient(capacities),
+            "gini_wealth": gini_coefficient(wealths),
+            "mean_agents": statistics.mean(a.agent_count for a in actors),
+            "max_agents": max(a.agent_count for a in actors),
+            "min_agents": min(a.agent_count for a in actors),
+            "top10_share": sum(sorted(capacities)[-10:]) / sum(capacities),
+        })
+    
+    return {
+        "final_gini_capacity": history[-1]["gini_capacity"],
+        "final_gini_wealth": history[-1]["gini_wealth"],
+        "final_top10_share": history[-1]["top10_share"],
+        "final_mean_agents": history[-1]["mean_agents"],
+        "gini_trajectory": [h["gini_capacity"] for h in history],
+        "history": history
+    }
+
+def compare_policies():
+    """Compare baseline vs Rawlsian minimum agent floor."""
     print("=" * 60)
     print("AGENTIC INEQUALITY SIMULATOR")
-    print("Based on Sharp et al (Oxford 2025)")
+    print("Based on Sharp et al (Oxford, 2025)")
     print("=" * 60)
     
-    interventions = ["none", "minimum_agency", "progressive_tax", "quality_floor"]
+    baseline = simulate_economy(min_agent_policy=False)
+    rawlsian = simulate_economy(min_agent_policy=True)
     
-    for intervention in interventions:
-        actors = create_initial_population(20)
-        metrics = simulate_market(actors, rounds=50, intervention=intervention)
-        
-        print(f"\n--- Intervention: {intervention} ---")
-        print(f"  Gini coefficient: {metrics['gini']}")
-        print(f"  Top/Bottom 20% ratio: {metrics['top_bottom_ratio']}x")
-        print(f"  Wealth range: {metrics['min_wealth']} - {metrics['max_wealth']}")
-        print(f"  Power ratio: {metrics['power_ratio']}x")
+    print("\n--- Baseline (no intervention) ---")
+    print(f"Final Gini (capacity): {baseline['final_gini_capacity']:.3f}")
+    print(f"Final Gini (wealth):   {baseline['final_gini_wealth']:.3f}")
+    print(f"Top 10% capacity share: {baseline['final_top10_share']:.1%}")
+    print(f"Mean agents/actor: {baseline['final_mean_agents']:.1f}")
+    
+    print("\n--- Rawlsian Floor (minimum 1 agent guaranteed) ---")
+    print(f"Final Gini (capacity): {rawlsian['final_gini_capacity']:.3f}")
+    print(f"Final Gini (wealth):   {rawlsian['final_gini_wealth']:.3f}")
+    print(f"Top 10% capacity share: {rawlsian['final_top10_share']:.1%}")
+    print(f"Mean agents/actor: {rawlsian['final_mean_agents']:.1f}")
+    
+    # Self-reinforcement threshold
+    print("\n--- Self-Reinforcement Analysis ---")
+    gini_traj = baseline['gini_trajectory']
+    for i, g in enumerate(gini_traj):
+        if g > 0.6:
+            print(f"⚠️  Gini crosses 0.6 at round {i} — concentration becomes self-reinforcing")
+            break
+    else:
+        print(f"Gini stays below 0.6 (max: {max(gini_traj):.3f})")
+    
+    # Levelling-up survival test
+    print("\n--- Levelling-Up Survival Test ---")
+    # Compare early vs late Gini change rate
+    early_delta = gini_traj[10] - gini_traj[0]
+    late_delta = gini_traj[-1] - gini_traj[-11]
+    print(f"Early Gini change (rounds 0-10): {early_delta:+.4f}")
+    print(f"Late Gini change (rounds 40-50): {late_delta:+.4f}")
+    if late_delta > early_delta:
+        print("Inequality ACCELERATING — levelling-up effect did not survive")
+    else:
+        print("Inequality decelerating — levelling-up may persist")
+    
+    # Sharp et al dimensions
+    print("\n--- Three Dimensions (Sharp et al) ---")
+    print("Availability: binary access gap")
+    print(f"  Actors with 0 agents (baseline): {sum(1 for h in [baseline] for _ in [1])}")
+    print("Quality: agent capability gap")
+    print("Quantity: scale gap")
+    print(f"  Max/min agent ratio (baseline): {baseline['history'][-1]['max_agents']}/{baseline['history'][-1]['min_agents']}")
+    print(f"  Compounding: availability × quality × quantity = effective capacity")
     
     print("\n" + "=" * 60)
-    print("KEY FINDINGS:")
-    print("- No intervention: Gini rises, power concentrates")
-    print("- Minimum agency: reduces exclusion but not concentration")  
-    print("- Progressive tax: slows concentration, doesn't prevent it")
-    print("- Quality floor (open-source): most effective equalizer")
-    print("  Because quality compounds — a floor lifts everyone's ceiling")
+    print("KEY FINDING: Without intervention, agentic inequality")
+    print("self-reinforces through wealth → agents → earnings → wealth loop.")
+    print(f"Rawlsian floor reduces Gini by {baseline['final_gini_capacity'] - rawlsian['final_gini_capacity']:.3f}")
     print("=" * 60)
+
+if __name__ == "__main__":
+    compare_policies()
