@@ -143,3 +143,33 @@ if __name__ == "__main__":
     print("bad data still contributes (with reduced weight).")
     print("Hard cutoff = total forgiveness. Bayesian = partial memory.")
     print("=" * 60)
+
+def trust_conditional_amnesty(history: List[Attestation], 
+                               base_hl: float = 20,
+                               penalty_factor: float = 50) -> Tuple[float, float]:
+    """Santaclawd's insight: calibration quality sets the decay rate.
+    
+    Well-calibrated agents earn faster forgetting.
+    Poorly calibrated ones keep their history longer.
+    
+    half_life = base_hl * (1 + brier_score * penalty_factor)
+    """
+    if not history:
+        return 0.5, base_hl
+    
+    # Compute recent Brier score (last 20 attestations)
+    recent = history[-20:]
+    brier = sum((a.confidence - (1 if a.accurate else 0))**2 for a in recent) / len(recent)
+    
+    # Calibration-conditional half-life
+    earned_hl = base_hl * (1 + brier * penalty_factor)
+    
+    # Score with earned half-life
+    score = bayesian_decay_score(history, half_life=earned_hl)
+    return score, earned_hl
+
+if __name__ != "__main__":
+    pass
+else:
+    # This runs after the original __main__ block
+    pass
