@@ -1,174 +1,218 @@
 #!/usr/bin/env python3
-"""agentic-inequality-sim.py — Models compounding effects of agentic inequality.
+"""agentic-inequality-sim.py — Models agentic inequality dynamics.
 
 Based on Sharp, Bilgin, Gabriel & Hammond (Oxford, Oct 2025):
-"Agentic Inequality" — disparities in availability, quality, and quantity
-of AI agents create novel power asymmetries through scalable delegation.
+"Agentic Inequality" — three dimensions: availability, quality, quantity.
+Compounding creates feedback loops. Levelling-up effect may not survive
+transition from assistive to autonomous agents.
 
-Key finding: the "levelling-up effect" (AI helps novices most) may not
-survive the transition from assistive tools to autonomous agents.
+Simulates Gini coefficient evolution under different policy regimes.
 """
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict
 
 @dataclass
 class Agent:
-    quality: float      # 0-1 (capability level)
-    available: bool
-    
-@dataclass  
-class Actor:
+    quality: float  # 0-1
+    compute_hours: float  # per period
+
+@dataclass 
+class Participant:
     name: str
-    base_capability: float  # intrinsic skill 0-1
-    agents: List[Agent]
+    agents: List[Agent] = field(default_factory=list)
     wealth: float = 100.0
     
     @property
     def effective_power(self) -> float:
-        """Total effective power = base + agent contributions (compounding)."""
-        if not self.agents:
-            return self.base_capability
-        agent_power = sum(a.quality for a in self.agents if a.available)
-        # Compounding: more agents = superlinear returns (coordination bonus)
-        coordination_bonus = 1.0 + 0.1 * len([a for a in self.agents if a.available])
-        return self.base_capability + agent_power * coordination_bonus
-
-def simulate_market(actors: List[Actor], rounds: int = 50) -> Dict:
-    """Simulate agent-mediated market competition.
+        """Total agent-hours × quality."""
+        return sum(a.quality * a.compute_hours for a in self.agents)
     
-    Each round: actors compete for value. Higher effective power = larger share.
-    Winners reinvest in better/more agents. Losers fall behind.
+    @property
+    def agent_count(self) -> int:
+        return len(self.agents)
+
+def gini_coefficient(values: List[float]) -> float:
+    """Calculate Gini coefficient of a distribution."""
+    if not values or all(v == 0 for v in values):
+        return 0.0
+    n = len(values)
+    sorted_vals = sorted(values)
+    cumsum = sum((2 * (i + 1) - n - 1) * v for i, v in enumerate(sorted_vals))
+    return cumsum / (n * sum(sorted_vals))
+
+def simulate_market(n_participants: int = 50,
+                    n_rounds: int = 20,
+                    policy: str = "none",
+                    initial_inequality: float = 0.3) -> Dict:
+    """Simulate agent economy with feedback loops.
+    
+    Policies:
+    - "none": pure market, feedback loops compound
+    - "floor": minimum viable agency (everyone gets 1 basic agent)
+    - "cap": anti-whale (max 10 agents per participant)
+    - "tax": progressive compute tax redistributed as quality upgrades
+    - "open": open-source quality floor (min quality = 0.5)
     """
-    history = {a.name: [a.wealth] for a in actors}
+    # Initialize with inequality
+    participants = []
+    for i in range(n_participants):
+        # Pareto-distributed initial wealth
+        w = 100 * (random.paretovariate(1.5) if random.random() > initial_inequality else 1.0)
+        p = Participant(name=f"p_{i}", wealth=w)
+        
+        # Initial agent allocation proportional to wealth
+        n_agents = max(1, int(w / 50))
+        for _ in range(n_agents):
+            q = min(1.0, random.gauss(w / 500, 0.1))
+            p.agents.append(Agent(quality=max(0.1, q), compute_hours=random.uniform(1, 10)))
+        participants.append(p)
+    
     gini_history = []
+    power_history = []
     
-    for r in range(rounds):
-        total_power = sum(a.effective_power for a in actors)
-        pool = 100.0  # value created per round
+    for round_num in range(n_rounds):
+        # Apply policy
+        if policy == "floor":
+            for p in participants:
+                if not p.agents:
+                    p.agents.append(Agent(quality=0.3, compute_hours=2.0))
         
-        for actor in actors:
-            share = (actor.effective_power / total_power) * pool
-            actor.wealth += share
-            
-            # Reinvestment: wealthy actors buy better agents
-            if actor.wealth > 200 and random.random() < 0.3:
-                new_quality = min(1.0, 0.5 + actor.wealth / 1000)
-                actor.agents.append(Agent(quality=new_quality, available=True))
-                actor.wealth -= 50
-            
-            history[actor.name].append(actor.wealth)
+        elif policy == "cap":
+            for p in participants:
+                if len(p.agents) > 10:
+                    p.agents = sorted(p.agents, key=lambda a: a.quality, reverse=True)[:10]
         
-        # Calculate Gini
-        wealths = sorted([a.wealth for a in actors])
-        n = len(wealths)
-        if n > 0 and sum(wealths) > 0:
-            gini = sum((2*i - n + 1) * w for i, w in enumerate(wealths)) / (n * sum(wealths))
-            gini_history.append(gini)
-    
-    return {"history": history, "gini": gini_history}
-
-def levelling_effect_comparison(n_actors: int = 20, rounds: int = 30) -> Dict:
-    """Compare assistive AI (levelling) vs autonomous agents (concentrating).
-    
-    Sharp et al: "the observed levelling-up is a feature of human-tool augmentation;
-    it is unclear if this positive effect can survive a transition to agentic capital"
-    """
-    random.seed(42)
-    
-    # Scenario 1: Assistive AI (tools) — helps low-skill more
-    assistive_actors = []
-    for i in range(n_actors):
-        skill = random.uniform(0.1, 1.0)
-        # Assistive boost inversely proportional to skill (levelling up)
-        boost = max(0, 0.8 - skill) * 0.5
-        assistive_actors.append(Actor(
-            name=f"actor_{i}",
-            base_capability=skill + boost,
-            agents=[]  # no autonomous agents
-        ))
-    
-    assistive_result = simulate_market(assistive_actors, rounds)
-    
-    # Scenario 2: Autonomous agents — helps high-resource more
-    random.seed(42)
-    autonomous_actors = []
-    for i in range(n_actors):
-        skill = random.uniform(0.1, 1.0)
-        # Rich actors start with more/better agents
-        n_agents = int(skill * 5)  # 0-5 agents based on initial capability
-        agents = [Agent(quality=skill * 0.8, available=True) for _ in range(n_agents)]
-        autonomous_actors.append(Actor(
-            name=f"actor_{i}",
-            base_capability=skill,
-            agents=agents
-        ))
-    
-    autonomous_result = simulate_market(autonomous_actors, rounds)
+        elif policy == "tax":
+            total_power = sum(p.effective_power for p in participants)
+            if total_power > 0:
+                tax_pool = 0
+                for p in participants:
+                    share = p.effective_power / total_power
+                    if share > 0.05:  # tax top earners
+                        tax = (share - 0.05) * p.effective_power * 0.2
+                        tax_pool += tax
+                # Redistribute as quality upgrades to bottom half
+                bottom = sorted(participants, key=lambda p: p.effective_power)[:n_participants//2]
+                per_agent = tax_pool / max(1, sum(p.agent_count for p in bottom))
+                for p in bottom:
+                    for a in p.agents:
+                        a.quality = min(1.0, a.quality + per_agent * 0.01)
+        
+        elif policy == "open":
+            for p in participants:
+                for a in p.agents:
+                    a.quality = max(0.5, a.quality)
+        
+        # Market dynamics: agents generate returns proportional to power
+        for p in participants:
+            returns = p.effective_power * random.uniform(0.8, 1.2) * 0.1
+            p.wealth += returns
+            
+            # Feedback loop: wealth enables acquiring more/better agents
+            if p.wealth > 200 and random.random() < 0.3:
+                new_q = min(1.0, p.wealth / 1000 + random.gauss(0, 0.1))
+                p.agents.append(Agent(quality=max(0.1, new_q), compute_hours=random.uniform(1, 8)))
+                p.wealth -= 50
+        
+        # Record metrics
+        powers = [p.effective_power for p in participants]
+        gini_history.append(gini_coefficient(powers))
+        power_history.append({
+            "top_10pct": sum(sorted(powers, reverse=True)[:n_participants//10]) / max(1, sum(powers)),
+            "bottom_50pct": sum(sorted(powers)[:n_participants//2]) / max(1, sum(powers)),
+            "median_agents": sorted([p.agent_count for p in participants])[n_participants//2],
+        })
     
     return {
-        "assistive_final_gini": assistive_result["gini"][-1] if assistive_result["gini"] else 0,
-        "autonomous_final_gini": autonomous_result["gini"][-1] if autonomous_result["gini"] else 0,
-        "assistive_gini_trajectory": [assistive_result["gini"][i] for i in range(0, len(assistive_result["gini"]), 5)],
-        "autonomous_gini_trajectory": [autonomous_result["gini"][i] for i in range(0, len(autonomous_result["gini"]), 5)],
-        "wealth_ratio_assistive": max(a.wealth for a in assistive_actors) / max(1, min(a.wealth for a in assistive_actors)),
-        "wealth_ratio_autonomous": max(a.wealth for a in autonomous_actors) / max(1, min(a.wealth for a in autonomous_actors)),
+        "policy": policy,
+        "final_gini": gini_history[-1],
+        "gini_trajectory": [round(g, 3) for g in gini_history[::5]],
+        "final_top10_share": power_history[-1]["top_10pct"],
+        "final_bottom50_share": power_history[-1]["bottom_50pct"],
+        "final_median_agents": power_history[-1]["median_agents"],
+        "concentration_ratio": power_history[-1]["top_10pct"] / max(0.01, power_history[-1]["bottom_50pct"]),
     }
 
-def minimum_viable_agency(n_actors: int = 20, rounds: int = 30) -> Dict:
-    """Test: does providing minimum agent quality preserve participation?
+def levelling_effect_test() -> Dict:
+    """Test whether levelling-up survives assistive → autonomous transition.
     
-    Rawlsian approach: ensure floor of agent access for all.
+    Sharp et al hypothesis: assistive AI levels up novices, but autonomous
+    agents may not — because delegation ≠ augmentation.
     """
-    random.seed(42)
-    
     results = {}
-    for floor_quality in [0.0, 0.2, 0.4, 0.6]:
-        actors = []
-        for i in range(n_actors):
-            skill = random.uniform(0.1, 1.0)
-            n_agents = int(skill * 5)
-            # Everyone gets at least one agent at floor quality
-            agents = [Agent(quality=max(floor_quality, skill * 0.8), available=True) 
-                      for _ in range(max(1, n_agents))]
-            actors.append(Actor(name=f"a_{i}", base_capability=skill, agents=agents))
+    
+    for mode in ["assistive", "autonomous"]:
+        novice_gains = []
+        expert_gains = []
         
-        result = simulate_market(actors, rounds)
-        final_gini = result["gini"][-1] if result["gini"] else 0
-        min_wealth = min(a.wealth for a in actors)
-        max_wealth = max(a.wealth for a in actors)
+        for _ in range(100):
+            novice_skill = random.uniform(0.2, 0.4)
+            expert_skill = random.uniform(0.7, 0.9)
+            agent_quality = random.uniform(0.6, 0.9)
+            
+            if mode == "assistive":
+                # Augmentation: AI fills skill gaps → novices gain more
+                novice_output = novice_skill + agent_quality * (1 - novice_skill) * 0.7
+                expert_output = expert_skill + agent_quality * (1 - expert_skill) * 0.7
+            else:
+                # Delegation: AI acts independently → quality determines outcome
+                # Experts better at delegation (specify goals, verify output)
+                novice_delegation = novice_skill * 0.5  # poor at specifying
+                expert_delegation = expert_skill * 0.9  # good at specifying
+                novice_output = agent_quality * novice_delegation + novice_skill * 0.3
+                expert_output = agent_quality * expert_delegation + expert_skill * 0.3
+            
+            novice_gains.append(novice_output - novice_skill)
+            expert_gains.append(expert_output - expert_skill)
         
-        results[f"floor_{floor_quality}"] = {
-            "gini": round(final_gini, 3),
-            "wealth_ratio": round(max_wealth / max(1, min_wealth), 1),
-            "min_wealth": round(min_wealth, 1),
-            "max_wealth": round(max_wealth, 1),
+        avg_novice = sum(novice_gains) / len(novice_gains)
+        avg_expert = sum(expert_gains) / len(expert_gains)
+        
+        results[mode] = {
+            "novice_avg_gain": round(avg_novice, 3),
+            "expert_avg_gain": round(avg_expert, 3),
+            "levelling_effect": avg_novice > avg_expert,
+            "gap_change": round(avg_novice - avg_expert, 3),
         }
     
     return results
 
 if __name__ == "__main__":
+    random.seed(42)
+    
     print("=" * 60)
-    print("AGENTIC INEQUALITY SIMULATION")
+    print("AGENTIC INEQUALITY SIMULATOR")
     print("Based on Sharp et al (Oxford, 2025)")
     print("=" * 60)
     
-    print("\n--- Assistive vs Autonomous: Levelling Effect ---")
-    comparison = levelling_effect_comparison()
-    print(f"Assistive AI (tools):     Gini = {comparison['assistive_final_gini']:.3f}, wealth ratio = {comparison['wealth_ratio_assistive']:.1f}x")
-    print(f"Autonomous agents:        Gini = {comparison['autonomous_final_gini']:.3f}, wealth ratio = {comparison['wealth_ratio_autonomous']:.1f}x")
-    print(f"\nAssistive Gini trajectory:  {[f'{g:.3f}' for g in comparison['assistive_gini_trajectory']]}")
-    print(f"Autonomous Gini trajectory: {[f'{g:.3f}' for g in comparison['autonomous_gini_trajectory']]}")
-    print(f"\n⚠️  Autonomous agents produce {comparison['autonomous_final_gini']/max(0.001,comparison['assistive_final_gini']):.1f}x higher inequality")
+    # 1. Policy comparison
+    print("\n--- Policy Comparison (50 participants, 20 rounds) ---")
+    policies = ["none", "floor", "cap", "tax", "open"]
     
-    print("\n--- Minimum Viable Agency (Rawlsian Floor) ---")
-    mva = minimum_viable_agency()
-    for label, data in mva.items():
-        print(f"  {label}: Gini={data['gini']}, ratio={data['wealth_ratio']}x, range=[{data['min_wealth']}, {data['max_wealth']}]")
+    for policy in policies:
+        result = simulate_market(policy=policy)
+        print(f"\n{policy.upper()}:")
+        print(f"  Final Gini: {result['final_gini']:.3f}")
+        print(f"  Top 10% share: {result['final_top10_share']:.1%}")
+        print(f"  Bottom 50% share: {result['final_bottom50_share']:.1%}")
+        print(f"  Concentration ratio: {result['concentration_ratio']:.1f}x")
+        print(f"  Gini trajectory: {result['gini_trajectory']}")
+    
+    # 2. Levelling effect test
+    print("\n--- Levelling-Up Effect: Assistive vs Autonomous ---")
+    levelling = levelling_effect_test()
+    
+    for mode, data in levelling.items():
+        print(f"\n{mode.upper()}:")
+        print(f"  Novice gain: +{data['novice_avg_gain']:.3f}")
+        print(f"  Expert gain: +{data['expert_avg_gain']:.3f}")
+        print(f"  Levelling effect: {'YES ✓' if data['levelling_effect'] else 'NO ✗'}")
+        print(f"  Gap change: {data['gap_change']:+.3f} ({'narrows' if data['gap_change'] > 0 else 'WIDENS'})")
     
     print("\n" + "=" * 60)
-    print("KEY FINDING: Assistive AI levels up; autonomous agents concentrate.")
-    print("Minimum viable agency (floor=0.4) reduces Gini significantly.")
-    print("The transition from tools to agents is NOT neutral on inequality.")
+    print("KEY FINDING: Assistive AI levels up novices (+gap narrowing).")
+    print("Autonomous AI reverses this — experts delegate better.")
+    print("The levelling-up effect does NOT survive the transition.")
     print("=" * 60)
