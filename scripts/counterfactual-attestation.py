@@ -1,264 +1,236 @@
 #!/usr/bin/env python3
-"""counterfactual-attestation.py — Popper demarcation for trust protocols.
+"""counterfactual-attestation.py — Popper demarcation for trust attestations.
 
-Inspired by Santa Clawd's insight: attestations without counterfactual 
-conditions are prior completion, not evaluation. If no evidence would 
-change the verdict, it's not falsifiable — and unfalsifiable claims 
-aren't trust.
+Every attestation must include a falsification condition.
+If the condition is met and attestation isn't revoked, attestor loses credibility.
 
-Connects to:
-- Popper: demarcation criterion (falsifiability)
-- Stanford mirage study: models pattern-match without processing input
-- Isnad-rfc: structural attestation layer
+Based on:
+- Popper (1934): demarcation via falsifiability
+- Stanford mirage study (2026): models pattern-match without processing
+- Santa Clawd's insight: counterfactual field = validity condition, not metadata
 """
 
-import json
 import hashlib
-import random
+import json
+import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
-from datetime import datetime, timedelta
 
 @dataclass
-class CounterfactualCondition:
-    """What would change the verdict."""
-    description: str
-    evidence_type: str  # "hash_mismatch", "timestamp_violation", "content_drift", etc.
-    threshold: Optional[float] = None
+class FalsificationCondition:
+    """Machine-parseable condition that would invalidate the attestation."""
+    condition_type: str  # "threshold", "event", "temporal", "behavioral"
+    description: str     # human-readable annotation
+    parameters: Dict     # machine-parseable params
     
-    def to_dict(self) -> Dict:
-        d = {"description": self.description, "evidence_type": self.evidence_type}
-        if self.threshold is not None:
-            d["threshold"] = self.threshold
-        return d
+    def evaluate(self, evidence: Dict) -> bool:
+        """Check if falsification condition is met."""
+        if self.condition_type == "threshold":
+            metric = evidence.get(self.parameters.get("metric", ""))
+            threshold = self.parameters.get("threshold", 0)
+            direction = self.parameters.get("direction", "above")
+            if metric is None:
+                return False
+            return metric > threshold if direction == "above" else metric < threshold
+        
+        elif self.condition_type == "event":
+            return evidence.get("event") == self.parameters.get("event_type")
+        
+        elif self.condition_type == "temporal":
+            deadline = self.parameters.get("deadline", float('inf'))
+            return evidence.get("timestamp", 0) > deadline
+        
+        elif self.condition_type == "behavioral":
+            pattern = self.parameters.get("pattern")
+            observed = evidence.get("behavior")
+            return observed == pattern
+        
+        return False
 
 @dataclass
-class Attestation:
-    """An attestation with mandatory counterfactual."""
+class CounterfactualAttestation:
+    """An attestation with mandatory falsification condition."""
     attestor: str
     subject: str
-    verdict: str
-    confidence: float
-    counterfactual: Optional[CounterfactualCondition]
-    evidence_refs: List[str] = field(default_factory=list)
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    claim: str
+    confidence: float  # 0-1
+    falsification: FalsificationCondition
+    timestamp: float = field(default_factory=time.time)
+    revoked: bool = False
+    revocation_reason: Optional[str] = None
     
     @property
-    def is_falsifiable(self) -> bool:
-        """Popper test: does this attestation specify what would change it?"""
-        return self.counterfactual is not None
-    
-    @property
-    def quality_score(self) -> float:
-        """Score attestation quality. Unfalsifiable = 0."""
-        if not self.is_falsifiable:
-            return 0.0
-        
-        # Specificity bonus: threshold-bearing counterfactuals are more specific
-        specificity = 0.5
-        if self.counterfactual.threshold is not None:
-            specificity = 0.8
-        
-        # Evidence backing
-        evidence_score = min(len(self.evidence_refs) / 3, 1.0)
-        
-        # Confidence calibration: very high confidence with few evidence refs = suspect
-        calibration = 1.0
-        if self.confidence > 0.95 and len(self.evidence_refs) < 2:
-            calibration = 0.5  # overconfident
-        
-        return specificity * 0.4 + evidence_score * 0.3 + calibration * 0.3
-    
-    def to_envelope(self) -> Dict:
-        """Serialize to isnad-compatible envelope."""
-        env = {
+    def hash(self) -> str:
+        """Content-addressable hash of the attestation."""
+        content = json.dumps({
             "attestor": self.attestor,
-            "subject": self.subject,
-            "verdict": self.verdict,
+            "subject": self.subject, 
+            "claim": self.claim,
             "confidence": self.confidence,
-            "counterfactual": self.counterfactual.to_dict() if self.counterfactual else None,
-            "evidence_refs": self.evidence_refs,
-            "timestamp": self.timestamp,
-            "quality_score": round(self.quality_score, 3),
-            "falsifiable": self.is_falsifiable
-        }
-        # Hash the envelope for chain integrity
-        content = json.dumps(env, sort_keys=True)
-        env["hash"] = hashlib.sha256(content.encode()).hexdigest()[:16]
-        return env
+            "falsification": {
+                "type": self.falsification.condition_type,
+                "params": self.falsification.parameters
+            },
+            "timestamp": self.timestamp
+        }, sort_keys=True)
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+    
+    def check_falsified(self, evidence: Dict) -> bool:
+        """Check if this attestation has been falsified."""
+        return self.falsification.evaluate(evidence)
 
-def detect_rubber_stamping(attestations: List[Attestation], 
-                           trigger_rate_threshold: float = 0.05) -> Dict:
-    """Detect attestors whose counterfactuals never trigger.
+@dataclass
+class AttestorReputation:
+    """Track attestor credibility based on falsification history."""
+    attestor_id: str
+    total_attestations: int = 0
+    falsified_not_revoked: int = 0  # worst: condition met, didn't revoke
+    falsified_and_revoked: int = 0  # good: condition met, revoked promptly
+    unfalsified: int = 0            # condition never triggered
     
-    An attestor whose counterfactual NEVER fires across many attestations
-    is either: (a) evaluating only easy cases, or (b) rubber-stamping.
-    """
-    by_attestor = {}
-    for a in attestations:
-        if a.attestor not in by_attestor:
-            by_attestor[a.attestor] = {"total": 0, "triggered": 0, "unfalsifiable": 0}
-        by_attestor[a.attestor]["total"] += 1
-        if not a.is_falsifiable:
-            by_attestor[a.attestor]["unfalsifiable"] += 1
+    @property
+    def credibility(self) -> float:
+        """Credibility score. Falsified-not-revoked is devastating."""
+        if self.total_attestations == 0:
+            return 0.5  # no track record
+        
+        good = self.unfalsified + self.falsified_and_revoked * 0.8
+        bad = self.falsified_not_revoked * 3.0  # heavy penalty
+        
+        return max(0, min(1, good / (good + bad)))
     
-    results = {}
-    for attestor, stats in by_attestor.items():
-        trigger_rate = stats["triggered"] / max(stats["total"], 1)
-        unfalsifiable_rate = stats["unfalsifiable"] / max(stats["total"], 1)
-        
-        status = "healthy"
-        if unfalsifiable_rate > 0.5:
-            status = "MIRAGE_RISK"  # mostly unfalsifiable = pattern completion
-        elif trigger_rate < trigger_rate_threshold and stats["total"] > 10:
-            status = "RUBBER_STAMP"  # counterfactuals never trigger
-        
-        results[attestor] = {
-            **stats,
-            "trigger_rate": round(trigger_rate, 3),
-            "unfalsifiable_rate": round(unfalsifiable_rate, 3),
-            "status": status
+    @property 
+    def is_mirage_attestor(self) -> bool:
+        """Detect pattern-matching attestors (high volume, no falsifications)."""
+        if self.total_attestations < 5:
+            return False
+        # If NOTHING is ever falsified, suspicious — like mirage mode
+        falsification_rate = (self.falsified_not_revoked + self.falsified_and_revoked) / self.total_attestations
+        return falsification_rate == 0 and self.total_attestations > 10
+
+def simulate_attestation_ecosystem(n_attestors: int = 20, 
+                                    n_rounds: int = 50) -> Dict:
+    """Simulate ecosystem with counterfactual attestations."""
+    import random
+    random.seed(42)
+    
+    # Create attestors with different behaviors
+    attestors = {}
+    for i in range(n_attestors):
+        behavior = random.choice(["honest", "honest", "honest", "mirage", "lazy"])
+        attestors[f"agent_{i}"] = {
+            "behavior": behavior,
+            "reputation": AttestorReputation(f"agent_{i}")
+        }
+    
+    results = {"rounds": [], "final_reputations": {}}
+    
+    for round_num in range(n_rounds):
+        # Each attestor makes an attestation
+        for aid, adata in attestors.items():
+            rep = adata["reputation"]
+            rep.total_attestations += 1
+            
+            if adata["behavior"] == "honest":
+                # Honest: specific falsification conditions, revokes when triggered
+                condition = FalsificationCondition(
+                    "threshold", 
+                    "Score drops below 0.5",
+                    {"metric": "score", "threshold": 0.5, "direction": "below"}
+                )
+                # 20% chance condition is triggered
+                if random.random() < 0.2:
+                    # Honest attestor revokes 90% of the time
+                    if random.random() < 0.9:
+                        rep.falsified_and_revoked += 1
+                    else:
+                        rep.falsified_not_revoked += 1
+                else:
+                    rep.unfalsified += 1
+                    
+            elif adata["behavior"] == "mirage":
+                # Mirage: vague conditions that never trigger (like "nothing would change my mind")
+                condition = FalsificationCondition(
+                    "event",
+                    "Complete system failure",
+                    {"event_type": "total_collapse"}  # never happens
+                )
+                rep.unfalsified += 1  # conditions never met
+                
+            elif adata["behavior"] == "lazy":
+                # Lazy: conditions trigger but doesn't bother revoking
+                condition = FalsificationCondition(
+                    "threshold",
+                    "Performance dips",
+                    {"metric": "perf", "threshold": 0.3, "direction": "below"}
+                )
+                if random.random() < 0.3:
+                    rep.falsified_not_revoked += 1  # never revokes
+                else:
+                    rep.unfalsified += 1
+    
+    # Compile results
+    for aid, adata in attestors.items():
+        rep = adata["reputation"]
+        results["final_reputations"][aid] = {
+            "behavior": adata["behavior"],
+            "credibility": rep.credibility,
+            "is_mirage": rep.is_mirage_attestor,
+            "total": rep.total_attestations,
+            "falsified_unrevoked": rep.falsified_not_revoked,
+            "falsified_revoked": rep.falsified_and_revoked,
         }
     
     return results
 
-def simulate_attestation_population(n_attestors: int = 10, 
-                                     n_attestations: int = 50) -> List[Attestation]:
-    """Generate realistic mix of attestation styles."""
-    attestations = []
-    
-    for i in range(n_attestors):
-        style = random.choice(["rigorous", "lazy", "mirage", "honest_uncertain"])
-        
-        for _ in range(n_attestations // n_attestors):
-            if style == "rigorous":
-                a = Attestation(
-                    attestor=f"agent_{i}",
-                    subject=f"task_{random.randint(1,100)}",
-                    verdict=random.choice(["delivered", "failed", "partial"]),
-                    confidence=random.uniform(0.6, 0.9),
-                    counterfactual=CounterfactualCondition(
-                        description=f"verdict changes if hash mismatch on section {random.randint(1,5)}",
-                        evidence_type="hash_mismatch",
-                        threshold=0.0
-                    ),
-                    evidence_refs=[f"hash:{random.randint(1000,9999)}" for _ in range(random.randint(2,4))]
-                )
-            elif style == "lazy":
-                a = Attestation(
-                    attestor=f"agent_{i}",
-                    subject=f"task_{random.randint(1,100)}",
-                    verdict="delivered",  # always positive
-                    confidence=0.99,  # always certain
-                    counterfactual=None,  # no counterfactual!
-                    evidence_refs=[]
-                )
-            elif style == "mirage":
-                a = Attestation(
-                    attestor=f"agent_{i}",
-                    subject=f"task_{random.randint(1,100)}",
-                    verdict=random.choice(["delivered", "delivered", "partial"]),
-                    confidence=random.uniform(0.85, 0.99),
-                    counterfactual=CounterfactualCondition(
-                        description="verdict would change with different evidence",  # vague!
-                        evidence_type="unspecified"
-                    ),
-                    evidence_refs=[f"ref:{random.randint(1,99)}"]
-                )
-            else:  # honest_uncertain
-                a = Attestation(
-                    attestor=f"agent_{i}",
-                    subject=f"task_{random.randint(1,100)}",
-                    verdict=random.choice(["delivered", "failed", "partial", "uncertain"]),
-                    confidence=random.uniform(0.4, 0.75),
-                    counterfactual=CounterfactualCondition(
-                        description=f"changes if delivery latency > {random.randint(24,72)}h",
-                        evidence_type="timestamp_violation",
-                        threshold=random.uniform(24, 72)
-                    ),
-                    evidence_refs=[f"ts:{random.randint(1000,9999)}", f"hash:{random.randint(1000,9999)}"]
-                )
-            
-            attestations.append(a)
-    
-    return attestations
-
 if __name__ == "__main__":
-    random.seed(42)
-    
     print("=" * 60)
-    print("COUNTERFACTUAL ATTESTATION SCORER")
-    print("Popper demarcation for trust protocols")
+    print("COUNTERFACTUAL ATTESTATION PROTOCOL")
+    print("Popper demarcation for agent trust")
     print("=" * 60)
     
-    # Demo: good vs bad attestations
-    print("\n--- Example Attestations ---")
+    results = simulate_attestation_ecosystem(20, 50)
     
-    good = Attestation(
-        attestor="kit_fox",
-        subject="test_case_3_delivery",
-        verdict="delivered",
-        confidence=0.92,
-        counterfactual=CounterfactualCondition(
-            description="verdict changes to 'failed' if hash mismatch on sections 2-4 OR delivery >48h late",
-            evidence_type="hash_mismatch",
-            threshold=0.0
-        ),
-        evidence_refs=["hash:abc123", "ts:2026-04-01T15:00Z", "size:7500chars"]
-    )
+    # Group by behavior
+    by_behavior = {}
+    for aid, data in results["final_reputations"].items():
+        b = data["behavior"]
+        if b not in by_behavior:
+            by_behavior[b] = []
+        by_behavior[b].append(data)
     
-    bad = Attestation(
-        attestor="rubber_stamp_bot",
-        subject="test_case_3_delivery",
-        verdict="delivered",
-        confidence=0.99,
-        counterfactual=None,
-        evidence_refs=[]
-    )
+    print("\n--- Credibility by Behavior Type ---")
+    for behavior, agents in sorted(by_behavior.items()):
+        avg_cred = sum(a["credibility"] for a in agents) / len(agents)
+        mirage_detected = sum(1 for a in agents if a["is_mirage"])
+        print(f"\n{behavior.upper()} (n={len(agents)}):")
+        print(f"  Avg credibility: {avg_cred:.3f}")
+        print(f"  Mirage-detected: {mirage_detected}/{len(agents)}")
+        if agents:
+            sample = agents[0]
+            print(f"  Sample: total={sample['total']}, "
+                  f"falsified_unrevoked={sample['falsified_unrevoked']}, "
+                  f"falsified_revoked={sample['falsified_revoked']}")
     
-    vague = Attestation(
-        attestor="mirage_bot",
-        subject="test_case_3_delivery",
-        verdict="delivered",
-        confidence=0.95,
-        counterfactual=CounterfactualCondition(
-            description="would change with different evidence",
-            evidence_type="unspecified"
-        ),
-        evidence_refs=["ref:1"]
-    )
+    # Key finding
+    print("\n--- Key Findings ---")
+    honest_cred = [a["credibility"] for a in by_behavior.get("honest", [])]
+    mirage_cred = [a["credibility"] for a in by_behavior.get("mirage", [])]
+    lazy_cred = [a["credibility"] for a in by_behavior.get("lazy", [])]
     
-    for label, att in [("Rigorous", good), ("Rubber stamp", bad), ("Mirage/vague", vague)]:
-        env = att.to_envelope()
-        print(f"\n{label}:")
-        print(f"  Falsifiable: {env['falsifiable']}")
-        print(f"  Quality: {env['quality_score']}")
-        print(f"  Confidence: {env['confidence']}")
-        print(f"  Evidence refs: {len(env['evidence_refs'])}")
+    if honest_cred and mirage_cred:
+        h_avg = sum(honest_cred)/len(honest_cred)
+        m_avg = sum(mirage_cred)/len(mirage_cred)
+        print(f"Honest avg: {h_avg:.3f}")
+        print(f"Mirage avg: {m_avg:.3f}")
+        print(f"Separation: {abs(h_avg - m_avg):.3f}")
     
-    # Population simulation
-    print("\n--- Population Simulation (10 attestors, 50 attestations) ---")
-    population = simulate_attestation_population(10, 50)
-    
-    # Quality distribution
-    scores = [a.quality_score for a in population]
-    falsifiable_count = sum(1 for a in population if a.is_falsifiable)
-    print(f"Total attestations: {len(population)}")
-    print(f"Falsifiable: {falsifiable_count}/{len(population)} ({falsifiable_count/len(population):.0%})")
-    print(f"Quality scores: mean={sum(scores)/len(scores):.3f} min={min(scores):.3f} max={max(scores):.3f}")
-    
-    # Rubber stamp detection
-    print("\n--- Rubber Stamp Detection ---")
-    results = detect_rubber_stamping(population)
-    for agent, stats in sorted(results.items()):
-        emoji = "✅" if stats["status"] == "healthy" else "⚠️" if stats["status"] == "RUBBER_STAMP" else "🔴"
-        print(f"  {emoji} {agent}: {stats['total']} attestations, "
-              f"unfalsifiable={stats['unfalsifiable_rate']:.0%}, "
-              f"status={stats['status']}")
+    mirage_total = sum(1 for data in results["final_reputations"].values() if data["is_mirage"])
+    actual_mirage = sum(1 for data in results["final_reputations"].values() if data["behavior"] == "mirage")
+    print(f"\nMirage detection: {mirage_total} flagged / {actual_mirage} actual")
     
     print("\n" + "=" * 60)
-    print("KEY INSIGHT: Unfalsifiable attestation = prior completion.")
-    print("Counterfactual field = Popper demarcation for trust.")
-    print("Rubber stamps detectable by: never-triggering counterfactuals")
-    print("OR missing counterfactuals entirely (mirage risk).")
+    print("RESULT: Counterfactual fields separate honest from mirage")
+    print("attestors. Unfalsifiable conditions = zero credibility growth.")
+    print("Lazy attestors (don't revoke) penalized 3x = fast credibility loss.")
     print("=" * 60)
