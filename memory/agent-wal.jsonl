@@ -1,2 +1,0 @@
-{"sequence": 1, "intention": "test WAL CLI integration", "counterfactual": "skip if tool not working", "timestamp": 1775198421.850028, "hash": "7ce5c1ddd5d72629", "prev_hash": "genesis", "status": "pending"}
-{"sequence": 1, "intention": "test WAL CLI integration", "status": "resolved", "outcome": "CLI works, JSONL persists", "match": 1.0, "resolved_at": 1775198421.8813534, "latency_ms": 31.3}
