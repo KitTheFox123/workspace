@@ -54,8 +54,7 @@ def lookup(word: str) -> str | None:
 
 def clean_challenge(text: str) -> list[str]:
     """Strip non-alpha, lowercase, greedy reassembly of fragments."""
-    # Don't convert punctuation to math ops — the challenges use WORDS for operations
-    # The / * + chars in challenges are just obfuscation noise, not math operators
+    """Strip non-alpha, lowercase, greedy reassembly of fragments."""
     text_processed = text.lower()
     stripped = re.sub(r"[^a-z ]", "", text_processed)
     fragments = stripped.split()
@@ -83,6 +82,7 @@ def clean_challenge(text: str) -> list[str]:
     for token in result:
         if not deduped or deduped[-1] != token:
             deduped.append(token)
+    
     return deduped
 
 
