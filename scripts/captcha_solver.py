@@ -33,9 +33,11 @@ def dedup(s: str) -> str:
     return re.sub(r"(.)\1+", r"\1", s)
 
 
+DECIMAL_WORDS = {"point", "dot"}  # decimal markers for "four point five" → 4.5
+
 def lookup(word: str) -> str | None:
     """Try to match a word (possibly obfuscated) to a known token."""
-    all_known = {**WORD_TO_NUM, **{w: w for ws in OP_WORDS.values() for w in ws}}
+    all_known = {**WORD_TO_NUM, **{w: w for ws in OP_WORDS.values() for w in ws}, **{w: w for w in DECIMAL_WORDS}}
     if word in all_known:
         return word
     d = dedup(word)
@@ -84,8 +86,9 @@ def clean_challenge(text: str) -> list[str]:
     return deduped
 
 
-def extract_numbers(tokens: list[str]) -> list[int]:
-    """Parse number words into integers, handling compounds like 'twenty three'.
+def extract_numbers(tokens: list[str]) -> list[float]:
+    """Parse number words into numbers (int or float), handling compounds like 'twenty three'
+    and decimals like 'four point five' → 4.5.
     
     Ignores small numbers (1-9) that appear in descriptive context like
     'one claw', 'other claw', 'six fights' when they're adjacent to
@@ -131,6 +134,26 @@ def extract_numbers(tokens: list[str]) -> list[int]:
                 else:
                     current += val
             in_number = True
+        elif token in DECIMAL_WORDS:
+            # "point" between numbers: peek ahead for fractional part
+            # Don't break the number sequence — just mark that next number is fractional
+            if in_number and current > 0:
+                # Look ahead for the fractional part
+                if idx + 1 < len(tokens) and WORD_TO_NUM.get(tokens[idx + 1]) is not None:
+                    frac_val = WORD_TO_NUM[tokens[idx + 1]]
+                    frac_str = str(frac_val)
+                    current = current + frac_val / (10 ** len(frac_str))
+                    all_numbers.append((start_idx, current))
+                    current = 0
+                    in_number = False
+                    # Skip next token (already consumed as fraction)
+                    tokens[idx + 1] = "__consumed__"
+                    continue
+            # If not in a number context, just skip "point"
+            if in_number:
+                all_numbers.append((start_idx, current))
+                current = 0
+                in_number = False
         else:
             if in_number:
                 all_numbers.append((start_idx, current))
@@ -139,6 +162,26 @@ def extract_numbers(tokens: list[str]) -> list[int]:
 
     if in_number:
         all_numbers.append((start_idx, current))
+
+    # Post-pass: handle "point" decimals (e.g., "four point five" → 4.5)
+    # Look for pattern: number at position X, "point" at X+1, number at X+2 in tokens
+    decimal_merged = []
+    skip_indices = set()
+    for i, (idx, val) in enumerate(all_numbers):
+        if i in skip_indices:
+            continue
+        # Check if next token after this number is "point" and then another number follows
+        if idx + 1 < len(tokens) and tokens[idx + 1] == "point" and i + 1 < len(all_numbers):
+            next_idx, next_val = all_numbers[i + 1]
+            # "point" should be between the two number positions
+            if next_idx == idx + 2 or (next_idx > idx and any(tokens[j] == "point" for j in range(idx + 1, next_idx))):
+                frac_str = str(int(next_val))
+                decimal_val = val + next_val / (10 ** len(frac_str))
+                decimal_merged.append((idx, decimal_val))
+                skip_indices.add(i + 1)
+                continue
+        decimal_merged.append((idx, val))
+    all_numbers = decimal_merged
 
     if len(all_numbers) <= 2:
         return [n for _, n in all_numbers]
